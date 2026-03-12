@@ -881,8 +881,9 @@ async function loadLLMStatus() {
     const json = await resp.json();
     const s = json.data;
     if (!s) return;
+    const providerLabel = s.provider_name || formatProviderLabel(s.selected_provider || (s.tier1 && s.tier1.provider));
     const t1Model = document.getElementById('llm-tier1-model');
-    if (t1Model) t1Model.textContent = `모델: ${s.tier1.model}`;
+    if (t1Model) t1Model.textContent = `${providerLabel} · T1 ${s.tier1.model}`;
   } catch (err) {
     console.error('LLM status error:', err);
   }
@@ -898,27 +899,46 @@ async function loadLLMUsage() {
       document.getElementById('usage-summary').innerHTML = '<div class="text-gray-600 text-xs">데이터 없음</div>';
       return;
     }
+    const providerLabel = d.provider_name || formatProviderLabel(d.provider || (d.app_usage && d.app_usage.provider));
+    const summary = d.summary || {};
+    const totalSessions = summary.total_sessions == null ? '-' : summary.total_sessions.toLocaleString();
+    const totalMessages = summary.total_messages == null ? '-' : summary.total_messages.toLocaleString();
     document.getElementById('usage-summary').innerHTML = `
       <div class="flex justify-between">
+        <span class="text-gray-400">Provider</span>
+        <span class="text-white">${providerLabel}</span>
+      </div>
+      <div class="flex justify-between">
         <span class="text-gray-400">총 세션</span>
-        <span class="text-white">${d.total_sessions.toLocaleString()}</span>
+        <span class="text-white">${totalSessions}</span>
       </div>
       <div class="flex justify-between">
         <span class="text-gray-400">총 메시지</span>
-        <span class="text-white">${d.total_messages.toLocaleString()}</span>
+        <span class="text-white">${totalMessages}</span>
       </div>`;
     const appEl = document.getElementById('usage-app');
-    const app = d.app_usage;
+    const app = d.app_usage || {};
     if (app && app.total_calls > 0) {
+      const totalInputTokens = app.total_input_tokens ?? app.input_tokens ?? 0;
+      const totalOutputTokens = app.total_output_tokens ?? app.output_tokens ?? 0;
       let html = `
         <div class="flex justify-between"><span class="text-gray-400">호출 수</span><span class="text-cyan-400">${app.total_calls}</span></div>
-        <div class="flex justify-between"><span class="text-gray-400">출력 토큰</span><span class="text-green-400">${formatTokens(app.total_output_tokens)}</span></div>`;
+        <div class="flex justify-between"><span class="text-gray-400">입력 토큰</span><span class="text-blue-400">${formatTokens(totalInputTokens)}</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">출력 토큰</span><span class="text-green-400">${formatTokens(totalOutputTokens)}</span></div>`;
+      if (app.session_id) {
+        html += `<div class="flex justify-between"><span class="text-gray-400">세션</span><span class="text-gray-300">${escapeHtml(String(app.session_id).slice(0, 8))}</span></div>`;
+      }
       if (app.by_model && Object.keys(app.by_model).length) {
         for (const [model, mu] of Object.entries(app.by_model)) {
-          const short = model.replace('claude-', '').replace(/-\d{8,}$/, '');
+          const short = model
+            .replace('claude-', '')
+            .replace('codex:', '')
+            .replace(/-\d{8,}$/, '');
+          const cachedTokens = mu.cached_input_tokens ?? mu.cache_read ?? 0;
           html += `<div class="bg-dark-900 rounded p-1.5 mt-1">
             <div class="text-gray-300 text-xs">${short} <span class="text-gray-600">(${mu.calls}회)</span></div>
             <div class="text-gray-500">${formatTokens(mu.input_tokens)} in / ${formatTokens(mu.output_tokens)} out</div>
+            ${cachedTokens ? `<div class="text-gray-600">${formatTokens(cachedTokens)} cached</div>` : ''}
           </div>`;
         }
       }
@@ -929,7 +949,7 @@ async function loadLLMUsage() {
     const modelsEl = document.getElementById('usage-models');
     if (d.model_usage && Object.keys(d.model_usage).length) {
       let html = '';
-      for (const [model, usage] of Object.entries(d.model_usage)) {
+        for (const [model, usage] of Object.entries(d.model_usage)) {
         const shortModel = model.replace('claude-', '').replace(/-\d{8}$/, '');
         html += `<div class="bg-dark-900 rounded p-2 mb-1">
           <div class="text-gray-300 font-medium mb-1" title="${model}">${shortModel}</div>
@@ -938,6 +958,20 @@ async function loadLLMUsage() {
             <span>출력</span><span class="text-right text-green-400">${formatTokens(usage.outputTokens)}</span>
             <span>캐시읽기</span><span class="text-right text-blue-400">${formatTokens(usage.cacheReadInputTokens)}</span>
             <span>캐시생성</span><span class="text-right text-purple-400">${formatTokens(usage.cacheCreationInputTokens)}</span>
+          </div>
+        </div>`;
+      }
+      modelsEl.innerHTML = html;
+    } else if (app.by_model && Object.keys(app.by_model).length) {
+      let html = '';
+      for (const [model, usage] of Object.entries(app.by_model)) {
+        const shortModel = model.replace('codex:', '').replace('claude-', '');
+        html += `<div class="bg-dark-900 rounded p-2 mb-1">
+          <div class="text-gray-300 font-medium mb-1" title="${model}">${shortModel}</div>
+          <div class="grid grid-cols-2 gap-x-2 gap-y-0.5 text-gray-500">
+            <span>입력</span><span class="text-right text-gray-400">${formatTokens(usage.input_tokens)}</span>
+            <span>출력</span><span class="text-right text-green-400">${formatTokens(usage.output_tokens)}</span>
+            <span>캐시입력</span><span class="text-right text-blue-400">${formatTokens(usage.cached_input_tokens ?? usage.cache_read ?? 0)}</span>
           </div>
         </div>`;
       }
@@ -980,6 +1014,13 @@ function formatTokens(n) {
   if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
   if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
   return n.toLocaleString();
+}
+
+function formatProviderLabel(provider) {
+  if (!provider) return 'LLM';
+  if (provider === 'CLAUDE_CODE') return 'Claude Code';
+  if (provider === 'CODEX_CLI') return 'Codex CLI';
+  return provider.replaceAll('_', ' ');
 }
 
 // ── System Status ──
