@@ -57,7 +57,7 @@ class TradingAgent:
         self._trading_context: str = ""
         # 데이트레이딩 일일 기준 자산 (손익 계산용)
         self._daily_start_balance: float = 0.0
-        # Claude Code 세션 ID (장중 → 장외 이어받기용)
+        # LLM 세션 ID (장중 → 장외 이어받기용)
         self._last_session_id: str | None = None
         # 병렬/다중경로 매수 시 잔고 이중사용 방지
         self._available_cash: float = 0.0
@@ -107,9 +107,7 @@ class TradingAgent:
 
     async def _run_trading_cycle(self) -> dict:
         """장중 사이클: 스캔 → 분석 → 매매"""
-        # Claude Code 세션 시작 (사이클 내 맥락 유지)
-        from analysis.llm.claude_code_provider import ClaudeCodeProvider
-        ClaudeCodeProvider.start_session()
+        llm_factory.start_session()
 
         cycle_id = activity_logger.start_cycle()
         cycle_timer = activity_logger.timer()
@@ -204,7 +202,7 @@ class TradingAgent:
             # 4. 후보 종목별 심층 분석 + 전략 평가 + 매매 (병렬)
             # 세션 일시 중지 → 각 종목 분석은 독립 호출 (병렬 가능)
             # 스크리닝 맥락은 self._market_context로 프롬프트에 전달됨
-            paused_sid = ClaudeCodeProvider.pause_session()
+            paused_sid = llm_factory.pause_session()
 
             semaphore = asyncio.Semaphore(3)
             executed_count = 0
@@ -256,7 +254,7 @@ class TradingAgent:
 
             # 병렬 분석 완료 → 세션 재개 (리포트/후속 처리용)
             if paused_sid:
-                ClaudeCodeProvider.resume_session(paused_sid)
+                llm_factory.resume_session(paused_sid)
 
             for i, r in enumerate(all_results):
                 if isinstance(r, Exception):
@@ -302,7 +300,7 @@ class TradingAgent:
             execution_time_ms=elapsed,
         )
         # 세션 종료 (세션 ID 보존 — 장외 사이클에서 재개 가능)
-        self._last_session_id = ClaudeCodeProvider.end_session()
+        self._last_session_id = llm_factory.end_session()
 
         logger.info("=== Agent 장중 사이클 종료: {} ===", results)
         return results
@@ -781,11 +779,10 @@ class TradingAgent:
 
     async def _run_after_hours_cycle(self) -> dict:
         """장외 사이클: 오늘 데이트레이딩 성과 리뷰 (피드백 학습용)"""
-        from analysis.llm.claude_code_provider import ClaudeCodeProvider
         from trading.account_manager import account_manager
         from util.time_util import now_kst
 
-        ClaudeCodeProvider.start_session()
+        llm_factory.start_session()
 
         cycle_id = activity_logger.start_cycle()
         cycle_timer = activity_logger.timer()
@@ -1024,7 +1021,7 @@ class TradingAgent:
             detail=results,
             execution_time_ms=elapsed,
         )
-        ClaudeCodeProvider.end_session()
+        llm_factory.end_session()
         self._last_session_id = None
 
         logger.info("=== Agent 장 마감 리뷰 종료 ===")

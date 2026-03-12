@@ -1,40 +1,76 @@
-"""LLM Factory — Claude Code CLI 전용"""
+"""LLM Factory — Claude/Codex CLI 공통 라우터"""
+from __future__ import annotations
+
 import asyncio
 import time
+from typing import Any, cast
 
 from loguru import logger
 
+from analysis.llm.base import LLMProviderProtocol, LLMSessionProtocol
 from analysis.llm.claude_code_provider import ClaudeCodeProvider
+from analysis.llm.codex_cli_provider import CodexCLIProvider
 from core.config import settings
-from trading.enums import ActivityPhase, ActivityType, LLMTier
+from trading.enums import ActivityPhase, ActivityType, LLMProvider, LLMTier
 
 
 class LLMFactory:
-    """Claude Code CLI 기반 LLM 라우팅
+    """CLI 기반 LLM 라우터"""
 
-    - Tier 1 (빠름): 스캔, 선별, 기술분석 해석
-    - Tier 2 (프리미엄): 최종 검토, 매매 결정
-    """
+    PROVIDER_CLASSES: dict[LLMProvider, type[LLMProviderProtocol]] = {
+        LLMProvider.CLAUDE_CODE: ClaudeCodeProvider,
+        LLMProvider.CODEX_CLI: CodexCLIProvider,
+    }
+    PROVIDER_LABELS = {
+        LLMProvider.CLAUDE_CODE: "Claude Code (로컬)",
+        LLMProvider.CODEX_CLI: "Codex CLI (로컬)",
+    }
 
     def __init__(self):
+        self._selected_provider: LLMProvider | None = None
+        self._providers: dict[LLMTier, LLMProviderProtocol] = {}
+
+    def _ensure_provider_cache(self) -> None:
+        """settings 기준으로 provider 인스턴스 갱신"""
+        selected_provider = settings.llm_provider
+        if self._selected_provider == selected_provider and self._providers:
+            return
+
+        provider_class = self.PROVIDER_CLASSES[selected_provider]
         self._providers = {
-            LLMTier.TIER1: ClaudeCodeProvider(LLMTier.TIER1),
-            LLMTier.TIER2: ClaudeCodeProvider(LLMTier.TIER2),
+            LLMTier.TIER1: provider_class(LLMTier.TIER1),
+            LLMTier.TIER2: provider_class(LLMTier.TIER2),
         }
+        self._selected_provider = selected_provider
+
+    def _get_provider(self, tier: LLMTier) -> LLMProviderProtocol:
+        """Tier별 provider 인스턴스 반환"""
+        self._ensure_provider_cache()
+        return self._providers[tier]
+
+    def _get_session_provider_class(self) -> type[LLMSessionProtocol]:
+        """현재 선택된 provider class 반환"""
+        provider = self._get_provider(LLMTier.TIER1)
+        return cast(type[LLMSessionProtocol], type(provider))
 
     async def generate(
-        self, prompt: str, tier: LLMTier = LLMTier.TIER1, system_prompt: str = "",
-        *, symbol: str | None = None, cycle_id: str | None = None,
+        self,
+        prompt: str,
+        tier: LLMTier = LLMTier.TIER1,
+        system_prompt: str = "",
+        *,
+        symbol: str | None = None,
+        cycle_id: str | None = None,
     ) -> tuple[str, str]:
         """텍스트 생성 (최대 2회 시도)
 
         Returns:
             (생성 텍스트, 사용된 provider 이름)
         """
-        provider = self._providers[tier]
+        provider = self._get_provider(tier)
 
         if not await provider.is_available():
-            raise RuntimeError("Claude Code CLI를 찾을 수 없습니다 (PATH 확인)")
+            raise RuntimeError(f"{provider.provider.value} CLI를 찾을 수 없습니다 (PATH 확인)")
 
         last_error = None
         for attempt in range(2):
@@ -50,7 +86,6 @@ class LLMFactory:
                     provider_name, model_id, elapsed_ms,
                 )
 
-                # LLM 대화 내역 자동 로깅 (모니터링용)
                 await self._log_llm_conversation(
                     tier=tier,
                     provider=provider_name,
@@ -73,9 +108,17 @@ class LLMFactory:
         raise last_error
 
     async def _log_llm_conversation(
-        self, *, tier: LLMTier, provider: str, model: str,
-        system_prompt: str, prompt: str, response: str, elapsed_ms: int,
-        symbol: str | None = None, cycle_id: str | None = None,
+        self,
+        *,
+        tier: LLMTier,
+        provider: str,
+        model: str,
+        system_prompt: str,
+        prompt: str,
+        response: str,
+        elapsed_ms: int,
+        symbol: str | None = None,
+        cycle_id: str | None = None,
     ) -> None:
         """LLM 프롬프트/응답을 activity log에 기록"""
         try:
@@ -99,34 +142,97 @@ class LLMFactory:
             logger.debug("LLM 대화 로깅 실패 (무시): {}", str(e))
 
     async def generate_tier1(
-        self, prompt: str, system_prompt: str = "",
-        *, symbol: str | None = None, cycle_id: str | None = None,
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        *,
+        symbol: str | None = None,
+        cycle_id: str | None = None,
     ) -> tuple[str, str]:
         """Tier 1 (빠른 분석용)"""
         return await self.generate(prompt, LLMTier.TIER1, system_prompt, symbol=symbol, cycle_id=cycle_id)
 
     async def generate_tier2(
-        self, prompt: str, system_prompt: str = "",
-        *, symbol: str | None = None, cycle_id: str | None = None,
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        *,
+        symbol: str | None = None,
+        cycle_id: str | None = None,
     ) -> tuple[str, str]:
         """Tier 2 (프리미엄 분석용)"""
         return await self.generate(prompt, LLMTier.TIER2, system_prompt, symbol=symbol, cycle_id=cycle_id)
 
-    def get_llm_status(self) -> dict:
+    def start_session(self) -> str | None:
+        """선택된 provider 세션 시작"""
+        return self._get_session_provider_class().start_session()
+
+    def end_session(self) -> str | None:
+        """선택된 provider 세션 종료"""
+        return self._get_session_provider_class().end_session()
+
+    def pause_session(self) -> str | None:
+        """선택된 provider 세션 일시 중지"""
+        return self._get_session_provider_class().pause_session()
+
+    def resume_session(self, session_id: str) -> None:
+        """선택된 provider 세션 재개"""
+        self._get_session_provider_class().resume_session(session_id)
+
+    def get_session_id(self) -> str | None:
+        """선택된 provider 세션 ID 반환"""
+        return self._get_session_provider_class().get_session_id()
+
+    def get_llm_usage(self) -> dict[str, Any]:
+        """선택된 provider 사용량 반환"""
+        report = self._get_session_provider_class().get_usage_report()
+        provider = settings.llm_provider
+        report.setdefault("provider", provider.value)
+        report.setdefault("selected_provider", provider.value)
+        report.setdefault("provider_name", self.PROVIDER_LABELS[provider])
+        report.setdefault("summary", {})
+        summary = report["summary"]
+        report.setdefault("total_sessions", summary.get("total_sessions"))
+        report.setdefault("total_messages", summary.get("total_messages"))
+        report.setdefault("model_usage", {})
+        report.setdefault("daily_activity", [])
+        report.setdefault("daily_model_tokens", [])
+        return report
+
+    async def get_llm_status(self) -> dict[str, Any]:
         """현재 LLM 설정 상태 반환 (Admin API용)"""
-        tier1_model = settings.CLAUDE_CODE_MODEL_TIER1 or settings.CLAUDE_CODE_MODEL or "haiku"
-        tier2_model = settings.CLAUDE_CODE_MODEL_TIER2 or settings.CLAUDE_CODE_MODEL or "sonnet"
-        return {
-            "tier1": {"provider": "CLAUDE_CODE", "model": tier1_model},
-            "tier2": {"provider": "CLAUDE_CODE", "model": tier2_model},
-            "available_providers": [
-                {
-                    "id": "CLAUDE_CODE",
-                    "name": "Claude Code (로컬)",
-                    "models": {"tier1": tier1_model, "tier2": tier2_model},
-                    "has_key": True,
+        selected_provider = settings.llm_provider
+        available_providers = []
+
+        for provider_enum, provider_class in self.PROVIDER_CLASSES.items():
+            provider_tier1 = provider_class(LLMTier.TIER1)
+            available_providers.append({
+                "id": provider_enum.value,
+                "name": provider_tier1.display_name,
+                "selected": provider_enum == selected_provider,
+                "available": await provider_tier1.is_available(),
+                "models": {
+                    "tier1": settings.get_llm_model(provider_enum, LLMTier.TIER1),
+                    "tier2": settings.get_llm_model(provider_enum, LLMTier.TIER2),
                 },
-            ],
+                "has_key": True,
+            })
+
+        return {
+            "current_provider": selected_provider.value,
+            "selected_provider": selected_provider.value,
+            "provider": selected_provider.value,
+            "provider_name": self.PROVIDER_LABELS[selected_provider],
+            "session_id": self.get_session_id(),
+            "tier1": {
+                "provider": selected_provider.value,
+                "model": settings.get_llm_model(selected_provider, LLMTier.TIER1),
+            },
+            "tier2": {
+                "provider": selected_provider.value,
+                "model": settings.get_llm_model(selected_provider, LLMTier.TIER2),
+            },
+            "available_providers": available_providers,
         }
 
 

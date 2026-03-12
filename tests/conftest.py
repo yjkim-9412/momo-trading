@@ -1,3 +1,7 @@
+import sys
+import types
+
+import pandas as pd
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import StaticPool
@@ -17,6 +21,21 @@ test_async_engine = create_async_engine(
 TestAsyncSessionLocal = async_sessionmaker(
     test_async_engine, expire_on_commit=False
 )
+
+
+class _PandasTAStub(types.ModuleType):
+    """테스트 import용 pandas_ta shim"""
+
+    def __getattr__(self, name: str):
+        if name == "ichimoku":
+            return lambda *args, **kwargs: (pd.DataFrame(), pd.DataFrame())
+        if name in {"macd", "bbands", "stoch", "adx"}:
+            return lambda *args, **kwargs: pd.DataFrame()
+        return lambda *args, **kwargs: pd.Series(dtype=float)
+
+
+if "pandas_ta" not in sys.modules:
+    sys.modules["pandas_ta"] = _PandasTAStub("pandas_ta")
 
 
 async def override_get_async_db():

@@ -1,5 +1,12 @@
+from __future__ import annotations
+
+import os
+import shutil
+
 from loguru import logger
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from trading.enums import LLMProvider, LLMTier
 
 
 class Settings(BaseSettings):
@@ -31,11 +38,20 @@ class Settings(BaseSettings):
     KIS_WS_URL_DOMESTIC: str = "ws://ops.koreainvestment.com:21000"
     KIS_WS_URL_OVERSEAS: str = "ws://ops.koreainvestment.com:31000"
 
-    # === AI / LLM (Claude Code CLI — 구독 크레딧 사용) ===
+    # === AI / LLM ===
+    LLM_PROVIDER: str = LLMProvider.CLAUDE_CODE.value
+
+    # Claude Code CLI
     CLAUDE_CODE_MODEL: str = "sonnet"  # 기본 모델 (Tier별 미지정 시 사용)
     CLAUDE_CODE_MODEL_TIER1: str = "haiku"  # Tier1 (스캔/분석): 빠른 모델
     CLAUDE_CODE_MODEL_TIER2: str = "sonnet"  # Tier2 (최종 검토): 정확한 모델
     CLAUDE_CODE_PATH: str = ""  # 비어있으면 자동 탐색 (예: /opt/homebrew/bin/claude)
+
+    # Codex CLI
+    CODEX_MODEL: str = "gpt-5.4"
+    CODEX_MODEL_TIER1: str = ""
+    CODEX_MODEL_TIER2: str = ""
+    CODEX_CLI_PATH: str = ""
 
     # === AI Agent ===
     AUTONOMY_MODE: str = "AUTONOMOUS"  # AUTONOMOUS / SEMI_AUTO
@@ -83,15 +99,51 @@ class Settings(BaseSettings):
     def is_paper_trading(self) -> bool:
         return self.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
 
+    @property
+    def llm_provider(self) -> LLMProvider:
+        """선택된 LLM provider 반환"""
+        raw_value = (self.LLM_PROVIDER or LLMProvider.CLAUDE_CODE.value).upper()
+        try:
+            return LLMProvider(raw_value)
+        except ValueError:
+            logger.warning(
+                "알 수 없는 LLM_PROVIDER={} → CLAUDE_CODE로 대체",
+                self.LLM_PROVIDER,
+            )
+            return LLMProvider.CLAUDE_CODE
+
+    def get_llm_model(self, provider: LLMProvider, tier: LLMTier) -> str:
+        """provider/tier 조합의 모델명 반환"""
+        if provider == LLMProvider.CLAUDE_CODE:
+            if tier == LLMTier.TIER1:
+                return self.CLAUDE_CODE_MODEL_TIER1 or self.CLAUDE_CODE_MODEL or "haiku"
+            return self.CLAUDE_CODE_MODEL_TIER2 or self.CLAUDE_CODE_MODEL or "sonnet"
+
+        if tier == LLMTier.TIER1:
+            return self.CODEX_MODEL_TIER1 or self.CODEX_MODEL or "gpt-5.4"
+        return self.CODEX_MODEL_TIER2 or self.CODEX_MODEL or "gpt-5.4"
+
+    def get_llm_cli_path(self, provider: LLMProvider) -> str | None:
+        """provider별 CLI 경로 탐색"""
+        if provider == LLMProvider.CLAUDE_CODE:
+            return self._find_claude_path()
+        return self._find_codex_path()
+
     def validate_on_startup(self) -> None:
         """시작 시 필수 설정 검증 — 누락된 키에 대해 경고 로그"""
-        claude_path = self._find_claude_path()
-        if claude_path:
-            logger.info("Claude Code CLI 감지: {} — CLAUDE_CODE 프로바이더 사용", claude_path)
-        else:
+        provider = self.llm_provider
+        cli_path = self.get_llm_cli_path(provider)
+        if cli_path:
+            logger.info("{} CLI 감지: {}", provider.value, cli_path)
+        elif provider == LLMProvider.CLAUDE_CODE:
             logger.warning(
                 "Claude Code CLI를 찾을 수 없음. "
                 "CLAUDE_CODE_PATH를 설정하거나 claude CLI를 설치하세요."
+            )
+        else:
+            logger.warning(
+                "Codex CLI를 찾을 수 없음. "
+                "CODEX_CLI_PATH를 설정하거나 codex CLI를 설치하세요."
             )
 
         if not self.KIS_APP_KEY and not self.KIS_PAPER_APP_KEY:
@@ -103,25 +155,50 @@ class Settings(BaseSettings):
         if not self.TRADING_ENABLED:
             logger.info("TRADING_ENABLED=false: 매매 기능이 비활성화 상태입니다.")
 
+    @staticmethod
+    def _find_executable_path(
+        configured_path: str,
+        command: str,
+        candidates: list[str],
+    ) -> str | None:
+        """설정값, PATH, 후보 경로 순으로 실행파일 탐색"""
+        if configured_path:
+            return configured_path
 
-    def _find_claude_path(self) -> str | None:
-        """claude CLI 경로 탐색 (설정값 → PATH → 일반적 설치 경로)"""
-        import os
-        import shutil
-        if self.CLAUDE_CODE_PATH:
-            return self.CLAUDE_CODE_PATH
-        path = shutil.which("claude")
+        path = shutil.which(command)
         if path:
             return path
-        for candidate in [
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude",
-            os.path.expanduser("~/.local/bin/claude"),
-            os.path.expanduser("~/.npm-global/bin/claude"),
-        ]:
+
+        for candidate in candidates:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 return candidate
         return None
+
+    def _find_claude_path(self) -> str | None:
+        """claude CLI 경로 탐색 (설정값 → PATH → 일반적 설치 경로)"""
+        return self._find_executable_path(
+            configured_path=self.CLAUDE_CODE_PATH,
+            command="claude",
+            candidates=[
+                "/opt/homebrew/bin/claude",
+                "/usr/local/bin/claude",
+                os.path.expanduser("~/.local/bin/claude"),
+                os.path.expanduser("~/.npm-global/bin/claude"),
+            ],
+        )
+
+    def _find_codex_path(self) -> str | None:
+        """codex CLI 경로 탐색 (설정값 → PATH → 일반적 설치 경로)"""
+        return self._find_executable_path(
+            configured_path=self.CODEX_CLI_PATH,
+            command="codex",
+            candidates=[
+                "/opt/homebrew/bin/codex",
+                "/usr/local/bin/codex",
+                os.path.expanduser("~/.local/bin/codex"),
+                os.path.expanduser("~/.npm-global/bin/codex"),
+            ],
+        )
 
 
 settings = Settings()

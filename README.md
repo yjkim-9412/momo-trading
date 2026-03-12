@@ -7,7 +7,7 @@ LLM 다단계 분석(스크리닝 → 기술적 분석 → 최종 검토)과 실
 ## 주요 기능
 
 - **AI 에이전트 파이프라인** — 시장 스캔 → LLM 스크리닝 → 5단계 CoT 분석 → 8항목 체크리스트 최종 검토 → 자동 주문
-- **2-Tier LLM 라우팅** — Tier1(빠른 모델: Gemini Flash/Haiku)로 스캔·분석, Tier2(정밀 모델: Claude/Bedrock)로 최종 승인
+- **2-Tier LLM 라우팅** — Tier1/Tier2에 대해 선택한 로컬 CLI provider(Claude Code 또는 Codex)로 스캔·분석·최종 검토를 수행
 - **듀얼 전략** — STABLE_SHORT(대형주 보수적) + AGGRESSIVE_SHORT(모멘텀 공격적), 시장 국면별 파라미터 자동 조정
 - **실시간 이벤트 트레이딩** — KIS WebSocket → 거래량 급증 / 급등 / 급락 감지 → 즉시 분석 및 매매
 - **스윙 모드** — 오버나이트 보유, 종목별 HOLD/SELL 판단, 갭 리스크 체크
@@ -27,7 +27,7 @@ LLM 다단계 분석(스크리닝 → 기술적 분석 → 최종 검토)과 실
 | **실시간 통신** | WebSocket (KIS), SSE (Admin) |
 | **스케줄러** | APScheduler (KRX 장 시간 기준 cron) |
 | **증권사 API** | KIS MCP Server (Docker) + KIS REST API 직접 호출 |
-| **LLM** | Claude Code CLI / Google Gemini / AWS Bedrock |
+| **LLM** | Claude Code CLI / Codex CLI |
 | **로깅** | loguru |
 | **테스트** | pytest + pytest-asyncio |
 
@@ -133,7 +133,7 @@ momo-trading/
 
 - Python 3.12+
 - [KIS Developers](https://apiportal.koreainvestment.com/) 계정 및 API 키
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (LLM 분석용)
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 또는 Codex CLI (LLM 분석용)
 - Docker & Docker Compose (KIS MCP 서버 실행용)
 
 ### 1. 저장소 클론 및 환경 설정
@@ -155,7 +155,7 @@ cp .env.example .env
 
 ### 2. `.env` 설정
 
-`.env` 파일을 열고 KIS API 키를 입력합니다.
+`.env` 파일을 열고 KIS API 키와 사용할 LLM provider를 입력합니다.
 
 ```bash
 # === 필수: KIS API 인증 ===
@@ -167,6 +167,19 @@ KIS_HTS_ID=your_hts_id               # HTS ID
 KIS_ACCT_STOCK=your_account_number    # 실전 계좌번호
 KIS_PAPER_STOCK=your_paper_account    # 모의 계좌번호
 KIS_ACCOUNT_TYPE=VIRTUAL              # VIRTUAL(모의) 또는 REAL(실전)
+
+# === LLM Provider 선택 ===
+LLM_PROVIDER=CLAUDE_CODE              # CLAUDE_CODE 또는 CODEX_CLI
+
+# Claude Code CLI
+CLAUDE_CODE_MODEL=sonnet
+CLAUDE_CODE_MODEL_TIER1=haiku
+CLAUDE_CODE_MODEL_TIER2=sonnet
+
+# Codex CLI
+CODEX_MODEL=gpt-5.4
+# CODEX_MODEL_TIER1=gpt-5.4
+# CODEX_MODEL_TIER2=gpt-5.4
 
 # === 거래 안전 설정 ===
 TRADING_ENABLED=false                 # true로 변경 시 실제 매매 실행
@@ -181,6 +194,8 @@ MAX_DAILY_TRADES=30                   # 일일 최대 거래 횟수
 ```
 
 > 전체 설정 항목은 `.env.example`을 참조하세요.
+
+> Codex를 사용할 경우 `codex login`이 선행되어 있어야 하며, Claude를 사용할 경우 `claude` CLI가 PATH에 있어야 합니다.
 
 ### 3. 실행
 

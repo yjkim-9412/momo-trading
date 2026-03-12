@@ -3,14 +3,17 @@
 claude -p 모드를 사용하여 API 키 없이 Claude Code 구독 크레딧으로 동작.
 세션을 유지하여 사이클 내 맥락(시장 스캔 → 종목 분석 → 리포트)을 공유.
 """
+from __future__ import annotations
+
 import asyncio
 import json
-import shutil
-from collections import defaultdict
+from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from loguru import logger
 
+from analysis.llm.base import empty_usage_snapshot
 from core.config import settings
 from trading.enums import LLMProvider, LLMTier
 
@@ -33,27 +36,12 @@ class ClaudeCodeProvider:
     _session_lock: asyncio.Lock | None = None
 
     # 클래스 레벨 누적 사용량
-    cumulative_usage: dict = {
-        "total_calls": 0,
-        "total_cost_usd": 0.0,
-        "total_input_tokens": 0,
-        "total_output_tokens": 0,
-        "total_cache_read": 0,
-        "total_cache_creation": 0,
-        "by_model": defaultdict(lambda: {
-            "calls": 0, "input_tokens": 0, "output_tokens": 0,
-            "cache_read": 0, "cache_creation": 0, "cost_usd": 0.0,
-        }),
-    }
+    cumulative_usage: dict = empty_usage_snapshot(LLMProvider.CLAUDE_CODE)
 
     def __init__(self, tier: LLMTier = LLMTier.TIER1):
         self._tier = tier
         self._claude_path: str | None = None
-        # Tier별 모델: TIER1=haiku(빠름), TIER2=sonnet(정확)
-        if tier == LLMTier.TIER1:
-            self._model = settings.CLAUDE_CODE_MODEL_TIER1 or settings.CLAUDE_CODE_MODEL or "haiku"
-        else:
-            self._model = settings.CLAUDE_CODE_MODEL_TIER2 or settings.CLAUDE_CODE_MODEL or "sonnet"
+        self._model = settings.get_llm_model(LLMProvider.CLAUDE_CODE, tier)
         self._resolved_model: str = ""
 
     @classmethod
@@ -113,8 +101,16 @@ class ClaudeCodeProvider:
         return LLMProvider.CLAUDE_CODE
 
     @property
+    def display_name(self) -> str:
+        return "Claude Code (로컬)"
+
+    @property
     def tier(self) -> LLMTier:
         return self._tier
+
+    @property
+    def configured_model(self) -> str:
+        return self._model
 
     @property
     def model_id(self) -> str:
@@ -124,24 +120,10 @@ class ClaudeCodeProvider:
         """claude CLI 경로 탐색"""
         if self._claude_path:
             return self._claude_path
-        configured = getattr(settings, "CLAUDE_CODE_PATH", "")
-        if configured:
-            self._claude_path = configured
-            return configured
-        path = shutil.which("claude")
+        path = settings.get_llm_cli_path(LLMProvider.CLAUDE_CODE)
         if path:
             self._claude_path = path
             return path
-        import os
-        for candidate in [
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude",
-            os.path.expanduser("~/.local/bin/claude"),
-            os.path.expanduser("~/.npm-global/bin/claude"),
-        ]:
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                self._claude_path = candidate
-                return candidate
         return None
 
     async def generate(self, prompt: str, system_prompt: str = "") -> str:
@@ -255,6 +237,7 @@ class ClaudeCodeProvider:
         cost = resp.get("total_cost_usd", 0)
         model_usage = resp.get("modelUsage", {})
 
+        self.cumulative_usage["provider"] = self.provider.value
         self.cumulative_usage["total_calls"] += 1
         self.cumulative_usage["total_cost_usd"] += cost
 
@@ -269,8 +252,17 @@ class ClaudeCodeProvider:
             self.cumulative_usage["total_output_tokens"] += out
             self.cumulative_usage["total_cache_read"] += cache_r
             self.cumulative_usage["total_cache_creation"] += cache_c
+            self.cumulative_usage["total_cached_input_tokens"] += cache_r
 
-            m = self.cumulative_usage["by_model"][model_name]
+            by_model = self.cumulative_usage["by_model"]
+            m = by_model.setdefault(model_name, {
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read": 0,
+                "cache_creation": 0,
+                "cost_usd": 0.0,
+            })
             m["calls"] += 1
             m["input_tokens"] += inp
             m["output_tokens"] += out
@@ -286,17 +278,91 @@ class ClaudeCodeProvider:
         """현재 누적 사용량 스냅샷 반환 (API용)"""
         u = cls.cumulative_usage
         return {
+            "provider": LLMProvider.CLAUDE_CODE.value,
             "total_calls": u["total_calls"],
             "total_cost_usd": round(u["total_cost_usd"], 4),
             "total_input_tokens": u["total_input_tokens"],
             "total_output_tokens": u["total_output_tokens"],
             "total_cache_read": u["total_cache_read"],
             "total_cache_creation": u["total_cache_creation"],
+            "total_cached_input_tokens": u["total_cached_input_tokens"],
             "by_model": {
                 model: {**stats}
                 for model, stats in u["by_model"].items()
             },
-            "session_id": cls._active_session_id[:8] if cls._active_session_id else None,
+            "session_id": cls._active_session_id,
+            "provider_data": {},
+        }
+
+    @classmethod
+    def get_usage_report(cls) -> dict[str, Any]:
+        """Claude 사용량 리포트 반환"""
+        stats_path = Path.home() / ".claude" / "stats-cache.json"
+        if not stats_path.exists():
+            return {
+                "provider": LLMProvider.CLAUDE_CODE.value,
+                "provider_name": "Claude Code (로컬)",
+                "summary": {
+                    "total_sessions": None,
+                    "total_messages": None,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "cached_input_tokens": None,
+                    "first_session_date": None,
+                },
+                "app_usage": cls.get_usage_snapshot(),
+                "model_usage": {},
+                "daily_model_tokens": [],
+                "provider_data": {},
+            }
+
+        try:
+            data = json.loads(stats_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.exception("[LLM] Claude 사용량 파싱 실패")
+            return {
+                "provider": LLMProvider.CLAUDE_CODE.value,
+                "provider_name": "Claude Code (로컬)",
+                "summary": {
+                    "total_sessions": None,
+                    "total_messages": None,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "cached_input_tokens": None,
+                    "first_session_date": None,
+                },
+                "app_usage": cls.get_usage_snapshot(),
+                "model_usage": {},
+                "daily_model_tokens": [],
+                "provider_data": {},
+            }
+
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_cached_input_tokens = 0
+        model_usage = data.get("modelUsage", {})
+        for usage in model_usage.values():
+            total_input_tokens += int(usage.get("inputTokens") or 0)
+            total_output_tokens += int(usage.get("outputTokens") or 0)
+            total_cached_input_tokens += int(usage.get("cacheReadInputTokens") or 0)
+
+        return {
+            "provider": LLMProvider.CLAUDE_CODE.value,
+            "provider_name": "Claude Code (로컬)",
+            "summary": {
+                "total_sessions": data.get("totalSessions"),
+                "total_messages": data.get("totalMessages"),
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "cached_input_tokens": total_cached_input_tokens,
+                "first_session_date": data.get("firstSessionDate"),
+            },
+            "app_usage": cls.get_usage_snapshot(),
+            "model_usage": model_usage,
+            "daily_model_tokens": data.get("dailyModelTokens", []),
+            "provider_data": {
+                "daily_activity": data.get("dailyActivity", []),
+            },
         }
 
     async def is_available(self) -> bool:
