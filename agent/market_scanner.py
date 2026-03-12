@@ -3,13 +3,19 @@ import asyncio
 
 from loguru import logger
 
+from core.config import settings
 from analysis.feedback.performance_tracker import PerformanceTracker
 from analysis.llm.llm_factory import llm_factory
-from analysis.llm.prompts.market_scan import MARKET_SCAN_PROMPT, MARKET_SCAN_SYSTEM
+from analysis.llm.prompts.market_scan import (
+    get_market_label,
+    get_market_scan_prompt,
+    get_market_scan_system,
+)
 from core.database import AsyncSessionLocal
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
+from trading.market_profile import is_us_market, normalize_market
 from trading.mcp_client import mcp_client
 
 # 모의투자 매매불가 종목 필터 키워드
@@ -47,16 +53,21 @@ class MarketScanner:
 
     async def scan(self, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
         """시장 스캔 + 종목 선별 통합 실행"""
-        logger.info("시장 스캔 시작")
+        primary_market = settings.primary_market_code
+        if is_us_market(primary_market) and not settings.US_TRADING_ENABLED:
+            logger.info("미국장 비활성화 → 시장 스캔 스킵")
+            return {"selected": [], "market_summary": "미국장 비활성화", "available_cash": 0}
+
+        logger.info("시장 스캔 시작: {}", primary_market)
         timer = activity_logger.timer()
 
         await activity_logger.log(
             ActivityType.SCAN, ActivityPhase.START,
-            "\U0001f4e1 시장 스캔 중... 거래량/등락 상위 종목 조회",
+            f"\U0001f4e1 시장 스캔 중... {get_market_label(primary_market)} 거래량/등락 상위 종목 조회",
             cycle_id=cycle_id,
         )
 
-        # 1. 데이터 수집 병렬화 (MCP 3건 + DB 1건 + 계좌 1건)
+        scan_markets = settings.scan_markets
         (
             account_snapshot,
             volume_rank,
@@ -64,10 +75,10 @@ class MarketScanner:
             drop_data,
             performance_summary,
         ) = await asyncio.gather(
-            account_manager.get_account_snapshot(),
-            self._get_volume_rank(),
-            self._get_fluctuation_rank("top"),
-            self._get_fluctuation_rank("bottom"),
+            account_manager.get_account_snapshot(primary_market),
+            self._get_volume_rank(scan_markets),
+            self._get_fluctuation_rank(scan_markets, "top"),
+            self._get_fluctuation_rank(scan_markets, "bottom"),
             self._get_performance_summary(),
         )
         balance, holdings = account_snapshot
@@ -83,8 +94,10 @@ class MarketScanner:
         # 2. AI 시장 분석 + 종목 선별 (통합 1회 호출)
         from util.time_util import now_kst
         from core.config import settings as _settings
+        from zoneinfo import ZoneInfo
+        from trading.market_profile import market_timezone
 
-        now = now_kst()
+        now = now_kst().astimezone(ZoneInfo(market_timezone(primary_market)))
         cutoff_time = now.replace(
             hour=_settings.BUY_CUTOFF_HOUR,
             minute=_settings.BUY_CUTOFF_MINUTE,
@@ -92,7 +105,8 @@ class MarketScanner:
         )
         minutes_until_cutoff = max(0, int((cutoff_time - now).total_seconds() / 60))
 
-        prompt = MARKET_SCAN_PROMPT.format(
+        prompt = get_market_scan_prompt(primary_market).format(
+            market_label=get_market_label(primary_market),
             current_time=now.strftime("%H:%M"),
             minutes_until_cutoff=minutes_until_cutoff,
             available_cash=available_cash,
@@ -107,15 +121,17 @@ class MarketScanner:
 
         try:
             result_text, provider = await llm_factory.generate_tier1(
-                prompt, system_prompt=MARKET_SCAN_SYSTEM
+                prompt, system_prompt=get_market_scan_system(primary_market)
             )
             parsed = self._parse_json_response(result_text)
             selected = parsed.get("selected", [])
+            for item in selected:
+                item["market"] = normalize_market(item.get("market", primary_market), default=primary_market)
             elapsed = activity_logger.elapsed_ms(timer)
 
             logger.info(
-                "시장 스캔+선별 완료 ({}): {}개 선정 (데이터 {}ms + AI {}ms)",
-                provider, len(selected), data_elapsed, elapsed - data_elapsed,
+                "시장 스캔+선별 완료 ({} / {}): {}개 선정 (데이터 {}ms + AI {}ms)",
+                primary_market, provider, len(selected), data_elapsed, elapsed - data_elapsed,
             )
 
             # 활동 로그 요약
@@ -146,6 +162,7 @@ class MarketScanner:
                     "market_regime": parsed.get("market_regime", ""),
                     "market_analysis": market_analysis,
                     "available_cash": available_cash,
+                    "markets": scan_markets,
                 },
                 llm_provider=provider,
                 llm_tier="TIER1",
@@ -161,6 +178,7 @@ class MarketScanner:
                 "available_cash": available_cash,
                 "max_per_stock": max_per_stock,
                 "provider": provider,
+                "markets": scan_markets,
             }
         except Exception as e:
             elapsed = activity_logger.elapsed_ms(timer)
@@ -206,19 +224,41 @@ class MarketScanner:
             logger.warning("성과 요약 조회 실패: {}", str(e))
             return "매매 이력 없음"
 
-    async def _get_volume_rank(self) -> list[dict]:
-        resp = await mcp_client.get_volume_rank()
-        if resp.success and resp.data:
-            stocks = resp.data.get("stocks", resp.data.get("items", []))
-            return self._filter_untradeable(stocks)
-        return []
+    async def _get_volume_rank(self, markets: list[str]) -> list[dict]:
+        responses = await asyncio.gather(
+            *[mcp_client.get_volume_rank(market=market) for market in markets],
+            return_exceptions=True,
+        )
+        return self._merge_scan_stocks(markets, responses)
 
-    async def _get_fluctuation_rank(self, sort: str) -> list[dict]:
-        resp = await mcp_client.get_fluctuation_rank(sort=sort)
-        if resp.success and resp.data:
-            stocks = resp.data.get("stocks", resp.data.get("items", []))
-            return self._filter_untradeable(stocks)
-        return []
+    async def _get_fluctuation_rank(self, markets: list[str], sort: str) -> list[dict]:
+        responses = await asyncio.gather(
+            *[mcp_client.get_fluctuation_rank(market=market, sort=sort) for market in markets],
+            return_exceptions=True,
+        )
+        stocks = self._merge_scan_stocks(markets, responses)
+        stocks.sort(key=lambda item: float(item.get("change_rate", 0)), reverse=(sort != "bottom"))
+        return stocks[:30]
+
+    def _merge_scan_stocks(self, markets: list[str], responses: list) -> list[dict]:
+        """시장별 스캔 결과 병합"""
+        merged: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+
+        for market, response in zip(markets, responses, strict=False):
+            if isinstance(response, Exception) or not getattr(response, "success", False):
+                continue
+            data = response.data or {}
+            stocks = data.get("stocks", data.get("items", []))
+            for item in stocks:
+                symbol = item.get("symbol", "")
+                item_market = normalize_market(item.get("market", market), default=market)
+                key = (item_market, symbol)
+                if not symbol or key in seen:
+                    continue
+                seen.add(key)
+                merged.append({**item, "market": item_market})
+        return self._filter_untradeable(merged)
 
     def _format_data(self, data: list[dict]) -> str:
         if not data:
@@ -230,7 +270,11 @@ class MarketScanner:
             price = item.get("price", item.get("current_price", ""))
             change_rate = item.get("change_rate", "")
             volume = item.get("volume", "")
-            lines.append(f"{i}. {name}({symbol}) {price}원 {change_rate}% 거래량:{volume}")
+            market = item.get("market", "")
+            currency = item.get("currency", "KRW")
+            unit = "원" if currency == "KRW" else currency
+            market_text = f"[{market}] " if market else ""
+            lines.append(f"{i}. {market_text}{name}({symbol}) {price}{unit} {change_rate}% 거래량:{volume}")
         return "\n".join(lines)
 
     def _format_holdings(self, holdings) -> str:
@@ -238,9 +282,12 @@ class MarketScanner:
             return "보유 종목 없음"
         lines = []
         for h in holdings:
+            market_text = f"[{h.market}] " if getattr(h, "market", "") else ""
+            currency = getattr(h, "currency", "KRW")
+            unit = "원" if currency == "KRW" else currency
             lines.append(
-                f"- {h.name}({h.symbol}) {h.quantity}주 "
-                f"평균단가:{h.avg_buy_price:,.0f} 수익률:{h.pnl_rate:+.2f}%"
+                f"- {market_text}{h.name}({h.symbol}) {h.quantity}주 "
+                f"평균단가:{h.avg_buy_price:,.2f}{unit} 수익률:{h.pnl_rate:+.2f}%"
             )
         return "\n".join(lines)
 

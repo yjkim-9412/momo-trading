@@ -52,14 +52,15 @@ class DecisionMaker:
             signal.suggested_quantity, signal.suggested_price,
         )
 
+        market = signal.metadata.get("market", "KRX")
         qty = signal.suggested_quantity or 0
         price = signal.suggested_price or 0
-        amount = price * qty
+        amount = (signal.metadata.get("price_krw") or price) * qty
         await activity_logger.log(
             ActivityType.DECISION, ActivityPhase.START,
             f"\U0001f4b0 [{signal.symbol}] 자동 주문 실행: "
             f"{signal.action.value} {qty}주 "
-            f"@{price:,.0f}원 ({amount:,.0f}원)",
+            f"@{price:,.2f}{signal.metadata.get('currency', 'KRW')} ({amount:,.0f}원)",
             cycle_id=cycle_id,
             symbol=signal.symbol,
         )
@@ -69,6 +70,7 @@ class DecisionMaker:
             side=signal.action.value,
             quantity=signal.suggested_quantity or 0,
             price=signal.suggested_price,
+            market=market,
         )
 
         # 주문 응답 검증: MCP success + 주문번호 존재 확인
@@ -98,6 +100,7 @@ class DecisionMaker:
             task = asyncio.create_task(
                 self.confirm_and_record(
                     symbol=signal.symbol,
+                    market=market,
                     side=signal.action.value,
                     order_id=order_id,
                     quantity=qty,
@@ -133,6 +136,7 @@ class DecisionMaker:
     async def confirm_and_record(
         self,
         symbol: str,
+        market: str,
         side: str,
         order_id: str,
         quantity: int,
@@ -148,7 +152,7 @@ class DecisionMaker:
         try:
             await asyncio.sleep(3)  # KIS 체결 처리 대기
 
-            resp = await mcp_client.get_order_list()
+            resp = await mcp_client.get_order_list(market=market)
             if not resp.success:
                 logger.warning("[{}] 주문내역 조회 실패: {}", symbol, resp.error)
                 return
@@ -180,8 +184,8 @@ class DecisionMaker:
                     or order.get("order_id") or ""
                 )
                 if str(kis_odno) == str(order_id):
-                    filled_order = order
-                    break
+                        filled_order = order
+                        break
 
             if not filled_order:
                 logger.info("[{}] 주문 {} 미체결 (체결내역에서 미발견)", symbol, order_id)
@@ -212,6 +216,7 @@ class DecisionMaker:
 
             await self._record_trade_result(
                 symbol=symbol,
+                market=market,
                 side=side,
                 order_id=order_id,
                 filled_qty=filled_qty,
@@ -231,6 +236,7 @@ class DecisionMaker:
     async def _record_trade_result(
         self,
         symbol: str,
+        market: str,
         side: str,
         order_id: str,
         filled_qty: int,
@@ -254,6 +260,7 @@ class DecisionMaker:
                             order_id=order_id,
                             stock_symbol=symbol,
                             stock_name=ctx.get("stock_name", symbol),
+                            market=market,
                             side="BUY",
                             strategy_type=ctx.get("strategy_type", ""),
                             entry_price=filled_price,
@@ -275,20 +282,20 @@ class DecisionMaker:
                         session.add(tr)
 
                         logger.info(
-                            "[TradeResult] 매수 기록 생성: {} {}주 @{:,.0f}원",
-                            symbol, filled_qty, filled_price,
+                            "[TradeResult] 매수 기록 생성: {} {} {}주 @{:,.2f}",
+                            market, symbol, filled_qty, filled_price,
                         )
                         await activity_logger.log(
                             ActivityType.TRADE_RESULT, ActivityPhase.COMPLETE,
                             f"\U0001f4dd [{symbol}] 매수 체결 기록: "
-                            f"{filled_qty}주 @{filled_price:,.0f}원",
+                            f"{filled_qty}주 @{filled_price:,.2f}{ctx.get('currency', 'KRW')}",
                             cycle_id=cycle_id,
                             symbol=symbol,
                         )
 
                     elif side == "SELL":
                         # 매도 체결 → 미청산 BUY 기록 찾아서 업데이트
-                        open_buy = await repo.get_open_buy(symbol)
+                        open_buy = await repo.get_open_buy(symbol, market=market)
                         if not open_buy:
                             logger.warning(
                                 "[TradeResult] {} 미청산 매수 기록 없음 → 매도 기록만 생성",
@@ -299,6 +306,7 @@ class DecisionMaker:
                                 order_id=order_id,
                                 stock_symbol=symbol,
                                 stock_name=ctx.get("stock_name", symbol),
+                                market=market,
                                 side="SELL",
                                 strategy_type=ctx.get("strategy_type", ""),
                                 entry_price=0.0,
@@ -361,6 +369,8 @@ class DecisionMaker:
         rec_data = {
             "stock_id": signal.stock_id,
             "analysis_id": analysis_id,
+            "market": signal.metadata.get("market", "KRX"),
+            "currency": signal.metadata.get("currency", "KRW"),
             "action": signal.action.value,
             "suggested_price": signal.suggested_price or 0,
             "suggested_quantity": signal.suggested_quantity or 0,
@@ -372,7 +382,7 @@ class DecisionMaker:
 
         qty = signal.suggested_quantity or 0
         price = signal.suggested_price or 0
-        amount = price * qty
+        amount = (signal.metadata.get("price_krw") or price) * qty
 
         logger.info(
             "[SEMI_AUTO] 추천 생성: {} {} x{} (만료: {})",
@@ -383,7 +393,7 @@ class DecisionMaker:
         await activity_logger.log(
             ActivityType.DECISION, ActivityPhase.COMPLETE,
             f"\U0001f4dd 매수 추천 생성: {signal.symbol} {qty}주 "
-            f"@{price:,.0f}원 ({amount:,.0f}원)"
+            f"@{price:,.2f}{signal.metadata.get('currency', 'KRW')} ({amount:,.0f}원)"
             f"\n   \u2192 사용자 승인 대기 (SEMI_AUTO 모드)",
             cycle_id=cycle_id,
             symbol=signal.symbol,

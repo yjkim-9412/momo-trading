@@ -25,6 +25,7 @@ from strategy.risk_manager import risk_manager
 from strategy.signal import TradeSignal
 from strategy.stable_short import StableShortStrategy
 from trading.enums import ActivityPhase, ActivityType, LLMTier, SignalAction, SignalUrgency
+from trading.market_profile import market_currency, market_timezone, normalize_market
 from trading.mcp_client import mcp_client
 
 
@@ -86,14 +87,17 @@ class TradingAgent:
             return {"skipped": True, "reason": "cycle_already_running"}
 
         async with self._cycle_lock:
-            if market_calendar.is_krx_trading_hours():
+            if market_calendar.is_primary_market_trading_hours():
                 # 데이트레이딩 모드: 매수 마감 시간 이후 신규 매수 차단
                 # 스윙 모드: 오버나이트 보유 가능 → 장 마감(15:20)까지 매수 허용
                 if settings.DAY_TRADING_ONLY:
                     from datetime import time as _time
                     from util.time_util import now_kst
+                    from zoneinfo import ZoneInfo
+
                     cutoff = _time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
-                    if now_kst().time() >= cutoff:
+                    market_now = now_kst().astimezone(ZoneInfo(market_timezone(settings.primary_market_code)))
+                    if market_now.time() >= cutoff:
                         logger.info("매수 마감 시간({}) 경과 → 신규 매매 사이클 스킵", cutoff)
                         await activity_logger.log(
                             ActivityType.CYCLE, ActivityPhase.COMPLETE,
@@ -177,7 +181,7 @@ class TradingAgent:
                 "holding_count": 0, "today_trade_count": 0,
             }
             try:
-                balance, holdings = await account_manager.get_account_snapshot()
+                balance, holdings = await account_manager.get_account_snapshot(settings.primary_market_code)
                 if not balance.is_valid:
                     logger.error("계좌 조회 실패 → 매매 사이클 중단")
                     await activity_logger.log(
@@ -189,7 +193,7 @@ class TradingAgent:
                 snapshot["cash"] = balance.cash
                 snapshot["total_asset"] = balance.total_asset
                 snapshot["holding_count"] = len(holdings)
-                snapshot["holding_symbols"] = [h.symbol for h in holdings]
+                snapshot["holding_symbols"] = [(h.market, h.symbol) for h in holdings]
                 snapshot["today_trade_count"] = await self._get_today_trade_count()
                 # 인스턴스 레벨 현금 트래커 갱신
                 async with self._cash_lock:
@@ -317,6 +321,7 @@ class TradingAgent:
         symbol = stock_info.get("symbol", "")
         name = stock_info.get("name", symbol)
         strategy_type = stock_info.get("strategy_type", "STABLE_SHORT")
+        market_code = normalize_market(stock_info.get("market", settings.primary_market_code))
 
         result = {"symbol": symbol, "signal": False, "executed": False}
 
@@ -339,14 +344,20 @@ class TradingAgent:
 
         # MCP로 데이터 병렬 조회 (일봉 60일 + 분봉 5분 + 현재가)
         price_resp, daily_resp, minute_resp = await asyncio.gather(
-            mcp_client.get_current_price(symbol),
-            mcp_client.get_daily_price(symbol, count=60),
-            mcp_client.get_minute_price(symbol, period="5"),
+            mcp_client.get_current_price(symbol, market=market_code),
+            mcp_client.get_daily_price(symbol, count=60, market=market_code),
+            mcp_client.get_minute_price(symbol, period="5", market=market_code),
         )
 
         current_price = 0
+        currency = market_currency(market_code)
+        exchange_rate_to_krw = 1.0
+        price_krw = 0.0
         if price_resp.success and price_resp.data:
             current_price = float(price_resp.data.get("price", price_resp.data.get("current_price", 0)))
+            currency = price_resp.data.get("currency", currency)
+            exchange_rate_to_krw = float(price_resp.data.get("exchange_rate_to_krw", 1.0) or 1.0)
+            price_krw = float(price_resp.data.get("price_krw", current_price * exchange_rate_to_krw) or 0.0)
         else:
             logger.warning("[{}] 현재가 조회 실패: {}", symbol, price_resp.error or "응답 없음")
 
@@ -670,6 +681,12 @@ class TradingAgent:
                 strategy_type=strategy_type,
                 reason=final.get("reason", "Tier2 승인"),
                 confidence=analysis.get("confidence", 0.7),
+                metadata={
+                    "market": market_code,
+                    "currency": currency,
+                    "exchange_rate_to_krw": exchange_rate_to_krw,
+                    "price_krw": price_krw or (final["entry_price"] * exchange_rate_to_krw),
+                },
             )
 
             result["signal"] = True
@@ -688,6 +705,10 @@ class TradingAgent:
                 "symbol": symbol,
                 "stock_id": stock_info.get("stock_id", ""),
                 "current_price": current_price,
+                "market": market_code,
+                "currency": currency,
+                "exchange_rate_to_krw": exchange_rate_to_krw,
+                "price_krw": price_krw,
             }
 
             if not strategy:
@@ -721,13 +742,13 @@ class TradingAgent:
                 signal.stop_loss_price = final["stop_loss_price"]
 
         # AI가 결정한 손절/익절/트레일링 스탑을 event_detector에 설정
-        self._apply_trade_thresholds(symbol, analysis, final)
+        self._apply_trade_thresholds(symbol, analysis, final, market=market_code)
 
         # 4.5 매도 시 보유 여부 확인 — 미보유 종목 매도 차단
         if signal.action == SignalAction.SELL:
             snap = portfolio_snapshot or {}
             holding_symbols = snap.get("holding_symbols", [])
-            if symbol not in holding_symbols:
+            if (market_code, symbol) not in holding_symbols:
                 logger.info("미보유 종목 매도 스킵: {} (보유: {})", symbol, holding_symbols)
                 await activity_logger.log(
                     ActivityType.RISK_CHECK, ActivityPhase.SKIP,
@@ -767,6 +788,9 @@ class TradingAgent:
             "market_regime": self._market_regime,
             "strategy_type": strategy_type,
             "stock_name": name,
+            "market": market_code,
+            "currency": currency,
+            "exchange_rate_to_krw": exchange_rate_to_krw,
         }
         exec_result = await decision_maker.execute(
             signal, cycle_id=cycle_id, analysis_context=analysis_context,
@@ -775,7 +799,7 @@ class TradingAgent:
 
         # 주문 금액 기록 (병렬 잔고 트래커용)
         if result["executed"] and signal.action == SignalAction.BUY:
-            result["order_amount"] = (signal.suggested_price or 0) * (signal.suggested_quantity or 0)
+            result["order_amount"] = (signal.metadata.get("price_krw") or signal.suggested_price or 0) * (signal.suggested_quantity or 0)
 
         return result
 
@@ -807,7 +831,7 @@ class TradingAgent:
             market_close_data, volume_rank_data, surge_data, drop_data = await self._collect_market_close_data()
 
             # 2. 포트폴리오 현황 (데이트레이딩이면 청산 완료 상태)
-            balance = await account_manager.get_balance()
+            balance = await account_manager.get_balance(settings.primary_market_code)
 
             cash_ratio = 0.0
             if balance.total_asset > 0:
@@ -1012,7 +1036,7 @@ class TradingAgent:
         self._last_cycle_time = now_kst()
         elapsed = activity_logger.elapsed_ms(cycle_timer)
 
-        next_open = market_calendar.next_krx_open()
+        next_open = market_calendar.next_market_open(market=settings.primary_market_code)
         await event_bus.publish(Event(
             type=EventType.AGENT_CYCLE_END, data=results, source="trading_agent",
         ))
@@ -1091,10 +1115,11 @@ class TradingAgent:
 
         try:
             # 병렬로 시장 데이터 수집
+            primary_market = settings.primary_market_code
             volume_resp, surge_resp, drop_resp = await asyncio.gather(
-                mcp_client.get_volume_rank(),
-                mcp_client.get_fluctuation_rank(sort="top"),
-                mcp_client.get_fluctuation_rank(sort="bottom"),
+                mcp_client.get_volume_rank(market=primary_market),
+                mcp_client.get_fluctuation_rank(market=primary_market, sort="top"),
+                mcp_client.get_fluctuation_rank(market=primary_market, sort="bottom"),
                 return_exceptions=True,
             )
 
@@ -1109,7 +1134,8 @@ class TradingAgent:
                         price = item.get("price", item.get("current_price", ""))
                         change_rate = item.get("change_rate", "")
                         volume = item.get("volume", "")
-                        lines.append(f"{i}. {name}({symbol}) {price}원 {change_rate}% 거래량:{volume}")
+                        unit = "원" if primary_market == "KRX" else market_currency(primary_market)
+                        lines.append(f"{i}. {name}({symbol}) {price}{unit} {change_rate}% 거래량:{volume}")
                     volume_rank_text = "\n".join(lines)
 
             # 등락률 상위 (급등)
@@ -1122,7 +1148,8 @@ class TradingAgent:
                         symbol = item.get("symbol", item.get("code", ""))
                         price = item.get("price", item.get("current_price", ""))
                         change_rate = item.get("change_rate", "")
-                        lines.append(f"{i}. {name}({symbol}) {price}원 {change_rate}%")
+                        unit = "원" if primary_market == "KRX" else market_currency(primary_market)
+                        lines.append(f"{i}. {name}({symbol}) {price}{unit} {change_rate}%")
                     surge_text = "\n".join(lines)
 
             # 등락률 하위 (급락)
@@ -1135,7 +1162,8 @@ class TradingAgent:
                         symbol = item.get("symbol", item.get("code", ""))
                         price = item.get("price", item.get("current_price", ""))
                         change_rate = item.get("change_rate", "")
-                        lines.append(f"{i}. {name}({symbol}) {price}원 {change_rate}%")
+                        unit = "원" if primary_market == "KRX" else market_currency(primary_market)
+                        lines.append(f"{i}. {name}({symbol}) {price}{unit} {change_rate}%")
                     drop_text = "\n".join(lines)
 
             # 시장 요약은 등락률 상위/하위 데이터로 판단
@@ -1146,10 +1174,11 @@ class TradingAgent:
 
         return market_close_data, volume_rank_text, surge_text, drop_text
 
-    async def _get_stock_trend_summary(self, symbol: str, name: str) -> str:
+    async def _get_stock_trend_summary(self, symbol: str, name: str, market: str | None = None) -> str:
         """종목 일봉 기반 간단 추세 요약 (장 마감 후 사용)"""
         try:
-            resp = await mcp_client.get_daily_price(symbol, count=20)
+            market_code = normalize_market(market or settings.primary_market_code)
+            resp = await mcp_client.get_daily_price(symbol, count=20, market=market_code)
             if not resp.success or not resp.data:
                 return ""
 
@@ -1193,8 +1222,9 @@ class TradingAgent:
 
             return (
                 f"- {name}({symbol}): {trend} | "
-                f"종가 {latest:,.0f}원 | 5일 {change_5d:+.1f}% | "
-                f"5MA {avg_5:,.0f} / 20MA {avg_20:,.0f}{vol_text}"
+                f"종가 {latest:,.2f}{'원' if market_currency(market_code) == 'KRW' else market_currency(market_code)} | "
+                f"5일 {change_5d:+.1f}% | "
+                f"5MA {avg_5:,.2f} / 20MA {avg_20:,.2f}{vol_text}"
             )
         except Exception as e:
             logger.debug("종목 추세 요약 실패 ({}): {}", symbol, str(e))
@@ -1228,8 +1258,9 @@ class TradingAgent:
         """데이트레이딩 컨텍스트 (프롬프트 주입용)"""
         from util.time_util import now_kst
         from trading.account_manager import account_manager
+        from zoneinfo import ZoneInfo
 
-        now = now_kst()
+        now = now_kst().astimezone(ZoneInfo(market_timezone(settings.primary_market_code)))
 
         # 강제 청산까지 남은 분
         close_time = now.replace(
@@ -1243,7 +1274,7 @@ class TradingAgent:
         daily_pnl_pct = 0.0
         if self._daily_start_balance > 0:
             try:
-                balance = await account_manager.get_balance()
+                balance = await account_manager.get_balance(settings.primary_market_code)
                 daily_pnl_pct = (
                     (balance.total_asset - self._daily_start_balance)
                     / self._daily_start_balance * 100
@@ -1303,6 +1334,7 @@ class TradingAgent:
         applied = 0
         for c in candidates:
             symbol = c.get("symbol", "")
+            market_code = normalize_market(c.get("market", settings.primary_market_code))
             monitoring = c.get("monitoring")
             if not symbol or not isinstance(monitoring, dict):
                 continue
@@ -1316,14 +1348,14 @@ class TradingAgent:
                 kwargs["volume_spike_ratio"] = float(monitoring["volume_spike_ratio"])
 
             if kwargs:
-                event_detector.set_thresholds(symbol, **kwargs)
+                event_detector.set_thresholds(symbol, market=market_code, **kwargs)
                 applied += 1
 
         if applied:
             logger.info("AI 모니터링 임계값 설정: {}종목", applied)
 
     def _apply_trade_thresholds(
-        self, symbol: str, tier1: dict, tier2: dict,
+        self, symbol: str, tier1: dict, tier2: dict, market: str | None = None,
     ) -> None:
         """Tier1/Tier2 분석 결과에서 손절/익절/트레일링 스탑을 event_detector에 적용
 
@@ -1347,7 +1379,7 @@ class TradingAgent:
             kwargs["trailing_stop_pct"] = float(trailing)
 
         if kwargs:
-            event_detector.set_thresholds(symbol, **kwargs)
+            event_detector.set_thresholds(symbol, market=market, **kwargs)
             logger.info(
                 "AI 손절/익절 설정: {} → {}",
                 symbol,
@@ -1383,11 +1415,18 @@ class TradingAgent:
         cycle_id: str | None = None,
     ) -> dict | None:
         """Tier 1 AI 심층 분석"""
+        market_code = normalize_market(price_data.get("market", settings.primary_market_code))
+        currency = price_data.get("currency", market_currency(market_code))
+        current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
+        change_value = float(price_data.get("change") or 0)
+        change_text = f"{change_value:+,.2f}{'원' if currency == 'KRW' else currency}"
         prompt = STOCK_ANALYSIS_PROMPT.format(
             stock_name=name,
             symbol=symbol,
-            current_price=current_price or 0,
-            change=float(price_data.get("change") or 0),
+            market=market_code,
+            currency=currency,
+            current_price_text=current_price_text,
+            change_text=change_text,
             change_rate=float(price_data.get("change_rate") or 0),
             volume=int(float(price_data.get("volume") or 0)),
             technical_indicators=chart_result.indicators_text or "지표 데이터 없음",
@@ -1409,6 +1448,10 @@ class TradingAgent:
             parsed = self._parse_json(result_text)
             if parsed:
                 parsed["provider"] = provider
+                parsed["market"] = market_code
+                parsed["currency"] = currency
+                parsed["exchange_rate_to_krw"] = float(price_data.get("exchange_rate_to_krw", 1.0) or 1.0)
+                parsed["price_krw"] = float(price_data.get("price_krw", current_price) or 0.0)
             return parsed
         except Exception as e:
             logger.error("Tier 1 분석 실패 ({}): {}", symbol, str(e))
@@ -1428,6 +1471,9 @@ class TradingAgent:
         """Tier 2 최종 검토"""
         strategy = self.strategies.get(strategy_type)
         snap = portfolio_snapshot or {}
+        market_code = normalize_market(tier1_analysis.get("market", settings.primary_market_code))
+        currency = tier1_analysis.get("currency", market_currency(market_code))
+        current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
 
         # 추세 분석 기반 전략 파라미터 조정 제안
         tuning_suggestions = "조정 제안 없음"
@@ -1457,7 +1503,9 @@ class TradingAgent:
             tier1_analysis=json.dumps(tier1_analysis, ensure_ascii=False, indent=2),
             stock_name=name,
             symbol=symbol,
-            current_price=current_price or 0,
+            market=market_code,
+            currency=currency,
+            current_price_text=current_price_text,
             strategy_type=strategy_type,
             max_amount=max_amount or 0,
             holding_count=snap.get("holding_count") or 0,
@@ -1480,6 +1528,8 @@ class TradingAgent:
             parsed = self._parse_json(result_text)
             if parsed:
                 parsed["provider"] = provider
+                parsed["market"] = market_code
+                parsed["currency"] = currency
             return parsed
         except Exception as e:
             logger.error("Tier 2 검토 실패 ({}): {}", symbol, str(e))
@@ -1494,25 +1544,29 @@ class TradingAgent:
         if settings.DAY_TRADING_ONLY:
             from datetime import time as _dt_time
             from util.time_util import now_kst
+            from zoneinfo import ZoneInfo
             cutoff = _dt_time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
-            if now_kst().time() >= cutoff:
+            market_now = now_kst().astimezone(ZoneInfo(market_timezone(settings.primary_market_code)))
+            if market_now.time() >= cutoff:
                 return
 
         symbol = event.data.get("symbol", "")
+        market_code = normalize_market(event.data.get("market", settings.primary_market_code))
         if not symbol:
             return
 
         # 쿨다운 체크 (동일 종목 연속 분석 방지)
         import time as _time
         now_ts = _time.time()
-        last_ts = self._cooldowns.get(symbol, 0)
+        cooldown_key = f"{market_code}:{symbol}"
+        last_ts = self._cooldowns.get(cooldown_key, 0)
         if now_ts - last_ts < self.EVENT_COOLDOWN_SEC:
             return
-        if symbol in self._analyzing:
+        if cooldown_key in self._analyzing:
             return
 
-        self._cooldowns[symbol] = now_ts
-        self._analyzing.add(symbol)
+        self._cooldowns[cooldown_key] = now_ts
+        self._analyzing.add(cooldown_key)
 
         price = event.data.get("price", 0)
         change_rate = event.data.get("change_rate", 0)
@@ -1534,6 +1588,7 @@ class TradingAgent:
             stock_info = {
                 "symbol": symbol,
                 "name": event.data.get("name", symbol),
+                "market": market_code,
                 "strategy_type": "AGGRESSIVE_SHORT" if abs(change_rate) >= 5 else "STABLE_SHORT",
                 "trigger": event_type,
             }
@@ -1543,7 +1598,7 @@ class TradingAgent:
             snapshot = {"cash": 0, "total_asset": 0, "holding_count": 0, "today_trade_count": 0}
             try:
                 from trading.account_manager import account_manager
-                balance, holdings = await account_manager.get_account_snapshot()
+                balance, holdings = await account_manager.get_account_snapshot(market_code)
                 if not balance.is_valid:
                     logger.error("실시간 이벤트: 계좌 조회 실패 → 분석 중단")
                     return
@@ -1552,7 +1607,7 @@ class TradingAgent:
                     snapshot["cash"] = self._available_cash
                 snapshot["total_asset"] = balance.total_asset
                 snapshot["holding_count"] = len(holdings)
-                snapshot["holding_symbols"] = [h.symbol for h in holdings]
+                snapshot["holding_symbols"] = [(h.market, h.symbol) for h in holdings]
                 snapshot["today_trade_count"] = await self._get_today_trade_count()
             except Exception as e:
                 logger.warning("실시간 이벤트 포트폴리오 스냅샷 조회 실패: {}", str(e))
@@ -1568,11 +1623,11 @@ class TradingAgent:
                 except Exception:
                     pass
 
-            result = await self._analyze_and_trade(
-                stock_info, cycle_id,
-                dynamic_limits=dynamic_limits,
-                portfolio_snapshot=snapshot,
-            )
+                result = await self._analyze_and_trade(
+                    stock_info, cycle_id,
+                    dynamic_limits=dynamic_limits,
+                    portfolio_snapshot=snapshot,
+                )
             if result.get("executed"):
                 logger.info("실시간 매매 실행: {} ({})", symbol, event_type)
                 # 체결 금액 인스턴스 트래커에서 차감
@@ -1585,17 +1640,18 @@ class TradingAgent:
                             symbol, order_amount, self._available_cash,
                         )
                 # 신규 매수 종목 WebSocket 구독 추가
-                await self._ensure_realtime_subscription(symbol)
+                await self._ensure_realtime_subscription(symbol, market=market_code)
         except Exception as e:
             logger.error("실시간 분석 오류 ({}): {}", symbol, str(e))
         finally:
-            self._analyzing.discard(symbol)
+            self._analyzing.discard(cooldown_key)
 
     async def _on_stop_loss(self, event: Event) -> None:
         """손절선 도달 → 즉시 매도"""
         if not self._running:
             return
         symbol = event.data.get("symbol", "")
+        market_code = normalize_market(event.data.get("market", settings.primary_market_code))
         price = event.data.get("price", 0)
         stop_loss = event.data.get("stop_loss_price", 0)
 
@@ -1612,12 +1668,12 @@ class TradingAgent:
         if settings.TRADING_ENABLED:
             try:
                 from trading.account_manager import account_manager
-                holdings = await account_manager.get_holdings()
-                holding = next((h for h in holdings if h.symbol == symbol), None)
+                holdings = await account_manager.get_holdings(market_code)
+                holding = next((h for h in holdings if h.symbol == symbol and h.market == market_code), None)
                 if holding and holding.quantity > 0:
                     resp = await mcp_client.place_order(
                         symbol=symbol, side="SELL",
-                        quantity=holding.quantity, price=None, market="KRX",
+                        quantity=holding.quantity, price=None, market=market_code,
                     )
                     await activity_logger.log(
                         ActivityType.ORDER, ActivityPhase.COMPLETE,
@@ -1626,12 +1682,13 @@ class TradingAgent:
                         symbol=symbol,
                     )
                     if resp.success:
-                        event_detector.remove_levels(symbol)
+                        event_detector.remove_levels(symbol, market=market_code)
                         # 체결 확인 + TradeResult 기록
                         order_data = resp.data or {}
                         order_id = order_data.get("order_id", "")
                         await decision_maker.confirm_and_record(
                             symbol=symbol,
+                            market=market_code,
                             side="SELL",
                             order_id=order_id,
                             quantity=holding.quantity,
@@ -1646,6 +1703,7 @@ class TradingAgent:
         if not self._running:
             return
         symbol = event.data.get("symbol", "")
+        market_code = normalize_market(event.data.get("market", settings.primary_market_code))
         price = event.data.get("price", 0)
         take_profit = event.data.get("take_profit_price", 0)
 
@@ -1662,12 +1720,12 @@ class TradingAgent:
         if settings.TRADING_ENABLED:
             try:
                 from trading.account_manager import account_manager
-                holdings = await account_manager.get_holdings()
-                holding = next((h for h in holdings if h.symbol == symbol), None)
+                holdings = await account_manager.get_holdings(market_code)
+                holding = next((h for h in holdings if h.symbol == symbol and h.market == market_code), None)
                 if holding and holding.quantity > 0:
                     resp = await mcp_client.place_order(
                         symbol=symbol, side="SELL",
-                        quantity=holding.quantity, price=None, market="KRX",
+                        quantity=holding.quantity, price=None, market=market_code,
                     )
                     await activity_logger.log(
                         ActivityType.ORDER, ActivityPhase.COMPLETE,
@@ -1676,12 +1734,13 @@ class TradingAgent:
                         symbol=symbol,
                     )
                     if resp.success:
-                        event_detector.remove_levels(symbol)
+                        event_detector.remove_levels(symbol, market=market_code)
                         # 체결 확인 + TradeResult 기록
                         order_data = resp.data or {}
                         order_id = order_data.get("order_id", "")
                         await decision_maker.confirm_and_record(
                             symbol=symbol,
+                            market=market_code,
                             side="SELL",
                             order_id=order_id,
                             quantity=holding.quantity,
@@ -1691,12 +1750,13 @@ class TradingAgent:
             except Exception as e:
                 logger.error("익절 매도 실패 ({}): {}", symbol, str(e))
 
-    async def _ensure_realtime_subscription(self, symbol: str) -> None:
+    async def _ensure_realtime_subscription(self, symbol: str, market: str | None = None) -> None:
         """매수 후 WebSocket 실시간 구독 확인/추가"""
         try:
             from realtime.stream_manager import stream_manager
-            await stream_manager.subscribe_symbols([(symbol, "KRX")])
-            logger.debug("매수 종목 WebSocket 구독 추가: {}", symbol)
+            market_code = normalize_market(market or settings.primary_market_code)
+            await stream_manager.subscribe_symbols([(symbol, market_code)])
+            logger.debug("매수 종목 WebSocket 구독 추가: {} ({})", symbol, market_code)
         except Exception as e:
             logger.warning("WebSocket 구독 추가 실패 ({}): {}", symbol, str(e))
 

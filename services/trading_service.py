@@ -17,7 +17,7 @@ class TradingService:
 
     async def get_account_balance(self) -> AccountBalance:
         """계좌 잔고 조회 (account_manager가 KIS 원본 키 정규화 담당)"""
-        return await account_manager.get_balance()
+        return await account_manager.get_balance(settings.primary_market_code)
 
     async def execute_order(self, request: OrderRequest) -> OrderResult:
         await self.check_trading_enabled()
@@ -47,6 +47,8 @@ class TradingService:
             message="주문 실행 완료",
             filled_quantity=int(data.get("filled_quantity", 0)),
             filled_price=float(data.get("filled_price", 0)),
+            currency=data.get("currency", request.currency),
+            filled_price_krw=float(data.get("filled_price_krw", 0)),
         )
 
     async def get_current_price(self, symbol: str, market: str = "KRX") -> dict:

@@ -27,7 +27,8 @@ class TradeResultCreate(BaseModel):
     entry_macd_hist: Optional[float] = None
     entry_bb_position: Optional[str] = None
     entry_pattern: Optional[str] = None
-    market: str = "KRX"
+    market: str
+    currency: str = "KRW"
     market_regime: str = ""
 
 
@@ -48,6 +49,8 @@ class TradeResultResponse(BaseModel):
     exit_reason: str
     ai_recommendation: str
     ai_confidence: float
+    market: str
+    currency: str = "KRW"
     entry_rsi: Optional[float] = None
     entry_pattern: Optional[str] = None
     market_regime: str = ""

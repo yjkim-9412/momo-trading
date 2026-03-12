@@ -30,7 +30,7 @@ class AIRiskTuner:
 
         try:
             # 1. 계좌 잔고 조회
-            balance = await account_manager.get_balance()
+            balance = await account_manager.get_balance(settings.primary_market_code)
 
             # 2. 최근 매매 성과 조회
             performance_summary = "매매 이력 없음"

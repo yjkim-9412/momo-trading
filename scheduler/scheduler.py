@@ -53,13 +53,31 @@ class TradingScheduler:
     def _setup_jobs(self) -> None:
         from scheduler.jobs.portfolio_sync_job import portfolio_sync_job
         from scheduler.jobs.market_data_job import market_data_job
+        from trading.market_profile import is_us_market, market_timezone
+        from zoneinfo import ZoneInfo
+
+        primary_market = settings.primary_market_code
+        job_timezone = ZoneInfo(market_timezone(primary_market))
+        is_us_primary = is_us_market(primary_market)
+
+        pre_market_hour, pre_market_minute = (9, 20) if is_us_primary else (8, 50)
+        market_open_hour, market_open_minute = (9, 35) if is_us_primary else (9, 5)
+        holdings_hours = "10-15" if is_us_primary else "9-14"
+        force_hour, force_minute = (15, 40) if is_us_primary else (
+            settings.FORCE_LIQUIDATION_HOUR,
+            settings.FORCE_LIQUIDATION_MINUTE,
+        )
+        post_market_hour, post_market_minute = (16, 10) if is_us_primary else (15, 40)
+        portfolio_sync_hour, portfolio_sync_minute = (16, 30) if is_us_primary else (16, 0)
+        market_data_hour, market_data_minute = (17, 0) if is_us_primary else (16, 30)
 
         # ── 장 시작 전 준비 (08:50 평일) — KRX 개장 10분 전 ──
         self.scheduler.add_job(
             self._pre_market,
             "cron",
-            hour=8, minute=50,
+            hour=pre_market_hour, minute=pre_market_minute,
             day_of_week="mon-fri",
+            timezone=job_timezone,
             id="pre_market",
             name="장 시작 전 준비",
             misfire_grace_time=600,
@@ -69,8 +87,9 @@ class TradingScheduler:
         self.scheduler.add_job(
             self._market_open_scan,
             "cron",
-            hour=9, minute=5,
+            hour=market_open_hour, minute=market_open_minute,
             day_of_week="mon-fri",
+            timezone=job_timezone,
             id="market_open_scan",
             name="장 시작 스캔 + 매매",
             misfire_grace_time=600,
@@ -82,6 +101,7 @@ class TradingScheduler:
             "cron",
             hour="11,13", minute=0,
             day_of_week="mon-fri",
+            timezone=job_timezone,
             id="intraday_rescan",
             name="장중 재스캔",
             misfire_grace_time=600,
@@ -92,8 +112,9 @@ class TradingScheduler:
             self._holdings_check,
             "cron",
             minute="30",
-            hour="9-14",
+            hour=holdings_hours,
             day_of_week="mon-fri",
+            timezone=job_timezone,
             id="holdings_check",
             name="보유종목 손절/익절 점검",
             misfire_grace_time=300,
@@ -103,9 +124,10 @@ class TradingScheduler:
         self.scheduler.add_job(
             self._force_liquidation,
             "cron",
-            hour=settings.FORCE_LIQUIDATION_HOUR,
-            minute=settings.FORCE_LIQUIDATION_MINUTE,
+            hour=force_hour,
+            minute=force_minute,
             day_of_week="mon-fri",
+            timezone=job_timezone,
             id="force_liquidation",
             name="장 마감 전 청산",
             misfire_grace_time=300,
@@ -115,8 +137,9 @@ class TradingScheduler:
         self.scheduler.add_job(
             self._post_market,
             "cron",
-            hour=15, minute=40,
+            hour=post_market_hour, minute=post_market_minute,
             day_of_week="mon-fri",
+            timezone=job_timezone,
             id="post_market",
             name="장 마감 성과 리뷰",
             misfire_grace_time=3600,
@@ -126,7 +149,8 @@ class TradingScheduler:
         self.scheduler.add_job(
             portfolio_sync_job,
             "cron",
-            hour=16, minute=0,
+            hour=portfolio_sync_hour, minute=portfolio_sync_minute,
+            timezone=job_timezone,
             id="portfolio_sync",
             name="포트폴리오 정산",
             misfire_grace_time=3600,
@@ -136,7 +160,8 @@ class TradingScheduler:
         self.scheduler.add_job(
             market_data_job,
             "cron",
-            hour=16, minute=30,
+            hour=market_data_hour, minute=market_data_minute,
+            timezone=job_timezone,
             id="market_data",
             name="일봉 데이터 수집",
             misfire_grace_time=3600,
@@ -161,11 +186,11 @@ class TradingScheduler:
         # 기동 직후 약간의 딜레이 (MCP 연결 안정화)
         await asyncio.sleep(3)
 
-        if market_calendar.is_krx_trading_hours():
+        if market_calendar.is_primary_market_trading_hours():
             logger.info("서버 기동: 장중 → 즉시 시장 스캔 + 매매 시작")
             asyncio.create_task(self._market_open_scan())
         else:
-            next_open = market_calendar.next_krx_open()
+            next_open = market_calendar.next_market_open(market=settings.primary_market_code)
             logger.info("서버 기동: 장외 → 다음 장 시작: {}", next_open.strftime("%m/%d %H:%M"))
             # 장외 기동 시 리뷰가 아직 안 되었으면 실행
             asyncio.create_task(self._post_market_if_needed())
@@ -175,8 +200,8 @@ class TradingScheduler:
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
 
-        if market_calendar.is_krx_holiday():
-            holiday_name = market_calendar.get_holiday_name() or "공휴일"
+        if market_calendar.is_primary_market_holiday():
+            holiday_name = market_calendar.get_holiday_name(market=settings.primary_market_code) or "공휴일"
             logger.info("오늘은 휴장일 ({}) — 장 시작 전 준비 스킵", holiday_name)
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
@@ -195,7 +220,7 @@ class TradingScheduler:
             from agent.trading_agent import trading_agent
             from trading.account_manager import account_manager
 
-            balance = await account_manager.get_balance()
+            balance = await account_manager.get_balance(settings.primary_market_code)
             trading_agent._daily_start_balance = balance.total_asset
             logger.info("일일 기준 자산 설정: {:,.0f}원", balance.total_asset)
         except Exception as e:
@@ -269,7 +294,7 @@ class TradingScheduler:
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
 
-        if market_calendar.is_krx_holiday():
+        if market_calendar.is_primary_market_holiday():
             logger.info("휴장일 — 장 시작 스캔 스킵")
             return
 
@@ -292,11 +317,11 @@ class TradingScheduler:
 
             # 보유종목 추가
             from trading.account_manager import account_manager
-            holdings = await account_manager.get_holdings()
-            holding_symbols = [(h.symbol, "KRX") for h in holdings if h.symbol]
+            holdings = await account_manager.get_holdings(settings.primary_market_code)
+            holding_symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
 
             # 합치기 (중복 제거, 최대 41)
-            all_symbols = list({s[0]: s for s in selected + holding_symbols}.values())[:41]
+            all_symbols = list({(market, symbol): (symbol, market) for symbol, market in selected + holding_symbols}.values())[:41]
 
             if all_symbols:
                 from realtime.stream_manager import stream_manager
@@ -322,7 +347,7 @@ class TradingScheduler:
         from services.activity_logger import activity_logger
         from util.time_util import now_kst
 
-        if market_calendar.is_krx_holiday():
+        if market_calendar.is_primary_market_holiday():
             return
 
         # 매수 마감 시간 이후면 재스캔 불필요
@@ -347,9 +372,9 @@ class TradingScheduler:
             if selected:
                 from trading.account_manager import account_manager
                 from realtime.stream_manager import stream_manager
-                holdings = await account_manager.get_holdings()
-                holding_symbols = [(h.symbol, "KRX") for h in holdings if h.symbol]
-                all_symbols = list({s[0]: s for s in selected + holding_symbols}.values())[:41]
+                holdings = await account_manager.get_holdings(settings.primary_market_code)
+                holding_symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
+                all_symbols = list({(market, symbol): (symbol, market) for symbol, market in selected + holding_symbols}.values())[:41]
                 if all_symbols:
                     await stream_manager.update_subscriptions(all_symbols)
 
@@ -367,9 +392,9 @@ class TradingScheduler:
             from trading.account_manager import account_manager
             from realtime.stream_manager import stream_manager
 
-            holdings = await account_manager.get_holdings()
+            holdings = await account_manager.get_holdings(settings.primary_market_code)
             if holdings:
-                symbols = [(h.symbol, "KRX") for h in holdings if h.symbol]
+                symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
                 await stream_manager.update_subscriptions(symbols)
                 logger.info("WebSocket 구독 갱신: {}종목", len(symbols))
         except Exception as e:
@@ -383,7 +408,7 @@ class TradingScheduler:
         조기 익절/손절도 실행한다. KRX 장중(09:00~15:30)에만 작동.
         """
         from scheduler.market_calendar import market_calendar
-        if not market_calendar.is_krx_trading_hours():
+        if not market_calendar.is_primary_market_trading_hours():
             return
 
         from services.activity_logger import activity_logger
@@ -393,7 +418,7 @@ class TradingScheduler:
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
 
-            holdings = await account_manager.get_holdings()
+            holdings = await account_manager.get_holdings(settings.primary_market_code)
             if not holdings:
                 return
 
@@ -414,7 +439,7 @@ class TradingScheduler:
                 if h.avg_buy_price <= 0 or h.quantity <= 0:
                     continue
                 # MCP로 현재가 직접 조회
-                resp = await _mcp.get_current_price(h.symbol)
+                resp = await _mcp.get_current_price(h.symbol, market=h.market)
                 if not resp.success or not resp.data:
                     continue
                 current = float(resp.data.get("price", 0))
@@ -427,7 +452,7 @@ class TradingScheduler:
 
                 # AI가 설정한 임계값이 있으면 우선 사용, 없으면 기본값
                 from realtime.event_detector import event_detector
-                th = event_detector.get_thresholds(h.symbol)
+                th = event_detector.get_thresholds(h.symbol, market=h.market)
 
                 stop_loss_pct = -3.0  # 기본값
                 take_profit_pct = 5.0
@@ -459,7 +484,7 @@ class TradingScheduler:
                             side="SELL",
                             quantity=h.quantity,
                             price=None,
-                            market="KRX",
+                            market=h.market,
                         )
                         status = "성공" if sell_resp.success else f"실패: {sell_resp.error or ''}"
                         alerts.append(
@@ -467,7 +492,7 @@ class TradingScheduler:
                         )
                         if sell_resp.success:
                             from realtime.event_detector import event_detector
-                            event_detector.remove_levels(h.symbol)
+                            event_detector.remove_levels(h.symbol, market=h.market)
                     except Exception as e:
                         alerts.append(
                             f"\u274c {h.name}({h.symbol}): {reason} → 매도 오류: {str(e)[:50]}"
@@ -492,7 +517,7 @@ class TradingScheduler:
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
 
-        if market_calendar.is_krx_holiday():
+        if market_calendar.is_primary_market_holiday():
             logger.info("휴장일 — 장 마감 리뷰 스킵")
             return
 
@@ -526,7 +551,7 @@ class TradingScheduler:
             now = now_kst()
             from datetime import time
             from scheduler.market_calendar import market_calendar
-            if market_calendar.is_krx_trading_day(now) and now.time() > time(15, 30):
+            if market_calendar.is_trading_day(settings.primary_market_code, now) and now.time() > time(15, 30):
                 logger.info("오늘 리뷰 미완료 — 장외 리뷰 실행")
                 from agent.trading_agent import trading_agent
                 await trading_agent.run_cycle()
@@ -543,7 +568,7 @@ class TradingScheduler:
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
 
-        if market_calendar.is_krx_holiday():
+        if market_calendar.is_primary_market_holiday():
             return
 
         if not settings.TRADING_ENABLED:
@@ -554,7 +579,7 @@ class TradingScheduler:
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
 
-            holdings = await account_manager.get_holdings()
+            holdings = await account_manager.get_holdings(settings.primary_market_code)
             if not holdings:
                 await activity_logger.log(
                     ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
@@ -590,7 +615,7 @@ class TradingScheduler:
                     side="SELL",
                     quantity=h.quantity,
                     price=None,
-                    market="KRX",
+                    market=h.market,
                 )
                 return (resp, h)
 
@@ -662,10 +687,10 @@ class TradingScheduler:
 
             # 매도한 종목만 이벤트 감시 임계값 제거 (HOLD 종목은 유지)
             from realtime.event_detector import event_detector
-            sold_symbols = {h.symbol for h in to_sell}
+            sold_symbols = {(h.market, h.symbol) for h in to_sell}
             for h in holdings:
-                if h.symbol in sold_symbols:
-                    event_detector.remove_levels(h.symbol)
+                if (h.market, h.symbol) in sold_symbols:
+                    event_detector.remove_levels(h.symbol, market=h.market)
 
         except Exception as e:
             logger.error("청산 오류: {}", str(e))
@@ -694,7 +719,7 @@ class TradingScheduler:
             for h in sellable:
                 try:
                     # 현재가 조회
-                    resp = await _mcp.get_current_price(h.symbol)
+                    resp = await _mcp.get_current_price(h.symbol, market=h.market)
                     current_price = 0.0
                     if resp.success and resp.data:
                         current_price = float(resp.data.get("price", 0))
@@ -705,7 +730,7 @@ class TradingScheduler:
                         continue
 
                     # TradeResult (미청산 매수)
-                    trade_result = await repo.get_open_buy(h.symbol)
+                    trade_result = await repo.get_open_buy(h.symbol, market=h.market)
 
                     decision = evaluate_overnight_hold(
                         h, trade_result, current_price, settings,
@@ -752,7 +777,7 @@ class TradingScheduler:
                 if tr.ai_target_price and tr.ai_target_price > 0:
                     kwargs["take_profit"] = tr.ai_target_price
                 if kwargs:
-                    event_detector.set_thresholds(tr.stock_symbol, **kwargs)
+                    event_detector.set_thresholds(tr.stock_symbol, market=tr.market, **kwargs)
                     restored += 1
 
                 # 최대 보유일 경고
@@ -787,7 +812,7 @@ class TradingScheduler:
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
 
-            holdings = await account_manager.get_holdings()
+            holdings = await account_manager.get_holdings(settings.primary_market_code)
             if not holdings:
                 return
 
@@ -796,17 +821,17 @@ class TradingScheduler:
                 open_positions = await repo.get_all_open()
 
             # symbol → TradeResult 매핑
-            open_map = {tr.stock_symbol: tr for tr in open_positions}
+            open_map = {(tr.market, tr.stock_symbol): tr for tr in open_positions}
 
             alerts = []
             for h in holdings:
                 if h.quantity <= 0:
                     continue
-                tr = open_map.get(h.symbol)
+                tr = open_map.get((h.market, h.symbol))
                 if not tr:
                     continue  # 당일 매수 등 — 갭 체크 불필요
 
-                resp = await _mcp.get_current_price(h.symbol)
+                resp = await _mcp.get_current_price(h.symbol, market=h.market)
                 if not resp.success or not resp.data:
                     continue
                 current = float(resp.data.get("price", 0))
@@ -829,13 +854,13 @@ class TradingScheduler:
                 if should_sell and settings.TRADING_ENABLED:
                     sell_resp = await _mcp.place_order(
                         symbol=h.symbol, side="SELL",
-                        quantity=h.quantity, price=None, market="KRX",
+                        quantity=h.quantity, price=None, market=h.market,
                     )
                     status = "성공" if sell_resp.success else f"실패: {sell_resp.error or ''}"
                     alerts.append(f"\U0001f6a8 {h.name}({h.symbol}): {reason} → 매도 {status}")
                     if sell_resp.success:
                         from realtime.event_detector import event_detector
-                        event_detector.remove_levels(h.symbol)
+                        event_detector.remove_levels(h.symbol, market=h.market)
                 elif should_sell:
                     alerts.append(f"\u26a0\ufe0f {h.name}({h.symbol}): {reason} (TRADING_ENABLED=false)")
 

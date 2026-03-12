@@ -4,6 +4,7 @@ import asyncio
 from loguru import logger
 
 from trading.kis_websocket import kis_websocket
+from trading.market_profile import normalize_market
 
 
 class StreamManager:
@@ -15,7 +16,7 @@ class StreamManager:
     """
 
     def __init__(self):
-        self._priority_symbols: dict[str, str] = {}  # symbol -> market
+        self._priority_symbols: dict[tuple[str, str], tuple[str, str]] = {}
         self._running = False
         self._listen_task: asyncio.Task | None = None
 
@@ -44,31 +45,51 @@ class StreamManager:
     async def subscribe_symbols(self, symbols: list[tuple[str, str]]) -> None:
         """종목 리스트 구독 (symbol, market) 쌍"""
         for symbol, market in symbols:
+            market_code = normalize_market(market)
+            key = (market_code, symbol.upper())
             if kis_websocket.subscription_count >= 41:
                 logger.warning("구독 한도 도달 (41종목), 우선순위 낮은 종목 해제 필요")
                 break
-            success = await kis_websocket.subscribe(symbol, market)
+            success = await kis_websocket.subscribe(symbol, market_code)
             if success:
-                self._priority_symbols[symbol] = market
+                self._priority_symbols[key] = (symbol, market_code)
 
-    async def unsubscribe_symbols(self, symbols: list[str]) -> None:
+    async def unsubscribe_symbols(self, symbols: list[str | tuple[str, str]]) -> None:
         """종목 구독 해제"""
-        for symbol in symbols:
-            market = self._priority_symbols.pop(symbol, "KRX")
+        for item in symbols:
+            if isinstance(item, tuple):
+                symbol, market = item
+                key = (normalize_market(market), symbol.upper())
+            else:
+                symbol = item
+                key = next(
+                    (candidate for candidate in self._priority_symbols if candidate[1] == symbol.upper()),
+                    None,
+                )
+                if key is None:
+                    market = "KRX"
+                    key = (market, symbol.upper())
+                else:
+                    market = key[0]
+            self._priority_symbols.pop(key, None)
             await kis_websocket.unsubscribe(symbol, market)
 
     async def update_subscriptions(self, new_symbols: list[tuple[str, str]]) -> None:
         """AI가 선정한 새 종목으로 구독 목록 업데이트"""
-        new_set = {s[0] for s in new_symbols}
+        new_set = {(normalize_market(m), s.upper()) for s, m in new_symbols}
         current_set = set(self._priority_symbols.keys())
 
         # 해제할 종목
         to_remove = current_set - new_set
         if to_remove:
-            await self.unsubscribe_symbols(list(to_remove))
+            await self.unsubscribe_symbols([(symbol, market) for market, symbol in to_remove])
 
         # 추가할 종목
-        to_add = [(s, m) for s, m in new_symbols if s not in current_set]
+        to_add = [
+            (symbol, market)
+            for symbol, market in new_symbols
+            if (normalize_market(market), symbol.upper()) not in current_set
+        ]
         if to_add:
             await self.subscribe_symbols(to_add)
 
@@ -87,7 +108,7 @@ class StreamManager:
                     try:
                         await kis_websocket.connect()
                         # 기존 구독 복원
-                        for symbol, market in self._priority_symbols.items():
+                        for symbol, market in self._priority_symbols.values():
                             await kis_websocket.subscribe(symbol, market)
                     except Exception as re:
                         logger.error("재연결 실패: {}", str(re))

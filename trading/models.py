@@ -31,10 +31,14 @@ class CurrentPrice(BaseModel):
     """현재가 정보"""
     symbol: str
     market: Market
+    currency: str = "KRW"
     price: float
+    price_krw: float = 0.0
+    exchange_rate_to_krw: float = 1.0
     change: float
     change_rate: float
     volume: int
+    session: str = ""
     timestamp: datetime
 
 
@@ -46,6 +50,8 @@ class OrderRequest(BaseModel):
     order_type: OrderType
     quantity: int
     price: Optional[float] = None  # 시장가 주문 시 None
+    currency: str = "KRW"
+    exchange_rate_to_krw: float = 1.0
 
 
 class OrderResult(BaseModel):
@@ -55,6 +61,8 @@ class OrderResult(BaseModel):
     message: str
     filled_quantity: int = 0
     filled_price: float = 0.0
+    currency: str = "KRW"
+    filled_price_krw: float = 0.0
 
 
 class AccountBalance(BaseModel):
@@ -64,6 +72,9 @@ class AccountBalance(BaseModel):
     stock_value: float
     total_pnl: float
     total_pnl_rate: float
+    market: str = "KRX"
+    currency: str = "KRW"
+    exchange_rate_to_krw: float = 1.0
     is_valid: bool = True  # False이면 조회 실패 상태
 
 
@@ -71,11 +82,14 @@ class HoldingInfo(BaseModel):
     """보유 종목 정보"""
     symbol: str
     name: str
+    market: str = "KRX"
+    currency: str = "KRW"
     quantity: int
     avg_buy_price: float
     current_price: float
     pnl: float
     pnl_rate: float
+    exchange_rate_to_krw: float = 1.0
 
 
 class PendingOrderInfo(BaseModel):
@@ -83,9 +97,12 @@ class PendingOrderInfo(BaseModel):
     order_id: str           # odno (주문번호)
     symbol: str             # pdno (종목코드)
     name: str               # prdt_name (종목명)
+    market: str = "KRX"
+    currency: str = "KRW"
     side: str               # 매수/매도
     order_qty: int          # 주문수량
     filled_qty: int         # 체결수량
     remaining_qty: int      # 미체결수량
     order_price: float      # 주문단가
     order_time: str         # 주문시각
+    exchange_rate_to_krw: float = 1.0

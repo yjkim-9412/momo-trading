@@ -20,10 +20,23 @@ class RiskManager:
     def __init__(self):
         self.max_daily_trades = settings.MAX_DAILY_TRADES
         self.max_single_order_krw = settings.MAX_SINGLE_ORDER_KRW
-        self.max_single_order_usd = settings.MAX_SINGLE_ORDER_USD
         self.min_cash_ratio = settings.MIN_CASH_RATIO  # 기본 5%
 
     RR_FLOOR = {"THEME": 1.0, "BULL": 1.0}
+
+    @staticmethod
+    def _unit_price_krw(signal: TradeSignal) -> float:
+        """시그널 단가를 KRW 기준으로 환산"""
+        price = signal.suggested_price or 0
+        metadata = signal.metadata or {}
+        price_krw = metadata.get("price_krw")
+        if isinstance(price_krw, (int, float)) and price_krw > 0:
+            return float(price_krw)
+
+        exchange_rate = metadata.get("exchange_rate_to_krw", 1.0)
+        if isinstance(exchange_rate, (int, float)) and exchange_rate > 0:
+            return price * float(exchange_rate)
+        return price
 
     async def check(
         self,
@@ -89,7 +102,8 @@ class RiskManager:
             await self._log_result(symbol, result, today_trade_count, cycle_id)
             return result
 
-        total_amount = price * quantity
+        unit_price_krw = self._unit_price_krw(signal)
+        total_amount = unit_price_krw * quantity
 
         # 리스크:보상 비율 검사 (다른 조정 전에 먼저 확인)
         entry = signal.suggested_price or 0
@@ -113,7 +127,7 @@ class RiskManager:
 
         # 단일 주문 금액 한도 (0이면 AI 자율 → 스킵)
         if eff_max_order > 0 and total_amount > eff_max_order:
-            adjusted_qty = int(eff_max_order / price)
+            adjusted_qty = int(eff_max_order / unit_price_krw)
             if adjusted_qty < eff_min_qty:
                 result = {"approved": False, "reason": "단일 주문 한도 내에서 최소 수량 미달"}
                 await self._log_result(symbol, result, today_trade_count, cycle_id)
@@ -133,7 +147,7 @@ class RiskManager:
             return result
 
         if total_amount > portfolio_cash:
-            adjusted_qty = int(portfolio_cash / price)
+            adjusted_qty = int(portfolio_cash / unit_price_krw)
             if adjusted_qty < eff_min_qty:
                 result = {"approved": False, "reason": "현금 부족"}
                 await self._log_result(symbol, result, today_trade_count, cycle_id)
@@ -154,7 +168,7 @@ class RiskManager:
                 result = {"approved": False, "reason": "현금 비중 최소 한도 미달"}
                 await self._log_result(symbol, result, today_trade_count, cycle_id)
                 return result
-            adjusted_qty = int(max_spend / price)
+            adjusted_qty = int(max_spend / unit_price_krw)
             if adjusted_qty < eff_min_qty:
                 result = {"approved": False, "reason": "현금 비중 유지 후 최소 수량 미달"}
                 await self._log_result(symbol, result, today_trade_count, cycle_id)
@@ -171,7 +185,7 @@ class RiskManager:
         if portfolio_budget > 0:
             position_pct = (total_amount / portfolio_budget) * 100
             if position_pct > eff_max_pos_pct:
-                adjusted_qty = int((portfolio_budget * eff_max_pos_pct / 100) / price)
+                adjusted_qty = int((portfolio_budget * eff_max_pos_pct / 100) / unit_price_krw)
                 if adjusted_qty < eff_min_qty:
                     result = {"approved": False, "reason": "비중 한도 내에서 최소 수량 미달"}
                     await self._log_result(symbol, result, today_trade_count, cycle_id)

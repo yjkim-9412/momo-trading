@@ -9,7 +9,7 @@ from trading.enums import Market, OrderSide, OrderType
 class OrderCreate(BaseModel):
     portfolio_id: str
     symbol: str
-    market: Market = Market.KOSPI
+    market: Market
     side: OrderSide
     order_type: OrderType = OrderType.LIMIT
     quantity: int

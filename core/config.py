@@ -21,15 +21,25 @@ class Settings(BaseSettings):
     KIS_APP_SECRET: str = ""
     KIS_PAPER_APP_KEY: str = ""
     KIS_PAPER_APP_SECRET: str = ""
-    KIS_HTS_ID: str = ""
     KIS_ACCT_STOCK: str = ""
     KIS_PAPER_STOCK: str = ""
-    KIS_PROD_TYPE: str = "01"
     KIS_ACCOUNT_TYPE: str = "VIRTUAL"
 
     # KIS WebSocket
     KIS_WS_URL_DOMESTIC: str = "ws://ops.koreainvestment.com:21000"
     KIS_WS_URL_OVERSEAS: str = "ws://ops.koreainvestment.com:31000"
+
+    # === Multi-market Runtime ===
+    ENABLED_MARKETS: str = "KRX"
+    PRIMARY_MARKET: str = "KRX"
+    US_SCAN_MARKETS: str = "NASDAQ,NYSE,AMEX"
+    US_TRADING_ENABLED: bool = False
+    US_PREMARKET_ENABLED: bool = False
+    US_AFTERMARKET_ENABLED: bool = False
+    US_WATCHLIST_SYMBOLS: str = "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD"
+    US_SCAN_LIMIT: int = 12
+    BASE_CURRENCY: str = "KRW"
+    FX_RATE_SOURCE: str = "KIS"
 
     # === AI / LLM (Claude Code CLI — 구독 크레딧 사용) ===
     CLAUDE_CODE_MODEL: str = "sonnet"  # 기본 모델 (Tier별 미지정 시 사용)
@@ -53,7 +63,6 @@ class Settings(BaseSettings):
     MAX_HOLD_DAYS_AGGRESSIVE: int = 3  # AGGRESSIVE_SHORT 최대 보유일
     MAX_DAILY_TRADES: int = 0  # 0 = 무제한
     MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정 (시스템 하드 리밋 없음)
-    MAX_SINGLE_ORDER_USD: int = 0  # 0 = AI 자율 결정
 
     # === AI Risk Tuning ===
     AI_RISK_TUNING_ENABLED: bool = True
@@ -83,6 +92,42 @@ class Settings(BaseSettings):
     def is_paper_trading(self) -> bool:
         return self.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
 
+    @property
+    def enabled_markets_list(self) -> list[str]:
+        """활성 시장 목록"""
+        from trading.market_profile import expand_scan_markets
+
+        raw_items = [item.strip() for item in self.ENABLED_MARKETS.split(",")]
+        items = [item for item in raw_items if item]
+        return expand_scan_markets(items or [self.PRIMARY_MARKET])
+
+    @property
+    def primary_market_code(self) -> str:
+        """대표 시장 코드"""
+        from trading.market_profile import normalize_market
+
+        return normalize_market(self.PRIMARY_MARKET)
+
+    @property
+    def scan_markets(self) -> list[str]:
+        """시장 스캔 대상 목록"""
+        from trading.market_profile import expand_scan_markets
+
+        if self.primary_market_code in ("NASDAQ", "NYSE", "AMEX"):
+            raw_items = [item.strip() for item in self.US_SCAN_MARKETS.split(",")]
+            items = [item for item in raw_items if item]
+            return expand_scan_markets(items)
+        return [self.primary_market_code]
+
+    @property
+    def us_watchlist_symbols(self) -> list[str]:
+        """미국장 스캔용 우선 감시 종목"""
+        return [
+            item.strip().upper()
+            for item in self.US_WATCHLIST_SYMBOLS.split(",")
+            if item.strip()
+        ][: self.US_SCAN_LIMIT]
+
     def validate_on_startup(self) -> None:
         """시작 시 필수 설정 검증 — 누락된 키에 대해 경고 로그"""
         claude_path = self._find_claude_path()
@@ -102,6 +147,13 @@ class Settings(BaseSettings):
 
         if not self.TRADING_ENABLED:
             logger.info("TRADING_ENABLED=false: 매매 기능이 비활성화 상태입니다.")
+
+        if self.BASE_CURRENCY.upper() != "KRW":
+            logger.warning(
+                "BASE_CURRENCY={}는 아직 부분 지원입니다. "
+                "현재 리스크 관리는 KRW 기준에 맞춰져 있습니다.",
+                self.BASE_CURRENCY,
+            )
 
 
     def _find_claude_path(self) -> str | None:

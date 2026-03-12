@@ -12,6 +12,7 @@ from repositories.agent_activity_repository import AgentActivityRepository
 from repositories.daily_report_repository import DailyReportRepository
 from repositories.trade_result_repository import TradeResultRepository
 from services.activity_logger import activity_logger
+from core.config import settings
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
 
@@ -74,7 +75,7 @@ class DailyReportService:
             cash = 0.0
             stock_value = 0.0
             try:
-                balance, holdings = await account_manager.get_account_snapshot()
+                balance, holdings = await account_manager.get_account_snapshot(settings.primary_market_code)
                 unrealized_pnl = balance.total_pnl
                 open_position_count = len(holdings)
                 total_asset = balance.total_asset

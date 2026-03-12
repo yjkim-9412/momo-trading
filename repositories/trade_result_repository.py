@@ -42,15 +42,18 @@ class TradeResultRepository(AsyncBaseRepository[TradeResult]):
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_open_buy(self, symbol: str) -> TradeResult | None:
+    async def get_open_buy(self, symbol: str, market: str | None = None) -> TradeResult | None:
         """미청산 매수 기록 조회 (exit_at IS NULL, side=BUY)"""
+        conditions = [
+            TradeResult.stock_symbol == symbol,
+            TradeResult.side == "BUY",
+            TradeResult.exit_at.is_(None),
+        ]
+        if market:
+            conditions.append(TradeResult.market == market)
         stmt = (
             select(TradeResult)
-            .where(and_(
-                TradeResult.stock_symbol == symbol,
-                TradeResult.side == "BUY",
-                TradeResult.exit_at.is_(None),
-            ))
+            .where(and_(*conditions))
             .order_by(TradeResult.created_at.desc())
             .limit(1)
         )
