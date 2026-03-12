@@ -48,7 +48,8 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 
 ### 종목 정보
 - 종목: {stock_name} ({symbol})
-- 현재가: {current_price:,.0f}원
+- 시장/통화: {market} / {currency}
+- 현재가: {current_price_text}
 - 전략 유형: {strategy_type}
 
 ### 투자 가능 금액

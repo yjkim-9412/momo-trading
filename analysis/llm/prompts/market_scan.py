@@ -1,5 +1,7 @@
 """Tier 1: 시장 스캔 + 종목 선정 프롬프트 — 시장 국면 판단 + 전략 배정 통합"""
 
+from trading.market_profile import is_us_market, market_label, normalize_market
+
 MARKET_SCAN_SYSTEM = """당신은 한국 주식 시장(KOSPI/KOSDAQ) 전문 스크리너입니다.
 주어진 시장 데이터만을 분석하여 단기 매매(1~5일) 후보 종목을 선별하고 전략을 배정합니다.
 
@@ -75,3 +77,95 @@ JSON:
   ]
 }}
 ```"""
+
+US_MARKET_SCAN_SYSTEM = """당신은 미국 주식 시장(NASDAQ/NYSE/AMEX) 전문 스크리너입니다.
+주어진 시장 데이터만을 분석하여 단기 매매(수시간~5일) 후보 종목을 선별하고 전략을 배정합니다.
+
+## 분석 프레임워크
+반드시 아래 순서로 분석하세요:
+
+**Step 1. 시장 국면 판단** — 오늘 미국장 전체 흐름
+  - BULL: 대형 성장주와 거래량 상위 종목이 동반 상승
+  - BEAR: 하락 폭 확대, 위험자산 회피, 약세 종목 다수
+  - SIDEWAYS: 방향성 약함, 혼조세
+  - THEME: AI/반도체/에너지 등 특정 섹터에 자금 집중
+
+**Step 2. 종목 선정 + 전략 배정**
+  - 안정형(STABLE_SHORT): 대형 우량주, ETF, 추세 유지 종목
+  - 공격형(AGGRESSIVE_SHORT): 거래량 급증, 강한 모멘텀, 뉴스/테마 동력 종목
+  - 장후반에는 오버나이트 리스크와 갭 리스크를 더 엄격히 반영
+
+## 핵심 원칙
+- 제공된 데이터만 사용 (추측 금지)
+- 투자 가용 금액은 KRW 기준 리스크 한도임
+- 반드시 주어진 데이터 안의 종목만 선정
+- 반드시 한국어로 답변
+- JSON만 출력"""
+
+US_MARKET_SCAN_PROMPT = """## 시장 데이터
+
+시장: {market_label}
+현재 시각(KST): {current_time} | 매수 마감까지: {minutes_until_cutoff}분
+투자 가용 현금(리스크 기준 KRW): {available_cash:,.0f}원 | 종목당 최대: {max_per_stock:,.0f}원
+보유 종목 수: {holding_count}개
+
+### 거래량/모멘텀 상위
+{volume_rank_data}
+
+### 급등/강세
+{surge_data}
+
+### 급락/약세
+{drop_data}
+
+### 보유 종목
+{holdings_data}
+
+### 매매 성과
+{performance_summary}
+
+---
+
+위 데이터를 분석하여 미국장 기준으로 **심층 분석할 종목 5~10개**를 직접 선정하세요.
+각 종목에 적합한 전략(STABLE_SHORT/AGGRESSIVE_SHORT)을 배정하세요.
+
+JSON:
+```json
+{{
+  "market_regime": "BULL/BEAR/SIDEWAYS/THEME",
+  "market_analysis": "시장 상황 1~2줄 요약",
+  "leading_sectors": ["주도 섹터"],
+  "selected": [
+    {{
+      "symbol": "티커",
+      "name": "종목명",
+      "market": "NASDAQ/NYSE/AMEX",
+      "strategy_type": "STABLE_SHORT 또는 AGGRESSIVE_SHORT",
+      "reason": "선정 근거 1줄",
+      "direction": "BUY/SELL",
+      "monitoring": {{"surge_pct": 2.5, "drop_pct": -2.5, "volume_spike_ratio": 2.0}}
+    }}
+  ]
+}}
+```"""
+
+
+def get_market_scan_system(primary_market: str) -> str:
+    """시장별 스캔 시스템 프롬프트 반환"""
+    market_code = normalize_market(primary_market)
+    if is_us_market(market_code):
+        return US_MARKET_SCAN_SYSTEM
+    return MARKET_SCAN_SYSTEM
+
+
+def get_market_scan_prompt(primary_market: str) -> str:
+    """시장별 스캔 프롬프트 템플릿 반환"""
+    market_code = normalize_market(primary_market)
+    if is_us_market(market_code):
+        return US_MARKET_SCAN_PROMPT
+    return MARKET_SCAN_PROMPT
+
+
+def get_market_label(primary_market: str) -> str:
+    """프롬프트 표시용 시장명"""
+    return market_label(primary_market)

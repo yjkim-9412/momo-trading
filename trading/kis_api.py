@@ -1,17 +1,25 @@
 """KIS REST API 직접 호출 클라이언트
 
 MCP를 거치지 않고 KIS API를 직접 호출하여
-분봉, 거래량순위, 등락률순위 등 MCP 미지원 데이터를 조회한다.
+분봉, 거래량순위, 등락률순위, 해외주식 주문/조회 데이터를 조회한다.
 """
 import asyncio
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 from loguru import logger
 
 from core.config import settings
+from trading.market_profile import (
+    kis_balance_exchange_code,
+    kis_exchange_code,
+    kis_order_exchange_code,
+    market_currency,
+    normalize_market,
+)
 
 DOMAIN = "https://openapi.koreainvestment.com:9443"
 VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
@@ -28,6 +36,13 @@ def _get_domain() -> str:
     return DOMAIN
 
 
+def _get_trading_domain() -> str:
+    """주문/계좌 API용 도메인 반환"""
+    if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
+        return VIRTUAL_DOMAIN
+    return DOMAIN
+
+
 def _get_app_key() -> str:
     if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
         return settings.KIS_PAPER_APP_KEY or settings.KIS_APP_KEY
@@ -38,6 +53,117 @@ def _get_app_secret() -> str:
     if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
         return settings.KIS_PAPER_APP_SECRET or settings.KIS_APP_SECRET
     return settings.KIS_APP_SECRET
+
+
+def _get_account_parts() -> tuple[str, str]:
+    """KIS 계좌번호를 8자리/2자리로 분리"""
+    raw = settings.KIS_PAPER_STOCK if settings.is_paper_trading else settings.KIS_ACCT_STOCK
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 10:
+        raise ValueError("KIS 계좌번호가 올바르지 않습니다. 10자리 계좌번호를 설정하세요.")
+    return digits[:8], digits[8:10]
+
+
+def _request_headers(token: str, tr_id: str, tr_cont: str = "") -> dict[str, str]:
+    """KIS REST 공통 헤더"""
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}",
+        "appkey": _get_app_key(),
+        "appsecret": _get_app_secret(),
+        "tr_id": tr_id,
+    }
+    if tr_cont:
+        headers["tr_cont"] = tr_cont
+    return headers
+
+
+async def _request_json(
+    api_url: str,
+    tr_id: str,
+    params: dict[str, Any] | None = None,
+    method: str = "GET",
+    use_trading_domain: bool = False,
+    tr_cont: str = "",
+) -> dict[str, Any]:
+    """KIS REST API 호출 후 JSON 응답 반환"""
+    domain = _get_trading_domain() if use_trading_domain else _get_domain()
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        token = await _get_access_token(client)
+        headers = _request_headers(token, tr_id, tr_cont=tr_cont)
+
+        if method.upper() == "POST":
+            response = await client.post(f"{domain}{api_url}", headers=headers, json=params or {})
+        else:
+            response = await client.get(f"{domain}{api_url}", headers=headers, params=params or {})
+
+    try:
+        data = response.json()
+    except json.JSONDecodeError:
+        data = {"rt_cd": "1", "msg1": response.text}
+
+    if not isinstance(data, dict):
+        data = {"output": data}
+
+    data.setdefault("http_status", response.status_code)
+    data.setdefault("tr_cont", response.headers.get("tr_cont", ""))
+    return data
+
+
+def _append_records(target: list[dict[str, Any]], value: Any) -> None:
+    """KIS output 레코드를 list 형태로 누적"""
+    if isinstance(value, list):
+        target.extend(item for item in value if isinstance(item, dict))
+        return
+    if isinstance(value, dict):
+        target.append(value)
+
+
+async def _request_paged_json(
+    api_url: str,
+    tr_id: str,
+    params: dict[str, Any],
+    output_keys: tuple[str, ...],
+    ctx_fk_key: str = "CTX_AREA_FK200",
+    ctx_nk_key: str = "CTX_AREA_NK200",
+) -> dict[str, Any]:
+    """연속조회형 KIS API를 단일 dict로 병합"""
+    merged: dict[str, Any] = {}
+    accumulators = {key: [] for key in output_keys}
+    tr_cont = ""
+    next_fk = params.get(ctx_fk_key, "")
+    next_nk = params.get(ctx_nk_key, "")
+
+    for index in range(10):
+        page_params = {**params, ctx_fk_key: next_fk, ctx_nk_key: next_nk}
+        page = await _request_json(
+            api_url,
+            tr_id,
+            params=page_params,
+            method="GET",
+            use_trading_domain=True,
+            tr_cont=tr_cont,
+        )
+        merged = page
+        for key in output_keys:
+            _append_records(accumulators[key], page.get(key))
+
+        header_tr_cont = ""
+        header = page.get("header")
+        if isinstance(header, dict):
+            header_tr_cont = str(header.get("tr_cont", ""))
+        if not header_tr_cont:
+            header_tr_cont = str(page.get("tr_cont", ""))
+
+        next_fk = str(page.get("ctx_area_fk200", ""))
+        next_nk = str(page.get("ctx_area_nk200", ""))
+        if header_tr_cont not in {"M", "F"} or (not next_fk and not next_nk) or index >= 9:
+            break
+        tr_cont = "N"
+
+    for key, records in accumulators.items():
+        merged[key] = records
+    return merged
 
 
 async def _get_access_token(client: httpx.AsyncClient) -> str:
@@ -328,3 +454,255 @@ async def get_fluctuation_rank(sort: str = "top", market: str = "J") -> dict:
     except Exception as e:
         logger.error("등락률순위 조회 오류: {}", str(e))
         return {"success": False, "error": str(e), "stocks": []}
+
+
+async def get_overseas_price(symbol: str, market: str = "NASDAQ") -> dict:
+    """해외주식 현재가 조회"""
+    market_code = normalize_market(market)
+    try:
+        result = await _request_json(
+            "/uapi/overseas-price/v1/quotations/price",
+            "HHDFS00000300",
+            params={
+                "AUTH": "",
+                "EXCD": kis_exchange_code(market_code),
+                "SYMB": symbol,
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 현재가 조회 오류 ({} {}): {}", market_code, symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
+
+
+async def get_overseas_daily_price(symbol: str, market: str = "NASDAQ") -> dict:
+    """해외주식 기간별 시세 조회"""
+    market_code = normalize_market(market)
+    try:
+        result = await _request_json(
+            "/uapi/overseas-price/v1/quotations/dailyprice",
+            "HHDFS76240000",
+            params={
+                "AUTH": "",
+                "EXCD": kis_exchange_code(market_code),
+                "SYMB": symbol,
+                "GUBN": "0",
+                "BYMD": "",
+                "MODP": "1",
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 일봉 조회 오류 ({} {}): {}", market_code, symbol, str(e))
+        return {"success": False, "error": str(e), "output1": [], "output2": []}
+
+
+async def get_overseas_minute_chart(
+    symbol: str,
+    market: str = "NASDAQ",
+    period: str = "5",
+) -> dict:
+    """해외주식 분봉 조회"""
+    market_code = normalize_market(market)
+    try:
+        result = await _request_json(
+            "/uapi/overseas-price/v1/quotations/inquire-time-itemchartprice",
+            "HHDFS76950200",
+            params={
+                "AUTH": "",
+                "EXCD": kis_exchange_code(market_code),
+                "SYMB": symbol,
+                "NMIN": period,
+                "PINC": "1",
+                "NEXT": "",
+                "NREC": "120",
+                "FILL": "",
+                "KEYB": "",
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 분봉 조회 오류 ({} {}): {}", market_code, symbol, str(e))
+        return {"success": False, "error": str(e), "output1": [], "output2": []}
+
+
+async def get_overseas_present_balance(market: str = "NASDAQ") -> dict:
+    """해외주식 주문가능금액/평가금액 조회"""
+    market_code = normalize_market(market)
+    cano, acnt_prdt_cd = _get_account_parts()
+    try:
+        result = await _request_json(
+            "/uapi/overseas-stock/v1/trading/inquire-present-balance",
+            "VTRP6504R" if settings.is_paper_trading else "CTRP6504R",
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "WCRC_FRCR_DVSN_CD": "01",
+                "NATN_CD": "000",
+                "TR_MKET_CD": "00",
+                "INQR_DVSN_CD": "00",
+            },
+            use_trading_domain=True,
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 현재잔고 조회 오류 ({}): {}", market_code, str(e))
+        return {"success": False, "error": str(e), "output1": [], "output2": []}
+
+
+async def get_overseas_balance(market: str = "NASDAQ") -> dict:
+    """해외주식 보유잔고 조회"""
+    market_code = normalize_market(market)
+    cano, acnt_prdt_cd = _get_account_parts()
+    try:
+        result = await _request_paged_json(
+            "/uapi/overseas-stock/v1/trading/inquire-balance",
+            "VTTS3012R" if settings.is_paper_trading else "TTTS3012R",
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "OVRS_EXCG_CD": kis_balance_exchange_code(market_code),
+                "TR_CRCY_CD": market_currency(market_code),
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
+            },
+            output_keys=("output1", "output2"),
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 잔고 조회 오류 ({}): {}", market_code, str(e))
+        return {"success": False, "error": str(e), "output1": [], "output2": []}
+
+
+async def get_overseas_order_list(market: str = "NASDAQ") -> dict:
+    """해외주식 주문/체결 내역 조회"""
+    market_code = normalize_market(market)
+    cano, acnt_prdt_cd = _get_account_parts()
+    today = datetime.now().strftime("%Y%m%d")
+    try:
+        result = await _request_paged_json(
+            "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+            "VTTS3035R" if settings.is_paper_trading else "TTTS3035R",
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "OVRS_EXCG_CD": kis_balance_exchange_code(market_code),
+                "PDNO": "",
+                "ORD_STRT_DT": today,
+                "ORD_END_DT": today,
+                "SLL_BUY_DVSN": "00",
+                "CCLD_NCCS_DVSN": "00",
+                "SORT_SQN": "DS",
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
+            },
+            output_keys=("output", "output1", "output2"),
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 주문내역 조회 오류 ({}): {}", market_code, str(e))
+        return {"success": False, "error": str(e), "output": []}
+
+
+async def place_overseas_order(
+    symbol: str,
+    side: str,
+    quantity: int,
+    price: float | None = None,
+    market: str = "NASDAQ",
+) -> dict:
+    """해외주식 주문 실행"""
+    market_code = normalize_market(market)
+    cano, acnt_prdt_cd = _get_account_parts()
+    is_buy = str(side).upper() == "BUY"
+    tr_id = (
+        "VTTT1002U" if settings.is_paper_trading and is_buy
+        else "VTTT1006U" if settings.is_paper_trading and not is_buy
+        else "TTTT1002U" if is_buy
+        else "TTTT1006U"
+    )
+
+    try:
+        result = await _request_json(
+            "/uapi/overseas-stock/v1/trading/order",
+            tr_id,
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "OVRS_EXCG_CD": kis_order_exchange_code(market_code),
+                "PDNO": symbol,
+                "ORD_QTY": str(quantity),
+                "OVRS_ORD_UNPR": f"{price or 0}",
+                "CTAC_TLNO": "",
+                "MGCO_APTM_ODNO": "",
+                "SLL_TYPE": "00",
+                "ORD_SVR_DVSN_CD": "0",
+                "ORD_DVSN": "00" if price else "31",
+            },
+            method="POST",
+            use_trading_domain=True,
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 주문 오류 ({} {}): {}", market_code, symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
+
+
+async def cancel_overseas_order(
+    symbol: str,
+    order_id: str,
+    quantity: int,
+    price: float | None = None,
+    market: str = "NASDAQ",
+) -> dict:
+    """해외주식 정정/취소"""
+    market_code = normalize_market(market)
+    cano, acnt_prdt_cd = _get_account_parts()
+    try:
+        result = await _request_json(
+            "/uapi/overseas-stock/v1/trading/order-rvsecncl",
+            "VTTT1004U" if settings.is_paper_trading else "TTTT1004U",
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "OVRS_EXCG_CD": kis_order_exchange_code(market_code),
+                "PDNO": symbol,
+                "ORGN_ODNO": order_id,
+                "RVSE_CNCL_DVSN_CD": "02",
+                "ORD_QTY": str(quantity),
+                "OVRS_ORD_UNPR": f"{price or 0}",
+                "CTAC_TLNO": "",
+                "MGCO_APTM_ODNO": "",
+                "ORD_SVR_DVSN_CD": "0",
+            },
+            method="POST",
+            use_trading_domain=True,
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 주문취소 오류 ({} {}): {}", market_code, symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}

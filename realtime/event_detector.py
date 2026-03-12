@@ -45,7 +45,12 @@ class EventDetector:
         self._last_events: dict[str, tuple[str, float]] = {}
         self.EVENT_DEDUP_SEC = 60  # 같은 이벤트 60초 내 재발행 방지
 
-    def set_thresholds(self, symbol: str, **kwargs) -> None:
+    @staticmethod
+    def _instrument_key(symbol: str, market: str | None = None) -> str:
+        market_code = str(market or "KRX").upper()
+        return f"{market_code}:{str(symbol).upper()}"
+
+    def set_thresholds(self, symbol: str, market: str | None = None, **kwargs) -> None:
         """종목별 감시 임계값 설정 (AI Agent가 호출)
 
         사용 예:
@@ -66,33 +71,35 @@ class EventDetector:
             else:
                 logger.warning("유효하지 않은 임계값 무시: {} {} = {}", symbol, k, v)
 
-        if symbol in self._thresholds:
-            th = self._thresholds[symbol]
+        instrument_key = self._instrument_key(symbol, market)
+
+        if instrument_key in self._thresholds:
+            th = self._thresholds[instrument_key]
             for k, v in validated.items():
                 if hasattr(th, k):
                     setattr(th, k, v)
         else:
-            self._thresholds[symbol] = StockThresholds(**validated)
+            self._thresholds[instrument_key] = StockThresholds(**validated)
 
         # trailing_stop 설정 시 highest_price를 stop_loss 기반으로 초기화
-        th = self._thresholds[symbol]
+        th = self._thresholds[instrument_key]
         if 0 < th.trailing_stop_pct < 100 and th.highest_price == 0 and th.stop_loss > 0:
             # stop_loss = highest × (1 - pct/100) → highest = stop_loss / (1 - pct/100)
             th.highest_price = th.stop_loss / (1 - th.trailing_stop_pct / 100)
 
-        logger.debug("임계값 설정: {} → {}", symbol, self._thresholds[symbol])
+        logger.debug("임계값 설정: {} → {}", instrument_key, self._thresholds[instrument_key])
 
-    def get_thresholds(self, symbol: str) -> StockThresholds:
-        return self._thresholds.get(symbol, DEFAULT_THRESHOLDS)
+    def get_thresholds(self, symbol: str, market: str | None = None) -> StockThresholds:
+        return self._thresholds.get(self._instrument_key(symbol, market), DEFAULT_THRESHOLDS)
 
-    def set_stop_loss(self, symbol: str, price: float) -> None:
-        self.set_thresholds(symbol, stop_loss=price)
+    def set_stop_loss(self, symbol: str, price: float, market: str | None = None) -> None:
+        self.set_thresholds(symbol, market=market, stop_loss=price)
 
-    def set_take_profit(self, symbol: str, price: float) -> None:
-        self.set_thresholds(symbol, take_profit=price)
+    def set_take_profit(self, symbol: str, price: float, market: str | None = None) -> None:
+        self.set_thresholds(symbol, market=market, take_profit=price)
 
-    def remove_levels(self, symbol: str) -> None:
-        self._thresholds.pop(symbol, None)
+    def remove_levels(self, symbol: str, market: str | None = None) -> None:
+        self._thresholds.pop(self._instrument_key(symbol, market), None)
 
     def clear_all(self) -> None:
         """전체 초기화 (장 시작 시)"""
@@ -108,6 +115,7 @@ class EventDetector:
     async def on_price_update(self, data: dict) -> None:
         """실시간 가격 업데이트 처리 + 이벤트 감지"""
         symbol = data.get("symbol", "")
+        market = data.get("market", "KRX")
         price = data.get("price", 0)
         volume = data.get("volume", 0)
         change_rate = data.get("change_rate", 0)
@@ -115,7 +123,8 @@ class EventDetector:
         if not symbol or price <= 0:
             return
 
-        th = self.get_thresholds(symbol)
+        th = self.get_thresholds(symbol, market=market)
+        instrument_key = self._instrument_key(symbol, market)
 
         # 가격 업데이트 이벤트 발행
         await event_bus.publish(Event(
@@ -135,19 +144,19 @@ class EventDetector:
                              symbol, new_stop, price)
 
         # 거래량 급증 감지
-        await self._check_volume_spike(symbol, volume, th, data)
+        await self._check_volume_spike(instrument_key, volume, th, data)
 
         # 급등/급락 감지
-        await self._check_price_movement(symbol, price, change_rate, th, data)
+        await self._check_price_movement(instrument_key, price, change_rate, th, data)
 
         # 손절/익절 감지
-        await self._check_stop_take(symbol, price, th, data)
+        await self._check_stop_take(instrument_key, price, th, data)
 
         # 캐시 업데이트
-        self._prev_prices[symbol] = price
-        self._volume_history[symbol].append(volume)
-        if len(self._volume_history[symbol]) > 20:
-            self._volume_history[symbol] = self._volume_history[symbol][-20:]
+        self._prev_prices[instrument_key] = price
+        self._volume_history[instrument_key].append(volume)
+        if len(self._volume_history[instrument_key]) > 20:
+            self._volume_history[instrument_key] = self._volume_history[instrument_key][-20:]
 
     async def _check_volume_spike(
         self, symbol: str, volume: int, th: StockThresholds, data: dict,

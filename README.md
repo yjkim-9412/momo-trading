@@ -35,35 +35,41 @@ LLM 다단계 분석(스크리닝 → 기술적 분석 → 최종 검토)과 실
 
 ### 요청 흐름
 
-```
-API Routes → Services → Repositories (AsyncBaseRepository[T]) → SQLAlchemy Models
-     ↕              ↕
-  schemas/      dependencies/
-  (Pydantic)    (Annotated[Type, Depends(factory)])
+```mermaid
+graph LR
+    A["API Routes"] --> B["Services"] --> C["Repositories\n(AsyncBaseRepository[T])"] --> D["SQLAlchemy Models"]
+    A <-.-> S["schemas/\n(Pydantic)"]
+    B <-.-> Dep["dependencies/\n(Annotated[Type, Depends(factory)])"]
 ```
 
 ### 에이전트 파이프라인 (장중)
 
-```
-Scheduler (APScheduler, KST cron)
-  → TradingAgent.run_cycle()
-    → MarketScanner.scan()              # 거래량순위, 등락률순위
-    → StockScreener.screen()            # LLM Tier1: 후보 필터링
-    → [병렬] _analyze_and_trade()       # Semaphore(3), asyncio.gather
-        → MCP: 현재가 + 일봉 + 분봉 (gather)
-        → ChartAnalyzer (pandas-ta 지표)
-        → LLM Tier1: 종목 분석 (CoT 5단계)
-        → LLM Tier2: 최종 검토 (체크리스트 + 스트레스테스트)
-        → Strategy.evaluate() → RiskManager.check()
-        → DecisionMaker.execute() → MCP: 주문 실행
+```mermaid
+graph TD
+    SCH["Scheduler\n(APScheduler, KST cron)"] --> TA["TradingAgent.run_cycle()"]
+    TA --> MS["MarketScanner.scan()\n거래량순위 · 등락률순위"]
+    MS --> SS["StockScreener.screen()\nLLM Tier1: 후보 필터링"]
+    SS --> PAR
+
+    subgraph PAR ["병렬 _analyze_and_trade() — Semaphore(3), asyncio.gather"]
+        direction TB
+        MCP1["MCP: 현재가 + 일봉 + 분봉\n(gather)"]
+        MCP1 --> CA["ChartAnalyzer\n(pandas-ta 지표)"]
+        CA --> T1["LLM Tier1: 종목 분석\n(CoT 5단계)"]
+        T1 --> T2["LLM Tier2: 최종 검토\n(체크리스트 + 스트레스테스트)"]
+        T2 --> SE["Strategy.evaluate()\nRiskManager.check()"]
+        SE --> DM["DecisionMaker.execute()\nMCP: 주문 실행"]
+    end
 ```
 
 ### 실시간 경로
 
-```
-KIS WebSocket → RealtimeMonitor → EventDetector
-  → EventBus (asyncio pub/sub) → TradingAgent._on_market_event()
-  → 즉시 분석 + 매매 (단일 종목 파이프라인)
+```mermaid
+graph LR
+    WS["KIS WebSocket"] --> RM["RealtimeMonitor"] --> ED["EventDetector"]
+    ED --> EB["EventBus\n(asyncio pub/sub)"]
+    EB --> TA["TradingAgent\n._on_market_event()"]
+    TA --> AN["즉시 분석 + 매매\n(단일 종목 파이프라인)"]
 ```
 
 ### 일일 스케줄 (KST)
@@ -163,7 +169,6 @@ KIS_APP_KEY=your_app_key              # 실전 투자 앱 키
 KIS_APP_SECRET=your_app_secret        # 실전 투자 앱 시크릿
 KIS_PAPER_APP_KEY=your_paper_key      # 모의 투자 앱 키
 KIS_PAPER_APP_SECRET=your_paper_secret # 모의 투자 앱 시크릿
-KIS_HTS_ID=your_hts_id               # HTS ID
 KIS_ACCT_STOCK=your_account_number    # 실전 계좌번호
 KIS_PAPER_STOCK=your_paper_account    # 모의 계좌번호
 KIS_ACCOUNT_TYPE=VIRTUAL              # VIRTUAL(모의) 또는 REAL(실전)

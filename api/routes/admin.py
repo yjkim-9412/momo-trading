@@ -140,16 +140,20 @@ async def get_report_by_date(
 
 # ── 계좌 정보 ──
 @router.get("/account/balance")
-async def get_account_balance():
+async def get_account_balance(market: str | None = Query(None)):
     """계좌 잔고 조회"""
     try:
-        balance = await account_manager.get_balance()
+        market_code = market or settings.primary_market_code
+        balance = await account_manager.get_balance(market_code)
         return SuccessResponse(data={
             "total_asset": balance.total_asset,
             "cash": balance.cash,
             "stock_value": balance.stock_value,
             "total_pnl": balance.total_pnl,
             "total_pnl_rate": balance.total_pnl_rate,
+            "market": balance.market,
+            "currency": balance.currency,
+            "exchange_rate_to_krw": balance.exchange_rate_to_krw,
         })
     except Exception as e:
         logger.error("계좌 잔고 조회 실패: {}", str(e))
@@ -157,19 +161,22 @@ async def get_account_balance():
 
 
 @router.get("/account/holdings")
-async def get_account_holdings():
+async def get_account_holdings(market: str | None = Query(None)):
     """보유 종목 조회"""
     try:
-        holdings = await account_manager.get_holdings()
+        holdings = await account_manager.get_holdings(market or settings.primary_market_code)
         return SuccessResponse(data=[
             {
                 "symbol": h.symbol,
                 "name": h.name,
+                "market": h.market,
+                "currency": h.currency,
                 "quantity": h.quantity,
                 "avg_buy_price": h.avg_buy_price,
                 "current_price": h.current_price,
                 "pnl": h.pnl,
                 "pnl_rate": h.pnl_rate,
+                "exchange_rate_to_krw": h.exchange_rate_to_krw,
             }
             for h in holdings
         ])
@@ -179,15 +186,17 @@ async def get_account_holdings():
 
 
 @router.get("/account/pending-orders")
-async def get_pending_orders():
+async def get_pending_orders(market: str | None = Query(None)):
     """미체결 주문 조회"""
     try:
-        orders = await account_manager.get_pending_orders()
+        orders = await account_manager.get_pending_orders(market or settings.primary_market_code)
         return SuccessResponse(data=[
             {
                 "order_id": o.order_id,
                 "symbol": o.symbol,
                 "name": o.name,
+                "market": o.market,
+                "currency": o.currency,
                 "side": o.side,
                 "order_qty": o.order_qty,
                 "filled_qty": o.filled_qty,
@@ -307,9 +316,10 @@ async def get_system_status():
         "last_cycle_time": trading_agent.last_cycle_time.isoformat() if trading_agent.last_cycle_time else None,
         "sse_clients": sse_manager.client_count,
         "environment": settings.ENVIRONMENT,
-        "market_open": market_calendar.is_krx_trading_hours(),
-        "market_holiday": market_calendar.get_holiday_name(),
-        "next_market_open": market_calendar.next_krx_open().strftime("%m/%d %H:%M"),
+        "primary_market": settings.primary_market_code,
+        "market_open": market_calendar.is_primary_market_trading_hours(),
+        "market_holiday": market_calendar.get_holiday_name(market=settings.primary_market_code),
+        "next_market_open": market_calendar.next_market_open(market=settings.primary_market_code).strftime("%m/%d %H:%M"),
     })
 
 

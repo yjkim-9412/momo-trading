@@ -8,6 +8,12 @@ import httpx
 from loguru import logger
 
 from core.config import settings
+from trading.market_profile import (
+    is_domestic_market,
+    kis_exchange_code,
+    market_currency,
+    normalize_market,
+)
 from trading.models import MCPResponse
 
 # SSE 재연결 설정
@@ -46,6 +52,7 @@ class MCPClient:
         self._call_timestamps: list[float] = []
         self._rate_lock = asyncio.Lock()
         self._call_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
+        self._fx_cache: dict[str, tuple[float, float]] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -470,74 +477,327 @@ class MCPClient:
         except (ValueError, TypeError):
             return default
 
+    @staticmethod
+    def _pick_first(data: dict[str, Any], *keys: str, default: Any = None) -> Any:
+        """응답 딕셔너리에서 첫 유효값 반환"""
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, "", []):
+                return value
+        return default
+
+    @staticmethod
+    def _extract_records(data: dict[str, Any], *keys: str) -> list[dict[str, Any]]:
+        """응답 내 배열/단일 레코드 정규화"""
+        for key in keys:
+            records = data.get(key)
+            if isinstance(records, list):
+                return [item for item in records if isinstance(item, dict)]
+            if isinstance(records, dict):
+                return [records]
+        return []
+
+    async def call_any_tool(
+        self, tool_calls: list[tuple[str, dict[str, Any]]]
+    ) -> MCPResponse:
+        """가능한 도구를 순차 시도하여 첫 성공 응답 반환"""
+        errors: list[str] = []
+        for tool_name, arguments in tool_calls:
+            response = await self.call_tool(tool_name, arguments)
+            if response.success:
+                return response
+            if response.error:
+                errors.append(f"{tool_name}: {response.error}")
+        return MCPResponse(
+            success=False,
+            error=" / ".join(errors[:3]) or "사용 가능한 MCP 도구를 찾지 못했습니다",
+        )
+
+    def _runtime_env_value(self) -> str:
+        return "demo" if settings.is_paper_trading else "real"
+
+    async def _get_exchange_rate_to_krw(self, market: str) -> float:
+        """시장 통화를 KRW로 환산하는 환율 조회"""
+        market_code = normalize_market(market)
+        if market_currency(market_code) == "KRW":
+            return 1.0
+
+        now = time.monotonic()
+        cached = self._fx_cache.get(market_code)
+        if cached and now - cached[1] < 300:
+            return cached[0]
+
+        try:
+            from trading.kis_api import get_overseas_present_balance
+
+            response = await get_overseas_present_balance(market_code)
+            if response.get("success"):
+                summaries = self._extract_records(response, "output2", "output1")
+                summary = summaries[0] if summaries else response
+                rate = self._to_float(self._pick_first(
+                    summary,
+                    "frst_bltn_exrt",
+                    "bass_exrt",
+                    "exchange_rate_to_krw",
+                ), 0.0)
+                if rate > 0:
+                    self._fx_cache[market_code] = (rate, now)
+                    return rate
+        except Exception as e:
+            logger.debug("환율 조회 실패 ({}): {}", market_code, str(e))
+
+        return cached[0] if cached else 1.0
+
+    async def _build_watchlist_scan(self, market: str) -> list[dict[str, Any]]:
+        """미국장 랭킹 API 폴백용 감시종목 스캔"""
+        watchlist = settings.us_watchlist_symbols
+        if not watchlist:
+            return []
+
+        responses = await asyncio.gather(
+            *[self.get_current_price(symbol, market=market) for symbol in watchlist],
+            return_exceptions=True,
+        )
+
+        stocks: list[dict[str, Any]] = []
+        for symbol, response in zip(watchlist, responses, strict=False):
+            if isinstance(response, Exception) or not getattr(response, "success", False):
+                continue
+            data = response.data or {}
+            price = self._to_float(data.get("price", data.get("current_price", 0)))
+            if price <= 0:
+                continue
+            stocks.append({
+                "symbol": symbol,
+                "name": data.get("name", symbol),
+                "market": normalize_market(data.get("market", market), default=market),
+                "currency": data.get("currency", market_currency(market)),
+                "price": price,
+                "current_price": price,
+                "change": self._to_float(data.get("change", 0)),
+                "change_rate": self._to_float(data.get("change_rate", 0)),
+                "volume": self._to_int(data.get("volume", 0)),
+            })
+        return stocks
+
+    def _normalize_stock_item(self, item: dict[str, Any], market: str) -> dict[str, Any]:
+        """시장 스캔용 종목 데이터 정규화"""
+        price_val = (
+            self._to_float(self._pick_first(
+                item,
+                "stck_prpr",
+                "last",
+                "price",
+                "ovrs_nmix_prpr",
+                "clos",
+                "base",
+            ))
+        )
+        change_val = self._to_float(self._pick_first(
+            item,
+            "prdy_vrss",
+            "diff",
+            "t_xsgn",
+            "ovrs_nmix_prdy_vrss",
+            "change",
+        ))
+        change_rate_val = self._to_float(self._pick_first(
+            item,
+            "prdy_ctrt",
+            "rate",
+            "t_rate",
+            "change_rate",
+            "ovrs_nmix_prdy_ctrt",
+        ))
+        volume_val = self._to_int(self._pick_first(
+            item,
+            "acml_vol",
+            "tvol",
+            "volume",
+            "avol",
+            "ovrs_vol",
+        ))
+        symbol = str(self._pick_first(
+            item,
+            "symbol",
+            "code",
+            "symb",
+            "pdno",
+            "mksc_shrn_iscd",
+            "stck_shrn_iscd",
+            "ovrs_pdno",
+            "rsym",
+            default="",
+        ))
+        name = str(self._pick_first(
+            item,
+            "name",
+            "hts_kor_isnm",
+            "ovrs_item_name",
+            "prdt_name",
+            "item_name",
+            default=symbol,
+        ))
+        item_market = str(self._pick_first(
+            item,
+            "market",
+            "ovrs_excg_cd",
+            default=market,
+        ))
+
+        return {
+            **item,
+            "symbol": symbol,
+            "name": name,
+            "market": normalize_market(item_market, default=market),
+            "currency": market_currency(market),
+            "price": price_val,
+            "current_price": price_val,
+            "change": change_val,
+            "change_rate": change_rate_val,
+            "volume": volume_val,
+        }
+
     # === 편의 메서드: KIS MCP 도구 래퍼 ===
 
     async def get_current_price(self, symbol: str, market: str = "KRX") -> MCPResponse:
         """현재가 조회 (KIS 원본 키 → 정규화)"""
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
+        market_code = normalize_market(market)
+        if is_domestic_market(market_code):
             resp = await self.call_tool("inquery-stock-price", {"symbol": symbol})
         else:
-            resp = await self.call_tool("inquery-overseas-stock-price", {
-                "symbol": symbol, "exchange": market
-            })
+            from trading.kis_api import get_overseas_price
+
+            result = await get_overseas_price(symbol, market_code)
+            resp = MCPResponse(
+                success=result.get("success", False),
+                data=result,
+                error=result.get("error"),
+            )
         if resp.success and resp.data:
             d = resp.data
-            # KIS는 모든 값을 문자열로 반환 → float 변환 후 or 체인 (0.0은 falsy)
-            price_val = (self._to_float(d.get("stck_prpr"))
-                         or self._to_float(d.get("last"))
-                         or self._to_float(d.get("price")))
+            source = d.get("output", d) if isinstance(d.get("output"), dict) else d
+            exchange_rate = await self._get_exchange_rate_to_krw(market_code)
+            price_val = (
+                self._to_float(self._pick_first(
+                    source,
+                    "stck_prpr",
+                    "last",
+                    "price",
+                    "ovrs_nmix_prpr",
+                    "last_price",
+                    "clos",
+                ))
+            )
             resp.data = {
                 **d,
+                "market": market_code,
+                "currency": market_currency(market_code),
+                "exchange_rate_to_krw": exchange_rate,
                 "price": price_val,
                 "current_price": price_val,
-                "change": self._to_float(d.get("prdy_vrss")),
-                "change_rate": self._to_float(d.get("prdy_ctrt")),
-                "volume": self._to_int(d.get("acml_vol")),
-                "per": d.get("per", "N/A"),
-                "pbr": d.get("pbr", "N/A"),
+                "price_krw": price_val * exchange_rate,
+                "change": self._to_float(self._pick_first(
+                    source, "prdy_vrss", "diff", "t_xsgn", "ovrs_nmix_prdy_vrss",
+                )),
+                "change_rate": self._to_float(self._pick_first(
+                    source, "prdy_ctrt", "rate", "t_rate", "ovrs_nmix_prdy_ctrt",
+                )),
+                "volume": self._to_int(self._pick_first(
+                    source, "acml_vol", "tvol", "ovrs_vol",
+                )),
+                "per": source.get("per", d.get("per", "N/A")),
+                "pbr": source.get("pbr", d.get("pbr", "N/A")),
             }
         return resp
 
-    async def get_account_balance(self) -> MCPResponse:
+    async def get_account_balance(self, market: str = "KRX") -> MCPResponse:
         """계좌 잔고 조회"""
-        return await self.call_tool("inquery-balance")
+        market_code = normalize_market(market)
+        if is_domestic_market(market_code):
+            return await self.call_tool("inquery-balance")
+        from trading.kis_api import get_overseas_balance, get_overseas_present_balance
+
+        try:
+            summary, holdings = await asyncio.gather(
+                get_overseas_present_balance(market_code),
+                get_overseas_balance(market_code),
+            )
+        except Exception as e:
+            return MCPResponse(success=False, error=str(e))
+
+        if not summary.get("success") and not holdings.get("success"):
+            return MCPResponse(
+                success=False,
+                error=summary.get("error") or holdings.get("error") or "해외 잔고 조회 실패",
+            )
+
+        summary_record = (summary.get("output2") or [{}])[0] if isinstance(summary.get("output2"), list) else summary
+        fx_rate = self._to_float(self._pick_first(
+            summary_record,
+            "exchange_rate_to_krw",
+            "frst_bltn_exrt",
+            "bass_exrt",
+        ), 1.0)
+        combined = {
+            **summary,
+            "output1": holdings.get("output1", []),
+            "output2": summary.get("output2", holdings.get("output2", [])),
+            "market": market_code,
+            "currency": market_currency(market_code),
+            "exchange_rate_to_krw": fx_rate,
+        }
+        return MCPResponse(success=True, data=combined)
 
     async def get_daily_price(
         self, symbol: str, period: str = "D", count: int = 30, market: str = "KRX"
     ) -> MCPResponse:
         """일봉 데이터 조회 (KIS 원본 키 → 정규화)"""
         from datetime import datetime, timedelta
+
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=count * 2)).strftime("%Y%m%d")
+        market_code = normalize_market(market)
 
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
+        if is_domestic_market(market_code):
             resp = await self.call_tool("inquery-stock-info", {
                 "symbol": symbol, "start_date": start_date, "end_date": end_date,
             })
         else:
-            resp = await self.call_tool("inquery-overseas-stock-price", {
-                "symbol": symbol, "exchange": market,
-            })
+            from trading.kis_api import get_overseas_daily_price
 
-        # KIS 원본 응답 정규화: output2[] → prices[]
-        # KIS API는 일봉 배열을 output2에 반환 (output1은 요약 헤더)
+            result = await get_overseas_daily_price(symbol, market_code)
+            resp = MCPResponse(
+                success=result.get("success", False),
+                data=result,
+                error=result.get("error"),
+            )
+
         if resp.success and resp.data:
-            raw_items = (resp.data.get("output2")
-                         or resp.data.get("output")
-                         or resp.data.get("prices")
-                         or [])
+            raw_items = (
+                self._extract_records(resp.data, "output2", "output", "prices")
+                or self._extract_records(resp.data, "output1")
+            )
             if isinstance(raw_items, list) and raw_items:
                 prices = []
                 for item in raw_items:
                     prices.append({
-                        "date": item.get("stck_bsop_date", ""),
-                        "open": self._to_float(item.get("stck_oprc")),
-                        "high": self._to_float(item.get("stck_hgpr")),
-                        "low": self._to_float(item.get("stck_lwpr")),
-                        "close": self._to_float(item.get("stck_clpr")),
-                        "volume": self._to_int(item.get("acml_vol")),
-                        "change": self._to_float(item.get("prdy_vrss")),
-                        "change_rate": self._to_float(item.get("prdy_ctrt")),
+                        "date": self._pick_first(
+                            item,
+                            "stck_bsop_date",
+                            "xymd",
+                            "date",
+                            default="",
+                        ),
+                        "open": self._to_float(self._pick_first(item, "stck_oprc", "open", "open_price")),
+                        "high": self._to_float(self._pick_first(item, "stck_hgpr", "high", "high_price")),
+                        "low": self._to_float(self._pick_first(item, "stck_lwpr", "low", "low_price")),
+                        "close": self._to_float(self._pick_first(
+                            item, "stck_clpr", "clos", "close", "ovrs_nmix_prpr",
+                        )),
+                        "volume": self._to_int(self._pick_first(item, "acml_vol", "tvol", "volume")),
+                        "change": self._to_float(self._pick_first(item, "prdy_vrss", "diff")),
+                        "change_rate": self._to_float(self._pick_first(item, "prdy_ctrt", "rate")),
                     })
                 resp.data["prices"] = prices
             else:
@@ -551,7 +811,8 @@ class MCPClient:
     ) -> MCPResponse:
         """주문 실행 (KIS 원본 키 → 정규화)"""
         order_type = "buy" if side == "BUY" else "sell"
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
+        market_code = normalize_market(market)
+        if is_domestic_market(market_code):
             resp = await self.call_tool("order-stock", {
                 "symbol": symbol,
                 "quantity": quantity,
@@ -559,49 +820,91 @@ class MCPClient:
                 "order_type": order_type,
             })
         else:
-            resp = await self.call_tool("order-overseas-stock", {
-                "symbol": symbol, "exchange": market,
-                "quantity": quantity,
-                "price": price or 0,
-                "order_type": order_type,
-            })
+            from trading.kis_api import place_overseas_order
+
+            result = await place_overseas_order(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                price=price,
+                market=market_code,
+            )
+            resp = MCPResponse(
+                success=result.get("success", False),
+                data=result,
+                error=result.get("error"),
+            )
         if resp.success and resp.data:
             d = resp.data
-            # KIS rt_cd='1' → 주문 실패 (잔고 부족 등)
             if d.get("rt_cd") == "1":
                 error_msg = d.get("msg1", "KIS 주문 실패")
                 logger.warning("KIS 주문 거부: {}", error_msg)
                 resp.success = False
                 resp.error = error_msg
                 return resp
-            # KIS 주문번호: 최상위 또는 output 중첩, 대소문자 혼용
             output = d.get("output", {}) if isinstance(d.get("output"), dict) else {}
             order_id = (
                 d.get("ODNO") or d.get("odno")
+                or d.get("ORDNO") or d.get("ordno")
                 or output.get("ODNO") or output.get("odno")
                 or d.get("order_id", "")
             )
             if not order_id:
                 logger.warning("주문 응답에서 주문번호 미발견, 원본: {}", str(d)[:500])
+            exchange_rate = await self._get_exchange_rate_to_krw(market_code)
+            filled_price = self._to_float(
+                d.get("exec_prc") or output.get("exec_prc")
+                or d.get("filled_price")
+            )
             resp.data = {
                 **d,
                 "order_id": order_id,
+                "market": market_code,
+                "currency": market_currency(market_code),
                 "filled_quantity": self._to_int(
                     d.get("exec_qty") or output.get("exec_qty")
                     or d.get("filled_quantity")
                 ),
-                "filled_price": self._to_float(
-                    d.get("exec_prc") or output.get("exec_prc")
-                    or d.get("filled_price")
-                ),
+                "filled_price": filled_price,
+                "filled_price_krw": filled_price * exchange_rate,
+                "exchange_rate_to_krw": exchange_rate,
             }
         return resp
 
     async def get_volume_rank(self, market: str = "KRX") -> MCPResponse:
-        """거래량 상위 종목 조회 (KIS API 직접 호출)"""
+        """거래량 상위 종목 조회"""
         from trading.kis_api import get_volume_rank
 
-        market_code = "J" if market in ("KOSPI", "KOSDAQ", "KRX") else market
+        market_code = normalize_market(market)
+        if not is_domestic_market(market_code):
+            exchange = kis_exchange_code(market_code)
+            response = await self.call_any_tool([
+                ("volume_surge", {
+                    "excd": exchange,
+                    "mixn": "0",
+                    "vol_range": "0",
+                }),
+                ("trade_growth", {
+                    "excd": exchange,
+                    "nday": "0",
+                    "vol_range": "0",
+                }),
+            ])
+            if response.success and response.data:
+                items = (
+                    self._extract_records(response.data, "output1", "output", "dataframe1")
+                    or self._extract_records(response.data, "output2", "dataframe2")
+                )
+                response.data = {
+                    **response.data,
+                    "stocks": [self._normalize_stock_item(item, market_code) for item in items],
+                }
+                return response
+            stocks = await self._build_watchlist_scan(market_code)
+            stocks.sort(key=lambda item: item.get("volume", 0), reverse=True)
+            return MCPResponse(success=bool(stocks), data={"stocks": stocks[:30]})
+
+        market_code = "J" if market_code in ("KOSPI", "KOSDAQ", "KRX") else market_code
         try:
             result = await get_volume_rank(market=market_code)
             return MCPResponse(success=result.get("success", False), data=result)
@@ -612,8 +915,39 @@ class MCPClient:
     async def get_minute_price(
         self, symbol: str, period: str = "5", market: str = "KRX"
     ) -> MCPResponse:
-        """분봉 데이터 조회 (KIS API 직접 호출)"""
+        """분봉 데이터 조회"""
         from trading.kis_api import get_minute_chart
+
+        market_code = normalize_market(market)
+        if not is_domestic_market(market_code):
+            from trading.kis_api import get_overseas_minute_chart
+
+            result = await get_overseas_minute_chart(symbol, market_code, period=period)
+            response = MCPResponse(
+                success=result.get("success", False),
+                data=result,
+                error=result.get("error"),
+            )
+            if response.success and response.data:
+                items = (
+                    self._extract_records(response.data, "output2", "dataframe2")
+                    or self._extract_records(response.data, "output1", "dataframe1")
+                )
+                response.data = {
+                    **response.data,
+                    "prices": [
+                        {
+                            "time": self._pick_first(item, "xymd", "time", default=""),
+                            "open": self._to_float(self._pick_first(item, "open", "stck_oprc")),
+                            "high": self._to_float(self._pick_first(item, "high", "stck_hgpr")),
+                            "low": self._to_float(self._pick_first(item, "low", "stck_lwpr")),
+                            "close": self._to_float(self._pick_first(item, "clos", "close", "stck_prpr")),
+                            "volume": self._to_int(self._pick_first(item, "tvol", "volume", "cntg_vol")),
+                        }
+                        for item in items
+                    ],
+                }
+            return response
 
         try:
             result = await get_minute_chart(symbol, period)
@@ -623,10 +957,37 @@ class MCPClient:
             return MCPResponse(success=False, error=str(e))
 
     async def get_fluctuation_rank(self, market: str = "KRX", sort: str = "top") -> MCPResponse:
-        """등락률 상위/하위 종목 조회 (KIS API 직접 호출)"""
+        """등락률 상위/하위 종목 조회"""
         from trading.kis_api import get_fluctuation_rank
 
-        market_code = "J" if market in ("KOSPI", "KOSDAQ", "KRX") else market
+        market_code = normalize_market(market)
+        if not is_domestic_market(market_code):
+            exchange = kis_exchange_code(market_code)
+            response = await self.call_any_tool([
+                ("price_fluct", {
+                    "excd": exchange,
+                    "gubn": "0",
+                    "mixn": "0",
+                    "vol_range": "0",
+                }),
+            ])
+            if response.success and response.data:
+                items = (
+                    self._extract_records(response.data, "output1", "output", "dataframe1")
+                    or self._extract_records(response.data, "output2", "dataframe2")
+                )
+                normalized = [self._normalize_stock_item(item, market_code) for item in items]
+                normalized.sort(key=lambda item: item.get("change_rate", 0), reverse=(sort != "bottom"))
+                response.data = {
+                    **response.data,
+                    "stocks": normalized[:30],
+                }
+                return response
+            stocks = await self._build_watchlist_scan(market_code)
+            stocks.sort(key=lambda item: item.get("change_rate", 0), reverse=(sort != "bottom"))
+            return MCPResponse(success=bool(stocks), data={"stocks": stocks[:30]})
+
+        market_code = "J" if market_code in ("KOSPI", "KOSDAQ", "KRX") else market_code
         try:
             result = await get_fluctuation_rank(sort=sort, market=market_code)
             return MCPResponse(success=result.get("success", False), data=result)
@@ -634,18 +995,50 @@ class MCPClient:
             logger.error("등락률순위 조회 실패: {}", str(e))
             return MCPResponse(success=False, error=str(e))
 
-    async def get_stock_ask(self, symbol: str) -> MCPResponse:
+    async def get_stock_ask(self, symbol: str, market: str = "KRX") -> MCPResponse:
         """호가 조회"""
-        return await self.call_tool("inquery-stock-ask", {"symbol": symbol})
+        market_code = normalize_market(market)
+        if is_domestic_market(market_code):
+            return await self.call_tool("inquery-stock-ask", {"symbol": symbol})
+        return await self.call_any_tool([
+            ("inquire_asking_price", {
+                "auth": "",
+                "excd": kis_exchange_code(market_code),
+                "symb": symbol,
+            }),
+        ])
 
-    async def get_order_list(self) -> MCPResponse:
-        """주문 체결 내역 조회 (당일 미체결)"""
+    async def get_order_list(self, market: str = "KRX") -> MCPResponse:
+        """주문 체결/미체결 내역 조회"""
         from datetime import datetime
+
         today = datetime.now().strftime("%Y%m%d")
-        return await self.call_tool("inquery-order-list", {
-            "start_date": today,
-            "end_date": today,
-        })
+        market_code = normalize_market(market)
+
+        if is_domestic_market(market_code):
+            return await self.call_tool("inquery-order-list", {
+                "start_date": today,
+                "end_date": today,
+            })
+
+        from trading.kis_api import get_overseas_order_list
+
+        result = await get_overseas_order_list(market_code)
+        response = MCPResponse(
+            success=result.get("success", False),
+            data=result,
+            error=result.get("error"),
+        )
+        if response.success and response.data:
+            records = (
+                self._extract_records(response.data, "output", "output1", "dataframe", "dataframe1")
+                or self._extract_records(response.data, "output2", "dataframe2")
+            )
+            response.data = {
+                **response.data,
+                "output": records,
+            }
+        return response
 
 
 # 싱글톤 MCP 클라이언트

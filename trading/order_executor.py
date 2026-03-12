@@ -37,6 +37,8 @@ class OrderExecutor:
             message="주문 실행 완료",
             filled_quantity=int(data.get("filled_quantity", 0)),
             filled_price=float(data.get("filled_price", 0)),
+            currency=data.get("currency", request.currency),
+            filled_price_krw=float(data.get("filled_price_krw", 0)),
         )
 
     async def cancel(self, order_id: str, market: str = "KRX") -> OrderResult:

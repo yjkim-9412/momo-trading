@@ -7,6 +7,7 @@ import websockets
 from loguru import logger
 
 from core.config import settings
+from trading.market_profile import build_ws_key, is_domestic_market, normalize_market
 
 
 def _ws_is_closed(ws) -> bool:
@@ -76,16 +77,17 @@ class KISWebSocket:
             logger.warning("WebSocket 구독 한도 초과 (최대 41종목)")
             return False
 
-        key = f"{market}:{symbol}"
+        market_code = normalize_market(market)
+        key = f"{market_code}:{symbol.upper()}"
         if key in self._subscriptions:
             return True
 
-        ws = await self._get_ws(market)
+        ws = await self._get_ws(market_code)
         if not ws:
             return False
 
         try:
-            sub_msg = self._build_subscribe_msg(symbol, market)
+            sub_msg = self._build_subscribe_msg(symbol, market_code)
             await ws.send(json.dumps(sub_msg))
             self._subscriptions.add(key)
             logger.debug("종목 구독: {}", key)
@@ -96,14 +98,15 @@ class KISWebSocket:
 
     async def unsubscribe(self, symbol: str, market: str = "KRX") -> None:
         """종목 구독 해제"""
-        key = f"{market}:{symbol}"
+        market_code = normalize_market(market)
+        key = f"{market_code}:{symbol.upper()}"
         if key not in self._subscriptions:
             return
 
-        ws = await self._get_ws(market)
+        ws = await self._get_ws(market_code)
         if ws:
             try:
-                unsub_msg = self._build_unsubscribe_msg(symbol, market)
+                unsub_msg = self._build_unsubscribe_msg(symbol, market_code)
                 await ws.send(json.dumps(unsub_msg))
             except Exception:
                 pass
@@ -112,7 +115,8 @@ class KISWebSocket:
 
     async def _get_ws(self, market: str):
         """시장별 WebSocket 연결 반환 (없으면 생성)"""
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
+        market_code = normalize_market(market)
+        if is_domestic_market(market_code):
             if not self._ws_domestic or _ws_is_closed(self._ws_domestic):
                 try:
                     self._ws_domestic = await websockets.connect(
@@ -134,6 +138,7 @@ class KISWebSocket:
             return self._ws_overseas
 
     def _build_subscribe_msg(self, symbol: str, market: str) -> dict:
+        market_code = normalize_market(market)
         return {
             "header": {
                 "approval_key": self._approval_key or "",
@@ -143,8 +148,8 @@ class KISWebSocket:
             },
             "body": {
                 "input": {
-                    "tr_id": "H0STCNT0" if market in ("KOSPI", "KOSDAQ", "KRX") else "HDFSCNT0",
-                    "tr_key": symbol,
+                    "tr_id": "H0STCNT0" if is_domestic_market(market_code) else "HDFSCNT0",
+                    "tr_key": build_ws_key(symbol, market_code),
                 }
             },
         }
@@ -218,6 +223,21 @@ class KISWebSocket:
         if not fields:
             return None
 
+        def _parse_overseas_symbol(raw_symbol: str) -> tuple[str, str, str]:
+            token = raw_symbol.upper()
+            prefixes = {
+                "DNAS": ("NASDAQ", token[4:], "US_DELAYED"),
+                "DNYS": ("NYSE", token[4:], "US_DELAYED"),
+                "DAMS": ("AMEX", token[4:], "US_DELAYED"),
+                "RBAQ": ("NASDAQ", token[4:], "US_DAYTIME"),
+                "RBAY": ("NYSE", token[4:], "US_DAYTIME"),
+                "RBAA": ("AMEX", token[4:], "US_DAYTIME"),
+            }
+            for prefix, parsed in prefixes.items():
+                if token.startswith(prefix):
+                    return parsed
+            return "NASDAQ", token, ""
+
         if tr_id in ("H0STCNT0",):  # 국내 실시간 체결
             if len(fields) < 20:
                 return None
@@ -234,9 +254,12 @@ class KISWebSocket:
         elif tr_id in ("HDFSCNT0",):  # 해외 실시간 체결
             if len(fields) < 10:
                 return None
+            market, symbol, session = _parse_overseas_symbol(fields[0])
             return {
-                "market": "OVERSEAS",
-                "symbol": fields[0],
+                "market": market,
+                "symbol": symbol,
+                "session": session,
+                "currency": "USD",
                 "time": fields[1],
                 "price": float(fields[2]) if fields[2] else 0,
                 "change": float(fields[6]) if fields[6] else 0,

@@ -42,6 +42,10 @@ class AggressiveShortStrategy:
         symbol = analysis.get("symbol", "")
         stock_id = analysis.get("stock_id", "")
         current_price = analysis.get("current_price", 0)
+        market = analysis.get("market", "KRX")
+        currency = analysis.get("currency", "KRW")
+        exchange_rate = float(analysis.get("exchange_rate_to_krw", 1.0) or 1.0)
+        price_krw = float(analysis.get("price_krw", current_price * exchange_rate) or 0.0)
 
         # 국면별 동적 파라미터 (기본값 폴백)
         params = self.REGIME_PARAMS.get(market_regime, {})
@@ -100,6 +104,12 @@ class AggressiveShortStrategy:
                 strategy_type=self.strategy_type,
                 reason=" + ".join(reasons),
                 confidence=confidence,
+                metadata={
+                    "market": market,
+                    "currency": currency,
+                    "exchange_rate_to_krw": exchange_rate,
+                    "price_krw": price_krw,
+                },
             )
 
         # === SELL ===
@@ -125,6 +135,12 @@ class AggressiveShortStrategy:
                 strategy_type=self.strategy_type,
                 reason=" + ".join(reasons),
                 confidence=confidence,
+                metadata={
+                    "market": market,
+                    "currency": currency,
+                    "exchange_rate_to_krw": exchange_rate,
+                    "price_krw": price_krw,
+                },
             )
 
         return None

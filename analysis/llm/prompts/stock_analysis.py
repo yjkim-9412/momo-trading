@@ -1,6 +1,6 @@
 """Tier 1: 종목 심층 분석 프롬프트 — Chain-of-Thought + 구조화된 의사결정"""
 
-STOCK_ANALYSIS_SYSTEM = """당신은 한국 주식 시장 단기 매매 전문 애널리스트입니다.
+STOCK_ANALYSIS_SYSTEM = """당신은 한국/미국 주식 시장 단기 매매 전문 애널리스트입니다.
 주어진 데이터만을 근거로 분석하며, 데이터에 없는 정보는 추측하지 않습니다.
 
 ## 분석 프레임워크
@@ -33,8 +33,9 @@ STOCK_ANALYSIS_PROMPT = """## 종목 분석 요청: {stock_name} ({symbol})
 {trading_context}
 
 ### 현재가 정보
-- 현재가: {current_price:,.0f}원
-- 전일 대비: {change:+,.0f}원 ({change_rate:+.2f}%)
+- 시장/통화: {market} / {currency}
+- 현재가: {current_price_text}
+- 전일 대비: {change_text} ({change_rate:+.2f}%)
 - 거래량: {volume:,}
 
 ### 기술적 지표

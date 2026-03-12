@@ -1,74 +1,143 @@
-"""MCP를 통한 잔고/체결내역 조회 — 장외 시간 폴링 차단 + 캐시"""
+"""MCP/REST를 통한 잔고·보유·미체결 조회"""
+from __future__ import annotations
+
 from loguru import logger
 
+from core.config import settings
 from scheduler.market_calendar import market_calendar
 from trading.mcp_client import mcp_client
+from trading.market_profile import market_currency, normalize_market
 from trading.models import AccountBalance, HoldingInfo, PendingOrderInfo
 
 
 class AccountManager:
-    """계좌 관리 (MCP 통신)
-
-    KIS API inquery-balance 응답 형식:
-    - output1: 보유종목 리스트 [{pdno, prdt_name, hldg_qty, pchs_avg_pric, prpr, evlu_pfls_amt, evlu_pfls_rt, ...}]
-    - output2: 계좌 총합 [{dnca_tot_amt, scts_evlu_amt, tot_evlu_amt, nass_amt, ...}]
-    """
+    """계좌 관리 (MCP/REST 통신)"""
 
     def __init__(self):
-        self._balance_cache: AccountBalance | None = None
-        self._holdings_cache: list[HoldingInfo] | None = None
-        self._pending_orders_cache: list[PendingOrderInfo] | None = None
+        self._balance_cache: dict[str, AccountBalance] = {}
+        self._holdings_cache: dict[str, list[HoldingInfo]] = {}
+        self._pending_orders_cache: dict[str, list[PendingOrderInfo]] = {}
 
     def invalidate_cache(self) -> None:
-        """캐시 무효화 (체결 후 즉시 최신 데이터 조회 강제)"""
-        self._balance_cache = None
-        self._holdings_cache = None
-        self._pending_orders_cache = None
+        """체결 이후 캐시를 비운다."""
+        self._balance_cache.clear()
+        self._holdings_cache.clear()
+        self._pending_orders_cache.clear()
 
-    def _empty_balance(self) -> AccountBalance:
+    @staticmethod
+    def _to_float(value, default: float = 0.0) -> float:
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_int(value, default: int = 0) -> int:
+        try:
+            if value in (None, ""):
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _first_value(source: dict, *keys: str):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def _empty_balance(self, market: str) -> AccountBalance:
+        normalized_market = normalize_market(market)
         return AccountBalance(
-            total_asset=0, cash=0, stock_value=0,
-            total_pnl=0, total_pnl_rate=0,
+            total_asset=0,
+            cash=0,
+            stock_value=0,
+            total_pnl=0,
+            total_pnl_rate=0,
+            market=normalized_market,
+            currency="KRW",
+            exchange_rate_to_krw=1.0,
             is_valid=False,
         )
 
-    def _parse_balance(self, data: dict, holdings: list["HoldingInfo"] | None = None) -> AccountBalance:
-        """MCP 응답에서 AccountBalance 파싱
-
-        holdings가 전달되면 stock_value를 보유종목 평가합계로 계산하여
-        화면 표시값과 일치시킵니다.
-        """
+    def _parse_balance(
+        self,
+        data: dict,
+        holdings: list[HoldingInfo] | None = None,
+        market: str = "KRX",
+    ) -> AccountBalance:
+        """원본 응답을 KRW 기준 AccountBalance로 정규화한다."""
+        normalized_market = normalize_market(market)
         output2 = data.get("output2", [])
+        if isinstance(output2, dict):
+            output2 = [output2]
+
         if output2 and isinstance(output2, list):
-            summary = output2[0] if output2 else {}
-            cash = float(summary.get("dnca_tot_amt", 0))
-
-            # 보유종목 평가합계 사용 (화면 일관성), 없으면 KIS output2 값 사용
-            if holdings:
-                stock_value = sum(
-                    h.current_price * h.quantity for h in holdings
+            summary = output2[0]
+            cash = self._to_float(
+                self._first_value(
+                    summary,
+                    "cash",
+                    "dnca_tot_amt",
+                    "ord_psbl_amt",
+                    "ovrs_ord_psbl_amt",
+                    "frcr_dncl_amt_2",
+                    "frcr_ord_psbl_amt1",
                 )
-            else:
-                stock_value = float(summary.get("scts_evlu_amt", 0))
-
-            total_asset = cash + stock_value
-
-            # 디버그 로깅: KIS 원본 필드값 기록
-            kis_scts = float(summary.get("scts_evlu_amt", 0))
-            logger.debug(
-                "KIS 잔고 원본: tot_evlu={} scts_evlu={:,.0f} "
-                "dnca={:,.0f} nass={} pchs={} | 보유종목 평가합={:,.0f}",
-                summary.get("tot_evlu_amt", "N/A"), kis_scts, cash,
-                summary.get("nass_amt", "N/A"),
-                summary.get("pchs_amt_smtl_amt", "N/A"),
-                stock_value,
             )
 
-            total_pnl = float(summary.get("evlu_pfls_smtl_amt", 0))
-            total_pnl_rate = 0.0
-            pchs_amt = float(summary.get("pchs_amt_smtl_amt", 0))
-            if pchs_amt > 0:
-                total_pnl_rate = (total_pnl / pchs_amt) * 100
+            if holdings:
+                stock_value = sum(
+                    (holding.current_price * holding.exchange_rate_to_krw) * holding.quantity
+                    if holding.currency != "KRW" else holding.current_price * holding.quantity
+                    for holding in holdings
+                )
+            else:
+                stock_value = self._to_float(
+                    self._first_value(
+                        summary,
+                        "stock_value",
+                        "scts_evlu_amt",
+                        "ovrs_stck_evlu_amt",
+                        "frcr_evlu_amt2",
+                    )
+                )
+
+            total_asset = self._to_float(
+                self._first_value(
+                    summary,
+                    "total_asset",
+                    "tot_evlu_amt",
+                    "tot_asst_amt",
+                ),
+                default=cash + stock_value,
+            )
+            total_pnl = self._to_float(
+                self._first_value(
+                    summary,
+                    "total_pnl",
+                    "evlu_pfls_smtl_amt",
+                    "tot_evlu_pfls_amt",
+                    "frcr_evlu_pfls_amt",
+                )
+            )
+            total_pnl_rate = self._to_float(
+                self._first_value(summary, "total_pnl_rate", "evlu_pfls_rt", "tot_pftrt")
+            )
+            purchase_amount = self._to_float(
+                self._first_value(summary, "pchs_amt_smtl_amt", "frcr_pchs_amt1")
+            )
+            if total_pnl_rate == 0.0 and purchase_amount > 0:
+                total_pnl_rate = (total_pnl / purchase_amount) * 100
+
+            exchange_rate = self._to_float(
+                self._first_value(summary, "exchange_rate_to_krw", "bass_exrt", "frst_bltn_exrt"),
+                1.0,
+            )
 
             return AccountBalance(
                 total_asset=total_asset,
@@ -76,143 +145,183 @@ class AccountManager:
                 stock_value=stock_value,
                 total_pnl=total_pnl,
                 total_pnl_rate=total_pnl_rate,
+                market=normalized_market,
+                currency="KRW",
+                exchange_rate_to_krw=exchange_rate,
             )
 
-        # 기존 래핑 형식 fallback
         return AccountBalance(
-            total_asset=float(data.get("total_asset", 0)),
-            cash=float(data.get("cash", 0)),
-            stock_value=float(data.get("stock_value", 0)),
-            total_pnl=float(data.get("total_pnl", 0)),
-            total_pnl_rate=float(data.get("total_pnl_rate", 0)),
+            total_asset=self._to_float(data.get("total_asset", 0)),
+            cash=self._to_float(data.get("cash", 0)),
+            stock_value=self._to_float(data.get("stock_value", 0)),
+            total_pnl=self._to_float(data.get("total_pnl", 0)),
+            total_pnl_rate=self._to_float(data.get("total_pnl_rate", 0)),
+            market=normalized_market,
+            currency=data.get("currency", "KRW"),
+            exchange_rate_to_krw=self._to_float(data.get("exchange_rate_to_krw", 1.0), 1.0),
         )
 
-    def _parse_holdings(self, data: dict) -> list[HoldingInfo]:
-        """MCP 응답에서 HoldingInfo 리스트 파싱"""
-        holdings = []
+    def _parse_holdings(self, data: dict, market: str = "KRX") -> list[HoldingInfo]:
+        """원본 응답을 HoldingInfo 리스트로 정규화한다."""
+        holdings: list[HoldingInfo] = []
+        default_market = normalize_market(market)
+        default_currency = market_currency(default_market)
+        default_exchange_rate = self._to_float(data.get("exchange_rate_to_krw", 1.0), 1.0)
 
         output1 = data.get("output1", [])
+        if isinstance(output1, dict):
+            output1 = [output1]
+
         if output1 and isinstance(output1, list):
             for item in output1:
-                qty = int(item.get("hldg_qty", 0))
+                qty = self._to_int(
+                    self._first_value(
+                        item,
+                        "hldg_qty",
+                        "ovrs_cblc_qty",
+                        "cblc_qty13",
+                        "quantity",
+                        "qty",
+                    )
+                )
                 if qty <= 0:
                     continue
+
+                holding_market = normalize_market(
+                    self._first_value(item, "market", "ovrs_excg_cd", "excg_dvsn_cd") or default_market
+                )
+                currency = self._first_value(item, "currency", "tr_crcy_cd", "crcy_cd") or market_currency(holding_market)
+                exchange_rate = self._to_float(
+                    self._first_value(item, "exchange_rate_to_krw", "bass_exrt", "frst_bltn_exrt"),
+                    default_exchange_rate if currency != "KRW" else 1.0,
+                )
+
                 holdings.append(HoldingInfo(
-                    symbol=item.get("pdno", ""),
-                    name=item.get("prdt_name", ""),
+                    symbol=self._first_value(item, "pdno", "ovrs_pdno", "symbol", "item_cd") or "",
+                    name=self._first_value(item, "prdt_name", "ovrs_item_name", "item_name", "name") or "",
+                    market=holding_market,
+                    currency=currency,
                     quantity=qty,
-                    avg_buy_price=float(item.get("pchs_avg_pric", 0)),
-                    current_price=float(item.get("prpr", 0)),
-                    pnl=float(item.get("evlu_pfls_amt", 0)),
-                    pnl_rate=float(item.get("evlu_pfls_rt", 0)),
+                    avg_buy_price=self._to_float(
+                        self._first_value(item, "pchs_avg_pric", "avg_buy_price", "avg_unpr", "frcr_pchs_unpr")
+                    ),
+                    current_price=self._to_float(
+                        self._first_value(item, "prpr", "ovrs_now_pric1", "now_pric2", "current_price", "last")
+                    ),
+                    pnl=self._to_float(
+                        self._first_value(item, "evlu_pfls_amt", "frcr_evlu_pfls_amt", "pnl")
+                    ),
+                    pnl_rate=self._to_float(
+                        self._first_value(item, "evlu_pfls_rt", "evlu_pfls_rt1", "pnl_rate")
+                    ),
+                    exchange_rate_to_krw=exchange_rate,
                 ))
             return holdings
 
-        # 기존 래핑 형식 fallback
         for item in data.get("holdings", []):
             holdings.append(HoldingInfo(
                 symbol=item.get("symbol", ""),
                 name=item.get("name", ""),
-                quantity=int(item.get("quantity", 0)),
-                avg_buy_price=float(item.get("avg_buy_price", 0)),
-                current_price=float(item.get("current_price", 0)),
-                pnl=float(item.get("pnl", 0)),
-                pnl_rate=float(item.get("pnl_rate", 0)),
+                market=normalize_market(item.get("market") or default_market),
+                currency=item.get("currency", default_currency),
+                quantity=self._to_int(item.get("quantity", 0)),
+                avg_buy_price=self._to_float(item.get("avg_buy_price", 0)),
+                current_price=self._to_float(item.get("current_price", 0)),
+                pnl=self._to_float(item.get("pnl", 0)),
+                pnl_rate=self._to_float(item.get("pnl_rate", 0)),
+                exchange_rate_to_krw=self._to_float(item.get("exchange_rate_to_krw", default_exchange_rate), default_exchange_rate),
             ))
         return holdings
 
-    async def get_account_snapshot(self) -> tuple[AccountBalance, list[HoldingInfo]]:
-        """잔고 + 보유종목을 단일 MCP 호출로 조회
-
-        장중: 매번 MCP 호출 → 양쪽 캐시 갱신
-        장외 + 캐시 있음: 캐시 반환, MCP 미호출
-        장외 + 캐시 없음: MCP 1회 호출 → 캐시 저장
-        """
-        # 장외 + 양쪽 캐시 모두 있음 → MCP 호출 없이 캐시 반환
-        if not market_calendar.is_krx_trading_hours():
-            if self._balance_cache and self._holdings_cache is not None:
-                logger.debug("장외 시간 → 계좌 스냅샷 캐시 반환")
-                return self._balance_cache, self._holdings_cache
-
-        response = await mcp_client.get_account_balance()
-        if not response.success:
-            logger.warning("계좌 조회 실패: {}", response.error)
-            balance = self._balance_cache if self._balance_cache else self._empty_balance()
-            holdings = self._holdings_cache if self._holdings_cache is not None else []
-            return balance, holdings
-
-        data = response.data or {}
-        logger.debug("계좌 MCP 응답: {}", str(data)[:500])
-
-        holdings = self._parse_holdings(data)
-        balance = self._parse_balance(data, holdings=holdings)
-
-        self._balance_cache = balance
-        self._holdings_cache = holdings
-        return balance, holdings
-
-    async def get_balance(self) -> AccountBalance:
-        """계좌 잔고 조회 (하위 호환)"""
-        balance, _ = await self.get_account_snapshot()
-        return balance
-
-    async def get_holdings(self) -> list[HoldingInfo]:
-        """보유 종목 목록 조회 (하위 호환)"""
-        _, holdings = await self.get_account_snapshot()
-        return holdings
-
-    def _parse_pending_orders(self, data: dict) -> list[PendingOrderInfo]:
-        """MCP 응답에서 미체결 주문 리스트 파싱"""
-        orders = []
+    def _parse_pending_orders(self, data: dict, market: str = "KRX") -> list[PendingOrderInfo]:
+        """원본 응답을 PendingOrderInfo 리스트로 정규화한다."""
+        orders: list[PendingOrderInfo] = []
         output = data.get("output", [])
+        if isinstance(output, dict):
+            output = [output]
         if not output or not isinstance(output, list):
             return orders
 
         for item in output:
-            rmn_qty = int(item.get("rmn_qty", 0))
-            if rmn_qty <= 0:
+            remaining_qty = self._to_int(
+                self._first_value(item, "rmn_qty", "nccs_qty", "remaining_qty")
+            )
+            if remaining_qty <= 0:
                 continue
-            # sll_buy_dvsn_cd: 01=매도, 02=매수
-            side_code = item.get("sll_buy_dvsn_cd", "")
-            side = "매수" if side_code == "02" else "매도"
+
+            side_code = self._first_value(item, "sll_buy_dvsn_cd", "side_code", "side") or ""
+            side = "매수" if side_code in ("02", "BUY", "매수") else "매도"
             orders.append(PendingOrderInfo(
-                order_id=item.get("odno", ""),
-                symbol=item.get("pdno", ""),
-                name=item.get("prdt_name", ""),
+                order_id=self._first_value(item, "odno", "order_id") or "",
+                symbol=self._first_value(item, "pdno", "ovrs_pdno", "symbol") or "",
+                name=self._first_value(item, "prdt_name", "ovrs_item_name", "name") or "",
+                market=normalize_market(self._first_value(item, "market", "ovrs_excg_cd") or market),
+                currency=self._first_value(item, "currency", "tr_crcy_cd", "crcy_cd") or market_currency(market),
                 side=side,
-                order_qty=int(item.get("ord_qty", 0)),
-                filled_qty=int(item.get("tot_ccld_qty", 0)),
-                remaining_qty=rmn_qty,
-                order_price=float(item.get("ord_unpr", 0)),
-                order_time=item.get("ord_tmd", ""),
+                order_qty=self._to_int(self._first_value(item, "ord_qty", "order_qty")),
+                filled_qty=self._to_int(self._first_value(item, "tot_ccld_qty", "filled_qty", "ccld_qty")),
+                remaining_qty=remaining_qty,
+                order_price=self._to_float(self._first_value(item, "ord_unpr", "ovrs_ord_unpr", "order_price")),
+                order_time=self._first_value(item, "ord_tmd", "order_time") or "",
+                exchange_rate_to_krw=self._to_float(item.get("exchange_rate_to_krw", data.get("exchange_rate_to_krw", 1.0)), 1.0),
             ))
         return orders
 
-    async def get_pending_orders(self) -> list[PendingOrderInfo]:
-        """미체결 주문 목록 조회
+    async def get_account_snapshot(self, market: str | None = None) -> tuple[AccountBalance, list[HoldingInfo]]:
+        """잔고와 보유종목을 단일 호출로 조회한다."""
+        market_code = normalize_market(market or settings.primary_market_code)
+        if not market_calendar.is_trading_hours(market_code):
+            if market_code in self._balance_cache and market_code in self._holdings_cache:
+                logger.debug("장외 시간 → 계좌 스냅샷 캐시 반환")
+                return self._balance_cache[market_code], self._holdings_cache[market_code]
 
-        장중: 매번 MCP 호출 → 캐시 갱신
-        장외 + 캐시 있음: 캐시 반환
-        장외 + 캐시 없음: MCP 1회 호출 → 캐시 저장
-        """
-        if not market_calendar.is_krx_trading_hours():
-            if self._pending_orders_cache is not None:
-                logger.debug("장외 시간 → 미체결 주문 캐시 반환")
-                return self._pending_orders_cache
-
-        response = await mcp_client.get_order_list()
+        response = await mcp_client.get_account_balance(market=market_code)
         if not response.success:
-            logger.warning("미체결 주문 조회 실패: {}", response.error)
-            return self._pending_orders_cache if self._pending_orders_cache is not None else []
+            logger.warning("계좌 조회 실패: {}", response.error)
+            balance = self._balance_cache.get(market_code, self._empty_balance(market_code))
+            holdings = self._holdings_cache.get(market_code, [])
+            return balance, holdings
 
         data = response.data or {}
-        orders = self._parse_pending_orders(data)
-        self._pending_orders_cache = orders
+        logger.debug("계좌 응답: {}", str(data)[:500])
+
+        holdings = self._parse_holdings(data, market=market_code)
+        balance = self._parse_balance(data, holdings=holdings, market=market_code)
+        self._balance_cache[market_code] = balance
+        self._holdings_cache[market_code] = holdings
+        return balance, holdings
+
+    async def get_balance(self, market: str | None = None) -> AccountBalance:
+        """계좌 잔고 조회"""
+        balance, _ = await self.get_account_snapshot(market=market)
+        return balance
+
+    async def get_holdings(self, market: str | None = None) -> list[HoldingInfo]:
+        """보유 종목 목록 조회"""
+        _, holdings = await self.get_account_snapshot(market=market)
+        return holdings
+
+    async def get_pending_orders(self, market: str | None = None) -> list[PendingOrderInfo]:
+        """미체결 주문 목록 조회"""
+        market_code = normalize_market(market or settings.primary_market_code)
+        if not market_calendar.is_trading_hours(market_code):
+            if market_code in self._pending_orders_cache:
+                logger.debug("장외 시간 → 미체결 주문 캐시 반환")
+                return self._pending_orders_cache[market_code]
+
+        response = await mcp_client.get_order_list(market=market_code)
+        if not response.success:
+            logger.warning("미체결 주문 조회 실패: {}", response.error)
+            return self._pending_orders_cache.get(market_code, [])
+
+        data = response.data or {}
+        orders = self._parse_pending_orders(data, market=market_code)
+        self._pending_orders_cache[market_code] = orders
         return orders
 
-    async def get_available_cash(self) -> float:
+    async def get_available_cash(self, market: str | None = None) -> float:
         """투자 가용 현금 조회"""
-        balance = await self.get_balance()
+        balance = await self.get_balance(market=market)
         return balance.cash
 
 
