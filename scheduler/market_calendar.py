@@ -31,6 +31,7 @@ class MarketCalendar:
 
     KRX_OPEN = time(9, 0)
     KRX_CLOSE = time(15, 30)
+    KRX_REVIEW_OPEN = time(15, 40)
 
     NXT_PRE_OPEN = time(8, 0)
     NXT_PRE_CLOSE = time(8, 50)
@@ -41,6 +42,7 @@ class MarketCalendar:
     US_REGULAR_OPEN = time(9, 30)
     US_REGULAR_CLOSE = time(16, 0)
     US_AFTER_CLOSE = time(20, 0)
+    US_REVIEW_OPEN = time(16, 10)
 
     @staticmethod
     def _to_kst(dt: datetime | None = None) -> datetime:
@@ -227,6 +229,19 @@ class MarketCalendar:
         start_kst = start_local.astimezone(KST).replace(tzinfo=None)
         end_kst = end_local.astimezone(KST).replace(tzinfo=None)
         return start_kst, end_kst
+
+    @staticmethod
+    def is_post_market_review_time(market: str | None = None, dt: datetime | None = None) -> bool:
+        """시장별 장마감 리뷰 허용 시각 여부"""
+        market_code = normalize_market(market or settings.primary_market_code)
+
+        if not MarketCalendar.is_trading_day(market_code, dt):
+            return False
+
+        if is_us_market(market_code):
+            return MarketCalendar._to_new_york(dt).time() >= MarketCalendar.US_REVIEW_OPEN
+
+        return MarketCalendar._to_kst(dt).time() >= MarketCalendar.KRX_REVIEW_OPEN
 
     @staticmethod
     def is_any_market_open(dt: datetime | None = None) -> bool:

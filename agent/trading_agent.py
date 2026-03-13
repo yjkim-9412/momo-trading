@@ -63,8 +63,10 @@ class MarketState:
     active_trading_rules: dict = field(default_factory=dict)
     rr_floor_overrides: dict[str, float] = field(default_factory=dict)
     cycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    after_hours_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     cash_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     strategies: dict[str, object] = field(default_factory=_default_strategies)
+    last_completed_review_date: date | None = None
 
 
 class TradingAgent:
@@ -138,10 +140,129 @@ class TradingAgent:
             runtime.trading_context = ""
             runtime.market_regime = ""
             runtime.session_ids = {}
+            runtime.last_completed_review_date = None
         return trading_date
+
+    @staticmethod
+    def _skip_result(
+        reason: str,
+        scope: str,
+        trading_date: date | None = None,
+        *,
+        mode: str | None = None,
+    ) -> dict:
+        result = {"skipped": True, "reason": reason, "market_scope": scope}
+        if trading_date:
+            result["trading_date"] = trading_date.isoformat()
+        if mode:
+            result["mode"] = mode
+        return result
+
+    async def _daily_report_exists(self, market_scope_code: str, trading_date: date) -> bool:
+        from repositories.daily_report_repository import DailyReportRepository
+
+        async with AsyncSessionLocal() as session:
+            repo = DailyReportRepository(session)
+            return await repo.get_by_date(trading_date, market_scope=market_scope_code) is not None
+
+    async def _preview_after_hours_cycle(
+        self,
+        market: str,
+        runtime: MarketState,
+        trading_date: date,
+        *,
+        skip_running_checks: bool = False,
+    ) -> dict:
+        scope = runtime.scope
+
+        if not skip_running_checks and runtime.after_hours_lock.locked():
+            return self._skip_result(
+                "after_hours_already_running",
+                scope,
+                trading_date,
+                mode="AFTER_HOURS",
+            )
+
+        if not market_calendar.is_post_market_review_time(market):
+            return self._skip_result(
+                "review_window_not_open",
+                scope,
+                trading_date,
+                mode="AFTER_HOURS",
+            )
+
+        if runtime.last_completed_review_date == trading_date:
+            return self._skip_result(
+                "already_reviewed",
+                scope,
+                trading_date,
+                mode="AFTER_HOURS",
+            )
+
+        if await self._daily_report_exists(scope, trading_date):
+            runtime.last_completed_review_date = trading_date
+            return self._skip_result(
+                "already_reviewed",
+                scope,
+                trading_date,
+                mode="AFTER_HOURS",
+            )
+
+        return {
+            "allowed": True,
+            "mode": "AFTER_HOURS",
+            "market_scope": scope,
+            "trading_date": trading_date.isoformat(),
+        }
+
+    async def preview_cycle(self, market: str | None = None) -> dict:
+        """사이클 실행 가능 여부와 skip 사유를 사전 판정"""
+        target = normalize_market(market or settings.primary_market_code)
+        scope = market_scope(target)
+        runtime = self._get_state(scope)
+        trading_date = self._refresh_runtime_date(runtime, scope)
+
+        if not market_calendar.is_trading_hours(target) and runtime.after_hours_lock.locked():
+            return self._skip_result(
+                "after_hours_already_running",
+                scope,
+                trading_date,
+                mode="AFTER_HOURS",
+            )
+
+        if runtime.cycle_lock.locked():
+            return self._skip_result("cycle_already_running", scope, trading_date)
+
+        if market_calendar.is_trading_hours(target):
+            if not mcp_client.is_connected:
+                result = self._skip_result("mcp_unavailable", scope, trading_date, mode="TRADING")
+                result.update({
+                    "scanned": 0,
+                    "analyzed": 0,
+                    "signals": 0,
+                    "executed": 0,
+                    "selected_symbols": [],
+                })
+                return result
+            return {
+                "allowed": True,
+                "mode": "TRADING",
+                "market_scope": scope,
+                "trading_date": trading_date.isoformat(),
+            }
+
+        return await self._preview_after_hours_cycle(
+            target,
+            runtime,
+            trading_date,
+            skip_running_checks=True,
+        )
 
     async def start(self) -> None:
         """에이전트 시작 - 실시간 이벤트 구독"""
+        if self._running:
+            logger.debug("AI Trading Agent 이미 시작됨 — 이벤트 재구독 스킵")
+            return
         self._running = True
         event_bus.subscribe(EventType.VOLUME_SPIKE, self._on_market_event)
         event_bus.subscribe(EventType.PRICE_SURGE, self._on_market_event)
@@ -163,9 +284,18 @@ class TradingAgent:
         runtime = self._get_state(scope)
         trading_date = self._refresh_runtime_date(runtime, scope)
 
+        if not market_calendar.is_trading_hours(target) and runtime.after_hours_lock.locked():
+            logger.info("[{}] 장마감 리뷰 이미 실행 중 — 중복 트리거 무시", scope)
+            return self._skip_result(
+                "after_hours_already_running",
+                scope,
+                trading_date,
+                mode="AFTER_HOURS",
+            )
+
         if runtime.cycle_lock.locked():
             logger.warning("[{}] 사이클 이미 실행 중 — 중복 트리거 무시", scope)
-            return {"skipped": True, "reason": "cycle_already_running", "market_scope": scope}
+            return self._skip_result("cycle_already_running", scope, trading_date)
 
         with activity_logger.context(market_scope=scope, trading_date=trading_date):
             async with runtime.cycle_lock:
@@ -205,6 +335,14 @@ class TradingAgent:
                             )
                             return {"skipped": True, "reason": "buy_cutoff", "market_scope": scope}
                     return await self._run_trading_cycle(target)
+                review_preview = await self._preview_after_hours_cycle(target, runtime, trading_date)
+                if review_preview.get("skipped"):
+                    logger.info(
+                        "[{}] 장마감 리뷰 스킵: {}",
+                        scope,
+                        review_preview["reason"],
+                    )
+                    return review_preview
                 return await self._run_after_hours_cycle(target)
 
     async def _run_trading_cycle(self, market: str | None = None) -> dict:
@@ -1001,262 +1139,274 @@ class TradingAgent:
         from trading.account_manager import account_manager
 
         trading_date = self._refresh_runtime_date(state, scope)
-        llm_factory.start_session(scope=scope, phase="after_hours")
+        async with state.after_hours_lock:
+            preview = await self._preview_after_hours_cycle(
+                target,
+                state,
+                trading_date,
+                skip_running_checks=True,
+            )
+            if preview.get("skipped"):
+                logger.info("[{}] 장마감 리뷰 스킵: {}", scope, preview["reason"])
+                return preview
 
-        cycle_id = activity_logger.start_cycle()
-        cycle_timer = activity_logger.timer()
+            llm_factory.start_session(scope=scope, phase="after_hours")
 
-        logger.info("=== Agent 장 마감 리뷰 시작 ===")
-        await event_bus.publish(Event(
-            type=EventType.AGENT_CYCLE_START, source="trading_agent",
-        ))
-        await activity_logger.log(
-            ActivityType.CYCLE, ActivityPhase.START,
-            "\U0001f319 장 마감 리뷰 시작 — 오늘 매매 성과 분석",
-            cycle_id=cycle_id,
-        )
+            cycle_id = activity_logger.start_cycle()
+            cycle_timer = activity_logger.timer()
 
-        results = {
-            "mode": "AFTER_HOURS",
-            "market_scope": scope,
-            "trading_date": trading_date.isoformat(),
-            "review_generated": False,
-        }
+            logger.info("=== Agent 장 마감 리뷰 시작 ===")
+            await event_bus.publish(Event(
+                type=EventType.AGENT_CYCLE_START, source="trading_agent",
+            ))
+            await activity_logger.log(
+                ActivityType.CYCLE, ActivityPhase.START,
+                "\U0001f319 장 마감 리뷰 시작 — 오늘 매매 성과 분석",
+                cycle_id=cycle_id,
+            )
 
-        try:
-            # 1. 오늘 시장 마감 데이터 수집 (MCP)
-            market_close_data, volume_rank_data, surge_data, drop_data = await self._collect_market_close_data(target)
-
-            # 2. 포트폴리오 현황 (데이트레이딩이면 청산 완료 상태)
-            balance = await account_manager.get_balance(target)
-
-            effective_cash = balance.effective_cash
-            cash_ratio = 0.0
-            if balance.total_asset > 0:
-                cash_ratio = (effective_cash / balance.total_asset) * 100
-
-            # 3. 오늘 활동 집계
-            today_date = trading_date
-            activity_summary = "활동 없음"
-            today_cycles = 0
-            today_analyses = 0
-            today_recommendations = 0
-            today_orders = 0
+            results = {
+                "mode": "AFTER_HOURS",
+                "market_scope": scope,
+                "trading_date": trading_date.isoformat(),
+                "review_generated": False,
+            }
 
             try:
-                async with AsyncSessionLocal() as session:
-                    from repositories.agent_activity_repository import AgentActivityRepository
-                    activity_repo = AgentActivityRepository(session)
-                    activity_counts = await activity_repo.count_by_date(today_date, market_scope=scope)
-                    activities = await activity_repo.get_by_date(today_date, limit=50, market_scope=scope)
+                # 1. 오늘 시장 마감 데이터 수집 (MCP)
+                market_close_data, volume_rank_data, surge_data, drop_data = await self._collect_market_close_data(target)
 
-                    today_cycles = activity_counts.get("CYCLE", 0) // 2
-                    today_analyses = activity_counts.get("TIER1_ANALYSIS", 0)
-                    today_recommendations = activity_counts.get("DECISION", 0)
-                    today_orders = activity_counts.get("ORDER", 0)
+                # 2. 포트폴리오 현황 (데이트레이딩이면 청산 완료 상태)
+                balance = await account_manager.get_balance(target)
 
-                    if activities:
-                        summary_lines = []
-                        for a in activities[-20:]:
-                            summary_lines.append(f"[{a.activity_type}/{a.phase}] {a.summary}")
-                        activity_summary = "\n".join(summary_lines)
-            except Exception as e:
-                logger.warning("활동 집계 실패: {}", str(e))
+                effective_cash = balance.effective_cash
+                cash_ratio = 0.0
+                if balance.total_asset > 0:
+                    cash_ratio = (effective_cash / balance.total_asset) * 100
 
-            # 4. 과거 매매 성과
-            performance_summary = "매매 이력 없음"
-            try:
-                from analysis.feedback.performance_tracker import PerformanceTracker
-                async with AsyncSessionLocal() as session:
-                    tracker = PerformanceTracker(session)
-                    stats = await tracker.get_overall_stats(market_scope=scope)
-                    overall = stats.get("overall")
-                    if overall and overall.total_trades > 0:
-                        performance_summary = (
-                            f"총 {overall.total_trades}거래, "
-                            f"승률 {overall.win_rate * 100:.1f}%, "
-                            f"총손익 {overall.total_pnl:+,.0f}원"
-                        )
-            except Exception as e:
-                logger.warning("성과 요약 실패: {}", str(e))
+                # 3. 오늘 활동 집계
+                today_date = trading_date
+                activity_summary = "활동 없음"
+                today_cycles = 0
+                today_analyses = 0
+                today_recommendations = 0
+                today_orders = 0
 
-            # 5. 오버나이트 보유종목 현황 (스윙 모드)
-            overnight_holdings_text = "없음 (당일 청산 모드)" if settings.DAY_TRADING_ONLY else "없음"
-            if not settings.DAY_TRADING_ONLY:
                 try:
                     async with AsyncSessionLocal() as session:
-                        from repositories.trade_result_repository import TradeResultRepository
-                        from strategy.holding_policy import _calc_hold_days, _get_max_hold_days
-                        repo = TradeResultRepository(session)
-                        open_positions = await repo.get_all_open(market_scope=scope)
-                        if open_positions:
-                            lines = []
-                            for tr in open_positions:
-                                hold_days = _calc_hold_days(tr)
-                                max_days = _get_max_hold_days(tr.strategy_type, settings)
-                                conf = tr.ai_confidence or 0.0
-                                target_pct = ""
-                                if tr.ai_target_price and tr.entry_price > 0:
-                                    target_pct = f", 목표 도달률 {(tr.entry_price / tr.ai_target_price) * 100:.0f}%"
-                                lines.append(
-                                    f"- {tr.stock_name}({tr.stock_symbol}): "
-                                    f"보유 {hold_days}/{max_days}일, "
-                                    f"신뢰도 {conf:.2f}, "
-                                    f"전략 {tr.strategy_type}"
-                                    f"{target_pct}"
-                                )
-                            overnight_holdings_text = "\n".join(lines)
+                        from repositories.agent_activity_repository import AgentActivityRepository
+                        activity_repo = AgentActivityRepository(session)
+                        activity_counts = await activity_repo.count_by_date(today_date, market_scope=scope)
+                        activities = await activity_repo.get_by_date(today_date, limit=50, market_scope=scope)
+
+                        today_cycles = activity_counts.get("CYCLE", 0) // 2
+                        today_analyses = activity_counts.get("TIER1_ANALYSIS", 0)
+                        today_recommendations = activity_counts.get("DECISION", 0)
+                        today_orders = activity_counts.get("ORDER", 0)
+
+                        if activities:
+                            summary_lines = []
+                            for a in activities[-20:]:
+                                summary_lines.append(f"[{a.activity_type}/{a.phase}] {a.summary}")
+                            activity_summary = "\n".join(summary_lines)
                 except Exception as e:
-                    logger.warning("오버나이트 보유종목 조회 실패: {}", str(e))
+                    logger.warning("활동 집계 실패: {}", str(e))
 
-            # 6. LLM으로 성과 리뷰
-            t1_timer = activity_logger.timer()
-            await activity_logger.log(
-                ActivityType.DAILY_PLAN, ActivityPhase.START,
-                "\U0001f4cb 장 마감 성과 리뷰 생성 중...",
-                cycle_id=cycle_id,
-            )
+                # 4. 과거 매매 성과
+                performance_summary = "매매 이력 없음"
+                try:
+                    from analysis.feedback.performance_tracker import PerformanceTracker
+                    async with AsyncSessionLocal() as session:
+                        tracker = PerformanceTracker(session)
+                        stats = await tracker.get_overall_stats(market_scope=scope)
+                        overall = stats.get("overall")
+                        if overall and overall.total_trades > 0:
+                            performance_summary = (
+                                f"총 {overall.total_trades}거래, "
+                                f"승률 {overall.win_rate * 100:.1f}%, "
+                                f"총손익 {overall.total_pnl:+,.0f}원"
+                            )
+                except Exception as e:
+                    logger.warning("성과 요약 실패: {}", str(e))
 
-            prompt = DAILY_PLAN_PROMPT.format(
-                today_date=today_date,
-                market_close_data=market_close_data,
-                volume_rank_data=volume_rank_data,
-                surge_data=surge_data,
-                drop_data=drop_data,
-                total_asset=balance.total_asset,
-                cash=effective_cash,
-                cash_ratio=cash_ratio,
-                stock_value=balance.stock_value,
-                total_pnl=balance.total_pnl,
-                total_pnl_rate=balance.total_pnl_rate,
-                today_cycles=today_cycles,
-                today_analyses=today_analyses,
-                today_recommendations=today_recommendations,
-                today_orders=today_orders,
-                activity_summary=activity_summary,
-                performance_summary=performance_summary,
-                overnight_holdings_text=overnight_holdings_text,
-            )
+                # 5. 오버나이트 보유종목 현황 (스윙 모드)
+                overnight_holdings_text = "없음 (당일 청산 모드)" if settings.DAY_TRADING_ONLY else "없음"
+                if not settings.DAY_TRADING_ONLY:
+                    try:
+                        async with AsyncSessionLocal() as session:
+                            from repositories.trade_result_repository import TradeResultRepository
+                            from strategy.holding_policy import _calc_hold_days, _get_max_hold_days
+                            repo = TradeResultRepository(session)
+                            open_positions = await repo.get_all_open(market_scope=scope)
+                            if open_positions:
+                                lines = []
+                                for tr in open_positions:
+                                    hold_days = _calc_hold_days(tr)
+                                    max_days = _get_max_hold_days(tr.strategy_type, settings)
+                                    conf = tr.ai_confidence or 0.0
+                                    target_pct = ""
+                                    if tr.ai_target_price and tr.entry_price > 0:
+                                        target_pct = f", 목표 도달률 {(tr.entry_price / tr.ai_target_price) * 100:.0f}%"
+                                    lines.append(
+                                        f"- {tr.stock_name}({tr.stock_symbol}): "
+                                        f"보유 {hold_days}/{max_days}일, "
+                                        f"신뢰도 {conf:.2f}, "
+                                        f"전략 {tr.strategy_type}"
+                                        f"{target_pct}"
+                                    )
+                                overnight_holdings_text = "\n".join(lines)
+                    except Exception as e:
+                        logger.warning("오버나이트 보유종목 조회 실패: {}", str(e))
 
-            result_text, provider = await llm_factory.generate_tier1(
-                prompt,
-                system_prompt=DAILY_PLAN_SYSTEM,
-                scope=scope,
-                phase="after_hours",
-            )
-            t1_elapsed = activity_logger.elapsed_ms(t1_timer)
-
-            parsed = self._parse_json(result_text)
-            if parsed:
-                results["review_generated"] = True
-
-                today_review = parsed.get("today_review", "")
-                trade_eval = parsed.get("trade_evaluation", {})
-                success_patterns = parsed.get("success_patterns", [])
-                failure_patterns = parsed.get("failure_patterns", [])
-                feedback = parsed.get("feedback_for_tomorrow", {})
-                risk_alerts = parsed.get("risk_alerts", [])
-
-                summary_msg = "\U0001f4cb 장 마감 리뷰 완료"
-                if today_review:
-                    summary_msg += f"\n\U0001f4dd 리뷰: {today_review[:150]}"
-                if trade_eval.get("total_trades"):
-                    summary_msg += (
-                        f"\n\U0001f4ca 매매: {trade_eval['total_trades']}건 "
-                        f"(수익 {trade_eval.get('profitable_trades', 0)}건, "
-                        f"손실 {trade_eval.get('loss_trades', 0)}건)"
-                    )
-                if success_patterns:
-                    summary_msg += f"\n\u2705 성공 패턴: {success_patterns[0][:80]}"
-                if failure_patterns:
-                    summary_msg += f"\n\u274c 실패 패턴: {failure_patterns[0][:80]}"
-                if feedback.get("system_improvement"):
-                    summary_msg += f"\n\U0001f527 개선: {feedback['system_improvement'][:80]}"
-                if risk_alerts:
-                    summary_msg += f"\n\u26a0\ufe0f 리스크: {', '.join(risk_alerts[:3])}"
-
+                # 6. LLM으로 성과 리뷰
+                t1_timer = activity_logger.timer()
                 await activity_logger.log(
-                    ActivityType.DAILY_PLAN, ActivityPhase.COMPLETE,
-                    summary_msg,
+                    ActivityType.DAILY_PLAN, ActivityPhase.START,
+                    "\U0001f4cb 장 마감 성과 리뷰 생성 중...",
                     cycle_id=cycle_id,
-                    detail=parsed,
-                    llm_provider=provider,
-                    llm_tier="TIER1",
-                    execution_time_ms=t1_elapsed,
                 )
 
-                # 일일 리포트 DB 저장
-                try:
-                    await self._save_daily_report(
-                        today_date, parsed,
-                        market_scope=scope,
-                        today_cycles=today_cycles,
-                        today_analyses=today_analyses,
-                        today_recommendations=today_recommendations,
-                        today_orders=today_orders,
-                    )
-                except Exception as e:
-                    logger.warning("일일 리포트 저장 실패: {}", str(e))
-
-                # 일일 리뷰 → 트레이딩 규칙 자동 생성 (내일 코드 레벨 강제 적용)
-                try:
-                    from analysis.feedback.trading_rules import trading_rule_engine
-                    rules = await trading_rule_engine.generate_rules_from_review(
-                        parsed,
-                        today_date,
-                        market_scope=scope,
-                    )
-                    if rules:
-                        rule_summary = ", ".join(
-                            f"{r.param_name}={r.param_value}" for r in rules
-                        )
-                        await activity_logger.log(
-                            ActivityType.TRADING_RULE, ActivityPhase.COMPLETE,
-                            f"📋 트레이딩 규칙 {len(rules)}건 생성 (내일 자동 적용): {rule_summary}",
-                            cycle_id=cycle_id,
-                            detail=[{"param": r.param_name, "value": r.param_value, "reason": r.reason} for r in rules],
-                        )
-                except Exception as e:
-                    logger.warning("트레이딩 규칙 생성 실패: {}", str(e))
-            else:
-                await activity_logger.log(
-                    ActivityType.DAILY_PLAN, ActivityPhase.ERROR,
-                    "\u274c 장 마감 리뷰 생성 실패 (응답 파싱 불가)",
-                    cycle_id=cycle_id,
-                    llm_provider=provider,
-                    execution_time_ms=t1_elapsed,
+                prompt = DAILY_PLAN_PROMPT.format(
+                    today_date=today_date,
+                    market_close_data=market_close_data,
+                    volume_rank_data=volume_rank_data,
+                    surge_data=surge_data,
+                    drop_data=drop_data,
+                    total_asset=balance.total_asset,
+                    cash=effective_cash,
+                    cash_ratio=cash_ratio,
+                    stock_value=balance.stock_value,
+                    total_pnl=balance.total_pnl,
+                    total_pnl_rate=balance.total_pnl_rate,
+                    today_cycles=today_cycles,
+                    today_analyses=today_analyses,
+                    today_recommendations=today_recommendations,
+                    today_orders=today_orders,
+                    activity_summary=activity_summary,
+                    performance_summary=performance_summary,
+                    overnight_holdings_text=overnight_holdings_text,
                 )
 
-        except Exception as e:
-            logger.error("장외 사이클 오류: {}", str(e))
+                result_text, provider = await llm_factory.generate_tier1(
+                    prompt,
+                    system_prompt=DAILY_PLAN_SYSTEM,
+                    scope=scope,
+                    phase="after_hours",
+                )
+                t1_elapsed = activity_logger.elapsed_ms(t1_timer)
+
+                parsed = self._parse_json(result_text)
+                if parsed:
+                    results["review_generated"] = True
+
+                    today_review = parsed.get("today_review", "")
+                    trade_eval = parsed.get("trade_evaluation", {})
+                    success_patterns = parsed.get("success_patterns", [])
+                    failure_patterns = parsed.get("failure_patterns", [])
+                    feedback = parsed.get("feedback_for_tomorrow", {})
+                    risk_alerts = parsed.get("risk_alerts", [])
+
+                    summary_msg = "\U0001f4cb 장 마감 리뷰 완료"
+                    if today_review:
+                        summary_msg += f"\n\U0001f4dd 리뷰: {today_review[:150]}"
+                    if trade_eval.get("total_trades"):
+                        summary_msg += (
+                            f"\n\U0001f4ca 매매: {trade_eval['total_trades']}건 "
+                            f"(수익 {trade_eval.get('profitable_trades', 0)}건, "
+                            f"손실 {trade_eval.get('loss_trades', 0)}건)"
+                        )
+                    if success_patterns:
+                        summary_msg += f"\n\u2705 성공 패턴: {success_patterns[0][:80]}"
+                    if failure_patterns:
+                        summary_msg += f"\n\u274c 실패 패턴: {failure_patterns[0][:80]}"
+                    if feedback.get("system_improvement"):
+                        summary_msg += f"\n\U0001f527 개선: {feedback['system_improvement'][:80]}"
+                    if risk_alerts:
+                        summary_msg += f"\n\u26a0\ufe0f 리스크: {', '.join(risk_alerts[:3])}"
+
+                    await activity_logger.log(
+                        ActivityType.DAILY_PLAN, ActivityPhase.COMPLETE,
+                        summary_msg,
+                        cycle_id=cycle_id,
+                        detail=parsed,
+                        llm_provider=provider,
+                        llm_tier="TIER1",
+                        execution_time_ms=t1_elapsed,
+                    )
+
+                    # 일일 리포트 DB 저장
+                    try:
+                        await self._save_daily_report(
+                            today_date, parsed,
+                            market_scope=scope,
+                            today_cycles=today_cycles,
+                            today_analyses=today_analyses,
+                            today_recommendations=today_recommendations,
+                            today_orders=today_orders,
+                        )
+                        state.last_completed_review_date = today_date
+                    except Exception as e:
+                        logger.warning("일일 리포트 저장 실패: {}", str(e))
+
+                    # 일일 리뷰 → 트레이딩 규칙 자동 생성 (내일 코드 레벨 강제 적용)
+                    try:
+                        from analysis.feedback.trading_rules import trading_rule_engine
+                        rules = await trading_rule_engine.generate_rules_from_review(
+                            parsed,
+                            today_date,
+                            market_scope=scope,
+                        )
+                        if rules:
+                            rule_summary = ", ".join(
+                                f"{r.param_name}={r.param_value}" for r in rules
+                            )
+                            await activity_logger.log(
+                                ActivityType.TRADING_RULE, ActivityPhase.COMPLETE,
+                                f"📋 트레이딩 규칙 {len(rules)}건 생성 (내일 자동 적용): {rule_summary}",
+                                cycle_id=cycle_id,
+                                detail=[{"param": r.param_name, "value": r.param_value, "reason": r.reason} for r in rules],
+                            )
+                    except Exception as e:
+                        logger.warning("트레이딩 규칙 생성 실패: {}", str(e))
+                else:
+                    await activity_logger.log(
+                        ActivityType.DAILY_PLAN, ActivityPhase.ERROR,
+                        "\u274c 장 마감 리뷰 생성 실패 (응답 파싱 불가)",
+                        cycle_id=cycle_id,
+                        llm_provider=provider,
+                        execution_time_ms=t1_elapsed,
+                    )
+
+            except Exception as e:
+                logger.error("장외 사이클 오류: {}", str(e))
+                await activity_logger.log(
+                    ActivityType.CYCLE, ActivityPhase.ERROR,
+                    f"\u274c 장외 사이클 오류: {str(e)[:100]}",
+                    cycle_id=cycle_id,
+                    error_message=str(e),
+                )
+
+            from util.time_util import now_kst
+            self._last_cycle_time = now_kst()
+            elapsed = activity_logger.elapsed_ms(cycle_timer)
+
+            next_open = market_calendar.next_market_open(market=target)
+            await event_bus.publish(Event(
+                type=EventType.AGENT_CYCLE_END, data=results, source="trading_agent",
+            ))
             await activity_logger.log(
-                ActivityType.CYCLE, ActivityPhase.ERROR,
-                f"\u274c 장외 사이클 오류: {str(e)[:100]}",
+                ActivityType.CYCLE, ActivityPhase.COMPLETE,
+                f"\U0001f319 장 마감 리뷰 완료 (소요 {elapsed / 1000:.1f}초) "
+                f"| 다음 장 시작: {next_open.strftime('%m/%d %H:%M')}",
                 cycle_id=cycle_id,
-                error_message=str(e),
+                detail=results,
+                execution_time_ms=elapsed,
             )
+            llm_factory.end_session(scope=scope, phase="after_hours")
+            state.session_ids["after_hours"] = None
 
-        from util.time_util import now_kst
-        self._last_cycle_time = now_kst()
-        elapsed = activity_logger.elapsed_ms(cycle_timer)
-
-        next_open = market_calendar.next_market_open(market=target)
-        await event_bus.publish(Event(
-            type=EventType.AGENT_CYCLE_END, data=results, source="trading_agent",
-        ))
-        await activity_logger.log(
-            ActivityType.CYCLE, ActivityPhase.COMPLETE,
-            f"\U0001f319 장 마감 리뷰 완료 (소요 {elapsed / 1000:.1f}초) "
-            f"| 다음 장 시작: {next_open.strftime('%m/%d %H:%M')}",
-            cycle_id=cycle_id,
-            detail=results,
-            execution_time_ms=elapsed,
-        )
-        llm_factory.end_session(scope=scope, phase="after_hours")
-        state.session_ids["after_hours"] = None
-
-        logger.info("=== Agent 장 마감 리뷰 종료 ===")
-        return results
+            logger.info("=== Agent 장 마감 리뷰 종료 ===")
+            return results
 
     async def _save_daily_report(
         self,
