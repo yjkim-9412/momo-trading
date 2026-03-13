@@ -216,23 +216,39 @@ class PortfolioMixin:
         current_price: float,
         currency: str,
         exchange_rate_to_krw: float,
+        orderable_amount_context: dict | None = None,
     ) -> dict[str, float | int | str]:
         snap = portfolio_snapshot or {}
         total_asset = float(snap.get("total_asset") or 0.0)
-        available_cash = float(snap.get("cash") or 0.0)
+        broker_cash_krw = float(snap.get("cash") or 0.0)
         holding_count = int(snap.get("holding_count") or 0)
-        cash_ratio = (available_cash / total_asset * 100) if total_asset > 0 else 0.0
+        cash_ratio = (broker_cash_krw / total_asset * 100) if total_asset > 0 else 0.0
 
         current_position_value_krw = float((current_position or {}).get("current_value_krw") or 0.0)
         current_position_pct = float((current_position or {}).get("position_pct") or 0.0)
         unit_price_krw = current_price if currency == "KRW" else current_price * float(exchange_rate_to_krw or 1.0)
 
+        orderable_context = orderable_amount_context or {}
+        orderable_amount_source: str | None = orderable_context.get("orderable_amount_source") or None
+        orderable_error = str(orderable_context.get("error") or "").strip()
+        if orderable_amount_source:
+            symbol_orderable_amount_krw = float(orderable_context.get("orderable_amount_krw") or 0.0)
+            symbol_orderable_amount_foreign = float(orderable_context.get("orderable_amount_foreign") or 0.0)
+            symbol_orderable_qty = int(orderable_context.get("orderable_qty") or 0)
+        else:
+            symbol_orderable_amount_krw = None
+            symbol_orderable_amount_foreign = None
+            symbol_orderable_qty = None
+        cash_cap_krw = broker_cash_krw
+        if symbol_orderable_amount_krw is not None:
+            cash_cap_krw = symbol_orderable_amount_krw
+
         limits = self._resolve_effective_limits(dynamic_limits)
-        hard_caps: list[float] = [max(available_cash, 0.0)]
+        hard_caps: list[float] = [max(cash_cap_krw, 0.0)]
         if limits["max_single_order_krw"] > 0:
             hard_caps.append(limits["max_single_order_krw"])
         if total_asset > 0 and limits["min_cash_ratio"] > 0:
-            hard_caps.append(max(available_cash - (total_asset * limits["min_cash_ratio"]), 0.0))
+            hard_caps.append(max(cash_cap_krw - (total_asset * limits["min_cash_ratio"]), 0.0))
         if total_asset > 0 and limits["max_position_pct"] > 0:
             hard_caps.append(
                 max((total_asset * limits["max_position_pct"] / 100) - current_position_value_krw, 0.0)
@@ -250,18 +266,29 @@ class PortfolioMixin:
         add_label = "추가매수 가능 최대" if current_position_value_krw > 0 else "신규 진입 가능 최대"
         lines = [
             f"- 총자산: {total_asset:,.0f}원",
-            f"- 가용현금: {available_cash:,.0f}원 (현금비율 {cash_ratio:.1f}%)",
+            f"- 브로커 잔고 현금: {broker_cash_krw:,.0f}원 (현금비율 {cash_ratio:.1f}%)",
             f"- 현재 보유 종목 수: {holding_count}개",
             f"- 현재 이 종목 비중: {current_position_pct:.1f}%",
             f"- {add_label}: {max_additional_amount:,.0f}원",
             f"- 현재가 기준 최대 수량: {max_additional_quantity}주",
             f"- 하드 가드 기준 최대 집행 시 예상 합산 비중: {projected_combined_position_pct:.1f}%",
         ]
+        if orderable_amount_source and symbol_orderable_amount_krw is not None:
+            foreign_text = f"{symbol_orderable_amount_foreign:,.2f}{currency}"
+            qty_text = (
+                f"{symbol_orderable_qty}주"
+                if symbol_orderable_qty and symbol_orderable_qty > 0
+                else "수량 정보 없음"
+            )
+            lines.insert(2, f"- 이 종목 기준 주문가능금액: {symbol_orderable_amount_krw:,.0f}원 ({foreign_text}, 최대 {qty_text})")
+        elif orderable_error:
+            lines.insert(2, f"- 이 종목 기준 주문가능금액: 조회 실패 ({orderable_error})")
 
         return {
             "text": "\n".join(lines),
             "total_asset": total_asset,
-            "available_cash": available_cash,
+            "available_cash": cash_cap_krw,
+            "broker_cash_krw": broker_cash_krw,
             "cash_ratio": cash_ratio,
             "holding_count": holding_count,
             "current_position_pct": current_position_pct,
@@ -271,6 +298,10 @@ class PortfolioMixin:
             "projected_combined_position_pct": projected_combined_position_pct,
             "max_position_pct": limits["max_position_pct"],
             "min_cash_ratio": limits["min_cash_ratio"],
+            "symbol_orderable_amount_krw": symbol_orderable_amount_krw,
+            "symbol_orderable_amount_foreign": symbol_orderable_amount_foreign,
+            "symbol_orderable_qty": symbol_orderable_qty,
+            "orderable_amount_source": orderable_amount_source,
         }
 
     @staticmethod

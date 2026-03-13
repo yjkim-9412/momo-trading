@@ -5,6 +5,7 @@ from core.config import settings
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, SignalAction
+from trading.market_profile import is_us_market
 from trading.risk_policy import DEFAULT_RR_FLOOR, resolve_rr_floor as resolve_shared_rr_floor
 from trading.product_policy import (
     build_product_context,
@@ -76,6 +77,7 @@ class RiskManager:
         today_trade_count: int,
         current_holding_count: int,
         current_position: dict | None = None,
+        orderable_cash_krw: float | None = None,
         max_position_pct: float = 20.0,
         cycle_id: str | None = None,
         dynamic_limits: dict | None = None,
@@ -169,6 +171,36 @@ class RiskManager:
         unit_price_krw = self._unit_price_krw(signal)
         total_amount = unit_price_krw * quantity
         current_position_value_krw = float((current_position or {}).get("current_value_krw") or 0.0)
+        broker_cash_krw = float(portfolio_cash or 0.0)
+        cash_basis_krw = broker_cash_krw
+
+        if is_us_market(market_code):
+            if orderable_cash_krw is None:
+                result = {
+                    "approved": False,
+                    "reason": "종목별 주문가능금액 조회 실패",
+                    "broker_cash_krw": broker_cash_krw,
+                    "cash_basis_krw": broker_cash_krw,
+                    "orderable_cash_krw": None,
+                }
+                await self._log_result(
+                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                )
+                return result
+
+            cash_basis_krw = float(orderable_cash_krw or 0.0)
+            if cash_basis_krw <= 0:
+                result = {
+                    "approved": False,
+                    "reason": "종목별 주문가능금액 없음",
+                    "broker_cash_krw": broker_cash_krw,
+                    "cash_basis_krw": cash_basis_krw,
+                    "orderable_cash_krw": cash_basis_krw,
+                }
+                await self._log_result(
+                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                )
+                return result
 
         # 리스크:보상 비율 검사 (다른 조정 전에 먼저 확인)
         entry = signal.suggested_price or 0
@@ -210,39 +242,66 @@ class RiskManager:
         if eff_max_order > 0 and total_amount > eff_max_order:
             _, reject_result = _apply_quantity_cap(int(eff_max_order / unit_price_krw), "단일 주문 한도")
             if reject_result:
+                reject_result.update({
+                    "broker_cash_krw": broker_cash_krw,
+                    "cash_basis_krw": cash_basis_krw,
+                    "orderable_cash_krw": orderable_cash_krw,
+                })
                 await self._log_result(
                     symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
                 return reject_result
 
         # 현금 부족 검사 (음수 현금 방어 포함)
-        if portfolio_cash <= 0:
-            result = {"approved": False, "reason": "가용 현금 없음"}
+        if cash_basis_krw <= 0:
+            result = {
+                "approved": False,
+                "reason": "가용 현금 없음",
+                "broker_cash_krw": broker_cash_krw,
+                "cash_basis_krw": cash_basis_krw,
+                "orderable_cash_krw": orderable_cash_krw,
+            }
             await self._log_result(
                 symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
             )
             return result
 
-        if total_amount > portfolio_cash:
-            _, reject_result = _apply_quantity_cap(int(portfolio_cash / unit_price_krw), "현금 부족")
+        if total_amount > cash_basis_krw:
+            _, reject_result = _apply_quantity_cap(int(cash_basis_krw / unit_price_krw), "현금 부족")
             if reject_result:
+                reject_result.update({
+                    "broker_cash_krw": broker_cash_krw,
+                    "cash_basis_krw": cash_basis_krw,
+                    "orderable_cash_krw": orderable_cash_krw,
+                })
                 await self._log_result(
                     symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
                 return reject_result
 
         # 최소 현금 비중 검사
-        cash_after = portfolio_cash - total_amount
+        cash_after = cash_basis_krw - total_amount
         if portfolio_budget > 0 and cash_after / portfolio_budget < eff_min_cash_ratio:
-            max_spend = portfolio_cash - (portfolio_budget * eff_min_cash_ratio)
+            max_spend = cash_basis_krw - (portfolio_budget * eff_min_cash_ratio)
             if max_spend <= 0:
-                result = {"approved": False, "reason": "현금 비중 최소 한도 미달"}
+                result = {
+                    "approved": False,
+                    "reason": "현금 비중 최소 한도 미달",
+                    "broker_cash_krw": broker_cash_krw,
+                    "cash_basis_krw": cash_basis_krw,
+                    "orderable_cash_krw": orderable_cash_krw,
+                }
                 await self._log_result(
                     symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
                 return result
             _, reject_result = _apply_quantity_cap(int(max_spend / unit_price_krw), "현금 비중 유지")
             if reject_result:
+                reject_result.update({
+                    "broker_cash_krw": broker_cash_krw,
+                    "cash_basis_krw": cash_basis_krw,
+                    "orderable_cash_krw": orderable_cash_krw,
+                })
                 await self._log_result(
                     symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
@@ -258,8 +317,13 @@ class RiskManager:
                     "합산 비중 한도",
                 )
                 if reject_result:
-                    reject_result["combined_position_pct"] = combined_position_pct
-                    reject_result["current_position_value_krw"] = current_position_value_krw
+                    reject_result.update({
+                        "combined_position_pct": combined_position_pct,
+                        "current_position_value_krw": current_position_value_krw,
+                        "broker_cash_krw": broker_cash_krw,
+                        "cash_basis_krw": cash_basis_krw,
+                        "orderable_cash_krw": orderable_cash_krw,
+                    })
                     await self._log_result(
                         symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
                     )
@@ -283,6 +347,9 @@ class RiskManager:
             "adjusted_quantity": adjusted_quantity,
             "combined_position_pct": combined_position_pct,
             "current_position_value_krw": current_position_value_krw,
+            "broker_cash_krw": broker_cash_krw,
+            "cash_basis_krw": cash_basis_krw,
+            "orderable_cash_krw": orderable_cash_krw,
         }
         await self._log_result(
             symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily

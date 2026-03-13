@@ -578,6 +578,36 @@ async def get_overseas_present_balance(market: str = "NASDAQ") -> dict:
         return {"success": False, "error": str(e), "output1": [], "output2": []}
 
 
+async def get_overseas_psamount(
+    symbol: str,
+    price: float,
+    market: str = "NASDAQ",
+) -> dict:
+    """해외주식 종목별 매수가능금액 조회"""
+    market_code = normalize_market(market)
+    cano, acnt_prdt_cd = _get_account_parts()
+    try:
+        result = await _request_json(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            "VTTS3007R" if settings.is_paper_trading else "TTTS3007R",
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "OVRS_EXCG_CD": kis_order_exchange_code(market_code),
+                "OVRS_ORD_UNPR": f"{float(price or 0.0):.8f}",
+                "ITEM_CD": symbol,
+            },
+            use_trading_domain=True,
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 매수가능금액 조회 오류 ({} {}): {}", market_code, symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
+
+
 async def get_overseas_balance(market: str = "NASDAQ") -> dict:
     """해외주식 보유잔고 조회"""
     market_code = normalize_market(market)

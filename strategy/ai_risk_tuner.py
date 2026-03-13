@@ -15,6 +15,7 @@ from core.database import AsyncSessionLocal
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType, Tier1Profile
+from trading.market_profile import is_us_market
 from trading.models import AccountBalance
 
 
@@ -88,6 +89,17 @@ class AIRiskTuner:
             if balance.total_asset > 0:
                 cash_ratio = (effective_cash / balance.total_asset) * 100
 
+            cash_interpretation_note = (
+                "브로커 잔고의 현금은 계좌 수준 참고치입니다. 이 단계에서는 계좌 전체의 집중도와 최소 현금 비율을 우선 조정하세요."
+            )
+            if settings.is_paper_trading and is_us_market(target):
+                cash_interpretation_note = (
+                    "미국장 모의투자에서는 present-balance 현금이 0으로 보일 수 있습니다. "
+                    "이 단계에서는 broker cash 0만으로 신규 진입을 단정 차단하지 말고, "
+                    "계좌 수준의 집중도와 최소 현금 비율을 우선 판단하세요. "
+                    "실제 종목별 주문가능금액은 개별 분석 단계에서 inquire-psamount로 다시 확인합니다."
+                )
+
             # 5. LLM에게 한도 요청
             prompt = RISK_TUNING_PROMPT.format(
                 total_asset=balance.total_asset,
@@ -100,6 +112,7 @@ class AIRiskTuner:
                 risk_guideline=risk_guideline,
                 max_daily_trades=settings.MAX_DAILY_TRADES,
                 min_buy_quantity=settings.MIN_BUY_QUANTITY,
+                cash_interpretation_note=cash_interpretation_note,
             )
 
             result_text, provider = await llm_factory.generate_tier1(

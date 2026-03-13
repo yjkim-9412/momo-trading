@@ -104,6 +104,12 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
                 dynamic_limits={"max_single_order_krw": 30_000_000, "max_position_pct": 25.0, "min_cash_ratio": 0.05},
                 market_context="시장 컨텍스트 없음",
                 trading_context="현재 세션: US_REGULAR",
+                orderable_amount_context={
+                    "orderable_amount_source": "INQUIRE_PSAMOUNT",
+                    "orderable_amount_krw": 6_500_000,
+                    "orderable_amount_foreign": 4_392.0,
+                    "orderable_qty": 43,
+                },
                 cycle_id="cycle-1",
             )
 
@@ -111,6 +117,8 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("### 현재 종목 포지션", prompt)
         self.assertIn("보유 수량: 1000주", prompt)
         self.assertIn("### 계좌 상태", prompt)
+        self.assertIn("브로커 잔고 현금", prompt)
+        self.assertIn("이 종목 기준 주문가능금액", prompt)
         self.assertIn("현재 이 종목 비중: 73.8%", prompt)
 
     async def test_on_market_event_analyzes_held_symbol(self):
@@ -202,6 +210,15 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
                 ]
             },
         )
+        orderable_response = MCPResponse(
+            success=True,
+            data={
+                "orderable_amount_source": "INQUIRE_PSAMOUNT",
+                "orderable_amount_krw": 6_500_000,
+                "orderable_amount_foreign": 4_392.0,
+                "orderable_qty": 43,
+            },
+        )
 
         class DummySession:
             async def __aenter__(self):
@@ -221,6 +238,7 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
                 patch("agent.trading_agent.mcp_client.get_current_price", AsyncMock(return_value=price_response)) as price_mock, \
                 patch("agent.trading_agent.mcp_client.get_daily_price", AsyncMock(return_value=daily_response)) as daily_mock, \
                 patch("agent.trading_agent.mcp_client.get_minute_price", AsyncMock(return_value=minute_response)) as minute_mock, \
+                patch("agent.trading_agent.mcp_client.get_orderable_amount", AsyncMock(return_value=orderable_response)) as orderable_mock, \
                 patch.object(self.agent, "_tier1_analysis", AsyncMock(return_value={
                     "recommendation": "BUY",
                     "confidence": 0.72,
@@ -243,7 +261,8 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
                     "approved": True,
                     "adjusted_quantity": None,
                     "combined_position_pct": 12.0,
-                })), \
+                    "cash_basis_krw": 6_500_000,
+                })) as risk_mock, \
                 patch("agent.trading_agent.decision_maker.execute", AsyncMock(return_value={"success": False})) as decision_mock:
             result = await self.agent._analyze_and_trade(
                 {
@@ -263,17 +282,26 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         price_mock.assert_awaited_once()
         daily_mock.assert_awaited_once()
         minute_mock.assert_awaited_once()
+        orderable_mock.assert_awaited_once_with("PLTR", 150.5, market="NASDAQ")
         tier1_mock.assert_awaited_once()
         tier2_mock.assert_awaited_once()
+        self.assertEqual(risk_mock.await_args.kwargs["orderable_cash_krw"], 6_500_000)
         decision_mock.assert_awaited_once()
         signal = decision_mock.await_args.args[0]
         analysis_context = decision_mock.await_args.kwargs["analysis_context"]
         self.assertEqual(signal.metadata["entry_mode"], "ADD_ON_PYRAMID")
         self.assertEqual(signal.metadata["analysis_source"], "event")
         self.assertEqual(signal.metadata["event_type"], "PRICE_SURGE")
+        self.assertEqual(signal.metadata["broker_cash_krw"], 100_000_000)
+        self.assertEqual(signal.metadata["symbol_orderable_amount_krw"], 6_500_000)
+        self.assertEqual(signal.metadata["symbol_orderable_qty"], 43)
+        self.assertEqual(signal.metadata["orderable_amount_source"], "INQUIRE_PSAMOUNT")
         self.assertEqual(analysis_context["entry_mode"], "ADD_ON_PYRAMID")
         self.assertEqual(analysis_context["analysis_source"], "event")
         self.assertEqual(analysis_context["event_type"], "PRICE_SURGE")
+        self.assertEqual(analysis_context["broker_cash_krw"], 100_000_000)
+        self.assertEqual(analysis_context["symbol_orderable_amount_krw"], 6_500_000)
+        self.assertEqual(analysis_context["symbol_orderable_qty"], 43)
 
     async def test_evaluate_position_intent_blocks_second_average_down_same_day(self):
         chart_result = ChartAnalysisResult(

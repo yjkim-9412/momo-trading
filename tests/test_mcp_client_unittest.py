@@ -192,6 +192,32 @@ class MCPClientTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rate, 1450.0)
 
+    async def test_get_orderable_amount_uses_foreign_amount_when_krw_amount_is_zero(self):
+        client = MCPClient()
+        client._call_overseas_balance = AsyncMock(return_value=MCPResponse(
+            success=True,
+            data={
+                "output": {
+                    "frcr_ord_psbl_amt1": "6602.449718",
+                    "ovrs_ord_psbl_amt": "0",
+                    "ovrs_max_ord_psbl_qty": "33",
+                    "ord_psbl_qty": "0",
+                },
+            },
+        ))
+        client._get_exchange_rate_to_krw = AsyncMock(return_value=1479.8)
+
+        response = await client.get_orderable_amount("COIN", 196.12, market="NASDAQ")
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.data["orderable_amount_source"], "INQUIRE_PSAMOUNT")
+        self.assertEqual(response.data["orderable_qty"], 33)
+        self.assertEqual(response.data["orderable_amount_foreign"], 6602.449718)
+        self.assertAlmostEqual(
+            response.data["orderable_amount_krw"],
+            round(6602.449718 * 1479.8, 4),
+        )
+
     async def test_get_order_list_normalizes_overseas_fill_fields(self):
         client = MCPClient()
         client._get_exchange_rate_to_krw = AsyncMock(return_value=1450.0)

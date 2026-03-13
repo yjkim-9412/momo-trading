@@ -1126,6 +1126,75 @@ class MCPClient:
         }
         return MCPResponse(success=True, data=combined)
 
+    async def get_orderable_amount(
+        self,
+        symbol: str,
+        price: float,
+        market: str = "NASDAQ",
+    ) -> MCPResponse:
+        """미국장 종목별 매수가능금액 조회"""
+        market_code = normalize_market(market)
+        if is_domestic_market(market_code):
+            return MCPResponse(success=False, error="국내 시장은 종목별 주문가능금액 조회를 사용하지 않습니다")
+
+        from trading.kis_api import get_overseas_psamount
+
+        response = await self._call_overseas_balance(
+            f"{market_code}:{symbol}:inquire-psamount",
+            lambda: get_overseas_psamount(symbol, price, market_code),
+        )
+        if not response.success:
+            return response
+
+        data = response.data or {}
+        source = self._first_record(data.get("output"))
+        if not source:
+            return MCPResponse(success=False, error="해외 매수가능금액 응답이 비어 있습니다", data=data)
+
+        exchange_rate = self._to_float(
+            self._pick_first(source, "exrt", default=None),
+            0.0,
+        )
+        if exchange_rate <= 0:
+            exchange_rate = await self._get_exchange_rate_to_krw(market_code)
+
+        raw_frcr_ord_psbl_amt1 = self._to_float(source.get("frcr_ord_psbl_amt1"), 0.0)
+        raw_ord_psbl_frcr_amt = self._to_float(source.get("ord_psbl_frcr_amt"), 0.0)
+        foreign_orderable = raw_frcr_ord_psbl_amt1
+        if foreign_orderable <= 0:
+            foreign_orderable = raw_ord_psbl_frcr_amt
+
+        raw_orderable_krw = self._to_float(source.get("ovrs_ord_psbl_amt"), 0.0)
+        orderable_amount_krw = raw_orderable_krw
+        if foreign_orderable > 0 and exchange_rate > 0:
+            orderable_amount_krw = foreign_orderable * exchange_rate
+
+        raw_ovrs_max_ord_psbl_qty = self._to_int(source.get("ovrs_max_ord_psbl_qty"), 0)
+        raw_ord_psbl_qty = self._to_int(source.get("ord_psbl_qty"), 0)
+        orderable_qty = raw_ovrs_max_ord_psbl_qty
+        if orderable_qty <= 0:
+            orderable_qty = raw_ord_psbl_qty
+        if orderable_qty <= 0:
+            orderable_qty = self._to_int(source.get("max_ord_psbl_qty"), 0)
+
+        response.data = {
+            **data,
+            "market": market_code,
+            "symbol": symbol,
+            "currency": market_currency(market_code),
+            "exchange_rate_to_krw": exchange_rate,
+            "orderable_amount_source": "INQUIRE_PSAMOUNT",
+            "orderable_amount_foreign": foreign_orderable,
+            "orderable_amount_krw": round(orderable_amount_krw, 4),
+            "orderable_qty": orderable_qty,
+            "raw_ord_psbl_frcr_amt": raw_ord_psbl_frcr_amt,
+            "raw_frcr_ord_psbl_amt1": raw_frcr_ord_psbl_amt1,
+            "raw_ovrs_ord_psbl_amt": raw_orderable_krw,
+            "raw_ord_psbl_qty": raw_ord_psbl_qty,
+            "raw_ovrs_max_ord_psbl_qty": raw_ovrs_max_ord_psbl_qty,
+        }
+        return response
+
     async def get_daily_price(
         self, symbol: str, period: str = "D", count: int = 30, market: str = "KRX"
     ) -> MCPResponse:

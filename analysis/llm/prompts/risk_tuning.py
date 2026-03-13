@@ -47,6 +47,9 @@ RISK_TUNING_PROMPT = """## AI 한도 결정 요청
 - 현재 현금 비율: {cash_ratio:.1f}%
 - 평가 손익: {total_pnl:+,.0f}원 ({total_pnl_rate:+.2f}%)
 
+### 현금 해석 메모
+{cash_interpretation_note}
+
 ### 최근 매매 성과
 {performance_summary}
 

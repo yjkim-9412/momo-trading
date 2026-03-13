@@ -31,6 +31,7 @@ from trading.enums import (
     Tier1Profile,
 )
 from trading.market_profile import (
+    is_us_market,
     market_currency,
     market_scope,
     market_timezone,
@@ -63,10 +64,11 @@ class AnalysisMixin:
         strategy_type = stock_info.get("strategy_type", "STABLE_SHORT")
         market_code = normalize_market(stock_info.get("market", settings.primary_market_code))
         scope = market_scope(market_code)
+        snap = portfolio_snapshot or {}
         cached_product = self._get_product_metadata(symbol, market_code)
         mkt_state = self._get_state(scope)
         trading_date = self._refresh_runtime_date(mkt_state, scope)
-        current_position = self._get_existing_position(portfolio_snapshot, symbol, market_code)
+        current_position = self._get_existing_position(snap, symbol, market_code)
         current_position_context = self._format_current_position_for_prompt(current_position)
         analysis_source = str(stock_info.get("analysis_source") or "cycle")
         event_type = str(stock_info.get("event_type") or stock_info.get("trigger") or "").upper()
@@ -125,6 +127,50 @@ class AnalysisMixin:
             price_krw = float(price_resp.data.get("price_krw", current_price * exchange_rate_to_krw) or 0.0)
         else:
             logger.warning("[{}] 현재가 조회 실패: {}", symbol, price_resp.error or "응답 없음")
+
+        orderable_amount_context: dict | None = None
+        if is_us_market(market_code) and current_price > 0:
+            orderable_resp = await mcp_client.get_orderable_amount(
+                symbol,
+                current_price,
+                market=market_code,
+            )
+            if orderable_resp.success and orderable_resp.data:
+                orderable_amount_context = dict(orderable_resp.data)
+            else:
+                orderable_amount_context = {
+                    "error": orderable_resp.error or "종목별 주문가능금액 조회 실패",
+                }
+
+        broker_cash_krw = float(snap.get("cash") or 0.0)
+        orderable_signal_metadata = {
+            "broker_cash_krw": broker_cash_krw,
+            "symbol_orderable_amount_krw": (
+                orderable_amount_context.get("orderable_amount_krw")
+                if orderable_amount_context
+                else None
+            ),
+            "symbol_orderable_amount_foreign": (
+                orderable_amount_context.get("orderable_amount_foreign")
+                if orderable_amount_context
+                else None
+            ),
+            "symbol_orderable_qty": (
+                orderable_amount_context.get("orderable_qty")
+                if orderable_amount_context
+                else None
+            ),
+            "orderable_amount_source": (
+                orderable_amount_context.get("orderable_amount_source")
+                if orderable_amount_context
+                else None
+            ),
+        }
+        orderable_detail = {
+            key: value
+            for key, value in orderable_signal_metadata.items()
+            if value not in (None, "", {})
+        }
 
         product_metadata = {
             **cached_product,
@@ -298,11 +344,12 @@ class AnalysisMixin:
             price_resp.data or {}, feedback_context,
             product_context=product_context,
             current_position_context=current_position_context,
-            portfolio_snapshot=portfolio_snapshot,
+            portfolio_snapshot=snap,
             current_position=current_position,
             dynamic_limits=dynamic_limits,
             market_context=mkt_state.market_context,
             trading_context=analysis_trading_context,
+            orderable_amount_context=orderable_amount_context,
             cycle_id=cycle_id,
         )
         t1_elapsed = activity_logger.elapsed_ms(t1_timer)
@@ -332,6 +379,7 @@ class AnalysisMixin:
                         "recommendation": "SELL",
                         "reason": reason,
                         "confidence": analysis.get("confidence") or 0,
+                        **orderable_detail,
                     },
                     product_context,
                 ),
@@ -354,6 +402,7 @@ class AnalysisMixin:
                         "reason": reason,
                         "confidence": analysis.get("confidence") or 0,
                         "key_factors": analysis.get("key_factors", []),
+                        **orderable_detail,
                     },
                     product_context,
                 ),
@@ -375,6 +424,7 @@ class AnalysisMixin:
                     "reason": analysis.get("reason") or analysis.get("summary", ""),
                     "target_price": analysis.get("target_price"),
                     "stop_loss": analysis.get("stop_loss_price"),
+                    **orderable_detail,
                 },
                 product_context,
             ),
@@ -507,7 +557,8 @@ class AnalysisMixin:
                 dynamic_limits=dynamic_limits,
                 market_context=mkt_state.market_context,
                 trading_context=analysis_trading_context,
-                portfolio_snapshot=portfolio_snapshot,
+                portfolio_snapshot=snap,
+                orderable_amount_context=orderable_amount_context,
                 cycle_id=cycle_id,
             )
             t2_elapsed = activity_logger.elapsed_ms(t2_timer)
@@ -522,6 +573,7 @@ class AnalysisMixin:
                         {
                             "approved": False,
                             "reason": reason,
+                            **orderable_detail,
                         },
                         product_context,
                     ),
@@ -549,6 +601,7 @@ class AnalysisMixin:
                         "target_price_currency": currency,
                         "target_price_krw": final.get("target_price_krw"),
                         "normalized_price_fields": final.get("normalized_price_fields"),
+                        **orderable_detail,
                     },
                     product_context,
                 ),
@@ -618,6 +671,7 @@ class AnalysisMixin:
                     "current_position": dict(current_position or {}),
                     "analysis_source": analysis_source,
                     "event_type": event_type or None,
+                    **orderable_signal_metadata,
                     **classification.to_metadata(),
                 },
             )
@@ -636,6 +690,7 @@ class AnalysisMixin:
                         "currency": currency,
                         "entry_price_krw": signal.metadata.get("entry_price_krw"),
                         "entry_mode": entry_mode,
+                        **orderable_detail,
                     },
                     product_context,
                 ),
@@ -707,6 +762,7 @@ class AnalysisMixin:
                 "current_position": dict(current_position or {}),
                 "analysis_source": analysis_source,
                 "event_type": event_type or None,
+                **orderable_signal_metadata,
                 **classification.to_metadata(),
             }
 
@@ -760,7 +816,6 @@ class AnalysisMixin:
                 return result
 
         # 5. 리스크 검사
-        snap = portfolio_snapshot or {}
         risk_result = await risk_manager.check(
             signal=signal,
             portfolio_cash=snap.get("cash", 0),
@@ -768,6 +823,11 @@ class AnalysisMixin:
             today_trade_count=snap.get("today_trade_count", 0),
             current_holding_count=snap.get("holding_count", 0),
             current_position=current_position,
+            orderable_cash_krw=(
+                orderable_amount_context.get("orderable_amount_krw")
+                if orderable_amount_context
+                else None
+            ),
             cycle_id=cycle_id,
             dynamic_limits=dynamic_limits,
             market_regime=mkt_state.market_regime,
@@ -789,14 +849,14 @@ class AnalysisMixin:
         total_amount = unit_price_krw * float(signal.suggested_quantity or 0)
         current_value_krw = float((current_position or {}).get("current_value_krw") or 0.0)
         total_asset = float(snap.get("total_asset") or 0.0)
-        available_cash = float(snap.get("cash") or 0.0)
+        cash_basis_krw = float(risk_result.get("cash_basis_krw") or broker_cash_krw)
         combined_position_pct = (
             (current_value_krw + total_amount) / total_asset * 100
             if total_asset > 0
             else float((current_position or {}).get("position_pct") or 0.0)
         )
         post_trade_cash_ratio = (
-            (available_cash - total_amount) / total_asset * 100
+            (cash_basis_krw - total_amount) / total_asset * 100
             if total_asset > 0
             else 0.0
         )
@@ -807,6 +867,7 @@ class AnalysisMixin:
             "current_position": dict(current_position or {}),
             "analysis_source": analysis_source,
             "event_type": event_type or None,
+            **orderable_signal_metadata,
         })
 
         # 6. 매매 결정 (자율/반자율)
@@ -836,6 +897,7 @@ class AnalysisMixin:
             "current_position": dict(current_position or {}),
             "analysis_source": analysis_source,
             "event_type": event_type or None,
+            **orderable_signal_metadata,
         }
         exec_result = await decision_maker.execute(
             signal, cycle_id=cycle_id, analysis_context=analysis_context,
@@ -1052,6 +1114,7 @@ class AnalysisMixin:
         dynamic_limits: dict | None = None,
         market_context: str = "",
         trading_context: str = "",
+        orderable_amount_context: dict | None = None,
         cycle_id: str | None = None,
     ) -> dict | None:
         """Tier 1 AI 심층 분석"""
@@ -1066,6 +1129,7 @@ class AnalysisMixin:
             current_price=current_price,
             currency=currency,
             exchange_rate_to_krw=exchange_rate_to_krw,
+            orderable_amount_context=orderable_amount_context,
         )
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
         change_value = float(price_data.get("change") or 0)
@@ -1128,6 +1192,7 @@ class AnalysisMixin:
         market_context: str = "",
         trading_context: str = "",
         portfolio_snapshot: dict | None = None,
+        orderable_amount_context: dict | None = None,
         cycle_id: str | None = None,
     ) -> dict | None:
         """Tier 2 최종 검토"""
@@ -1144,6 +1209,7 @@ class AnalysisMixin:
             current_price=current_price,
             currency=currency,
             exchange_rate_to_krw=exchange_rate_to_krw,
+            orderable_amount_context=orderable_amount_context,
         )
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
         tier1_prompt_payload = {

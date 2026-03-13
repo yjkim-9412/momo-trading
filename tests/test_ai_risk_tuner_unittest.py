@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from core.config import settings
 from strategy.ai_risk_tuner import AIRiskTuner
 from trading.enums import ActivityPhase, ActivityType
 from trading.models import AccountBalance
@@ -160,6 +161,54 @@ class AIRiskTunerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(limits["max_daily_trades"], 0)
         self.assertIn("일일거래 무제한", log_mock.await_args.args[2])
+
+    async def test_compute_limits_adds_us_paper_cash_interpretation_note(self):
+        tuner = AIRiskTuner()
+        valid_balance = AccountBalance(
+            total_asset=372_000_000,
+            cash=0,
+            raw_cash=0,
+            effective_cash=0,
+            cash_source="BROKER",
+            stock_value=381_000_000,
+            total_pnl=1_000_000,
+            total_pnl_rate=0.27,
+            market="NASDAQ",
+            currency="KRW",
+            exchange_rate_to_krw=1450.0,
+            is_valid=True,
+        )
+
+        class _DummySession:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with (
+            patch.object(settings, "KIS_ACCOUNT_TYPE", "VIRTUAL"),
+            patch("strategy.ai_risk_tuner.AsyncSessionLocal", return_value=_DummySession()),
+            patch("strategy.ai_risk_tuner.PerformanceTracker.get_overall_stats", AsyncMock(return_value={"overall": None})),
+            patch(
+                "strategy.ai_risk_tuner.llm_factory.generate_tier1",
+                AsyncMock(return_value=(
+                    '{"max_daily_trades": 0, "max_single_order_krw": 45000000, "min_buy_quantity": 1, "max_position_pct": 28, "min_cash_ratio": 0.05, "reasoning": "ok"}',
+                    "TEST",
+                )),
+            ) as generate_mock,
+            patch("strategy.ai_risk_tuner.activity_logger.log", AsyncMock()),
+        ):
+            await tuner.compute_limits(
+                market="NASDAQ",
+                risk_appetite="AGGRESSIVE",
+                cycle_id="cycle-4",
+                balance=valid_balance,
+            )
+
+        prompt = generate_mock.await_args.args[0]
+        self.assertIn("inquire-psamount", prompt)
+        self.assertIn("broker cash 0만으로 신규 진입을 단정 차단하지 말고", prompt)
 
 
 if __name__ == "__main__":

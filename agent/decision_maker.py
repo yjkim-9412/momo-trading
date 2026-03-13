@@ -124,6 +124,11 @@ class DecisionMaker:
             "current_position",
             "analysis_source",
             "event_type",
+            "broker_cash_krw",
+            "symbol_orderable_amount_krw",
+            "symbol_orderable_amount_foreign",
+            "symbol_orderable_qty",
+            "orderable_amount_source",
         ):
             value = metadata.get(key)
             if value not in (None, "", {}):
@@ -807,6 +812,11 @@ class DecisionMaker:
                         "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
                         "analysis_source": ctx.get("analysis_source"),
                         "event_type": ctx.get("event_type"),
+                        "broker_cash_krw": ctx.get("broker_cash_krw"),
+                        "symbol_orderable_amount_krw": ctx.get("symbol_orderable_amount_krw"),
+                        "symbol_orderable_amount_foreign": ctx.get("symbol_orderable_amount_foreign"),
+                        "symbol_orderable_qty": ctx.get("symbol_orderable_qty"),
+                        "orderable_amount_source": ctx.get("orderable_amount_source"),
                         "market": market,
                     }
 
@@ -904,6 +914,11 @@ class DecisionMaker:
                                 "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
                                 "analysis_source": ctx.get("analysis_source"),
                                 "event_type": ctx.get("event_type"),
+                                "broker_cash_krw": ctx.get("broker_cash_krw"),
+                                "symbol_orderable_amount_krw": ctx.get("symbol_orderable_amount_krw"),
+                                "symbol_orderable_amount_foreign": ctx.get("symbol_orderable_amount_foreign"),
+                                "symbol_orderable_qty": ctx.get("symbol_orderable_qty"),
+                                "orderable_amount_source": ctx.get("orderable_amount_source"),
                                 "is_add_on": is_add_on,
                             },
                         )
