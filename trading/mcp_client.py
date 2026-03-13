@@ -54,6 +54,16 @@ class MCPClient:
         self._call_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
         self._fx_cache: dict[str, tuple[float, float]] = {}
 
+    @staticmethod
+    def _extract_business_error(data: Any) -> tuple[str | None, str]:
+        if not isinstance(data, dict):
+            return None, ""
+        rt_cd = str(data.get("rt_cd") or "").strip()
+        if not rt_cd or rt_cd == "0":
+            return None, ""
+        error_msg = str(data.get("msg1") or data.get("msg_cd") or f"KIS 요청 실패 (rt_cd={rt_cd})")
+        return rt_cd, error_msg
+
     @property
     def is_connected(self) -> bool:
         return self._post_client is not None and self._session_id is not None
@@ -399,6 +409,17 @@ class MCPClient:
                 logger.warning("MCP 도구 응답 content 비어있음: {}", str(result)[:300])
                 return MCPResponse(success=False, error=f"빈 응답: {tool_name}", data={})
 
+            rt_cd, error_msg = self._extract_business_error(data)
+            if rt_cd is not None:
+                logger.warning("KIS business error ({}): rt_cd={}, msg={}", tool_name, rt_cd, error_msg)
+                return await self._maybe_retry_rate_limit(
+                    error_msg,
+                    tool_name,
+                    arguments,
+                    _retry,
+                    data=data,
+                )
+
             return MCPResponse(success=True, data=data)
 
         except asyncio.TimeoutError:
@@ -417,6 +438,7 @@ class MCPClient:
     async def _maybe_retry_rate_limit(
         self, error_msg: str, tool_name: str,
         arguments: dict[str, Any] | None, _retry: int,
+        data: dict[str, Any] | None = None,
     ) -> MCPResponse:
         """rate limit 에러면 1초 대기 후 재시도, 아니면 그대로 실패"""
         if "초당 거래건수" in error_msg and _retry < 2:
@@ -426,7 +448,7 @@ class MCPClient:
             await asyncio.sleep(wait)
             await self._rate_limit()
             return await self._call_tool_inner(tool_name, arguments, _retry + 1)
-        return MCPResponse(success=False, error=error_msg[:200])
+        return MCPResponse(success=False, error=error_msg[:200], data=data)
 
     async def list_tools(self) -> list[dict]:
         """사용 가능한 MCP 도구 목록 조회"""

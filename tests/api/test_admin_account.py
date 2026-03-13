@@ -39,4 +39,34 @@ async def test_admin_account_balance_exposes_effective_cash(client, monkeypatch)
     assert payload["raw_total_pnl"] == 7497.903
     assert payload["raw_total_pnl_rate"] == 1.23
     assert payload["pnl_source"] == "HOLDINGS_SUM"
+    assert payload["is_valid"] is True
     assert "모의투자" in payload["status_message"]
+
+
+@pytest.mark.asyncio
+async def test_admin_account_balance_exposes_invalid_state(client, monkeypatch):
+    async def fake_get_balance(market=None):
+        return AccountBalance(
+            total_asset=0,
+            cash=0,
+            raw_cash=0,
+            effective_cash=0,
+            cash_source="BROKER",
+            stock_value=0,
+            total_pnl=0,
+            total_pnl_rate=0,
+            market=market or "KRX",
+            currency="KRW",
+            exchange_rate_to_krw=1.0,
+            status_message="ERROR INVALID INPUT_FILED_SIZE",
+            is_valid=False,
+        )
+
+    monkeypatch.setattr(account_manager, "get_balance", fake_get_balance)
+
+    response = await client.get("/api/v1/admin/account/balance?market=KRX")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["is_valid"] is False
+    assert "INVALID INPUT_FILED_SIZE" in payload["status_message"]

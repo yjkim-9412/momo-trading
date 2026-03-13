@@ -18,6 +18,10 @@ RUN sed -i 's/from mcp.server.fastmcp.server import FastMCP/from fastmcp import 
 
 # httpcore/httpx DEBUG 로그 억제 entrypoint
 COPY entrypoint.py /app/entrypoint.py
+COPY patch_server.py /tmp/patch_server.py
+
+RUN python /tmp/patch_server.py /app/server.py \
+    && rm /tmp/patch_server.py
 
 EXPOSE 3000
 

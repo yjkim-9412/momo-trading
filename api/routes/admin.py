@@ -161,6 +161,7 @@ async def get_account_balance(market: str | None = Query(None)):
             "currency": balance.currency,
             "exchange_rate_to_krw": balance.exchange_rate_to_krw,
             "status_message": balance.status_message,
+            "is_valid": balance.is_valid,
         })
     except Exception as e:
         logger.error("계좌 잔고 조회 실패: {}", str(e))
