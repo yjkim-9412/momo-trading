@@ -59,9 +59,8 @@ data/kis_token.json
 .pip-cache/
 
 # ===== Claude Code 관련 =====
-.claude
+.claude/settings.local.json
 .mcp.json
-CLAUDE.md
 *_custom_prompt.md
 compact_custom_prompt.md
 
