@@ -15,16 +15,22 @@ from core.database import AsyncSessionLocal
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType, Tier1Profile
+from trading.models import AccountBalance
 
 
 class AIRiskTuner:
     """AI가 계좌 상태 + 성과 + 리스크 성향을 분석하여 한도를 자율 결정"""
+
+    @staticmethod
+    def _format_daily_trade_limit(limit: int) -> str:
+        return "무제한" if int(limit or 0) == 0 else f"{int(limit)}회"
 
     async def compute_limits(
         self,
         market: str | None = None,
         risk_appetite: str = "MODERATE",
         cycle_id: str | None = None,
+        balance: AccountBalance | None = None,
     ) -> dict:
         """적정 한도 계산"""
         from trading.market_profile import market_scope, normalize_market
@@ -34,7 +40,25 @@ class AIRiskTuner:
 
         try:
             # 1. 계좌 잔고 조회
-            balance = await account_manager.get_balance(target)
+            if balance is None:
+                balance = await account_manager.get_balance(target)
+            if not balance.is_valid:
+                reason = balance.status_message or "계좌 잔고 조회 실패"
+                limits = self._blocked_limits(reason)
+                elapsed = activity_logger.elapsed_ms(timer)
+                logger.warning("[{}] AI 한도 결정 스킵: {}", target, reason)
+                await activity_logger.log(
+                    ActivityType.RISK_TUNING, ActivityPhase.SKIP,
+                    f"🎯 AI 한도 결정 스킵 ({risk_appetite}): 계좌 잔고 조회 실패",
+                    cycle_id=cycle_id,
+                    detail={
+                        **limits,
+                        "blocked_reason": reason,
+                        "market": target,
+                    },
+                    execution_time_ms=elapsed,
+                )
+                return limits
 
             # 2. 최근 매매 성과 조회
             performance_summary = "매매 이력 없음"
@@ -98,7 +122,7 @@ class AIRiskTuner:
             await activity_logger.log(
                 ActivityType.RISK_TUNING, ActivityPhase.COMPLETE,
                 f"\U0001f3af AI 한도 결정 ({risk_appetite}): "
-                f"일일거래 {limits['max_daily_trades']}회, "
+                f"일일거래 {self._format_daily_trade_limit(limits['max_daily_trades'])}, "
                 f"주문한도 {limits['max_single_order_krw']:,.0f}원",
                 cycle_id=cycle_id,
                 detail=limits,
@@ -143,6 +167,17 @@ class AIRiskTuner:
             "max_position_pct": 25.0,
             "min_cash_ratio": 0.05,
             "reasoning": "AI 한도 결정 실패, 기본값 사용",
+        }
+
+    def _blocked_limits(self, reason: str) -> dict:
+        """잔고 조회 실패 시 신규 매수를 사실상 차단하는 안전 한도"""
+        return {
+            "max_daily_trades": 1,
+            "max_single_order_krw": 1,
+            "min_buy_quantity": settings.MIN_BUY_QUANTITY,
+            "max_position_pct": 5.0,
+            "min_cash_ratio": 1.0,
+            "reasoning": f"계좌 잔고 조회 실패로 신규 매수를 차단했습니다: {reason}",
         }
 
     def _parse_json(self, text: str) -> dict | None:

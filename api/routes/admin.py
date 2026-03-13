@@ -5,11 +5,13 @@ from datetime import date, datetime
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from loguru import logger
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from admin.sse_manager import sse_manager
 from core.config import settings
 from core.database import get_async_db
+from models.broker_order import BrokerOrder
 from repositories.agent_activity_repository import AgentActivityRepository
 from repositories.daily_report_repository import DailyReportRepository
 from schemas.activity_schema import ActivityResponse, CycleResponse
@@ -83,6 +85,35 @@ def _serialize_pending_orders(orders: list[PendingOrderInfo]) -> list[dict[str, 
     ]
 
 
+def _serialize_broker_orders(orders: list[BrokerOrder]) -> list[dict[str, object]]:
+    return [
+        {
+            "id": order.id,
+            "cycle_id": order.cycle_id,
+            "kis_order_id": order.kis_order_id,
+            "market": order.market,
+            "symbol": order.symbol,
+            "stock_name": order.stock_name,
+            "side": order.side,
+            "status": order.status,
+            "quantity": order.quantity,
+            "requested_price": order.requested_price,
+            "requested_price_krw": order.requested_price_krw,
+            "filled_quantity": order.filled_quantity,
+            "filled_price": order.filled_price,
+            "filled_price_krw": order.filled_price_krw,
+            "currency": order.currency,
+            "exchange_rate_to_krw": order.exchange_rate_to_krw,
+            "status_detail": order.status_detail,
+            "error_message": order.error_message,
+            "submitted_at": order.submitted_at.isoformat() if order.submitted_at else None,
+            "filled_at": order.filled_at.isoformat() if order.filled_at else None,
+            "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+        }
+        for order in orders
+    ]
+
+
 # ── AI 관심종목 (WebSocket 구독 + 임계값) ──
 @router.get("/watchlist")
 async def get_watchlist(market: str | None = Query(None)):
@@ -118,8 +149,8 @@ async def get_watchlist(market: str | None = Query(None)):
                     name_map[sym] = sym_info.get("name", "")
 
     # 3) scope에 해당하는 desired 종목 수집
-    desired_set = stream_manager._desired_by_scope.get(scope, set())
-    active_set = set(stream_manager._active_symbols.keys())
+    desired_set = stream_manager.desired_keys(scope)
+    active_set = stream_manager.active_keys(scope)
 
     # 4) event_detector 임계값 중 이 scope에 해당하는 것
     scope_prefixes = (f"{scope}:",) if scope == "KRX" else ("NASDAQ:", "NYSE:", "AMEX:", "US:")
@@ -163,11 +194,7 @@ async def get_watchlist(market: str | None = Query(None)):
 
     return SuccessResponse(data={
         "symbols": symbols_list,
-        "stream_status": {
-            "connected": stream_manager.is_connected,
-            "subscription_count": stream_manager.subscription_count,
-            "subscription_limit": 41,
-        },
+        "stream_status": stream_manager.stream_status(scope),
     })
 
 
@@ -328,6 +355,20 @@ async def get_pending_orders(market: str | None = Query(None)):
         return SuccessResponse(data=[], message=f"미체결 주문 조회 실패: {str(e)[:100]}")
 
 
+@router.get("/account/broker-orders")
+async def get_broker_orders(
+    market: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """자동매매 브로커 주문 이력 조회"""
+    stmt = select(BrokerOrder).order_by(BrokerOrder.created_at.desc()).limit(limit)
+    if market:
+        stmt = stmt.where(BrokerOrder.market == market)
+    rows = (await db.execute(stmt)).scalars().all()
+    return SuccessResponse(data=_serialize_broker_orders(list(rows)))
+
+
 @router.get("/account/overview")
 async def get_account_overview(market: str | None = Query(None)):
     """계좌 overview 조회"""
@@ -424,6 +465,8 @@ async def get_llm_status():
 async def get_system_status(market: str | None = Query(None)):
     """시스템 전체 상태"""
     from agent.trading_agent import trading_agent
+    from realtime.monitor import realtime_monitor
+    from realtime.stream_manager import stream_manager
     from scheduler.scheduler import trading_scheduler
 
     from scheduler.market_calendar import market_calendar
@@ -438,6 +481,7 @@ async def get_system_status(market: str | None = Query(None)):
         "scheduler_running": trading_scheduler.is_running,
         "agent_running": trading_agent._running,
         "last_cycle_time": trading_agent.last_cycle_time.isoformat() if trading_agent.last_cycle_time else None,
+        "realtime_monitor_running": realtime_monitor.is_running,
         "sse_clients": sse_manager.client_count,
         "environment": settings.ENVIRONMENT,
         "primary_market": settings.primary_market_code,
@@ -449,6 +493,108 @@ async def get_system_status(market: str | None = Query(None)):
         "dst_active": session_schedule["dst_active"],
         "market_holiday": market_calendar.get_holiday_name(market=market_code),
         "next_market_open": market_calendar.next_market_open(market=market_code).strftime("%m/%d %H:%M"),
+        "realtime": stream_manager.stream_status(market_code),
+    })
+
+
+# ── 스케줄 타임라인 ──
+@router.get("/schedule/timeline")
+async def get_schedule_timeline(market: str | None = Query(None)):
+    """AI 동적 재스캔 상태 + 정규 스케줄 타임라인"""
+    from scheduler.scheduler import trading_scheduler
+    from scheduler.market_calendar import market_calendar
+    from trading.market_profile import is_us_market, market_scope, normalize_market
+
+    market_code = normalize_market(market or settings.primary_market_code)
+    scope = market_scope(market_code)
+    is_us = is_us_market(market_code)
+    now_local = trading_scheduler._market_now(market_code)
+
+    # ── Adaptive state ──
+    state = trading_scheduler._adaptive_state(market_code)
+    remaining = trading_scheduler._remaining_scheduled_budget(market_code)
+    next_run_at = state.next_adaptive_run_at
+    next_run_in_minutes = None
+    if next_run_at:
+        delta = (next_run_at - now_local).total_seconds()
+        next_run_in_minutes = max(0, int(delta / 60))
+
+    adaptive_data = {
+        "enabled": settings.AI_DYNAMIC_RESCAN_ENABLED,
+        "cycles_used": state.scheduled_cycle_count_today,
+        "cycles_max": settings.AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION,
+        "cycles_remaining": remaining,
+        "next_run_at": next_run_at.isoformat() if next_run_at else None,
+        "next_run_in_minutes": next_run_in_minutes,
+        "last_hint": state.last_schedule_hint or None,
+    }
+
+    # ── Fixed jobs ──
+    schedule = trading_scheduler._market_schedule_profile(market_code)
+    mkt_cfg = settings.get_market_config(market_code)
+    pre_h, pre_m = schedule.prep_time.hour, schedule.prep_time.minute
+    open_h, open_m = schedule.open_scan_time.hour, schedule.open_scan_time.minute
+    force_h = mkt_cfg["force_liquidation_hour"]
+    force_m = mkt_cfg["force_liquidation_minute"]
+    post_h, post_m = (16, 10) if is_us else (15, 40)
+    sync_h, sync_m = (16, 30) if is_us else (16, 0)
+    data_h, data_m = (17, 0) if is_us else (16, 30)
+    holdings_range = trading_scheduler._holdings_check_hours(market_code)
+
+    job_defs = [
+        ("prep", "장 시작 전 준비", pre_h, pre_m),
+        ("scan", "장 시작 스캔 + 매매", open_h, open_m),
+        ("holdings", f"보유종목 점검 ({holdings_range}시 매 :30)", None, 30),
+        ("liquidation", "장 마감 전 청산", force_h, force_m),
+        ("review", "장 마감 성과 리뷰", post_h, post_m),
+        ("sync", "포트폴리오 정산", sync_h, sync_m),
+        ("data", "일봉 데이터 수집", data_h, data_m),
+    ]
+
+    current_hm = now_local.hour * 60 + now_local.minute
+    found_next = False
+    fixed_jobs = []
+    for category, name, h, m in job_defs:
+        if h is None:
+            # holdings_check: 범위 기반, 첫/끝 시간으로 상태 판정
+            parts = holdings_range.split("-")
+            start_h, end_h = int(parts[0]), int(parts[1])
+            job_start_hm = start_h * 60 + 30
+            job_end_hm = end_h * 60 + 30
+            if current_hm > job_end_hm:
+                status = "done"
+            elif current_hm >= job_start_hm and not found_next:
+                status = "next"
+                found_next = True
+            else:
+                status = "upcoming" if found_next else "next"
+                if status == "next":
+                    found_next = True
+            time_str = f"{start_h:02d}:30~{end_h:02d}:30"
+        else:
+            job_hm = h * 60 + m
+            if current_hm > job_hm + 5:
+                status = "done"
+            elif not found_next:
+                status = "next"
+                found_next = True
+            else:
+                status = "upcoming"
+            time_str = f"{h:02d}:{m:02d}"
+
+        fixed_jobs.append({
+            "category": category,
+            "name": name,
+            "time": time_str,
+            "status": status,
+        })
+
+    return SuccessResponse(data={
+        "market": market_code,
+        "market_scope": scope,
+        "adaptive": adaptive_data,
+        "fixed_jobs": fixed_jobs,
+        "server_time_local": now_local.isoformat(),
     })
 
 
@@ -466,6 +612,7 @@ async def get_agent_state():
                 "cycle_active": False,
                 "cycle_id": None,
                 "started_at": None,
+                "phase": None,
                 "scanned_count": 0,
                 "analyzed_count": 0,
                 "selected_symbols": [],
@@ -476,6 +623,7 @@ async def get_agent_state():
                 "cycle_active": state.cycle_lock.locked(),
                 "cycle_id": pipeline.get("cycle_id"),
                 "started_at": pipeline.get("started_at"),
+                "phase": pipeline.get("phase"),
                 "scanned_count": pipeline.get("scanned_count", 0),
                 "analyzed_count": pipeline.get("analyzed_count", 0),
                 "selected_symbols": pipeline.get("selected_symbols", []),

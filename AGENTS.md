@@ -20,7 +20,7 @@ KIS Open API 구현, 디버깅, 새 API 연동 시 반드시 `kis-api-ref` 스�
 | Validation | Pydantic v2 |
 | 기술적 분석 | pandas + pandas-ta |
 | 실시간 통신 | WebSocket (KIS), SSE (Admin) |
-| 스케줄러 | APScheduler (KRX/US 세션 기준 cron) |
+| 스케줄러 | APScheduler (장 시작/안전 앵커는 cron, 장중 재스캔은 adaptive one-shot) |
 | 증권사 API | KIS REST API 직접 호출 |
 | LLM | Claude Code CLI / Codex CLI (2-Tier) |
 | 로깅 | loguru |
@@ -37,7 +37,7 @@ API Routes → Services → Repositories(AsyncBaseRepository[T]) → SQLAlchemy 
 
 ### 에이전트 파이프라인 (장중)
 ```
-Scheduler (APScheduler, KST/EST cron)
+Scheduler (고정 오픈 스캔 + adaptive 장중 재스캔)
   └─ TradingAgent.run_cycle()
        ├─ MarketScanner.scan()          # 거래량순위 + 등락률 + AI 스크리닝 (Tier1)
        │    └─ 종목 선정 + market_regime 판단
@@ -51,7 +51,8 @@ Scheduler (APScheduler, KST/EST cron)
             ├─ Tier2 최종 리뷰 (LLM) → 승인/거절
             ├─ 전략 평가 (StableShort / AggressiveShort)
             ├─ 리스크 체크 (일일한도, 단일주문한도, 최소현금비율)
-            └─ DecisionMaker.execute() → 자동주문 또는 추천 생성
+            ├─ DecisionMaker.execute() → 자동주문 또는 추천 생성
+            └─ schedule_hint 생성 → Scheduler가 다음 one-shot 재스캔 예약
 ```
 
 ### 핵심 컴포넌트
@@ -61,10 +62,22 @@ Scheduler (APScheduler, KST/EST cron)
 | TradingAgent | `agent/trading_agent.py` | `run_cycle()`, `_run_trading_cycle()`, `_analyze_and_trade()` |
 | MarketScanner | `agent/market_scanner.py` | `scan()` |
 | DecisionMaker | `agent/decision_maker.py` | `execute()`, `_execute_autonomous()` |
-| TradingScheduler | `scheduler/scheduler.py` | `start()`, `_setup_jobs()`, `_market_open_scan()` |
+| TradingScheduler | `scheduler/scheduler.py` | `start()`, `_market_open_scan()`, `_adaptive_rescan()`, `_schedule_next_adaptive_rescan()` |
 | StableShortStrategy | `strategy/stable_short.py` | `evaluate()` |
 | AggressiveShortStrategy | `strategy/aggressive_short.py` | `evaluate()` |
 | RiskManager | `strategy/risk_manager.py` | `check()` |
+
+### 스케줄 구조
+
+- `장 시작 스캔`은 시장별 고정 cron으로 유지한다.
+- `장중 재스캔`은 더 이상 `11:00/13:00` 고정 cron이 아니다.
+  - `run_cycle()` 종료 후 `schedule_hint`를 생성한다.
+  - 스케줄러는 시장별 `adaptive_rescan_*` one-shot job 하나만 유지한다.
+- `보유종목 점검`, `강제 청산`, `장마감 리뷰`, `포트폴리오 정산`, `일봉 데이터 수집`은 고정 스케줄로 유지한다.
+- scheduled 재스캔 예산은 `오픈 스캔 제외` 기준으로 `AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION`만큼만 사용한다.
+- `cycle_already_running`, `buy_cutoff`, `mcp_unavailable`, 휴장일 같은 skip는 scheduled 예산을 차감하지 않는다.
+- WebSocket 실시간 이벤트 기반 분석은 scheduled 재스캔 예산과 별개다.
+- 롤백이 필요하면 `.env`에서 `AI_DYNAMIC_RESCAN_ENABLED=false`로 두면 기존 고정 `11:00/13:00` 재스캔 구조로 복귀한다.
 
 ### 2-Tier LLM 시스템
 
@@ -83,6 +96,7 @@ Scheduler (APScheduler, KST/EST cron)
 WebSocket → EventDetector → EventBus:
 - `VOLUME_SPIKE`, `PRICE_SURGE`, `PRICE_DROP` → 즉시 분석
 - `STOP_LOSS_HIT`, `TAKE_PROFIT_HIT` → 즉시 매도
+- 이 경로는 scheduled 재스캔 예산을 차감하지 않는다.
 
 ### 피드백 학습
 
@@ -97,7 +111,7 @@ WebSocket → EventDetector → EventBus:
 
 ## 미국장 구현 회고
 
-- 미국 프리마켓은 `US_PREMARKET_ENABLED=true`일 때 정식 장중 세션으로 취급한다. 스케줄 기준은 `03:50 ET` 준비, `04:05 ET` 오픈 스캔, `11:00/13:00 ET` 장중 재스캔이며, 미국장 매수·매도 판단은 이 트리거 텀에 맞춰 이뤄져야 한다. 미국장 스케줄은 `scheduler/scheduler.py`의 프로필 계산을 기준으로 유지하고, `09:35 ET` 같은 정규장 하드코딩을 다시 넣지 말 것.
+- 미국 프리마켓은 `US_PREMARKET_ENABLED=true`일 때 정식 장중 세션으로 취급한다. 스케줄 기준은 `03:50 ET` 준비, `04:05 ET` 오픈 스캔이며, 그 이후 장중 재스캔은 고정 `11:00/13:00 ET`가 아니라 adaptive one-shot으로 이어진다. 미국장 스케줄은 `scheduler/scheduler.py`의 프로필 계산과 `schedule_hint` 흐름을 기준으로 유지하고, `09:35 ET` 같은 정규장 하드코딩을 다시 넣지 말 것.
 - 미국장 API 장애의 1차 원인은 `프리마켓 미지원`이 아니라 `해외 시세 burst 호출`이었다. 종목 병렬 분석과 종목 내부 `현재가 + 일봉 + 분봉` 동시 호출이 겹치면 KIS가 `초당 거래건수를 초과하였습니다.`를 반환할 수 있다. 해외 현재가/일봉/분봉은 반드시 공통 limiter 또는 직렬화 경로를 타게 유지할 것.
 - 미국장 API 장애의 2차 원인은 `시계열 역순 응답`이었다. KIS 해외 `dailyprice`, `inquire-time-itemchartprice` 응답은 최신순일 수 있고, 지표 계산기는 `oldest -> newest`를 가정한다. 해외 시세는 `trading/mcp_client.py`에서 먼저 `date/time` 오름차순 정렬하고, `agent/trading_agent.py`의 DataFrame 단계에서도 다시 정렬하는 이중 방어를 유지할 것.
 - 미국 단기매매에서는 `실시간 현재가`와 같은 가격 축을 쓰는 것이 우선이다. 해외 일봉은 `trading/kis_api.py`에서 `MODP="0"`을 사용해 비수정주가 기준으로 가져오고, 수정주가 기준 일봉과 실시간 현재가를 혼용하지 말 것. 장기 백테스트처럼 수정주가가 꼭 필요한 경우가 아니라면 단기 AI 분석 경로에서는 `MODP="1"`로 되돌리지 않는다.

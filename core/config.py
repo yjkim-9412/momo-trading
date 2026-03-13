@@ -109,6 +109,12 @@ class Settings(BaseSettings):
 
     # === Scheduler ===
     SCHEDULER_ENABLED: bool = True
+    AI_DYNAMIC_RESCAN_ENABLED: bool = True
+    AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION: int = 3
+    AI_DYNAMIC_RESCAN_ALLOWED_INTERVALS: str = "15,30,45,60,90,120"
+    AI_DYNAMIC_RESCAN_MIN_INTERVAL_MINUTES: int = 15
+    AI_DYNAMIC_RESCAN_MAX_INTERVAL_MINUTES: int = 120
+    AI_DYNAMIC_RESCAN_DEFAULT_INTERVAL_MINUTES: int = 60
 
     @property
     def async_database_url(self) -> str:
@@ -238,6 +244,28 @@ class Settings(BaseSettings):
     def us_inverse_keywords_list(self) -> list[str]:
         """미국 인버스 상품명 판별 키워드"""
         return self._parse_csv(self.US_INVERSE_KEYWORDS, upper=True)
+
+    @property
+    def ai_dynamic_rescan_allowed_intervals_list(self) -> list[int]:
+        """AI 동적 재스캔 허용 간격 목록"""
+        parsed: list[int] = []
+        for raw in self._parse_csv(self.AI_DYNAMIC_RESCAN_ALLOWED_INTERVALS):
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                parsed.append(value)
+
+        minimum = max(1, int(self.AI_DYNAMIC_RESCAN_MIN_INTERVAL_MINUTES or 15))
+        maximum = max(minimum, int(self.AI_DYNAMIC_RESCAN_MAX_INTERVAL_MINUTES or 120))
+        intervals = sorted({
+            min(maximum, max(minimum, value))
+            for value in parsed
+        })
+        if intervals:
+            return intervals
+        return [15, 30, 45, 60, 90, 120]
 
     @property
     def llm_provider(self) -> LLMProvider:

@@ -1,12 +1,16 @@
 """매매 결정 + 자율/반자율 모드 분기 + 체결 확인/기록"""
 import asyncio
+import json
 from datetime import timedelta
 
 from loguru import logger
+from sqlalchemy import select
 
 from core.config import settings
 from core.database import AsyncSessionLocal
 from core.events import Event, EventType, event_bus
+from models.agent_activity import AgentActivityLog
+from models.broker_order import BrokerOrder
 from models.order import Order
 from models.recommendation import Recommendation
 from models.trade_result import TradeResult
@@ -14,13 +18,14 @@ from repositories.trade_result_repository import TradeResultRepository
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, AutonomyMode, OrderSource, RecommendationStatus
-from trading.market_profile import is_us_market, normalize_market
+from trading.market_profile import is_us_market, normalize_market, normalize_market_scope
 from trading.mcp_client import mcp_client
 from trading.product_policy import build_product_context
 from scheduler.market_calendar import market_calendar
 from util.time_util import now_kst
 
 _US_ORDER_SANITY_MAX_GAP_PCT = 0.15
+_OVERSEAS_CONFIRM_DELAYS_SECONDS = (3, 6, 10)
 
 
 class DecisionMaker:
@@ -112,6 +117,229 @@ class DecisionMaker:
         enriched = dict(detail or {})
         enriched["product_context"] = cls._signal_product_context(signal)
         return enriched
+
+    @staticmethod
+    def _to_trade_krw(value: float, currency: str, exchange_rate: float) -> float:
+        if currency == "KRW":
+            return float(value)
+        return float(value) * float(exchange_rate if exchange_rate > 0 else 1.0)
+
+    @classmethod
+    def _format_trade_price(cls, price: float, currency: str, exchange_rate: float) -> str:
+        price = float(price or 0.0)
+        if currency == "KRW":
+            return f"{price:,.0f}원"
+        price_krw = cls._to_trade_krw(price, currency, exchange_rate)
+        return f"{price:,.2f}{currency} ({price_krw:,.0f}원)"
+
+    @staticmethod
+    def _trade_context_value(ctx: dict, key: str, fallback=0.0):
+        value = ctx.get(key)
+        return fallback if value in (None, "") else value
+
+    async def _upsert_broker_order(
+        self,
+        *,
+        cycle_id: str | None,
+        order_id: str,
+        symbol: str,
+        stock_name: str,
+        market: str,
+        side: str,
+        status: str,
+        quantity: int,
+        requested_price: float,
+        requested_price_krw: float,
+        currency: str,
+        exchange_rate_to_krw: float,
+        strategy_type: str = "",
+        filled_quantity: int = 0,
+        filled_price: float = 0.0,
+        filled_price_krw: float = 0.0,
+        status_detail: str = "",
+        error_message: str = "",
+        submitted_at=None,
+        filled_at=None,
+    ) -> BrokerOrder | None:
+        try:
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    existing = await session.scalar(
+                        select(BrokerOrder).where(BrokerOrder.kis_order_id == order_id).limit(1)
+                    )
+                    if existing is None:
+                        existing = BrokerOrder(
+                            cycle_id=cycle_id,
+                            kis_order_id=order_id,
+                            symbol=symbol,
+                            stock_name=stock_name,
+                            market=market,
+                            side=side,
+                            quantity=quantity,
+                            requested_price=requested_price,
+                            requested_price_krw=requested_price_krw,
+                            currency=currency,
+                            exchange_rate_to_krw=exchange_rate_to_krw,
+                            strategy_type=strategy_type,
+                        )
+                        session.add(existing)
+
+                    existing.cycle_id = cycle_id or existing.cycle_id
+                    existing.status = status
+                    existing.stock_name = stock_name or existing.stock_name
+                    existing.market = market
+                    existing.side = side
+                    existing.quantity = quantity
+                    existing.requested_price = requested_price
+                    existing.requested_price_krw = requested_price_krw
+                    existing.currency = currency
+                    existing.exchange_rate_to_krw = exchange_rate_to_krw
+                    existing.strategy_type = strategy_type or existing.strategy_type
+                    existing.filled_quantity = filled_quantity
+                    existing.filled_price = filled_price
+                    existing.filled_price_krw = filled_price_krw
+                    existing.status_detail = status_detail or None
+                    existing.error_message = error_message or None
+                    if submitted_at is not None:
+                        existing.submitted_at = submitted_at
+                    if filled_at is not None:
+                        existing.filled_at = filled_at
+                    await session.flush()
+                    return existing
+        except Exception:
+            logger.exception(
+                "[BrokerOrder] 저장 실패: order_id={} symbol={} market={} status={}",
+                order_id,
+                symbol,
+                market,
+                status,
+            )
+            return None
+
+    async def _load_broker_order(self, order_id: str) -> BrokerOrder | None:
+        async with AsyncSessionLocal() as session:
+            return await session.scalar(
+                select(BrokerOrder).where(BrokerOrder.kis_order_id == order_id).limit(1)
+            )
+
+    @staticmethod
+    def _extract_broker_order_payload(activity: AgentActivityLog) -> dict | None:
+        if not activity.detail:
+            return None
+
+        try:
+            detail = json.loads(activity.detail)
+        except Exception:
+            return None
+
+        if not detail.get("success"):
+            return None
+
+        order_id = str(detail.get("order_id") or "").strip()
+        if not order_id:
+            return None
+
+        response_data = detail.get("data") or {}
+        market_code = normalize_market(
+            response_data.get("market")
+            or detail.get("market")
+            or ("KRX" if normalize_market_scope(activity.market_scope or "KRX") == "KRX" else "NASDAQ")
+        )
+        currency = str(
+            detail.get("currency")
+            or response_data.get("currency")
+            or ("USD" if is_us_market(market_code) else "KRW")
+        )
+        requested_price = float(detail.get("requested_price") or 0.0)
+        requested_price_krw = float(detail.get("requested_price_krw") or 0.0)
+        exchange_rate = float(response_data.get("exchange_rate_to_krw") or 0.0)
+        if exchange_rate <= 0:
+            if currency != "KRW" and requested_price > 0 and requested_price_krw > 0:
+                exchange_rate = requested_price_krw / requested_price
+            else:
+                exchange_rate = 1.0
+
+        output = response_data.get("output") or {}
+        if isinstance(output, list):
+            output = output[0] if output else {}
+
+        quantity = mcp_client._to_int(
+            detail.get("requested_quantity")
+            or output.get("ORD_QTY")
+            or output.get("ord_qty")
+            or response_data.get("filled_quantity")
+        )
+        if quantity <= 0:
+            return None
+
+        side = str(detail.get("action") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            return None
+
+        symbol = str(activity.symbol or detail.get("symbol") or "").upper()
+        if not symbol:
+            return None
+
+        return {
+            "cycle_id": activity.cycle_id,
+            "order_id": order_id,
+            "symbol": symbol,
+            "stock_name": symbol,
+            "market": market_code,
+            "side": side,
+            "status": "SUBMITTED",
+            "quantity": quantity,
+            "requested_price": requested_price,
+            "requested_price_krw": requested_price_krw,
+            "currency": currency,
+            "exchange_rate_to_krw": exchange_rate,
+            "strategy_type": "",
+            "status_detail": str(response_data.get("msg1") or detail.get("message") or "주문 접수"),
+            "submitted_at": activity.created_at,
+        }
+
+    async def repair_recent_broker_orders(
+        self,
+        *,
+        market_scope: str | None = None,
+        trading_date=None,
+    ) -> int:
+        """activity log에만 남은 주문 접수 건을 broker ledger로 복구"""
+        repaired = 0
+        target_scope = normalize_market_scope(market_scope) if market_scope else None
+
+        async with AsyncSessionLocal() as session:
+            stmt = (
+                select(AgentActivityLog)
+                .where(
+                    AgentActivityLog.activity_type == ActivityType.DECISION,
+                    AgentActivityLog.phase == ActivityPhase.COMPLETE,
+                )
+                .order_by(AgentActivityLog.created_at.asc())
+            )
+            if target_scope:
+                stmt = stmt.where(AgentActivityLog.market_scope == target_scope)
+            if trading_date is not None:
+                stmt = stmt.where(AgentActivityLog.trading_date == trading_date)
+            rows = list((await session.execute(stmt)).scalars().all())
+
+        for activity in rows:
+            payload = self._extract_broker_order_payload(activity)
+            if not payload:
+                continue
+            if await self._load_broker_order(payload["order_id"]):
+                continue
+            record = await self._upsert_broker_order(**payload)
+            if record:
+                repaired += 1
+
+        if repaired:
+            logger.warning(
+                "[BrokerOrder] activity log 기반 누락 주문 {}건 복구 (market_scope={})",
+                repaired,
+                target_scope or "ALL",
+            )
+        return repaired
 
     async def execute(
         self, signal: TradeSignal, analysis_id: str = "", cycle_id: str | None = None,
@@ -239,12 +467,43 @@ class DecisionMaker:
         }
 
         if is_submitted:
-            await activity_logger.log(
-                ActivityType.DECISION, ActivityPhase.COMPLETE,
-                f"\u2705 [{signal.symbol}] 주문 접수 완료 (체결 대기) — 주문번호: {order_id}",
-                cycle_id=cycle_id, symbol=signal.symbol,
-                detail=self._enrich_detail(signal, result),
+            order_submitted_at = now_kst()
+            broker_order = await self._upsert_broker_order(
+                cycle_id=cycle_id,
+                order_id=order_id,
+                symbol=signal.symbol,
+                stock_name=str((analysis_context or {}).get("stock_name", signal.symbol)),
+                market=market_code,
+                side=signal.action.value,
+                status="SUBMITTED",
+                quantity=qty,
+                requested_price=float(price or 0.0),
+                requested_price_krw=float(price_krw or 0.0),
+                currency=str(currency),
+                exchange_rate_to_krw=float(exchange_rate or 1.0),
+                strategy_type=str((analysis_context or {}).get("strategy_type", "")),
+                status_detail=str(order_data.get("msg1") or "주문 접수"),
+                submitted_at=order_submitted_at,
             )
+            result["broker_order_recorded"] = broker_order is not None
+            if broker_order is not None:
+                await activity_logger.log(
+                    ActivityType.DECISION, ActivityPhase.COMPLETE,
+                    f"\u2705 [{signal.symbol}] 주문 접수 완료 (체결 대기) — 주문번호: {order_id}",
+                    cycle_id=cycle_id, symbol=signal.symbol,
+                    detail=self._enrich_detail(signal, result),
+                )
+            else:
+                ledger_error = "broker ledger 저장 실패"
+                result["ledger_error"] = ledger_error
+                await activity_logger.log(
+                    ActivityType.DECISION, ActivityPhase.ERROR,
+                    f"⚠️ [{signal.symbol}] 주문은 접수됐지만 broker ledger 저장 실패 — 주문번호: {order_id}",
+                    cycle_id=cycle_id,
+                    symbol=signal.symbol,
+                    error_message=ledger_error,
+                    detail=self._enrich_detail(signal, result),
+                )
             # 체결 확인 + TradeResult 기록 (백그라운드, 매매 흐름 차단 안 함)
             task = asyncio.create_task(
                 self.confirm_and_record(
@@ -304,80 +563,197 @@ class DecisionMaker:
     ) -> None:
         """주문 접수 후 체결 확인 → TradeResult 기록
 
-        3초 대기 → get_order_list()로 체결 확인 → 체결 시 기록.
+        해외장은 체결 반영이 늦을 수 있어 짧은 backoff polling 후 기록한다.
         """
         try:
-            await asyncio.sleep(3)  # KIS 체결 처리 대기
+            ctx = analysis_context or {}
+            market_code = normalize_market(market)
+            currency = str(ctx.get("currency") or ("USD" if is_us_market(market_code) else "KRW"))
+            exchange_rate = float(ctx.get("exchange_rate_to_krw") or 0.0)
+            if exchange_rate <= 0:
+                exchange_rate = await mcp_client._get_exchange_rate_to_krw(market_code)
 
-            resp = await mcp_client.get_order_list(market=market)
-            if not resp.success:
-                logger.warning("[{}] 주문내역 조회 실패: {}", symbol, resp.error)
-                return
+            matched_order: dict | None = None
+            for delay_seconds in _OVERSEAS_CONFIRM_DELAYS_SECONDS:
+                await asyncio.sleep(delay_seconds)
 
-            # 응답 구조 로깅 (첫 호출 디버깅용)
-            logger.debug("[체결확인] get_order_list 응답: {}", str(resp.data)[:500])
-
-            # KIS 주문내역 응답 파싱: output 또는 output1 배열
-            orders = []
-            if isinstance(resp.data, dict):
-                orders = (
-                    resp.data.get("output", [])
-                    or resp.data.get("output1", [])
-                    or resp.data.get("orders", [])
-                )
-                if isinstance(orders, dict):
-                    orders = [orders]
-            elif isinstance(resp.data, list):
-                orders = resp.data
-
-            # order_id 매칭으로 체결 확인
-            filled_order = None
-            for order in orders:
-                if not isinstance(order, dict):
+                resp = await mcp_client.get_order_list(market=market)
+                if not resp.success:
+                    logger.warning("[{}] 주문내역 조회 실패: {}", symbol, resp.error)
+                    record = await self._upsert_broker_order(
+                        cycle_id=cycle_id,
+                        order_id=order_id,
+                        symbol=symbol,
+                        stock_name=str(ctx.get("stock_name", symbol)),
+                        market=market_code,
+                        side=side,
+                        status="SUBMITTED",
+                        quantity=quantity,
+                        requested_price=float(expected_price or 0.0),
+                        requested_price_krw=self._to_trade_krw(float(expected_price or 0.0), currency, exchange_rate),
+                        currency=currency,
+                        exchange_rate_to_krw=exchange_rate,
+                        strategy_type=str(ctx.get("strategy_type", "")),
+                        status_detail=str(resp.error or "주문내역 조회 실패"),
+                        error_message=str(resp.error or ""),
+                    )
+                    if record is None:
+                        await activity_logger.log(
+                            ActivityType.DECISION,
+                            ActivityPhase.ERROR,
+                            f"⚠️ [{symbol}] broker ledger 업데이트 실패 — 주문번호: {order_id}",
+                            cycle_id=cycle_id,
+                            symbol=symbol,
+                            error_message="broker ledger 저장 실패",
+                        )
                     continue
-                # KIS 주문번호 키: odno (대소문자 혼용)
-                kis_odno = (
-                    order.get("odno") or order.get("ODNO")
-                    or order.get("order_id") or ""
-                )
-                if str(kis_odno) == str(order_id):
-                        filled_order = order
-                        break
 
-            if not filled_order:
+                logger.debug("[체결확인] get_order_list 응답: {}", str(resp.data)[:500])
+
+                orders = []
+                if isinstance(resp.data, dict):
+                    orders = (
+                        resp.data.get("output", [])
+                        or resp.data.get("output1", [])
+                        or resp.data.get("orders", [])
+                    )
+                    if isinstance(orders, dict):
+                        orders = [orders]
+                elif isinstance(resp.data, list):
+                    orders = resp.data
+
+                current_match = None
+                for order in orders:
+                    if not isinstance(order, dict):
+                        continue
+                    if str(order.get("order_id") or order.get("odno") or order.get("ODNO") or "") == str(order_id):
+                        current_match = order
+                        break
+                if current_match is None:
+                    continue
+                matched_order = current_match
+                current_filled_qty = mcp_client._to_int(
+                    current_match.get("filled_qty")
+                    or current_match.get("filled_quantity")
+                )
+                if current_filled_qty > 0:
+                    break
+
+            if not matched_order:
                 logger.info("[{}] 주문 {} 미체결 (체결내역에서 미발견)", symbol, order_id)
                 return
 
-            # 체결 수량/가격 추출
+            currency = str(matched_order.get("currency") or currency)
+            exchange_rate = float(matched_order.get("exchange_rate_to_krw") or exchange_rate or 1.0)
             filled_qty = mcp_client._to_int(
-                filled_order.get("tot_ccld_qty")
-                or filled_order.get("filled_quantity")
-                or filled_order.get("ccld_qty")
+                matched_order.get("filled_qty")
+                or matched_order.get("filled_quantity")
                 or quantity
             )
+            remaining_qty = mcp_client._to_int(matched_order.get("remaining_qty"))
             filled_price = mcp_client._to_float(
-                filled_order.get("avg_prvs")
-                or filled_order.get("ccld_pric")
-                or filled_order.get("filled_price")
+                matched_order.get("filled_price")
+                or matched_order.get("avg_prvs")
+                or matched_order.get("ccld_pric")
                 or expected_price
             )
+            filled_price_krw = self._to_trade_krw(filled_price, currency, exchange_rate)
+            status_text = str(matched_order.get("status") or "체결 대기")
+            reject_reason = str(matched_order.get("reject_reason") or "")
 
             if filled_qty <= 0:
-                logger.info("[{}] 주문 {} 체결수량 0 → 미체결", symbol, order_id)
+                open_status = "OPEN" if remaining_qty > 0 else "SUBMITTED"
+                record = await self._upsert_broker_order(
+                    cycle_id=cycle_id,
+                    order_id=order_id,
+                    symbol=symbol,
+                    stock_name=str(matched_order.get("name") or ctx.get("stock_name", symbol)),
+                    market=str(matched_order.get("market") or market_code),
+                    side=side,
+                    status=open_status,
+                    quantity=max(quantity, mcp_client._to_int(matched_order.get("order_qty"))),
+                    requested_price=float(matched_order.get("order_price") or expected_price or 0.0),
+                    requested_price_krw=self._to_trade_krw(
+                        float(matched_order.get("order_price") or expected_price or 0.0),
+                        currency,
+                        exchange_rate,
+                    ),
+                    currency=currency,
+                    exchange_rate_to_krw=exchange_rate,
+                    strategy_type=str(ctx.get("strategy_type", "")),
+                    filled_quantity=0,
+                    filled_price=0.0,
+                    filled_price_krw=0.0,
+                    status_detail=" / ".join(part for part in (status_text, reject_reason) if part),
+                    error_message=reject_reason,
+                )
+                if record is None:
+                    await activity_logger.log(
+                        ActivityType.DECISION,
+                        ActivityPhase.ERROR,
+                        f"⚠️ [{symbol}] broker ledger 업데이트 실패 — 주문번호: {order_id}",
+                        cycle_id=cycle_id,
+                        symbol=symbol,
+                        error_message="broker ledger 저장 실패",
+                    )
+                logger.info("[{}] 주문 {} 체결수량 0 → 미체결 ({})", symbol, order_id, status_text)
                 return
 
+            broker_status = "FILLED" if remaining_qty <= 0 else "PARTIAL"
+            record = await self._upsert_broker_order(
+                cycle_id=cycle_id,
+                order_id=order_id,
+                symbol=symbol,
+                stock_name=str(matched_order.get("name") or ctx.get("stock_name", symbol)),
+                market=str(matched_order.get("market") or market_code),
+                side=side,
+                status=broker_status,
+                quantity=max(quantity, mcp_client._to_int(matched_order.get("order_qty")) or filled_qty),
+                requested_price=float(matched_order.get("order_price") or expected_price or 0.0),
+                requested_price_krw=self._to_trade_krw(
+                    float(matched_order.get("order_price") or expected_price or 0.0),
+                    currency,
+                    exchange_rate,
+                ),
+                currency=currency,
+                exchange_rate_to_krw=exchange_rate,
+                strategy_type=str(ctx.get("strategy_type", "")),
+                filled_quantity=filled_qty,
+                filled_price=filled_price,
+                filled_price_krw=filled_price_krw,
+                status_detail=" / ".join(part for part in (status_text, reject_reason) if part),
+                error_message=reject_reason,
+                filled_at=now_kst(),
+            )
+            if record is None:
+                await activity_logger.log(
+                    ActivityType.DECISION,
+                    ActivityPhase.ERROR,
+                    f"⚠️ [{symbol}] broker ledger 업데이트 실패 — 주문번호: {order_id}",
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    error_message="broker ledger 저장 실패",
+                )
+
             logger.info(
-                "[체결확인] {} {} {}주 @{:,.0f}원 체결 완료 (주문번호: {})",
-                symbol, side, filled_qty, filled_price, order_id,
+                "[체결확인] {} {} {}주 @{} 체결 완료 (주문번호: {}, 상태: {})",
+                symbol,
+                side,
+                filled_qty,
+                self._format_trade_price(filled_price, currency, exchange_rate),
+                order_id,
+                broker_status,
             )
 
             await self._record_trade_result(
                 symbol=symbol,
-                market=market,
+                market=market_code,
                 side=side,
                 order_id=order_id,
                 filled_qty=filled_qty,
                 filled_price=filled_price,
+                currency=currency,
+                exchange_rate_to_krw=exchange_rate,
                 analysis_context=analysis_context,
                 exit_reason=exit_reason,
                 cycle_id=cycle_id,
@@ -398,6 +774,8 @@ class DecisionMaker:
         order_id: str,
         filled_qty: int,
         filled_price: float,
+        currency: str,
+        exchange_rate_to_krw: float,
         analysis_context: dict | None = None,
         exit_reason: str = "",
         cycle_id: str | None = None,
@@ -405,6 +783,7 @@ class DecisionMaker:
         """체결 확인 후 TradeResult 생성/업데이트"""
         ctx = analysis_context or {}
         now = now_kst()
+        filled_price_krw = self._to_trade_krw(filled_price, currency, exchange_rate_to_krw)
 
         try:
             async with AsyncSessionLocal() as session:
@@ -417,12 +796,17 @@ class DecisionMaker:
                             order_id=order_id,
                             stock_symbol=symbol,
                             stock_name=ctx.get("stock_name", symbol),
+                            currency=currency,
+                            exchange_rate_to_krw=exchange_rate_to_krw,
                             market=market,
                             side="BUY",
                             strategy_type=ctx.get("strategy_type", ""),
                             entry_price=filled_price,
+                            entry_price_krw=filled_price_krw,
                             exit_price=0.0,
+                            exit_price_krw=0.0,
                             quantity=filled_qty,
+                            raw_pnl=0.0,
                             pnl=0.0,
                             return_pct=0.0,
                             is_win=False,
@@ -439,15 +823,24 @@ class DecisionMaker:
                         session.add(tr)
 
                         logger.info(
-                            "[TradeResult] 매수 기록 생성: {} {} {}주 @{:,.2f}",
-                            market, symbol, filled_qty, filled_price,
+                            "[TradeResult] 매수 기록 생성: {} {} {}주 @{}",
+                            market,
+                            symbol,
+                            filled_qty,
+                            self._format_trade_price(filled_price, currency, exchange_rate_to_krw),
                         )
                         await activity_logger.log(
                             ActivityType.TRADE_RESULT, ActivityPhase.COMPLETE,
                             f"\U0001f4dd [{symbol}] 매수 체결 기록: "
-                            f"{filled_qty}주 @{filled_price:,.2f}{ctx.get('currency', 'KRW')}",
+                            f"{filled_qty}주 @{self._format_trade_price(filled_price, currency, exchange_rate_to_krw)}",
                             cycle_id=cycle_id,
                             symbol=symbol,
+                            detail={
+                                "currency": currency,
+                                "exchange_rate_to_krw": exchange_rate_to_krw,
+                                "entry_price": filled_price,
+                                "entry_price_krw": filled_price_krw,
+                            },
                         )
 
                     elif side == "SELL":
@@ -463,12 +856,18 @@ class DecisionMaker:
                                 order_id=order_id,
                                 stock_symbol=symbol,
                                 stock_name=ctx.get("stock_name", symbol),
+                                currency=currency,
+                                exchange_rate_to_krw=exchange_rate_to_krw,
                                 market=market,
                                 side="SELL",
                                 strategy_type=ctx.get("strategy_type", ""),
                                 entry_price=0.0,
+                                entry_price_krw=0.0,
                                 exit_price=filled_price,
+                                exit_price_krw=filled_price_krw,
                                 quantity=filled_qty,
+                                raw_pnl=0.0,
+                                pnl=0.0,
                                 exit_reason=exit_reason or "SIGNAL",
                                 exit_at=now,
                                 entry_at=now,
@@ -478,12 +877,16 @@ class DecisionMaker:
 
                         # 손익 계산
                         entry_price = open_buy.entry_price
-                        pnl = (filled_price - entry_price) * open_buy.quantity
+                        entry_exchange_rate = float(open_buy.exchange_rate_to_krw or exchange_rate_to_krw or 1.0)
+                        raw_pnl = (filled_price - entry_price) * open_buy.quantity
+                        pnl = self._to_trade_krw(raw_pnl, open_buy.currency, entry_exchange_rate)
                         return_pct = ((filled_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
                         is_win = pnl > 0
                         hold_days = (now - open_buy.entry_at).days if open_buy.entry_at else 0
 
                         open_buy.exit_price = filled_price
+                        open_buy.exit_price_krw = filled_price_krw
+                        open_buy.raw_pnl = raw_pnl
                         open_buy.pnl = pnl
                         open_buy.return_pct = round(return_pct, 2)
                         open_buy.is_win = is_win
@@ -492,22 +895,37 @@ class DecisionMaker:
                         open_buy.exit_at = now
 
                         pnl_sign = "+" if pnl >= 0 else ""
+                        raw_pnl_sign = "+" if raw_pnl >= 0 else ""
                         logger.info(
-                            "[TradeResult] 매도 청산: {} {}주 진입@{:,.0f} → 청산@{:,.0f} "
-                            "= {}{:,.0f}원 ({}{:.1f}%)",
-                            symbol, open_buy.quantity, entry_price, filled_price,
-                            pnl_sign, pnl, pnl_sign, return_pct,
+                            "[TradeResult] 매도 청산: {} {}주 진입@{} → 청산@{} "
+                            "= {}{} ({}{:.0f}원, {}{:.1f}%)",
+                            symbol,
+                            open_buy.quantity,
+                            self._format_trade_price(entry_price, open_buy.currency, entry_exchange_rate),
+                            self._format_trade_price(filled_price, currency, exchange_rate_to_krw),
+                            raw_pnl_sign,
+                            self._format_trade_price(abs(raw_pnl), open_buy.currency, entry_exchange_rate),
+                            pnl_sign,
+                            abs(pnl),
+                            pnl_sign,
+                            return_pct,
                         )
                         await activity_logger.log(
                             ActivityType.TRADE_RESULT, ActivityPhase.COMPLETE,
                             f"{'✅' if is_win else '❌'} [{symbol}] 매도 청산: "
-                            f"{pnl_sign}{pnl:,.0f}원 ({pnl_sign}{return_pct:.1f}%) "
+                            f"{raw_pnl_sign}{self._format_trade_price(abs(raw_pnl), open_buy.currency, entry_exchange_rate)} "
+                            f"({pnl_sign}{abs(pnl):,.0f}원, {pnl_sign}{return_pct:.1f}%) "
                             f"| {exit_reason or 'SIGNAL'} | {hold_days}일 보유",
                             cycle_id=cycle_id,
                             symbol=symbol,
                             detail={
+                                "currency": open_buy.currency,
+                                "exchange_rate_to_krw": entry_exchange_rate,
                                 "entry_price": entry_price,
+                                "entry_price_krw": open_buy.entry_price_krw,
                                 "exit_price": filled_price,
+                                "exit_price_krw": filled_price_krw,
+                                "raw_pnl": raw_pnl,
                                 "pnl": pnl,
                                 "return_pct": return_pct,
                                 "hold_days": hold_days,

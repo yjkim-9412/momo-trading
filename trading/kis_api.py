@@ -609,7 +609,10 @@ async def get_overseas_order_list(market: str = "NASDAQ") -> dict:
     """해외주식 주문/체결 내역 조회"""
     market_code = normalize_market(market)
     cano, acnt_prdt_cd = _get_account_parts()
-    today = datetime.now().strftime("%Y%m%d")
+    from scheduler.market_calendar import market_calendar
+
+    today = market_calendar.market_date(market=market_code).strftime("%Y%m%d")
+    overseas_exchange = "" if settings.is_paper_trading else kis_balance_exchange_code(market_code)
     try:
         result = await _request_paged_json(
             "/uapi/overseas-stock/v1/trading/inquire-ccnl",
@@ -617,7 +620,7 @@ async def get_overseas_order_list(market: str = "NASDAQ") -> dict:
             params={
                 "CANO": cano,
                 "ACNT_PRDT_CD": acnt_prdt_cd,
-                "OVRS_EXCG_CD": kis_balance_exchange_code(market_code),
+                "OVRS_EXCG_CD": overseas_exchange,
                 "PDNO": "",
                 "ORD_STRT_DT": today,
                 "ORD_END_DT": today,

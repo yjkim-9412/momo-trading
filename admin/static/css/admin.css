@@ -567,3 +567,87 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .wl-thresholds .wl-th-val-surge { color: #fbbf24; }
 .wl-thresholds .wl-th-val-drop { color: #60a5fa; }
 .wl-default-tag { color: #4b5563; font-size: 10px; font-style: italic; margin-top: 3px; }
+
+/* ── Schedule Timeline ── */
+.schedule-adaptive-card {
+  border: 1px solid rgba(167, 139, 250, 0.2);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: linear-gradient(180deg, rgba(37, 39, 68, 0.4) 0%, rgba(15, 16, 33, 0.6) 100%);
+}
+.schedule-adaptive-header {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;
+}
+.schedule-adaptive-title {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; color: #a78bfa;
+}
+.schedule-adaptive-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 600;
+}
+.schedule-adaptive-badge.sched-on {
+  background: rgba(52, 211, 153, 0.12); color: #34d399; border: 1px solid rgba(52, 211, 153, 0.3);
+}
+.schedule-adaptive-badge.sched-off {
+  background: rgba(107, 114, 128, 0.12); color: #6b7280; border: 1px solid rgba(107, 114, 128, 0.2);
+}
+
+/* Budget dots */
+.schedule-budget { display: flex; align-items: center; gap: 4px; margin: 6px 0 4px; }
+.schedule-budget-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  border: 1.5px solid #3a3d5f; background: #2a2d45; transition: all 0.25s;
+}
+.schedule-budget-dot.used {
+  background: #34d399; border-color: #34d399; box-shadow: 0 0 4px rgba(52, 211, 153, 0.3);
+}
+.schedule-budget-label { font-size: 10px; color: #6b7280; margin-left: 4px; }
+
+/* Next scan */
+.schedule-next-scan { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 11px; }
+.schedule-next-scan .next-time {
+  color: #60a5fa; font-weight: 600;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+}
+.schedule-next-scan .next-label { color: #9ca3af; }
+.schedule-next-scan .next-countdown { color: #a78bfa; animation: pulse 2s infinite; }
+.schedule-hint-reason { font-size: 10px; color: #4b5563; margin-top: 2px; line-height: 1.3; }
+.schedule-exhausted { font-size: 11px; color: #6b7280; padding: 3px 0; }
+
+/* Fixed schedule vertical timeline */
+.schedule-timeline { position: relative; padding-left: 18px; }
+.schedule-timeline::before {
+  content: ''; position: absolute; left: 5px; top: 6px; bottom: 6px;
+  width: 1.5px; background: #2a2d45;
+}
+.sched-item {
+  position: relative; display: flex; align-items: center; gap: 8px;
+  padding: 3px 0; min-height: 22px;
+}
+.sched-dot {
+  position: absolute; left: -18px;
+  width: 8px; height: 8px; border-radius: 50%;
+  border: 1.5px solid #3a3d5f; background: #2a2d45;
+  z-index: 1;
+}
+.sched-item.sched-done .sched-dot {
+  background: #34d399; border-color: #34d399; box-shadow: 0 0 4px rgba(52, 211, 153, 0.25);
+}
+.sched-item.sched-next .sched-dot {
+  background: #60a5fa; border-color: #60a5fa;
+  box-shadow: 0 0 6px rgba(96, 165, 250, 0.4); animation: pulse 2s infinite;
+}
+.sched-time {
+  font-size: 10px;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  color: #6b7280; min-width: 40px; flex-shrink: 0;
+}
+.sched-item.sched-done .sched-time { color: #4b5563; }
+.sched-item.sched-next .sched-time { color: #60a5fa; font-weight: 600; }
+.sched-label { font-size: 11px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sched-item.sched-done .sched-label { color: #4b5563; }
+.sched-item.sched-next .sched-label { color: #e5e7eb; font-weight: 500; }
+
+/* Workspace theme accents */
+.workspace-krx .schedule-adaptive-card { border-color: rgba(248, 113, 113, 0.15); }
+.workspace-us .schedule-adaptive-card { border-color: rgba(96, 165, 250, 0.2); }

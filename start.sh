@@ -237,8 +237,7 @@ case "${1:-}" in
 
         PYTHONUNBUFFERED=1 python -u -m uvicorn main:app \
             --host "$HOST" --port "$PORT" \
-            --log-level info \
-            --reload
+            --log-level info
         ;;
 
     ""|--foreground)
@@ -254,8 +253,7 @@ case "${1:-}" in
 
         PYTHONUNBUFFERED=1 python -u -m uvicorn main:app \
             --host "$HOST" --port "$PORT" \
-            --log-level info \
-            --reload
+            --log-level info
         ;;
 
     *)

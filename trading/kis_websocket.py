@@ -51,6 +51,18 @@ class KISWebSocket:
             raise ConnectionError("WebSocket approval key 발급 실패")
         logger.info("KIS WebSocket 연결 시작")
 
+    async def reset_runtime_state(self) -> None:
+        """런타임 연결 상태만 초기화 (desired 구독은 상위 매니저가 복원)"""
+        for attr_name in ("_ws_domestic", "_ws_overseas"):
+            ws = getattr(self, attr_name)
+            if ws and not _ws_is_closed(ws):
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            setattr(self, attr_name, None)
+        self._subscriptions.clear()
+
     async def disconnect(self) -> None:
         """WebSocket 연결 종료"""
         self._running = False
@@ -205,6 +217,28 @@ class KISWebSocket:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
+            for task in pending:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            first_error = None
+            for task in done:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    continue
+                except Exception as e:
+                    first_error = first_error or e
+
+            if first_error:
+                raise first_error
+
+            if self._running:
+                raise ConnectionError("WebSocket listener ended unexpectedly")
 
     async def _listen_ws(self, ws, ws_type: str) -> None:
         """개별 WebSocket 메시지 수신"""
@@ -213,12 +247,22 @@ class KISWebSocket:
                 if not self._running:
                     break
                 await self._handle_message(raw_msg, ws_type, ws)
-        except websockets.ConnectionClosed:
-            logger.warning("{} WebSocket 연결 끊김, 재연결 시도...", ws_type)
+        except websockets.ConnectionClosed as e:
+            logger.warning("{} WebSocket 연결 끊김, 재연결 시도... ({})", ws_type, str(e))
+            if ws_type == "domestic":
+                self._ws_domestic = None
+            else:
+                self._ws_overseas = None
             if self._running:
-                await asyncio.sleep(self._reconnect_delay)
+                raise ConnectionError(f"{ws_type} WebSocket 연결 끊김")
         except Exception as e:
+            if ws_type == "domestic":
+                self._ws_domestic = None
+            else:
+                self._ws_overseas = None
             logger.error("{} WebSocket 오류: {}", ws_type, str(e))
+            if self._running:
+                raise
 
     async def _handle_message(self, raw_msg: str, ws_type: str, ws) -> None:
         """수신된 메시지 처리"""

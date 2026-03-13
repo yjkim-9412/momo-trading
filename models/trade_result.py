@@ -20,15 +20,20 @@ class TradeResult(Base, TimestampMixin):
     order_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     stock_symbol: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     stock_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="KRW")
+    exchange_rate_to_krw: Mapped[float] = mapped_column(Float, default=1.0)
 
     # 매매 정보
     side: Mapped[str] = mapped_column(String(10), nullable=False)  # BUY / SELL
     strategy_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    entry_price_krw: Mapped[float] = mapped_column(Float, default=0.0)
     exit_price: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_price_krw: Mapped[float] = mapped_column(Float, default=0.0)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
 
     # 결과
+    raw_pnl: Mapped[float] = mapped_column(Float, default=0.0)  # 시장 통화 기준 손익
     pnl: Mapped[float] = mapped_column(Float, default=0.0)  # 손익 (원)
     return_pct: Mapped[float] = mapped_column(Float, default=0.0)  # 수익률 (%)
     is_win: Mapped[bool] = mapped_column(Boolean, default=False)

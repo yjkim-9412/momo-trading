@@ -178,5 +178,75 @@ class OverseasQuoteRateLimitTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class OverseasBalanceRateLimitTest(unittest.IsolatedAsyncioTestCase):
+    async def test_get_account_balance_serializes_summary_then_holdings(self):
+        client = MCPClient()
+        client._rate_limit_overseas_balance = AsyncMock()
+
+        active_calls = 0
+        max_active_calls = 0
+        summary_started = asyncio.Event()
+        release_summary = asyncio.Event()
+        holdings_started = asyncio.Event()
+
+        async def present_balance_side_effect(market):
+            nonlocal active_calls, max_active_calls
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+            summary_started.set()
+            await release_summary.wait()
+            active_calls -= 1
+            return {
+                "success": True,
+                "rt_cd": "0",
+                "output2": [{
+                    "crcy_cd": "USD",
+                    "frcr_dncl_amt_2": "100",
+                    "frcr_drwg_psbl_amt_1": "100",
+                    "frcr_evlu_amt2": "200",
+                    "frst_bltn_exrt": "1450.0",
+                }],
+                "output3": {
+                    "tot_asst_amt": "300",
+                    "tot_evlu_pfls_amt": "0",
+                    "evlu_erng_rt1": "0",
+                },
+            }
+
+        async def holdings_side_effect(market):
+            nonlocal active_calls, max_active_calls
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+            holdings_started.set()
+            active_calls -= 1
+            return {
+                "success": True,
+                "rt_cd": "0",
+                "output1": [],
+                "output2": [],
+            }
+
+        with (
+            patch(
+                "trading.kis_api.get_overseas_present_balance",
+                new=AsyncMock(side_effect=present_balance_side_effect),
+            ),
+            patch(
+                "trading.kis_api.get_overseas_balance",
+                new=AsyncMock(side_effect=holdings_side_effect),
+            ),
+        ):
+            task = asyncio.create_task(client.get_account_balance("NASDAQ"))
+            await summary_started.wait()
+            await asyncio.sleep(0)
+            self.assertFalse(holdings_started.is_set())
+            release_summary.set()
+            response = await task
+
+        self.assertTrue(response.success)
+        self.assertEqual(max_active_calls, 1)
+        self.assertTrue(holdings_started.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -133,7 +133,13 @@ class MarketScanner:
             return "3~5"
         return "5~8"
 
-    async def scan(self, market: str | None = None, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
+    async def scan(
+        self,
+        market: str | None = None,
+        cycle_id: str | None = None,
+        dynamic_limits: dict | None = None,
+        account_snapshot: tuple | None = None,
+    ) -> dict:
         """시장 스캔 + 종목 선별 통합 실행"""
         target = normalize_market(market or settings.primary_market_code)
         primary_market = target
@@ -151,19 +157,32 @@ class MarketScanner:
         )
 
         scan_markets = settings.scan_markets_for(target)
-        (
-            account_snapshot,
-            volume_rank,
-            surge_data,
-            drop_data,
-            performance_summary,
-        ) = await asyncio.gather(
-            account_manager.get_account_snapshot(target),
-            self._get_volume_rank(scan_markets),
-            self._get_fluctuation_rank(scan_markets, "top"),
-            self._get_fluctuation_rank(scan_markets, "bottom"),
+        if account_snapshot is None:
+            (
+                account_snapshot,
+                volume_rank,
+                surge_data,
+                drop_data,
+                performance_summary,
+            ) = await asyncio.gather(
+                account_manager.get_account_snapshot(target),
+                self._get_volume_rank(scan_markets),
+                self._get_fluctuation_rank(scan_markets, "top"),
+                self._get_fluctuation_rank(scan_markets, "bottom"),
                 self._get_performance_summary(target),
-        )
+            )
+        else:
+            (
+                volume_rank,
+                surge_data,
+                drop_data,
+                performance_summary,
+            ) = await asyncio.gather(
+                self._get_volume_rank(scan_markets),
+                self._get_fluctuation_rank(scan_markets, "top"),
+                self._get_fluctuation_rank(scan_markets, "bottom"),
+                self._get_performance_summary(target),
+            )
         balance, holdings = account_snapshot
         available_cash = balance.effective_cash
         max_pos_pct = 0.2

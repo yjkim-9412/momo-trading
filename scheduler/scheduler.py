@@ -9,7 +9,7 @@ KRX와 US 등을 동시에 자동 매매할 수 있다.
   09:05  장 시작 스캔 → 종목 선정 → 실시간 모니터링 돌입
   09:00~14:30  WebSocket 실시간 이벤트 → AI 분석/매매 (이벤트 기반)
               + 1시간 간격 보유종목 안전 점검 (시간 기반 조기 청산 포함)
-  11:00/13:00  장중 재스캔 — 새로운 기회 탐색
+  장중 adaptive 재스캔  장 시작 스캔 이후 AI가 다음 시점을 one-shot 예약
   14:30  신규 매수 마감 (청산 시간 확보)
   15:10  보유종목 전량 시장가 강제 청산 (종가경매 전, 병렬 실행)
   15:30  KRX 폐장
@@ -21,7 +21,7 @@ KRX와 US 등을 동시에 자동 매매할 수 있다.
   03:50  프리마켓 준비
   04:05  프리마켓 시작 스캔
   04:30~15:30  보유종목 점검 (1시간 간격)
-  11:00/13:00  장중 재스캔
+  장중 adaptive 재스캔  세션 강도에 따라 다음 스캔 시점 동적 예약
   15:40  강제 청산
   16:10  장 마감 리뷰
   16:30  포트폴리오 정산
@@ -34,8 +34,8 @@ KRX와 US 등을 동시에 자동 매매할 수 있다.
 ※ DAY_TRADING_ONLY=true: 당일 매수→당일 청산 필수 (오버나이트 없음)
 ※ DAY_TRADING_ONLY=false: 스윙 모드 — 유망 종목 오버나이트 보유 (스마트 청산)
 """
-from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from loguru import logger
@@ -52,6 +52,14 @@ class MarketScheduleProfile:
     session_label: str
 
 
+@dataclass
+class AdaptiveRescanState:
+    trading_date: date | None = None
+    scheduled_cycle_count_today: int = 0
+    next_adaptive_run_at: datetime | None = None
+    last_schedule_hint: dict = field(default_factory=dict)
+
+
 class TradingScheduler:
     """멀티마켓 자동 운영 스케줄러"""
 
@@ -60,6 +68,7 @@ class TradingScheduler:
     def __init__(self):
         self.scheduler = AsyncIOScheduler()  # 잡별 timezone 사용
         self._running = False
+        self._adaptive_states: dict[str, AdaptiveRescanState] = {}
 
     async def start(self) -> None:
         if not settings.SCHEDULER_ENABLED:
@@ -189,10 +198,20 @@ class TradingScheduler:
                 f"🔄 [{market}] 서버 기동 후 장중 재개 — 현재 세션 복구",
                 f"✅ [{market}] 서버 기동 후 장중 재개 완료",
             ),
+            "startup_recovery": (
+                "서버 기동 후 adaptive recovery 스캔",
+                f"🟡 [{market}] 서버 기동 후 adaptive recovery 예약 스캔 실행",
+                f"✅ [{market}] 서버 기동 후 adaptive recovery 완료",
+            ),
             "intraday_rescan": (
                 f"장중 재스캔 시작 ({market_now.strftime('%H:%M') if market_now else '--:--'})",
                 f"🔄 [{market}] 장중 재스캔 시작 ({market_now.strftime('%H:%M') if market_now else '--:--'}) — 새로운 기회 탐색",
                 f"✅ [{market}] 장중 재스캔 완료",
+            ),
+            "adaptive_rescan": (
+                f"AI 동적 재스캔 시작 ({market_now.strftime('%H:%M') if market_now else '--:--'})",
+                f"🤖 [{market}] AI 동적 재스캔 시작 ({market_now.strftime('%H:%M') if market_now else '--:--'})",
+                f"✅ [{market}] AI 동적 재스캔 완료",
             ),
         }
         return trigger_messages[trigger_reason]
@@ -204,6 +223,181 @@ class TradingScheduler:
         if is_us_market(market):
             return "4-15" if settings.US_PREMARKET_ENABLED else "10-15"
         return "9-14"
+
+    @staticmethod
+    def _adaptive_rescan_job_id(market: str) -> str:
+        from trading.market_profile import normalize_market
+
+        return f"adaptive_rescan_{normalize_market(market)}"
+
+    @staticmethod
+    def _adaptive_trigger_uses_budget(trigger_reason: str) -> bool:
+        return trigger_reason in {"adaptive_rescan", "startup_recovery"}
+
+    @staticmethod
+    def _adaptive_trigger_can_reschedule(trigger_reason: str) -> bool:
+        return trigger_reason in {
+            "scheduled_open",
+            "startup_catchup",
+            "adaptive_rescan",
+            "startup_recovery",
+        }
+
+    def _adaptive_state(self, market: str) -> AdaptiveRescanState:
+        scope, trading_date = self._resolve_market_context(market)
+        state = self._adaptive_states.setdefault(
+            scope,
+            AdaptiveRescanState(trading_date=trading_date),
+        )
+        if state.trading_date != trading_date:
+            state.trading_date = trading_date
+            state.scheduled_cycle_count_today = 0
+            state.next_adaptive_run_at = None
+            state.last_schedule_hint = {}
+        return state
+
+    def _reset_adaptive_state(self, market: str) -> None:
+        state = self._adaptive_state(market)
+        state.scheduled_cycle_count_today = 0
+        state.next_adaptive_run_at = None
+        state.last_schedule_hint = {}
+
+    def _remaining_scheduled_budget(
+        self,
+        market: str,
+        *,
+        include_current_run: bool = False,
+        trigger_reason: str | None = None,
+    ) -> int:
+        state = self._adaptive_state(market)
+        remaining = settings.AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION - state.scheduled_cycle_count_today
+        if include_current_run and trigger_reason and self._adaptive_trigger_uses_budget(trigger_reason):
+            remaining -= 1
+        return max(0, remaining)
+
+    @staticmethod
+    def _clamp_adaptive_interval(minutes: int | float | None) -> int:
+        allowed = settings.ai_dynamic_rescan_allowed_intervals_list
+        default_interval = int(settings.AI_DYNAMIC_RESCAN_DEFAULT_INTERVAL_MINUTES or 60)
+        if not allowed:
+            return default_interval
+        try:
+            numeric = int(float(minutes or default_interval))
+        except (TypeError, ValueError):
+            numeric = default_interval
+        return min(allowed, key=lambda value: (abs(value - numeric), value))
+
+    def _clear_adaptive_rescan_job(self, market: str) -> None:
+        state = self._adaptive_state(market)
+        job_id = self._adaptive_rescan_job_id(market)
+        existing = self.scheduler.get_job(job_id)
+        if existing:
+            self.scheduler.remove_job(job_id)
+        state.next_adaptive_run_at = None
+
+    def _record_completed_adaptive_cycle(self, market: str, trigger_reason: str) -> None:
+        if not self._adaptive_trigger_uses_budget(trigger_reason):
+            return
+        state = self._adaptive_state(market)
+        state.scheduled_cycle_count_today += 1
+
+    async def _schedule_startup_recovery(self, market: str, startup_action: str) -> None:
+        if not settings.AI_DYNAMIC_RESCAN_ENABLED:
+            return
+        if self._remaining_scheduled_budget(market) <= 0:
+            return
+
+        delay = self._clamp_adaptive_interval(settings.AI_DYNAMIC_RESCAN_MIN_INTERVAL_MINUTES)
+        run_at = self._market_now(market) + timedelta(minutes=delay)
+        if settings.DAY_TRADING_ONLY:
+            mkt_cfg = settings.get_market_config(market)
+            cutoff = time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
+            if run_at.time() >= cutoff:
+                return
+        state = self._adaptive_state(market)
+        self._clear_adaptive_rescan_job(market)
+        self.scheduler.add_job(
+            self._adaptive_rescan,
+            "date",
+            run_date=run_at,
+            args=[market, "startup_recovery"],
+            id=self._adaptive_rescan_job_id(market),
+            name=f"Adaptive recovery 재스캔 ({market})",
+            misfire_grace_time=600,
+        )
+        state.next_adaptive_run_at = run_at
+        state.last_schedule_hint = {
+            "action": "SCHEDULE_NEXT",
+            "next_run_in_minutes": delay,
+            "reason": f"{startup_action} → recovery one-shot 예약",
+            "confidence": 1.0,
+            "source": "fallback",
+        }
+        await self._log_schedule(
+            market,
+            ActivityPhase.PROGRESS,
+            f"⏰ [{market}] 서버 기동 recovery 예약: {delay}분 뒤 ({run_at.strftime('%H:%M')})",
+        )
+
+    async def _schedule_next_adaptive_rescan(self, market: str, cycle_result: dict) -> None:
+        if not settings.AI_DYNAMIC_RESCAN_ENABLED:
+            return
+
+        state = self._adaptive_state(market)
+        remaining = self._remaining_scheduled_budget(market)
+        if remaining <= 0:
+            self._clear_adaptive_rescan_job(market)
+            await self._log_schedule(
+                market,
+                ActivityPhase.PROGRESS,
+                f"🛑 [{market}] scheduled 재스캔 예산 소진 — 추가 예약 중단",
+            )
+            return
+
+        schedule_hint = dict(cycle_result.get("schedule_hint") or {})
+        state.last_schedule_hint = schedule_hint
+        if schedule_hint.get("action") != "SCHEDULE_NEXT":
+            self._clear_adaptive_rescan_job(market)
+            await self._log_schedule(
+                market,
+                ActivityPhase.PROGRESS,
+                f"🛑 [{market}] AI가 세션 종료 판단 — {schedule_hint.get('reason', '사유 없음')}",
+            )
+            return
+
+        delay = self._clamp_adaptive_interval(schedule_hint.get("next_run_in_minutes"))
+        run_at = self._market_now(market) + timedelta(minutes=delay)
+
+        if settings.DAY_TRADING_ONLY:
+            mkt_cfg = settings.get_market_config(market)
+            cutoff = time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
+            if run_at.time() >= cutoff:
+                self._clear_adaptive_rescan_job(market)
+                await self._log_schedule(
+                    market,
+                    ActivityPhase.PROGRESS,
+                    f"🛑 [{market}] 다음 재스캔이 매수 마감 이후여서 예약 중단",
+                )
+                return
+
+        self._clear_adaptive_rescan_job(market)
+        self.scheduler.add_job(
+            self._adaptive_rescan,
+            "date",
+            run_date=run_at,
+            args=[market],
+            id=self._adaptive_rescan_job_id(market),
+            name=f"AI 동적 재스캔 ({market})",
+            misfire_grace_time=600,
+        )
+        state.next_adaptive_run_at = run_at
+        await self._log_schedule(
+            market,
+            ActivityPhase.PROGRESS,
+            f"⏰ [{market}] 다음 AI 재스캔 {delay}분 뒤 ({run_at.strftime('%H:%M')}) "
+            f"| 남은 예산 {remaining}회 | {schedule_hint.get('source', 'unknown')} "
+            f"| {schedule_hint.get('reason', '사유 없음')}",
+        )
 
     def _setup_jobs(self) -> None:
         from scheduler.jobs.portfolio_sync_job import portfolio_sync_job
@@ -256,17 +450,18 @@ class TradingScheduler:
             )
 
             # ── 장중 재스캔 ──
-            self.scheduler.add_job(
-                self._intraday_rescan,
-                "cron",
-                args=[market],
-                hour="11,13", minute=0,
-                day_of_week="mon-fri",
-                timezone=tz,
-                id=f"intraday_rescan_{label}",
-                name=f"장중 재스캔 ({label})",
-                misfire_grace_time=600,
-            )
+            if not settings.AI_DYNAMIC_RESCAN_ENABLED:
+                self.scheduler.add_job(
+                    self._intraday_rescan,
+                    "cron",
+                    args=[market],
+                    hour="11,13", minute=0,
+                    day_of_week="mon-fri",
+                    timezone=tz,
+                    id=f"intraday_rescan_{label}",
+                    name=f"장중 재스캔 ({label})",
+                    misfire_grace_time=600,
+                )
 
             # ── 장중 보유종목 점검 ──
             self.scheduler.add_job(
@@ -347,6 +542,7 @@ class TradingScheduler:
     async def _on_startup(self) -> None:
         """서버 기동 시 즉시 매매사이클은 막고 장외 리뷰만 체크"""
         import asyncio
+        from agent.decision_maker import decision_maker
         from scheduler.market_calendar import market_calendar
         from trading.market_profile import normalize_market
 
@@ -355,6 +551,30 @@ class TradingScheduler:
 
         for market_group in settings.enabled_market_groups:
             market = normalize_market(market_group)
+            await self._seed_startup_holdings_watchlist(market)
+            try:
+                repaired = await decision_maker.repair_recent_broker_orders(
+                    market_scope=market,
+                    trading_date=market_calendar.market_date(market=market),
+                )
+                if repaired:
+                    await self._log_schedule(
+                        market,
+                        ActivityPhase.PROGRESS,
+                        f"🧾 [{market}] 누락 broker ledger {repaired}건 복구",
+                    )
+            except Exception as e:
+                logger.warning("[{}] broker ledger startup 복구 실패: {}", market, str(e))
+            startup_action = self._startup_trading_action(market)
+            if settings.AI_DYNAMIC_RESCAN_ENABLED and startup_action:
+                logger.info(
+                    "서버 기동: {} {} → 즉시 매매 대신 recovery one-shot 예약",
+                    market,
+                    startup_action,
+                )
+                await self._schedule_startup_recovery(market, startup_action)
+                continue
+
             if market_calendar.is_trading_hours(market):
                 session = market_calendar.get_market_session(market=market)
                 logger.info(
@@ -371,6 +591,21 @@ class TradingScheduler:
             )
 
         asyncio.create_task(self._post_market_if_needed())
+
+    async def _seed_startup_holdings_watchlist(self, market: str) -> None:
+        """서버 기동 직후 보유종목은 즉시 desired watchlist에 복구"""
+        try:
+            from realtime.stream_manager import stream_manager
+            from trading.account_manager import account_manager
+
+            holdings = await account_manager.get_holdings(market)
+            symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
+            if not symbols:
+                return
+            await stream_manager.replace_market_subscriptions(market, symbols)
+            logger.info("[{}] 서버 기동 보유종목 감시 복원: {}종목", market, len(symbols))
+        except Exception as e:
+            logger.warning("[{}] 서버 기동 보유종목 감시 복원 실패: {}", market, str(e))
 
     async def _pre_market(self, market: str) -> None:
         """장 시작 전 준비 — 어제 리뷰 피드백 확인"""
@@ -513,7 +748,18 @@ class TradingScheduler:
             if include_gap_check and not settings.DAY_TRADING_ONLY:
                 await self._check_overnight_gap(market)
 
-            result = await trading_agent.run_cycle(market=market)
+            scheduled_budget_remaining = None
+            if settings.AI_DYNAMIC_RESCAN_ENABLED and self._adaptive_trigger_can_reschedule(trigger_reason):
+                scheduled_budget_remaining = self._remaining_scheduled_budget(
+                    market,
+                    include_current_run=True,
+                    trigger_reason=trigger_reason,
+                )
+
+            result = await trading_agent.run_cycle(
+                market=market,
+                scheduled_budget_remaining=scheduled_budget_remaining,
+            )
             if result.get("skipped"):
                 reason = result.get("reason", "skipped")
                 if reason == "mcp_unavailable":
@@ -532,6 +778,9 @@ class TradingScheduler:
                     f"⏭️ [{market}] 트레이딩 스캔 스킵 — {reason}",
                 )
                 return
+
+            if settings.AI_DYNAMIC_RESCAN_ENABLED and self._adaptive_trigger_uses_budget(trigger_reason):
+                self._record_completed_adaptive_cycle(market, trigger_reason)
 
             selected = result.get("selected_symbols", [])
             holdings = await account_manager.get_holdings(market)
@@ -552,6 +801,8 @@ class TradingScheduler:
                 f"매매 {result.get('executed', 0)}건, "
                 f"실시간 감시 {len(all_symbols)}종목 → 모니터링 돌입",
             )
+            if settings.AI_DYNAMIC_RESCAN_ENABLED and self._adaptive_trigger_can_reschedule(trigger_reason):
+                await self._schedule_next_adaptive_rescan(market, result)
         except Exception as e:
             logger.error("[{}] 트레이딩 스캔 오류: {}", market, str(e))
 
@@ -561,10 +812,46 @@ class TradingScheduler:
         AI Agent가 전체 시장 데이터를 받아서 어떤 종목에 투자할지 판단하고,
         선정된 종목을 WebSocket 실시간 구독에 등록하여 이후 이벤트 기반 매매.
         """
+        if settings.AI_DYNAMIC_RESCAN_ENABLED:
+            self._reset_adaptive_state(market)
+            self._clear_adaptive_rescan_job(market)
         await self._execute_trading_scan(
             market,
             trigger_reason=trigger_reason,
             include_gap_check=trigger_reason in {"scheduled_open", "startup_catchup"},
+        )
+
+    async def _adaptive_rescan(
+        self,
+        market: str,
+        trigger_reason: str = "adaptive_rescan",
+    ) -> None:
+        """AI가 예약한 one-shot 장중 재스캔"""
+        from scheduler.market_calendar import market_calendar
+        from util.time_util import now_kst
+        from trading.market_profile import market_timezone
+        from zoneinfo import ZoneInfo
+
+        if market_calendar.is_holiday(market):
+            return
+        if self._remaining_scheduled_budget(market) <= 0:
+            self._clear_adaptive_rescan_job(market)
+            return
+
+        if settings.DAY_TRADING_ONLY:
+            mkt_cfg = settings.get_market_config(market)
+            cutoff = time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
+            tz = ZoneInfo(market_timezone(market))
+            market_now = now_kst().astimezone(tz)
+            if market_now.time() >= cutoff:
+                logger.info("[{}] 매수 마감 시간 경과 → adaptive 재스캔 스킵", market)
+                self._clear_adaptive_rescan_job(market)
+                return
+
+        await self._execute_trading_scan(
+            market,
+            trigger_reason=trigger_reason,
+            include_gap_check=False,
         )
 
     async def _intraday_rescan(self, market: str) -> None:
@@ -573,6 +860,10 @@ class TradingScheduler:
         기존 run_cycle()을 재사용하여 시장 재스캔 → 분석 → 매매.
         cycle_lock이 잡혀있으면 자동 스킵.
         """
+        if settings.AI_DYNAMIC_RESCAN_ENABLED:
+            logger.debug("[{}] 고정 intraday_rescan 무시 — adaptive mode 활성", market)
+            return
+
         from scheduler.market_calendar import market_calendar
         from util.time_util import now_kst
         from trading.market_profile import market_timezone
@@ -733,6 +1024,9 @@ class TradingScheduler:
         """장 마감 성과 리뷰"""
         from agent.trading_agent import trading_agent
         from scheduler.market_calendar import market_calendar
+
+        if settings.AI_DYNAMIC_RESCAN_ENABLED:
+            self._clear_adaptive_rescan_job(market)
         if market_calendar.is_holiday(market):
             logger.info("[{}] 휴장일 — 장 마감 리뷰 스킵", market)
             return
@@ -794,6 +1088,8 @@ class TradingScheduler:
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
 
+        if settings.AI_DYNAMIC_RESCAN_ENABLED:
+            self._clear_adaptive_rescan_job(market)
         if market_calendar.is_holiday(market):
             return
 

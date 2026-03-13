@@ -96,6 +96,37 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["approved"])
         self.assertIn("US_REGULAR", result["reason"])
 
+    async def test_risk_log_formats_unlimited_daily_limit(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="PLTR",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=100.0,
+            suggested_quantity=1,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="AGGRESSIVE_SHORT",
+            metadata={
+                "market": "NASDAQ",
+                "price_krw": 100.0,
+                "session": "US_REGULAR",
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()) as log_mock:
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50000,
+                portfolio_budget=100000,
+                today_trade_count=3,
+                current_holding_count=0,
+                dynamic_limits={"max_daily_trades": 0},
+            )
+
+        self.assertTrue(result["approved"])
+        self.assertIn("3/무제한", log_mock.await_args.args[2])
+
 
 if __name__ == "__main__":
     unittest.main()

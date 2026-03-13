@@ -38,6 +38,7 @@ class RealtimeMonitor:
 
     async def _on_price_update(self, data: dict) -> None:
         """WebSocket에서 가격 데이터 수신 시 호출"""
+        stream_manager.note_message_received()
         await event_detector.on_price_update(data)
 
     @property

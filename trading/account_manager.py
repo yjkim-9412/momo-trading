@@ -1,6 +1,9 @@
 """MCP/REST를 통한 잔고·보유·미체결 조회"""
 from __future__ import annotations
 
+import asyncio
+import time
+
 from loguru import logger
 
 from core.config import settings
@@ -8,6 +11,8 @@ from scheduler.market_calendar import market_calendar
 from trading.mcp_client import mcp_client
 from trading.market_profile import is_us_market, market_currency, normalize_market
 from trading.models import AccountBalance, AccountOverview, HoldingInfo, PendingOrderInfo
+
+_INTRADAY_SNAPSHOT_TTL_SECONDS = 2.0
 
 
 class AccountManager:
@@ -17,12 +22,16 @@ class AccountManager:
         self._balance_cache: dict[str, AccountBalance] = {}
         self._holdings_cache: dict[str, list[HoldingInfo]] = {}
         self._pending_orders_cache: dict[str, list[PendingOrderInfo]] = {}
+        self._snapshot_cached_at: dict[str, float] = {}
+        self._snapshot_inflight: dict[str, asyncio.Task[tuple[AccountBalance, list[HoldingInfo]]]] = {}
+        self._snapshot_lock = asyncio.Lock()
 
     def invalidate_cache(self) -> None:
         """체결 이후 캐시를 비운다."""
         self._balance_cache.clear()
         self._holdings_cache.clear()
         self._pending_orders_cache.clear()
+        self._snapshot_cached_at.clear()
 
     @staticmethod
     def _to_float(value, default: float = 0.0) -> float:
@@ -389,31 +398,66 @@ class AccountManager:
 
         for item in output:
             remaining_qty = self._to_int(
-                self._first_value(item, "rmn_qty", "nccs_qty", "remaining_qty")
+                self._first_value(item, "remaining_qty", "rmn_qty", "nccs_qty")
             )
             if remaining_qty <= 0:
                 continue
 
-            side_code = self._first_value(item, "sll_buy_dvsn_cd", "side_code", "side") or ""
+            side_code = self._first_value(item, "side_code", "sll_buy_dvsn_cd", "side") or ""
             side = "매수" if side_code in ("02", "BUY", "매수") else "매도"
             orders.append(PendingOrderInfo(
-                order_id=self._first_value(item, "odno", "order_id") or "",
-                symbol=self._first_value(item, "pdno", "ovrs_pdno", "symbol") or "",
-                name=self._first_value(item, "prdt_name", "ovrs_item_name", "name") or "",
+                order_id=self._first_value(item, "order_id", "odno") or "",
+                symbol=self._first_value(item, "symbol", "pdno", "ovrs_pdno") or "",
+                name=self._first_value(item, "name", "prdt_name", "ovrs_item_name") or "",
                 market=normalize_market(
                     self._first_value(item, "market", "ovrs_excg_cd") or market,
                     default=market,
                 ),
                 currency=self._first_value(item, "currency", "tr_crcy_cd", "crcy_cd") or market_currency(market),
                 side=side,
-                order_qty=self._to_int(self._first_value(item, "ord_qty", "order_qty")),
-                filled_qty=self._to_int(self._first_value(item, "tot_ccld_qty", "filled_qty", "ccld_qty")),
+                order_qty=self._to_int(self._first_value(item, "order_qty", "ft_ord_qty", "ord_qty")),
+                filled_qty=self._to_int(
+                    self._first_value(item, "filled_qty", "ft_ccld_qty", "tot_ccld_qty", "ccld_qty")
+                ),
                 remaining_qty=remaining_qty,
-                order_price=self._to_float(self._first_value(item, "ord_unpr", "ovrs_ord_unpr", "order_price")),
-                order_time=self._first_value(item, "ord_tmd", "order_time") or "",
+                order_price=self._to_float(
+                    self._first_value(item, "order_price", "ft_ord_unpr3", "ord_unpr", "ovrs_ord_unpr")
+                ),
+                order_time=self._first_value(item, "order_time", "ord_tmd", "thco_ord_tmd") or "",
                 exchange_rate_to_krw=self._to_float(item.get("exchange_rate_to_krw", data.get("exchange_rate_to_krw", 1.0)), 1.0),
             ))
         return orders
+
+    def _has_fresh_snapshot_cache(self, market: str, now: float | None = None) -> bool:
+        cached_balance = self._balance_cache.get(market)
+        if cached_balance is None or not cached_balance.is_valid:
+            return False
+        if market not in self._holdings_cache:
+            return False
+        cached_at = self._snapshot_cached_at.get(market)
+        if cached_at is None:
+            return False
+        current = time.monotonic() if now is None else now
+        return (current - cached_at) <= _INTRADAY_SNAPSHOT_TTL_SECONDS
+
+    async def _fetch_account_snapshot(self, market_code: str) -> tuple[AccountBalance, list[HoldingInfo]]:
+        response = await mcp_client.get_account_balance(market=market_code)
+        if not response.success:
+            logger.warning("계좌 조회 실패: {}", response.error)
+            error_message = str((response.data or {}).get("msg1") or response.error or "")
+            balance = self._empty_balance(market_code, status_message=error_message)
+            return balance, []
+
+        data = response.data or {}
+        logger.debug("계좌 응답: {}", str(data)[:500])
+
+        holdings = self._parse_holdings(data, market=market_code)
+        balance = self._parse_balance(data, holdings=holdings, market=market_code)
+        if balance.is_valid:
+            self._balance_cache[market_code] = balance
+            self._holdings_cache[market_code] = holdings
+            self._snapshot_cached_at[market_code] = time.monotonic()
+        return balance, holdings
 
     async def get_account_snapshot(self, market: str | None = None) -> tuple[AccountBalance, list[HoldingInfo]]:
         """잔고와 보유종목을 단일 호출로 조회한다."""
@@ -423,22 +467,28 @@ class AccountManager:
                 logger.debug("장외 시간 → 계좌 스냅샷 캐시 반환")
                 return self._balance_cache[market_code], self._holdings_cache[market_code]
 
-        response = await mcp_client.get_account_balance(market=market_code)
-        if not response.success:
-            logger.warning("계좌 조회 실패: {}", response.error)
-            error_message = str((response.data or {}).get("msg1") or response.error or "")
-            balance = self._empty_balance(market_code, status_message=error_message)
-            holdings: list[HoldingInfo] = []
-            return balance, holdings
+        now = time.monotonic()
+        if self._has_fresh_snapshot_cache(market_code, now):
+            logger.debug("[{}] 장중 계좌 스냅샷 TTL 캐시 반환", market_code)
+            return self._balance_cache[market_code], self._holdings_cache[market_code]
 
-        data = response.data or {}
-        logger.debug("계좌 응답: {}", str(data)[:500])
+        async with self._snapshot_lock:
+            if self._has_fresh_snapshot_cache(market_code, now):
+                logger.debug("[{}] 장중 계좌 스냅샷 TTL 캐시 반환", market_code)
+                return self._balance_cache[market_code], self._holdings_cache[market_code]
+            inflight = self._snapshot_inflight.get(market_code)
+            if inflight is None:
+                inflight = asyncio.create_task(self._fetch_account_snapshot(market_code))
+                self._snapshot_inflight[market_code] = inflight
+            else:
+                logger.debug("[{}] 계좌 스냅샷 진행 중 요청 합류", market_code)
 
-        holdings = self._parse_holdings(data, market=market_code)
-        balance = self._parse_balance(data, holdings=holdings, market=market_code)
-        self._balance_cache[market_code] = balance
-        self._holdings_cache[market_code] = holdings
-        return balance, holdings
+        try:
+            return await inflight
+        finally:
+            async with self._snapshot_lock:
+                if self._snapshot_inflight.get(market_code) is inflight and inflight.done():
+                    self._snapshot_inflight.pop(market_code, None)
 
     async def get_balance(self, market: str | None = None) -> AccountBalance:
         """계좌 잔고 조회"""

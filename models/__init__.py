@@ -7,6 +7,7 @@ from models.analysis import AnalysisResult
 from models.strategy import StrategyConfig, StrategySignal
 from models.recommendation import Recommendation
 from models.trade_result import TradeResult
+from models.broker_order import BrokerOrder
 from models.agent_activity import AgentActivityLog
 from models.daily_report import DailyReport
 from models.trading_rule import TradingRule

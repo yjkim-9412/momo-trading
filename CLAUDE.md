@@ -22,9 +22,21 @@ Codex CLI 관련 개발·디버깅 시 프로젝트 내 구현과 공식 레포�
 - 실제 주문/시세용 `market` 코드는 `KRX`, `NASDAQ`, `NYSE`, `AMEX` 같은 거래소 코드를 그대로 유지한다.
 - 미국장은 거래소 단위로 주문하지만, 장중 런타임과 장후 리뷰는 `US` scope로 묶어 처리한다.
 
+## 스케줄 구조
+
+- `장 시작 스캔`은 시장별 고정 cron으로 유지한다.
+- `장중 재스캔`은 adaptive one-shot 구조다.
+  - `TradingAgent.run_cycle()` 종료 후 `schedule_hint`가 생성된다.
+  - 스케줄러는 시장별 `adaptive_rescan_*` job 하나만 유지한다.
+  - 허용 간격은 `15/30/45/60/90/120분` 버킷으로 보정된다.
+- scheduled 재스캔 예산은 `오픈 스캔 제외` 기준으로 `AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION`만큼만 사용한다.
+- `보유종목 점검`, `강제 청산`, `장마감 리뷰`, `포트폴리오 정산`, `데이터 수집`은 여전히 고정 스케줄이다.
+- 실시간 이벤트 기반 분석은 scheduled 재스캔 예산을 차감하지 않는다.
+- 롤백 시에는 `AI_DYNAMIC_RESCAN_ENABLED=false`로 두면 기존 고정 `11:00/13:00` 장중 재스캔으로 복귀한다.
+
 ## 미국장 구현 회고
 
-- 미국 프리마켓은 `US_PREMARKET_ENABLED=true`일 때 정식 분석 세션이다. 스케줄 기준은 `03:50 ET` 준비, `04:05 ET` 오픈 스캔, `11:00/13:00 ET` 장중 재스캔이며, 미국장 AI 판단은 이 텀에 맞춰 유지해야 한다. 미국장 스케줄은 `scheduler/scheduler.py` 프로필을 기준으로 사용하고, 정규장 시간 하드코딩을 다시 넣지 말 것.
+- 미국 프리마켓은 `US_PREMARKET_ENABLED=true`일 때 정식 분석 세션이다. 스케줄 기준은 `03:50 ET` 준비, `04:05 ET` 오픈 스캔이며, 그 이후 장중 재스캔은 `schedule_hint` 기반 adaptive one-shot으로 이어진다. 미국장 스케줄은 `scheduler/scheduler.py` 프로필과 adaptive 흐름을 기준으로 사용하고, 정규장 시간 하드코딩을 다시 넣지 말 것.
 - 미국장 API 실패 원인은 `프리마켓 조회 불가`가 아니라 `해외 시세 burst 호출`이었다. 종목 병렬 분석과 종목 내부 `현재가 + 일봉 + 분봉` 동시 조회가 겹치면 KIS가 `초당 거래건수를 초과하였습니다.`를 반환할 수 있다. 해외 quote 경로는 공통 limiter/직렬화 경로를 유지할 것.
 - KIS 해외 `dailyprice`와 `inquire-time-itemchartprice`는 최신순 응답일 수 있다. 지표 계산기는 `oldest -> newest`를 가정하므로, 미국장 시세는 `trading/mcp_client.py`에서 정렬하고 `agent/trading_agent.py`에서 DataFrame 단계에서 다시 정렬하는 이중 방어를 유지할 것.
 - 미국 단기매매는 실시간 현재가와 같은 가격 축이 우선이다. 해외 일봉은 `MODP="0"` 비수정주가 기준으로 맞추고, 수정주가 일봉과 실시간 현재가를 섞지 말 것. 단기 AI 분석 경로에서 `MODP="1"` 복귀는 금지한다.

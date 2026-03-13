@@ -423,6 +423,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadWatchlist();
   loadLLMStatus();
   loadLLMUsage();
+  loadScheduleTimeline();
   connectSSE();
   loadTodayActivities();
   initAgentMonitor();
@@ -430,6 +431,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   accountPollTimer = setInterval(loadMarketAccountInfo, 30000);
   setInterval(loadWatchlist, 30000);
   setInterval(loadLLMUsage, 60000);
+  setInterval(loadScheduleTimeline, 15000);
 });
 
 // ── Scroll to Bottom ──
@@ -741,6 +743,7 @@ function switchMarket(market) {
   loadWatchlist();
   loadSystemStatus();
   loadReportList();
+  loadScheduleTimeline();
 
   // 11. Re-render agent monitor for new market
   renderAgentMonitor();
@@ -2490,6 +2493,93 @@ function renderLLMAgentGuide(status, providerId, providerLabel) {
         ${tier1ProfileMeta ? `<div class="agent-guide-meta">프로필 · ${tier1ProfileMeta}</div>` : ''}
       </div>
     `;
+  }).join('');
+}
+
+// ── Schedule Timeline ──
+async function loadScheduleTimeline() {
+  try {
+    const json = await fetchJSON(`${API}/schedule/timeline?market=${currentMarket}`);
+    const d = json.data;
+    if (!d) return;
+    renderAdaptivePanel(d.adaptive);
+    renderFixedTimeline(d.fixed_jobs);
+  } catch (err) {
+    console.error('Schedule timeline error:', err);
+  }
+}
+
+function renderAdaptivePanel(a) {
+  const el = document.getElementById('schedule-adaptive');
+  if (!el || !a) return;
+
+  const badgeCls = a.enabled ? 'sched-on' : 'sched-off';
+  const badgeText = a.enabled ? 'ON' : 'OFF';
+
+  let budgetHtml = '';
+  for (let i = 0; i < a.cycles_max; i++) {
+    budgetHtml += `<span class="schedule-budget-dot ${i < a.cycles_used ? 'used' : ''}"></span>`;
+  }
+
+  let nextHtml = '';
+  if (!a.enabled) {
+    nextHtml = '<div class="schedule-exhausted">동적 재스캔 비활성</div>';
+  } else if (a.cycles_remaining <= 0 && !a.next_run_at) {
+    nextHtml = '<div class="schedule-exhausted">예산 소진 — 추가 스캔 없음</div>';
+  } else if (a.next_run_at) {
+    const t = new Date(a.next_run_at);
+    const timeStr = t.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const minLabel = a.next_run_in_minutes != null ? `${a.next_run_in_minutes}분 후` : '';
+    nextHtml = `<div class="schedule-next-scan">
+      <i data-lucide="clock" class="w-3 h-3 text-gray-500"></i>
+      <span class="next-label">다음 스캔</span>
+      <span class="next-time">${timeStr}</span>
+      ${minLabel ? `<span class="next-countdown">(${minLabel})</span>` : ''}
+    </div>`;
+  } else if (a.last_hint && a.last_hint.action === 'STOP_SESSION') {
+    nextHtml = `<div class="schedule-exhausted">세션 종료 — ${a.last_hint.reason || 'AI 판단'}</div>`;
+  } else {
+    nextHtml = '<div class="schedule-exhausted">대기 중</div>';
+  }
+
+  let hintHtml = '';
+  if (a.last_hint && a.last_hint.reason) {
+    hintHtml = `<div class="schedule-hint-reason">${a.last_hint.reason}</div>`;
+  }
+
+  el.innerHTML = `
+    <div class="schedule-adaptive-header">
+      <span class="schedule-adaptive-title">
+        <i data-lucide="bot" class="w-3.5 h-3.5"></i> AI 동적 재스캔
+      </span>
+      <span class="schedule-adaptive-badge ${badgeCls}">${badgeText}</span>
+    </div>
+    <div class="schedule-budget">
+      ${budgetHtml}
+      <span class="schedule-budget-label">${a.cycles_used}/${a.cycles_max} 사용</span>
+    </div>
+    ${nextHtml}
+    ${hintHtml}`;
+  refreshIcons();
+}
+
+function renderFixedTimeline(jobs) {
+  const el = document.getElementById('schedule-fixed');
+  if (!el || !jobs || !jobs.length) return;
+
+  const categoryIcons = {
+    prep: 'sunrise', scan: 'radar', holdings: 'shield-check',
+    liquidation: 'alert-triangle', review: 'clipboard-check',
+    sync: 'refresh-cw', data: 'database',
+  };
+
+  el.innerHTML = jobs.map(j => {
+    const icon = categoryIcons[j.category] || 'circle';
+    return `<div class="sched-item sched-${j.status}">
+      <span class="sched-dot"></span>
+      <span class="sched-time">${j.time}</span>
+      <span class="sched-label">${j.name}</span>
+    </div>`;
   }).join('');
 }
 

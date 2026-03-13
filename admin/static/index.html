@@ -282,12 +282,24 @@
     </main>
 
     <!-- Right Sidebar: LLM Usage -->
-    <aside id="right-sidebar" class="sidebar-right w-64 bg-dark-800 border-l border-gray-700 flex flex-col shrink-0 relative">
+    <aside id="right-sidebar" class="sidebar-right w-80 bg-dark-800 border-l border-gray-700 flex flex-col shrink-0 relative">
       <button onclick="toggleRightSidebar()" class="sidebar-toggle-btn sidebar-toggle-right" aria-label="LLM 사이드바 접기/펼치기">
         <i data-lucide="panel-right-close" class="w-3 h-3 sidebar-collapse-icon"></i>
       </button>
       <div class="sidebar-content overflow-y-auto flex-1">
       <div class="p-3 space-y-3">
+        <!-- Schedule Timeline -->
+        <div id="schedule-panel">
+          <div class="text-xs text-gray-500 font-medium mb-2">스케줄 타임라인</div>
+          <div id="schedule-adaptive" class="schedule-adaptive-card mb-3">
+            <div class="text-xs text-gray-500">로딩 중...</div>
+          </div>
+          <div id="schedule-fixed" class="schedule-timeline mb-1">
+            <div class="text-xs text-gray-500">로딩 중...</div>
+          </div>
+        </div>
+        <div class="border-t border-gray-700"></div>
+
         <div>
           <div class="text-xs text-gray-500 font-medium mb-2">분석 에이전트</div>
           <div id="llm-agent-guide" class="space-y-2">

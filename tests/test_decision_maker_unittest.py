@@ -3,8 +3,10 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 from agent.decision_maker import DecisionMaker
+from models.agent_activity import AgentActivityLog
 from strategy.signal import TradeSignal
 from trading.enums import SignalAction, SignalUrgency
+from trading.models import MCPResponse
 from util.time_util import now_kst
 
 
@@ -84,6 +86,163 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
         place_order_mock.assert_not_awaited()
         publish_mock.assert_awaited_once()
         self.assertGreaterEqual(log_mock.await_count, 3)
+
+    async def test_confirm_and_record_retries_until_overseas_fill_is_visible(self):
+        maker = DecisionMaker()
+        maker._upsert_broker_order = AsyncMock()
+        maker._record_trade_result = AsyncMock()
+
+        responses = [
+            MCPResponse(success=True, data={
+                "output": [{
+                    "order_id": "0000041303",
+                    "symbol": "PLTR",
+                    "name": "Palantir",
+                    "market": "NASDAQ",
+                    "currency": "USD",
+                    "order_qty": 1000,
+                    "filled_qty": 0,
+                    "remaining_qty": 1000,
+                    "order_price": 154.16,
+                    "filled_price": 0.0,
+                    "exchange_rate_to_krw": 1450.0,
+                    "status": "접수",
+                }],
+            }),
+            MCPResponse(success=True, data={
+                "output": [{
+                    "order_id": "0000041303",
+                    "symbol": "PLTR",
+                    "name": "Palantir",
+                    "market": "NASDAQ",
+                    "currency": "USD",
+                    "order_qty": 1000,
+                    "filled_qty": 1000,
+                    "remaining_qty": 0,
+                    "order_price": 154.16,
+                    "filled_price": 154.16,
+                    "exchange_rate_to_krw": 1450.0,
+                    "status": "체결",
+                }],
+            }),
+        ]
+
+        with (
+            patch("agent.decision_maker.asyncio.sleep", AsyncMock()),
+            patch("agent.decision_maker.mcp_client.get_order_list", AsyncMock(side_effect=responses)) as order_list_mock,
+            patch("agent.decision_maker.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1450.0)),
+            patch("trading.account_manager.account_manager.invalidate_cache"),
+        ):
+            await maker.confirm_and_record(
+                symbol="PLTR",
+                market="NASDAQ",
+                side="BUY",
+                order_id="0000041303",
+                quantity=1000,
+                expected_price=154.16,
+                analysis_context={"stock_name": "Palantir", "currency": "USD", "strategy_type": "AGGRESSIVE_SHORT"},
+                cycle_id="cycle-3",
+            )
+
+        self.assertEqual(order_list_mock.await_count, 2)
+        maker._upsert_broker_order.assert_awaited_once()
+        maker._record_trade_result.assert_awaited_once()
+        self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_qty"], 1000)
+        self.assertEqual(maker._record_trade_result.await_args.kwargs["currency"], "USD")
+
+    async def test_execute_logs_error_when_broker_ledger_write_fails(self):
+        signal = TradeSignal(
+            symbol="COIN",
+            stock_id="stock-1",
+            action=SignalAction.BUY,
+            strength=0.7,
+            suggested_price=200.86,
+            suggested_quantity=300,
+            urgency=SignalUrgency.IMMEDIATE,
+            metadata={
+                "market": "NASDAQ",
+                "currency": "USD",
+                "exchange_rate_to_krw": 1450.0,
+                "live_price": 200.86,
+                "live_price_krw": 291247.0,
+                "entry_price_krw": 291247.0,
+            },
+        )
+
+        maker = DecisionMaker()
+        maker._upsert_broker_order = AsyncMock(return_value=None)
+        maker.confirm_and_record = AsyncMock()
+
+        class DummyTask:
+            def add_done_callback(self, callback):
+                return None
+
+        def fake_create_task(coro):
+            coro.close()
+            return DummyTask()
+
+        with (
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()) as log_mock,
+            patch("agent.decision_maker.event_bus.publish", AsyncMock()),
+            patch("agent.decision_maker.asyncio.create_task", side_effect=fake_create_task),
+            patch(
+                "agent.decision_maker.mcp_client.place_order",
+                AsyncMock(return_value=MCPResponse(success=True, data={
+                    "order_id": "0000041726",
+                    "market": "NASDAQ",
+                    "currency": "USD",
+                    "exchange_rate_to_krw": 1450.0,
+                    "msg1": "모의투자 매수주문이 완료 되었습니다.",
+                    "output": {"ORD_QTY": "300"},
+                })),
+            ),
+        ):
+            result = await maker.execute(signal, cycle_id="cycle-ledger")
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["broker_order_recorded"])
+        self.assertEqual(log_mock.await_args_list[-1].args[1], "ERROR")
+        self.assertIn("broker ledger 저장 실패", log_mock.await_args_list[-1].args[2])
+
+    def test_extract_broker_order_payload_from_activity_log(self):
+        created_at = now_kst()
+        activity = AgentActivityLog(
+            cycle_id="cycle-1",
+            market_scope="US",
+            trading_date=created_at.date(),
+            activity_type="DECISION",
+            phase="COMPLETE",
+            symbol="COIN",
+            summary="✅ [COIN] 주문 접수 완료 (체결 대기) — 주문번호: 0000041726",
+            detail="""{
+                "symbol": "COIN",
+                "action": "BUY",
+                "success": true,
+                "order_id": "0000041726",
+                "requested_price": 200.86,
+                "requested_price_krw": 291247.0,
+                "currency": "USD",
+                "message": "주문 접수",
+                "data": {
+                    "market": "NASDAQ",
+                    "currency": "USD",
+                    "exchange_rate_to_krw": 1450.0,
+                    "msg1": "모의투자 매수주문이 완료 되었습니다.",
+                    "output": {"ORD_QTY": "300"}
+                }
+            }""",
+            created_at=created_at,
+        )
+
+        payload = DecisionMaker._extract_broker_order_payload(activity)
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["order_id"], "0000041726")
+        self.assertEqual(payload["market"], "NASDAQ")
+        self.assertEqual(payload["quantity"], 300)
+        self.assertEqual(payload["status"], "SUBMITTED")
+        self.assertEqual(payload["currency"], "USD")
 
 
 if __name__ == "__main__":

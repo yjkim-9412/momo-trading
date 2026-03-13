@@ -28,6 +28,8 @@ _RATE_LIMIT_WINDOW = 1.0  # 초
 _MAX_CONCURRENT_CALLS = 3  # 동시 MCP 호출 상한
 _OVERSEAS_QUOTE_MIN_INTERVAL = 1.0  # 해외 시세는 더 보수적으로 직렬화
 _OVERSEAS_QUOTE_MAX_RETRIES = 2
+_OVERSEAS_BALANCE_MIN_INTERVAL = 1.0  # 해외 잔고도 계정 단위로 직렬화
+_OVERSEAS_BALANCE_MAX_RETRIES = 2
 
 
 class MCPClient:
@@ -59,6 +61,9 @@ class MCPClient:
         self._overseas_quote_semaphore = asyncio.Semaphore(1)
         self._overseas_quote_rate_lock = asyncio.Lock()
         self._overseas_quote_last_call_at = 0.0
+        self._overseas_balance_semaphore = asyncio.Semaphore(1)
+        self._overseas_balance_rate_lock = asyncio.Lock()
+        self._overseas_balance_last_call_at = 0.0
 
     @staticmethod
     def _extract_business_error(data: Any) -> tuple[str | None, str]:
@@ -69,6 +74,100 @@ class MCPClient:
             return None, ""
         error_msg = str(data.get("msg1") or data.get("msg_cd") or f"KIS 요청 실패 (rt_cd={rt_cd})")
         return rt_cd, error_msg
+
+    @staticmethod
+    def _summarize_overseas_balance_payload(data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {"payload_type": type(data).__name__}
+
+        output1 = data.get("output1")
+        output2 = data.get("output2")
+        output3 = data.get("output3")
+
+        return {
+            "success": data.get("success"),
+            "rt_cd": data.get("rt_cd"),
+            "msg1": data.get("msg1"),
+            "output1_count": len(output1) if isinstance(output1, list) else int(bool(output1)),
+            "output2_count": len(output2) if isinstance(output2, list) else int(isinstance(output2, dict)),
+            "output3_keys": sorted(output3.keys())[:8] if isinstance(output3, dict) else [],
+        }
+
+    def _select_present_balance_currency_record(
+        self,
+        data: dict[str, Any] | None,
+        market: str,
+    ) -> tuple[str, dict[str, Any]]:
+        market_code = normalize_market(market)
+        target_currency = market_currency(market_code)
+        summaries = self._extract_records(data or {}, "output2", "output1")
+
+        for rec in summaries:
+            if isinstance(rec, dict) and str(rec.get("crcy_cd") or "").upper() == target_currency:
+                return target_currency, rec
+        return target_currency, {}
+
+    def _normalize_overseas_order_record(
+        self,
+        item: dict[str, Any],
+        market: str,
+        default_exchange_rate: float,
+    ) -> dict[str, Any]:
+        market_code = normalize_market(
+            self._pick_first(item, "market", "ovrs_excg_cd", default=market),
+            default=market,
+        )
+        currency = str(
+            self._pick_first(item, "currency", "tr_crcy_cd", default=market_currency(market_code))
+        )
+        exchange_rate = self._to_float(
+            self._pick_first(item, "exchange_rate_to_krw", "frst_bltn_exrt", "bass_exrt"),
+            default_exchange_rate,
+        )
+        order_qty = self._to_int(
+            self._pick_first(item, "order_qty", "ft_ord_qty", "ord_qty")
+        )
+        filled_qty = self._to_int(
+            self._pick_first(
+                item,
+                "filled_qty",
+                "ft_ccld_qty",
+                "tot_ccld_qty",
+                "ccld_qty",
+            )
+        )
+        remaining_qty = self._to_int(
+            self._pick_first(item, "remaining_qty", "nccs_qty", "rmn_qty")
+        )
+        order_price = self._to_float(
+            self._pick_first(item, "order_price", "ft_ord_unpr3", "ord_unpr", "ovrs_ord_unpr")
+        )
+        filled_price = self._to_float(
+            self._pick_first(item, "filled_price", "ft_ccld_unpr3", "avg_prvs", "ccld_pric")
+        )
+        side_code = str(self._pick_first(item, "side_code", "sll_buy_dvsn_cd", "side", default=""))
+        side_label = "BUY" if side_code in ("02", "BUY", "매수") else "SELL" if side_code else ""
+
+        return {
+            **item,
+            "order_id": self._pick_first(item, "order_id", "odno", "ODNO", default=""),
+            "symbol": self._pick_first(item, "symbol", "pdno", "ovrs_pdno", default=""),
+            "name": self._pick_first(item, "name", "prdt_name", "ovrs_item_name", default=""),
+            "market": market_code,
+            "currency": currency,
+            "side_code": side_code,
+            "side": side_label,
+            "order_qty": order_qty,
+            "filled_qty": filled_qty,
+            "remaining_qty": remaining_qty,
+            "order_price": order_price,
+            "filled_price": filled_price,
+            "filled_price_krw": filled_price * exchange_rate if currency != "KRW" else filled_price,
+            "order_time": self._pick_first(item, "order_time", "ord_tmd", "thco_ord_tmd", default=""),
+            "status": self._pick_first(item, "status", "prcs_stat_name", default=""),
+            "reject_reason": self._pick_first(item, "reject_reason", "rjct_rson_name", "rjct_rson", default=""),
+            "exchange_rate_to_krw": exchange_rate,
+        }
 
     @property
     def is_connected(self) -> bool:
@@ -350,6 +449,16 @@ class MCPClient:
                 await asyncio.sleep(wait)
             self._overseas_quote_last_call_at = time.monotonic()
 
+    async def _rate_limit_overseas_balance(self) -> None:
+        """해외 잔고 REST 호출은 계정 단위 burst를 피하도록 직렬화한다."""
+        async with self._overseas_balance_rate_lock:
+            now = time.monotonic()
+            wait = _OVERSEAS_BALANCE_MIN_INTERVAL - (now - self._overseas_balance_last_call_at)
+            if wait > 0:
+                logger.debug("해외 잔고 rate limit 대기: {:.2f}초", wait)
+                await asyncio.sleep(wait)
+            self._overseas_balance_last_call_at = time.monotonic()
+
     async def _call_overseas_quote(
         self,
         request_name: str,
@@ -381,6 +490,59 @@ class MCPClient:
                 )
                 await asyncio.sleep(wait)
                 return await self._call_overseas_quote(
+                    request_name,
+                    request_factory,
+                    _retry=_retry + 1,
+                )
+            return MCPResponse(success=False, error=error_msg[:200], data=result)
+
+        return MCPResponse(
+            success=result.get("success", False),
+            data=result,
+            error=result.get("error"),
+        )
+
+    async def _call_overseas_balance(
+        self,
+        request_name: str,
+        request_factory: Callable[[], Awaitable[dict[str, Any]]],
+        _retry: int = 0,
+    ) -> MCPResponse:
+        """해외 잔고 REST 호출 공통 게이트: 직렬화 + 간격 제한 + rate-limit 재시도"""
+        async with self._overseas_balance_semaphore:
+            await self._rate_limit_overseas_balance()
+            try:
+                result = await request_factory()
+            except Exception as e:
+                logger.error("해외 잔고 호출 오류 ({}): {}", request_name, str(e))
+                return MCPResponse(success=False, error=str(e))
+
+        if not isinstance(result, dict):
+            return MCPResponse(success=False, error=f"잘못된 해외 잔고 응답: {request_name}")
+
+        rt_cd, business_error = self._extract_business_error(result)
+        error_msg = business_error
+        if rt_cd is None and not result.get("success", False):
+            error_msg = str(result.get("error") or result.get("msg1") or f"해외 잔고 조회 실패: {request_name}")
+
+        if error_msg:
+            logger.warning(
+                "해외 잔고 응답 오류 ({}): {} | {}",
+                request_name,
+                error_msg,
+                self._summarize_overseas_balance_payload(result),
+            )
+            if "초당 거래건수" in error_msg and _retry < _OVERSEAS_BALANCE_MAX_RETRIES:
+                wait = max(_OVERSEAS_BALANCE_MIN_INTERVAL, 1.0 + _retry * 0.5)
+                logger.warning(
+                    "해외 잔고 rate limit ({}) → {:.1f}초 대기 후 재시도 ({}/{})",
+                    request_name,
+                    wait,
+                    _retry + 1,
+                    _OVERSEAS_BALANCE_MAX_RETRIES,
+                )
+                await asyncio.sleep(wait)
+                return await self._call_overseas_balance(
                     request_name,
                     request_factory,
                     _retry=_retry + 1,
@@ -637,10 +799,12 @@ class MCPClient:
         try:
             from trading.kis_api import get_overseas_present_balance
 
-            response = await get_overseas_present_balance(market_code)
-            if response.get("success"):
-                summaries = self._extract_records(response, "output2", "output1")
-                summary = summaries[0] if summaries else response
+            response = await self._call_overseas_balance(
+                f"{market_code}:fx-present-balance",
+                lambda: get_overseas_present_balance(market_code),
+            )
+            if response.success and response.data:
+                _, summary = self._select_present_balance_currency_record(response.data, market_code)
                 rate = self._to_float(self._pick_first(
                     summary,
                     "frst_bltn_exrt",
@@ -650,6 +814,12 @@ class MCPClient:
                 if rate > 0:
                     self._fx_cache[market_code] = (rate, now)
                     return rate
+                logger.warning(
+                    "[{}] 환율 조회 응답에서 {} 통화 환율을 찾지 못함 | {}",
+                    market_code,
+                    market_currency(market_code),
+                    self._summarize_overseas_balance_payload(response.data),
+                )
         except Exception as e:
             logger.debug("환율 조회 실패 ({}): {}", market_code, str(e))
 
@@ -834,29 +1004,80 @@ class MCPClient:
             return await self.call_tool("inquery-balance")
         from trading.kis_api import get_overseas_balance, get_overseas_present_balance
 
-        try:
-            summary, holdings = await asyncio.gather(
-                get_overseas_present_balance(market_code),
-                get_overseas_balance(market_code),
+        summary_response = await self._call_overseas_balance(
+            f"{market_code}:inquire-present-balance",
+            lambda: get_overseas_present_balance(market_code),
+        )
+        if not summary_response.success:
+            error_message = (
+                "inquire-present-balance 실패: "
+                f"{summary_response.error or 'unknown'}"
             )
-        except Exception as e:
-            return MCPResponse(success=False, error=str(e))
-
-        if not summary.get("success") and not holdings.get("success"):
+            logger.warning(
+                "[{}] {} | {}",
+                market_code,
+                error_message,
+                self._summarize_overseas_balance_payload(summary_response.data),
+            )
             return MCPResponse(
                 success=False,
-                error=summary.get("error") or holdings.get("error") or "해외 잔고 조회 실패",
+                error=error_message,
+                data={"summary": summary_response.data},
             )
 
+        summary = summary_response.data or {}
+
+        holdings_response = await self._call_overseas_balance(
+            f"{market_code}:inquire-balance",
+            lambda: get_overseas_balance(market_code),
+        )
+        if not holdings_response.success:
+            error_message = (
+                "inquire-balance 실패: "
+                f"{holdings_response.error or 'unknown'}"
+            )
+            logger.warning(
+                "[{}] {} | {}",
+                market_code,
+                error_message,
+                self._summarize_overseas_balance_payload(holdings_response.data),
+            )
+            return MCPResponse(
+                success=False,
+                error=error_message,
+                data={"summary": summary, "holdings": holdings_response.data},
+            )
+
+        holdings = holdings_response.data or {}
+
         # output2는 통화별 리스트 → 대상 통화(USD 등) 레코드를 찾아 정규화
-        target_currency = market_currency(market_code)
-        currency_record: dict = {}
-        for rec in summary.get("output2") or []:
-            if isinstance(rec, dict) and rec.get("crcy_cd") == target_currency:
-                currency_record = rec
-                break
+        target_currency, currency_record = self._select_present_balance_currency_record(summary, market_code)
 
         output3 = summary.get("output3") or {}
+        total_asset_value = None
+        if isinstance(output3, dict):
+            total_asset_value = self._pick_first(output3, "tot_asst_amt")
+
+        incomplete_reasons: list[str] = []
+        if not currency_record:
+            incomplete_reasons.append(f"{target_currency} 통화 요약 없음")
+        if not isinstance(output3, dict) or total_asset_value in (None, ""):
+            incomplete_reasons.append("총자산 요약(output3.tot_asst_amt) 없음")
+
+        if incomplete_reasons:
+            error_message = "해외 잔고 응답 불완전: " + ", ".join(incomplete_reasons)
+            logger.warning(
+                "[{}] {} | summary={} holdings_count={}",
+                market_code,
+                error_message,
+                self._summarize_overseas_balance_payload(summary),
+                len(holdings.get("output1", [])) if isinstance(holdings.get("output1"), list) else 0,
+            )
+            return MCPResponse(
+                success=False,
+                error=error_message,
+                data={"summary": summary, "holdings": holdings},
+            )
 
         fx_rate = self._to_float(self._pick_first(
             currency_record,
@@ -1166,9 +1387,20 @@ class MCPClient:
                 self._extract_records(response.data, "output", "output1", "dataframe", "dataframe1")
                 or self._extract_records(response.data, "output2", "dataframe2")
             )
+            exchange_rate = self._to_float(
+                response.data.get("exchange_rate_to_krw"),
+                0.0,
+            )
+            if exchange_rate <= 0:
+                exchange_rate = await self._get_exchange_rate_to_krw(market_code)
             response.data = {
                 **response.data,
-                "output": records,
+                "output": [
+                    self._normalize_overseas_order_record(record, market_code, exchange_rate)
+                    for record in records
+                    if isinstance(record, dict)
+                ],
+                "exchange_rate_to_krw": exchange_rate,
             }
         return response
 

@@ -222,9 +222,128 @@ def test_get_account_overview_uses_sequential_snapshot_then_orders():
     overview, calls = asyncio.run(scenario())
 
     assert calls == [("snapshot", "NASDAQ"), ("orders", "NASDAQ")]
+
+
+def test_parse_pending_orders_reads_overseas_fill_fields():
+    manager = AccountManager()
+    orders = manager._parse_pending_orders(
+        {
+            "exchange_rate_to_krw": 1450.0,
+            "output": [{
+                "order_id": "0000041303",
+                "symbol": "PLTR",
+                "name": "Palantir",
+                "market": "NASDAQ",
+                "currency": "USD",
+                "side_code": "02",
+                "order_qty": "1000",
+                "filled_qty": "250",
+                "remaining_qty": "750",
+                "order_price": "154.16",
+                "order_time": "225710",
+            }],
+        },
+        market="NASDAQ",
+    )
+
+    assert len(orders) == 1
+    assert orders[0].order_id == "0000041303"
+    assert orders[0].symbol == "PLTR"
+    assert orders[0].filled_qty == 250
+    assert orders[0].remaining_qty == 750
+    assert orders[0].exchange_rate_to_krw == 1450.0
     assert overview.balance.total_asset == 1000
     assert overview.holdings[0].symbol == "NVDA"
     assert overview.pending_orders[0].order_id == "A1"
+
+
+def test_get_account_snapshot_deduplicates_concurrent_intraday_requests():
+    async def scenario():
+        manager = AccountManager()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        response = MCPResponse(
+            success=True,
+            data={
+                "output1": [],
+                "output2": [{
+                    "dnca_tot_amt": "1500000",
+                    "tot_evlu_amt": "2500000",
+                    "scts_evlu_amt": "1000000",
+                }],
+            },
+        )
+
+        async def fake_get_account_balance(market=None):
+            started.set()
+            await release.wait()
+            return response
+
+        with (
+            patch("trading.account_manager.market_calendar.is_trading_hours", return_value=True),
+            patch(
+                "trading.account_manager.mcp_client.get_account_balance",
+                AsyncMock(side_effect=fake_get_account_balance),
+            ) as balance_mock,
+        ):
+            task1 = asyncio.create_task(manager.get_account_snapshot("KRX"))
+            await started.wait()
+            task2 = asyncio.create_task(manager.get_account_snapshot("KRX"))
+            await asyncio.sleep(0)
+            assert balance_mock.await_count == 1
+            release.set()
+            first, second = await asyncio.gather(task1, task2)
+            cached = await manager.get_account_snapshot("KRX")
+
+        return balance_mock.await_count, first, second, cached
+
+    await_count, first, second, cached = asyncio.run(scenario())
+
+    assert await_count == 1
+    assert first[0].total_asset == 2500000.0
+    assert second[0].total_asset == 2500000.0
+    assert cached[0].total_asset == 2500000.0
+
+
+def test_get_account_snapshot_does_not_cache_invalid_intraday_balance():
+    async def scenario():
+        manager = AccountManager()
+        responses = [
+            MCPResponse(
+                success=False,
+                error="초당 거래건수를 초과하였습니다.",
+                data={"rt_cd": "1", "msg1": "초당 거래건수를 초과하였습니다."},
+            ),
+            MCPResponse(
+                success=True,
+                data={
+                    "output1": [],
+                    "output2": [{
+                        "dnca_tot_amt": "1500000",
+                        "tot_evlu_amt": "2500000",
+                        "scts_evlu_amt": "1000000",
+                    }],
+                },
+            ),
+        ]
+
+        with (
+            patch("trading.account_manager.market_calendar.is_trading_hours", return_value=True),
+            patch(
+                "trading.account_manager.mcp_client.get_account_balance",
+                AsyncMock(side_effect=responses),
+            ) as balance_mock,
+        ):
+            first = await manager.get_account_snapshot("KRX")
+            second = await manager.get_account_snapshot("KRX")
+
+        return balance_mock.await_count, first, second
+
+    await_count, first, second = asyncio.run(scenario())
+
+    assert await_count == 2
+    assert first[0].is_valid is False
+    assert second[0].is_valid is True
 
 
 if __name__ == "__main__":

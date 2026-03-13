@@ -20,7 +20,7 @@ class AgentActivityRepository(AsyncBaseRepository[AgentActivityLog]):
         offset: int = 0,
         market_scope: str | None = None,
     ) -> list[AgentActivityLog]:
-        stmt = select(AgentActivityLog).order_by(AgentActivityLog.created_at.asc())
+        stmt = select(AgentActivityLog).order_by(AgentActivityLog.created_at.desc())
         if market_scope:
             stmt = stmt.where(
                 AgentActivityLog.market_scope == normalize_market_scope(market_scope),

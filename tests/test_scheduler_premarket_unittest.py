@@ -98,6 +98,7 @@ class SchedulerStartupExecutionTest(unittest.IsolatedAsyncioTestCase):
         settings.ENABLED_MARKETS = "US"
         self.scheduler._market_open_scan = AsyncMock()
         self.scheduler._post_market_if_needed = AsyncMock()
+        self.scheduler._schedule_startup_recovery = AsyncMock()
 
         with patch("asyncio.sleep", AsyncMock()), \
                 patch("asyncio.create_task", MagicMock()) as create_task, \
@@ -106,6 +107,7 @@ class SchedulerStartupExecutionTest(unittest.IsolatedAsyncioTestCase):
             await self.scheduler._on_startup()
 
         self.scheduler._market_open_scan.assert_not_called()
+        self.scheduler._schedule_startup_recovery.assert_awaited_once()
         self.scheduler._post_market_if_needed.assert_called_once()
         self.assertEqual(create_task.call_count, 1)
         create_task.call_args.args[0].close()
