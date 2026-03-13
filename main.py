@@ -9,6 +9,7 @@ from loguru import logger
 
 from api.router import api_router
 from core.config import settings
+from core.database import validate_database_schema
 from core.events import event_bus
 from core.logging import setup_logging
 from exceptions.common import ServiceException
@@ -23,6 +24,7 @@ from util.time_util import now_kst
 async def lifespan(app: FastAPI):
     setup_logging()
     settings.validate_on_startup()
+    await validate_database_schema()
     # DB 스키마는 Alembic으로 관리: python -m alembic upgrade head
     logger.info("애플리케이션 시작 (ENVIRONMENT={})", settings.ENVIRONMENT)
 
