@@ -366,6 +366,20 @@ async def trigger_agent_cycle(market: str | None = Query(None)):
 
     market_code = market or settings.primary_market_code
     market_label = "US" if market_code in ("NASDAQ", "NYSE", "AMEX") else "KRX"
+    preview = await trading_agent.preview_cycle(market=market_code)
+
+    if preview.get("skipped"):
+        reason = preview.get("reason", "skipped")
+        return SuccessResponse(
+            data={
+                "market": market_code,
+                "market_scope": preview.get("market_scope"),
+                "trading_date": preview.get("trading_date"),
+                "reason": reason,
+                "skipped": True,
+            },
+            message=f"에이전트 사이클 스킵 ({market_label}, {reason})",
+        )
 
     await activity_logger.log(
         ActivityType.EVENT, ActivityPhase.PROGRESS,
@@ -374,7 +388,16 @@ async def trigger_agent_cycle(market: str | None = Query(None)):
 
     # 비동기로 실행 (즉시 응답)
     asyncio.create_task(trading_agent.run_cycle(market=market_code))
-    return SuccessResponse(message=f"에이전트 사이클이 트리거되었습니다 ({market_label})")
+    return SuccessResponse(
+        data={
+            "market": market_code,
+            "market_scope": preview.get("market_scope"),
+            "trading_date": preview.get("trading_date"),
+            "mode": preview.get("mode"),
+            "skipped": False,
+        },
+        message=f"에이전트 사이클이 트리거되었습니다 ({market_label})",
+    )
 
 
 # ── 수동 일일 리포트 생성 ──

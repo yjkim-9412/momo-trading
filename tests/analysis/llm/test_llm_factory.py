@@ -154,8 +154,12 @@ async def test_get_llm_status_uses_selected_provider(monkeypatch):
         "provider": LLMProvider.CODEX_CLI.value,
         "model": "gpt-5.4",
         "reasoning_effort": "medium",
+        "display_name": "후보 분석 에이전트",
+        "short_label": "후보 분석",
+        "description": "차트·시장 컨텍스트를 바탕으로 매수 후보와 목표/손절을 1차 판단",
     }
     assert status["tier2"]["reasoning_effort"] == "high"
+    assert status["tier2"]["display_name"] == "최종 검토 에이전트"
     assert status["session_id"] == "dummy-session"
     assert any(
         item["id"] == LLMProvider.CODEX_CLI.value and item["selected"]

@@ -25,6 +25,18 @@ class LLMFactory:
         LLMProvider.CLAUDE_CODE: "Claude Code (로컬)",
         LLMProvider.CODEX_CLI: "Codex CLI (로컬)",
     }
+    TIER_METADATA = {
+        LLMTier.TIER1: {
+            "display_name": "후보 분석 에이전트",
+            "short_label": "후보 분석",
+            "description": "차트·시장 컨텍스트를 바탕으로 매수 후보와 목표/손절을 1차 판단",
+        },
+        LLMTier.TIER2: {
+            "display_name": "최종 검토 에이전트",
+            "short_label": "최종 검토",
+            "description": "1차 분석 결과를 리스크·포트폴리오 관점에서 재검증해 주문 승인 여부를 결정",
+        },
+    }
 
     def __init__(self):
         self._selected_provider: LLMProvider | None = None
@@ -53,14 +65,21 @@ class LLMFactory:
         provider = self._get_provider(LLMTier.TIER1)
         return cast(type[LLMSessionProtocol], type(provider))
 
+    @classmethod
+    def get_tier_metadata(cls, tier: LLMTier) -> dict[str, str]:
+        """Tier별 사용자 표시 메타데이터 반환"""
+        return dict(cls.TIER_METADATA[tier])
+
     @staticmethod
     def _serialize_tier_status(provider: LLMProviderProtocol) -> dict[str, Any]:
         """Tier별 provider 상태 직렬화"""
-        return {
+        tier_status = {
             "provider": provider.provider.value,
             "model": provider.configured_model,
             "reasoning_effort": provider.configured_reasoning_effort,
         }
+        tier_status.update(LLMFactory.get_tier_metadata(provider.tier))
+        return tier_status
 
     async def generate(
         self,
