@@ -2,7 +2,7 @@
 import asyncio
 import json
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pandas as pd
 from loguru import logger
@@ -226,7 +226,7 @@ class TradingAgent:
 
             # 3. 포트폴리오 스냅샷 (병렬 분석 전 공유 상태 조회, MCP 1회)
             from trading.account_manager import account_manager
-            snapshot = {
+            snapshot: dict = {
                 "cash": 0, "total_asset": 0,
                 "holding_count": 0, "today_trade_count": 0,
             }
@@ -263,7 +263,7 @@ class TradingAgent:
 
             # 4. 후보 종목별 심층 분석 + 전략 평가 + 매매 (병렬)
             # 세션 일시 중지 → 각 종목 분석은 독립 호출 (병렬 가능)
-            # 스크리닝 맥락은 self._market_context로 프롬프트에 전달됨
+            # 스크리닝 맥락은 state.market_context로 프롬프트에 전달됨
             paused_sid = llm_factory.pause_session()
 
             semaphore = asyncio.Semaphore(3)
@@ -379,6 +379,7 @@ class TradingAgent:
         strategy_type = stock_info.get("strategy_type", "STABLE_SHORT")
         market_code = normalize_market(stock_info.get("market", settings.primary_market_code))
         cached_product = self._get_product_metadata(symbol, market_code)
+        mkt_state = self._get_state(market_code)
 
         result = {"symbol": symbol, "signal": False, "executed": False}
 
@@ -542,8 +543,8 @@ class TradingAgent:
         analysis = await self._tier1_analysis(
             symbol, name, current_price, chart_result,
             price_resp.data or {}, feedback_context,
-            market_context=self._market_context,
-            trading_context=self._trading_context,
+            market_context=mkt_state.market_context,
+            trading_context=mkt_state.trading_context,
             cycle_id=cycle_id,
         )
         t1_elapsed = activity_logger.elapsed_ms(t1_timer)
@@ -651,8 +652,8 @@ class TradingAgent:
                     code_rr = code_reward / code_risk
                     rr_overrides = active_rules.get("rr_floor_overrides", {})
                     min_rr = rr_overrides.get(
-                        self._market_regime,
-                        risk_manager.RR_FLOOR.get(self._market_regime, 1.2),
+                        mkt_state.market_regime,
+                        risk_manager.RR_FLOOR.get(mkt_state.market_regime, 1.2),
                     )
                     if code_rr < min_rr:
                         await activity_logger.log(
@@ -687,7 +688,7 @@ class TradingAgent:
         # 3d. Tier 2 최종 검토 (또는 fast-path 스킵)
         skip_tier2 = (
             tier1_confidence >= 0.80
-            and self._market_regime in ("THEME", "BULL")
+            and mkt_state.market_regime in ("THEME", "BULL")
             and analysis.get("recommendation") == "BUY"
         )
 
@@ -701,13 +702,13 @@ class TradingAgent:
                 "target_price": analysis.get("target_price"),
                 "stop_loss_price": analysis.get("stop_loss_price"),
                 "trailing_stop_pct": analysis.get("trailing_stop_pct", 0),
-                "reason": f"Tier2 fast-path: Tier1 신뢰도 {tier1_confidence:.0%} + {self._market_regime} 국면",
+                "reason": f"Tier2 fast-path: Tier1 신뢰도 {tier1_confidence:.0%} + {mkt_state.market_regime} 국면",
                 "provider": "fast-path",
             }
             await activity_logger.log(
                 ActivityType.TIER2_REVIEW, ActivityPhase.COMPLETE,
                 f"\u26a1 [{name}] Tier2 스킵: fast-path "
-                f"(신뢰도 {tier1_confidence:.0%}, {self._market_regime} 국면)",
+                f"(신뢰도 {tier1_confidence:.0%}, {mkt_state.market_regime} 국면)",
                 cycle_id=cycle_id, symbol=symbol,
                 detail={"approved": True, "skip_reason": "fast-path"},
                 llm_tier="TIER2",
@@ -725,8 +726,8 @@ class TradingAgent:
                 feedback_context=feedback_context,
                 chart_result=chart_result,
                 dynamic_limits=dynamic_limits,
-                market_context=self._market_context,
-                trading_context=self._trading_context,
+                market_context=mkt_state.market_context,
+                trading_context=mkt_state.trading_context,
                 portfolio_snapshot=portfolio_snapshot,
                 cycle_id=cycle_id,
             )
@@ -828,7 +829,7 @@ class TradingAgent:
             if not strategy:
                 return result
 
-            signal = await strategy.evaluate(analysis_for_strategy, market_regime=self._market_regime)
+            signal = await strategy.evaluate(analysis_for_strategy, market_regime=mkt_state.market_regime)
             if not signal or signal.action == SignalAction.HOLD:
                 await activity_logger.log(
                     ActivityType.STRATEGY_EVAL, ActivityPhase.COMPLETE,
@@ -886,7 +887,7 @@ class TradingAgent:
             current_holding_count=snap.get("holding_count", 0),
             cycle_id=cycle_id,
             dynamic_limits=dynamic_limits,
-            market_regime=self._market_regime,
+            market_regime=mkt_state.market_regime,
         )
 
         if not risk_result.get("approved"):
@@ -904,7 +905,7 @@ class TradingAgent:
             "ai_stop_loss_price": analysis.get("stop_loss_price"),
             "entry_rsi": indicators.get("rsi_14"),
             "entry_macd_hist": indicators.get("macd_histogram"),
-            "market_regime": self._market_regime,
+            "market_regime": mkt_state.market_regime,
             "strategy_type": strategy_type,
             "stock_name": name,
             "market": market_code,
@@ -925,8 +926,10 @@ class TradingAgent:
 
         return result
 
-    async def _run_after_hours_cycle(self) -> dict:
+    async def _run_after_hours_cycle(self, market: str | None = None) -> dict:
         """장외 사이클: 오늘 데이트레이딩 성과 리뷰 (피드백 학습용)"""
+        target = normalize_market(market or settings.primary_market_code)
+
         from trading.account_manager import account_manager
         from util.time_util import now_kst
 
@@ -949,10 +952,10 @@ class TradingAgent:
 
         try:
             # 1. 오늘 시장 마감 데이터 수집 (MCP)
-            market_close_data, volume_rank_data, surge_data, drop_data = await self._collect_market_close_data()
+            market_close_data, volume_rank_data, surge_data, drop_data = await self._collect_market_close_data(target)
 
             # 2. 포트폴리오 현황 (데이트레이딩이면 청산 완료 상태)
-            balance = await account_manager.get_balance(settings.primary_market_code)
+            balance = await account_manager.get_balance(target)
 
             effective_cash = balance.effective_cash
             cash_ratio = 0.0
@@ -1158,7 +1161,7 @@ class TradingAgent:
         self._last_cycle_time = now_kst()
         elapsed = activity_logger.elapsed_ms(cycle_timer)
 
-        next_open = market_calendar.next_market_open(market=settings.primary_market_code)
+        next_open = market_calendar.next_market_open(market=target)
         await event_bus.publish(Event(
             type=EventType.AGENT_CYCLE_END, data=results, source="trading_agent",
         ))
@@ -1171,7 +1174,7 @@ class TradingAgent:
             execution_time_ms=elapsed,
         )
         llm_factory.end_session()
-        self._last_session_id = None
+        self._get_state(target).last_session_id = None
 
         logger.info("=== Agent 장 마감 리뷰 종료 ===")
         return results
@@ -1224,7 +1227,7 @@ class TradingAgent:
                     session.add(report)
                     logger.info("일일 리포트 생성 완료: {}", report_date)
 
-    async def _collect_market_close_data(self) -> tuple[str, str, str, str]:
+    async def _collect_market_close_data(self, market: str | None = None) -> tuple[str, str, str, str]:
         """오늘 시장 마감 데이터 수집 (MCP) — 장외 리뷰용
 
         Returns:
@@ -1237,7 +1240,7 @@ class TradingAgent:
 
         try:
             # 병렬로 시장 데이터 수집
-            primary_market = settings.primary_market_code
+            primary_market = normalize_market(market or settings.primary_market_code)
             volume_resp, surge_resp, drop_resp = await asyncio.gather(
                 mcp_client.get_volume_rank(market=primary_market),
                 mcp_client.get_fluctuation_rank(market=primary_market, sort="top"),
@@ -1376,30 +1379,34 @@ class TradingAgent:
 
         return "\n".join(parts)
 
-    async def _build_trading_context(self) -> str:
+    async def _build_trading_context(self, market: str | None = None) -> str:
         """데이트레이딩 컨텍스트 (프롬프트 주입용)"""
         from util.time_util import now_kst
         from trading.account_manager import account_manager
         from zoneinfo import ZoneInfo
 
-        now = now_kst().astimezone(ZoneInfo(market_timezone(settings.primary_market_code)))
+        target = normalize_market(market or settings.primary_market_code)
+        state = self._get_state(target)
+        mkt_cfg = settings.get_market_config(target)
+
+        now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
 
         # 강제 청산까지 남은 분
         close_time = now.replace(
-            hour=settings.FORCE_LIQUIDATION_HOUR,
-            minute=settings.FORCE_LIQUIDATION_MINUTE,
+            hour=mkt_cfg["force_liquidation_hour"],
+            minute=mkt_cfg["force_liquidation_minute"],
             second=0, microsecond=0,
         )
         minutes_left = max(0, int((close_time - now).total_seconds() / 60))
 
         # 일일 손익
         daily_pnl_pct = 0.0
-        if self._daily_start_balance > 0:
+        if state.daily_start_balance > 0:
             try:
-                balance = await account_manager.get_balance(settings.primary_market_code)
+                balance = await account_manager.get_balance(target)
                 daily_pnl_pct = (
-                    (balance.total_asset - self._daily_start_balance)
-                    / self._daily_start_balance * 100
+                    (balance.total_asset - state.daily_start_balance)
+                    / state.daily_start_balance * 100
                 )
             except Exception:
                 pass
@@ -1663,18 +1670,19 @@ class TradingAgent:
         if not self._running:
             return
 
+        symbol = event.data.get("symbol", "")
+        market_code = normalize_market(event.data.get("market", settings.primary_market_code))
+
         # 데이트레이딩: 매수 마감 시간 이후 신규 매수 이벤트 무시
         if settings.DAY_TRADING_ONLY:
             from datetime import time as _dt_time
             from util.time_util import now_kst
             from zoneinfo import ZoneInfo
-            cutoff = _dt_time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
-            market_now = now_kst().astimezone(ZoneInfo(market_timezone(settings.primary_market_code)))
+            mkt_cfg = settings.get_market_config(market_code)
+            cutoff = _dt_time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
+            market_now = now_kst().astimezone(ZoneInfo(market_timezone(market_code)))
             if market_now.time() >= cutoff:
                 return
-
-        symbol = event.data.get("symbol", "")
-        market_code = normalize_market(event.data.get("market", settings.primary_market_code))
         if not symbol:
             return
 
@@ -1706,7 +1714,8 @@ class TradingAgent:
         # 즉시 분석 + 매매 (비동기)
         try:
             # 실시간 이벤트에서도 트레이딩 컨텍스트 갱신
-            self._trading_context = await self._build_trading_context()
+            event_state = self._get_state(market_code)
+            event_state.trading_context = await self._build_trading_context(market_code)
 
             product_metadata = self._get_product_metadata(symbol, market_code)
             stock_info = {
@@ -1729,7 +1738,7 @@ class TradingAgent:
                     return
                 # 인스턴스 트래커의 현금을 사용 (병렬 매수 추적)
                 async with self._cash_lock:
-                    snapshot["cash"] = self._available_cash
+                    snapshot["cash"] = event_state.available_cash
                 snapshot["total_asset"] = balance.total_asset
                 snapshot["holding_count"] = len(holdings)
                 snapshot["holding_symbols"] = [(h.market, h.symbol) for h in holdings]
@@ -1749,26 +1758,27 @@ class TradingAgent:
                 try:
                     from strategy.ai_risk_tuner import ai_risk_tuner
                     dynamic_limits = await ai_risk_tuner.compute_limits(
+                        market=market_code,
                         risk_appetite=settings.RISK_APPETITE, cycle_id=cycle_id,
                     )
                 except Exception:
                     pass
 
-                result = await self._analyze_and_trade(
-                    stock_info, cycle_id,
-                    dynamic_limits=dynamic_limits,
-                    portfolio_snapshot=snapshot,
-                )
+            result = await self._analyze_and_trade(
+                stock_info, cycle_id,
+                dynamic_limits=dynamic_limits,
+                portfolio_snapshot=snapshot,
+            )
             if result.get("executed"):
                 logger.info("실시간 매매 실행: {} ({})", symbol, event_type)
                 # 체결 금액 인스턴스 트래커에서 차감
                 order_amount = result.get("order_amount", 0)
                 if order_amount > 0:
                     async with self._cash_lock:
-                        self._available_cash -= order_amount
+                        event_state.available_cash -= order_amount
                         logger.debug(
                             "[{}] 실시간 주문 {:,.0f}원 차감 → 잔여 현금 {:,.0f}원",
-                            symbol, order_amount, self._available_cash,
+                            symbol, order_amount, event_state.available_cash,
                         )
                 # 신규 매수 종목 WebSocket 구독 추가
                 await self._ensure_realtime_subscription(symbol, market=market_code)

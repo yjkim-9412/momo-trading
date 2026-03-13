@@ -1,6 +1,9 @@
-"""트레이딩 에이전트 스케줄러 — KRX 데이트레이딩 자동 운영
+"""트레이딩 에이전트 스케줄러 — 멀티마켓 자동 운영
 
-타임라인 (KST):
+각 활성 시장(ENABLED_MARKETS)별로 독립된 잡 세트를 등록하여
+KRX와 US 등을 동시에 자동 매매할 수 있다.
+
+타임라인 예시 — KRX (Asia/Seoul):
   08:50  장 시작 전 준비 — 어제 리뷰 피드백 확인
   09:00  KRX 개장
   09:05  장 시작 스캔 → 종목 선정 → 실시간 모니터링 돌입
@@ -14,6 +17,16 @@
   16:00  포트폴리오 정산 (KIS ↔ DB 동기화)
   16:30  일봉 데이터 보관용 수집
 
+타임라인 예시 — US (America/New_York):
+  09:20  장 시작 전 준비
+  09:35  장 시작 스캔
+  10:30~15:30  보유종목 점검 (1시간 간격)
+  11:00/13:00  장중 재스캔
+  15:40  강제 청산
+  16:10  장 마감 리뷰
+  16:30  포트폴리오 정산
+  17:00  일봉 데이터 수집
+
 ※ DAY_TRADING_ONLY=true: 당일 매수→당일 청산 필수 (오버나이트 없음)
 ※ DAY_TRADING_ONLY=false: 스윙 모드 — 유망 종목 오버나이트 보유 (스마트 청산)
 """
@@ -25,10 +38,10 @@ from trading.enums import ActivityPhase, ActivityType
 
 
 class TradingScheduler:
-    """KRX 장 시간 기반 자동 운영 스케줄러"""
+    """멀티마켓 자동 운영 스케줄러"""
 
     def __init__(self):
-        self.scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
+        self.scheduler = AsyncIOScheduler()  # 잡별 timezone 사용
         self._running = False
 
     async def start(self) -> None:
@@ -53,121 +66,131 @@ class TradingScheduler:
     def _setup_jobs(self) -> None:
         from scheduler.jobs.portfolio_sync_job import portfolio_sync_job
         from scheduler.jobs.market_data_job import market_data_job
-        from trading.market_profile import is_us_market, market_timezone
+        from trading.market_profile import is_us_market, market_timezone, normalize_market
         from zoneinfo import ZoneInfo
 
-        primary_market = settings.primary_market_code
-        job_timezone = ZoneInfo(market_timezone(primary_market))
-        is_us_primary = is_us_market(primary_market)
+        for market_group in settings.enabled_market_groups:
+            market = normalize_market(market_group)
+            tz = ZoneInfo(market_timezone(market))
+            is_us = is_us_market(market)
+            mkt_cfg = settings.get_market_config(market)
+            label = market  # 잡 ID 서픽스
 
-        pre_market_hour, pre_market_minute = (9, 20) if is_us_primary else (8, 50)
-        market_open_hour, market_open_minute = (9, 35) if is_us_primary else (9, 5)
-        holdings_hours = "10-15" if is_us_primary else "9-14"
-        force_hour, force_minute = (15, 40) if is_us_primary else (
-            settings.FORCE_LIQUIDATION_HOUR,
-            settings.FORCE_LIQUIDATION_MINUTE,
-        )
-        post_market_hour, post_market_minute = (16, 10) if is_us_primary else (15, 40)
-        portfolio_sync_hour, portfolio_sync_minute = (16, 30) if is_us_primary else (16, 0)
-        market_data_hour, market_data_minute = (17, 0) if is_us_primary else (16, 30)
+            # 시장별 시간 계산
+            pre_h, pre_m = (9, 20) if is_us else (8, 50)
+            open_h, open_m = (9, 35) if is_us else (9, 5)
+            holdings_hours = "10-15" if is_us else "9-14"
+            force_h = mkt_cfg["force_liquidation_hour"]
+            force_m = mkt_cfg["force_liquidation_minute"]
+            post_h, post_m = (16, 10) if is_us else (15, 40)
+            sync_h, sync_m = (16, 30) if is_us else (16, 0)
+            data_h, data_m = (17, 0) if is_us else (16, 30)
 
-        # ── 장 시작 전 준비 (08:50 평일) — KRX 개장 10분 전 ──
-        self.scheduler.add_job(
-            self._pre_market,
-            "cron",
-            hour=pre_market_hour, minute=pre_market_minute,
-            day_of_week="mon-fri",
-            timezone=job_timezone,
-            id="pre_market",
-            name="장 시작 전 준비",
-            misfire_grace_time=600,
-        )
+            # ── 장 시작 전 준비 ──
+            self.scheduler.add_job(
+                self._pre_market,
+                "cron",
+                args=[market],
+                hour=pre_h, minute=pre_m,
+                day_of_week="mon-fri",
+                timezone=tz,
+                id=f"pre_market_{label}",
+                name=f"장 시작 전 준비 ({label})",
+                misfire_grace_time=600,
+            )
 
-        # ── 장 시작 스캔 (09:05 평일) — 전체 시장 스캔 → 종목 선정 → 매매 시작 ──
-        self.scheduler.add_job(
-            self._market_open_scan,
-            "cron",
-            hour=market_open_hour, minute=market_open_minute,
-            day_of_week="mon-fri",
-            timezone=job_timezone,
-            id="market_open_scan",
-            name="장 시작 스캔 + 매매",
-            misfire_grace_time=600,
-        )
+            # ── 장 시작 스캔 ──
+            self.scheduler.add_job(
+                self._market_open_scan,
+                "cron",
+                args=[market],
+                hour=open_h, minute=open_m,
+                day_of_week="mon-fri",
+                timezone=tz,
+                id=f"market_open_scan_{label}",
+                name=f"장 시작 스캔 + 매매 ({label})",
+                misfire_grace_time=600,
+            )
 
-        # ── 장중 재스캔 (11:00, 13:00 평일) — 새로운 기회 탐색 ──
-        self.scheduler.add_job(
-            self._intraday_rescan,
-            "cron",
-            hour="11,13", minute=0,
-            day_of_week="mon-fri",
-            timezone=job_timezone,
-            id="intraday_rescan",
-            name="장중 재스캔",
-            misfire_grace_time=600,
-        )
+            # ── 장중 재스캔 ──
+            self.scheduler.add_job(
+                self._intraday_rescan,
+                "cron",
+                args=[market],
+                hour="11,13", minute=0,
+                day_of_week="mon-fri",
+                timezone=tz,
+                id=f"intraday_rescan_{label}",
+                name=f"장중 재스캔 ({label})",
+                misfire_grace_time=600,
+            )
 
-        # ── 장중 보유종목 점검 (1시간 간격, 09:00~15:00) — WebSocket 보완용 안전망 ──
-        self.scheduler.add_job(
-            self._holdings_check,
-            "cron",
-            minute="30",
-            hour=holdings_hours,
-            day_of_week="mon-fri",
-            timezone=job_timezone,
-            id="holdings_check",
-            name="보유종목 손절/익절 점검",
-            misfire_grace_time=300,
-        )
+            # ── 장중 보유종목 점검 ──
+            self.scheduler.add_job(
+                self._holdings_check,
+                "cron",
+                args=[market],
+                minute="30",
+                hour=holdings_hours,
+                day_of_week="mon-fri",
+                timezone=tz,
+                id=f"holdings_check_{label}",
+                name=f"보유종목 손절/익절 점검 ({label})",
+                misfire_grace_time=300,
+            )
 
-        # ── 장 마감 전 청산 (15:10 평일) — DAY_TRADING: 전량 매도 / 스윙: 스마트 청산 ──
-        self.scheduler.add_job(
-            self._force_liquidation,
-            "cron",
-            hour=force_hour,
-            minute=force_minute,
-            day_of_week="mon-fri",
-            timezone=job_timezone,
-            id="force_liquidation",
-            name="장 마감 전 청산",
-            misfire_grace_time=300,
-        )
+            # ── 장 마감 전 청산 ──
+            self.scheduler.add_job(
+                self._force_liquidation,
+                "cron",
+                args=[market],
+                hour=force_h,
+                minute=force_m,
+                day_of_week="mon-fri",
+                timezone=tz,
+                id=f"force_liquidation_{label}",
+                name=f"장 마감 전 청산 ({label})",
+                misfire_grace_time=300,
+            )
 
-        # ── 장 마감 리뷰 (15:40 평일) — KRX 종가 기반 성과 리뷰 ──
-        self.scheduler.add_job(
-            self._post_market,
-            "cron",
-            hour=post_market_hour, minute=post_market_minute,
-            day_of_week="mon-fri",
-            timezone=job_timezone,
-            id="post_market",
-            name="장 마감 성과 리뷰",
-            misfire_grace_time=3600,
-        )
+            # ── 장 마감 리뷰 ──
+            self.scheduler.add_job(
+                self._post_market,
+                "cron",
+                args=[market],
+                hour=post_h, minute=post_m,
+                day_of_week="mon-fri",
+                timezone=tz,
+                id=f"post_market_{label}",
+                name=f"장 마감 성과 리뷰 ({label})",
+                misfire_grace_time=3600,
+            )
 
-        # ── 포트폴리오 정산 (16:00) ──
-        self.scheduler.add_job(
-            portfolio_sync_job,
-            "cron",
-            hour=portfolio_sync_hour, minute=portfolio_sync_minute,
-            timezone=job_timezone,
-            id="portfolio_sync",
-            name="포트폴리오 정산",
-            misfire_grace_time=3600,
-        )
+            # ── 포트폴리오 정산 ──
+            self.scheduler.add_job(
+                portfolio_sync_job,
+                "cron",
+                args=[market],
+                hour=sync_h, minute=sync_m,
+                timezone=tz,
+                id=f"portfolio_sync_{label}",
+                name=f"포트폴리오 정산 ({label})",
+                misfire_grace_time=3600,
+            )
 
-        # ── 일봉 데이터 수집 (16:30) ──
-        self.scheduler.add_job(
-            market_data_job,
-            "cron",
-            hour=market_data_hour, minute=market_data_minute,
-            timezone=job_timezone,
-            id="market_data",
-            name="일봉 데이터 수집",
-            misfire_grace_time=3600,
-        )
+            # ── 일봉 데이터 수집 ──
+            self.scheduler.add_job(
+                market_data_job,
+                "cron",
+                args=[market],
+                hour=data_h, minute=data_m,
+                timezone=tz,
+                id=f"market_data_{label}",
+                name=f"일봉 데이터 수집 ({label})",
+                misfire_grace_time=3600,
+            )
 
-        # ── 만료 추천 정리 (1시간 간격) ──
+        # ── 만료 추천 정리 (시장 무관, 1개만) ──
         self.scheduler.add_job(
             self._expire_recommendations,
             "interval",
@@ -182,37 +205,51 @@ class TradingScheduler:
         """서버 기동 시 현재 시간대에 맞는 초기 작업 실행"""
         import asyncio
         from scheduler.market_calendar import market_calendar
+        from trading.market_profile import normalize_market
 
         # 기동 직후 약간의 딜레이 (MCP 연결 안정화)
         await asyncio.sleep(3)
 
-        if market_calendar.is_primary_market_trading_hours():
-            logger.info("서버 기동: 장중 → 즉시 시장 스캔 + 매매 시작")
-            asyncio.create_task(self._market_open_scan())
-        else:
-            next_open = market_calendar.next_market_open(market=settings.primary_market_code)
-            logger.info("서버 기동: 장외 → 다음 장 시작: {}", next_open.strftime("%m/%d %H:%M"))
+        # 활성 시장 중 현재 장중인 시장을 찾아 즉시 스캔
+        found_open = False
+        for market_group in settings.enabled_market_groups:
+            market = normalize_market(market_group)
+            if market_calendar.is_trading_hours(market):
+                logger.info("서버 기동: {} 장중 → 즉시 시장 스캔 + 매매 시작", market)
+                asyncio.create_task(self._market_open_scan(market))
+                found_open = True
+
+        if not found_open:
+            # 모두 장외면 각 시장의 다음 개장 시간 로깅
+            for market_group in settings.enabled_market_groups:
+                market = normalize_market(market_group)
+                next_open = market_calendar.next_market_open(market=market)
+                logger.info(
+                    "서버 기동: {} 장외 → 다음 장 시작: {}",
+                    market, next_open.strftime("%m/%d %H:%M"),
+                )
             # 장외 기동 시 리뷰가 아직 안 되었으면 실행
             asyncio.create_task(self._post_market_if_needed())
 
-    async def _pre_market(self) -> None:
-        """장 시작 전 준비 (08:50) — 어제 리뷰 피드백 확인"""
+    async def _pre_market(self, market: str) -> None:
+        """장 시작 전 준비 — 어제 리뷰 피드백 확인"""
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
+        from trading.market_profile import market_timezone
 
-        if market_calendar.is_primary_market_holiday():
-            holiday_name = market_calendar.get_holiday_name(market=settings.primary_market_code) or "공휴일"
-            logger.info("오늘은 휴장일 ({}) — 장 시작 전 준비 스킵", holiday_name)
+        if market_calendar.is_holiday(market):
+            holiday_name = market_calendar.get_holiday_name(market=market) or "공휴일"
+            logger.info("[{}] 오늘은 휴장일 ({}) — 장 시작 전 준비 스킵", market, holiday_name)
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                f"\U0001f3d6\ufe0f 오늘은 휴장일 ({holiday_name}) — 매매 스킵",
+                f"\U0001f3d6\ufe0f [{market}] 오늘은 휴장일 ({holiday_name}) — 매매 스킵",
             )
             return
 
-        logger.info("=== 장 시작 전 준비 (08:50) ===")
+        logger.info("=== [{}] 장 시작 전 준비 ===", market)
         await activity_logger.log(
             ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-            "\u2615 장 시작 전 준비 — 10분 후 KRX 개장",
+            f"\u2615 [{market}] 장 시작 전 준비 — 곧 개장",
         )
 
         # 1. 일일 기준 자산 설정 (데이트레이딩 손익 계산용)
@@ -220,34 +257,36 @@ class TradingScheduler:
             from agent.trading_agent import trading_agent
             from trading.account_manager import account_manager
 
-            balance = await account_manager.get_balance(settings.primary_market_code)
-            trading_agent._daily_start_balance = balance.total_asset
-            logger.info("일일 기준 자산 설정: {:,.0f}원", balance.total_asset)
+            balance = await account_manager.get_balance(market)
+            trading_agent._get_state(market).daily_start_balance = balance.total_asset
+            logger.info("[{}] 일일 기준 자산 설정: {:,.0f}원", market, balance.total_asset)
         except Exception as e:
-            logger.warning("기준 자산 설정 실패: {}", str(e))
+            logger.warning("[{}] 기준 자산 설정 실패: {}", market, str(e))
 
         # 2. 어제 리뷰 피드백 확인 (AI 학습용)
         try:
             from datetime import timedelta
+            from zoneinfo import ZoneInfo
             from util.time_util import now_kst
             from core.database import AsyncSessionLocal
             from repositories.daily_report_repository import DailyReportRepository
 
-            yesterday = (now_kst() - timedelta(days=1)).date()
+            tz = ZoneInfo(market_timezone(market))
+            yesterday = (now_kst().astimezone(tz) - timedelta(days=1)).date()
             async with AsyncSessionLocal() as session:
                 repo = DailyReportRepository(session)
                 report = await repo.get_by_date(yesterday)
                 if report and report.lessons_learned:
                     await activity_logger.log(
                         ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                        f"\U0001f4cb 어제 리뷰 피드백: {report.lessons_learned[:200]}",
+                        f"\U0001f4cb [{market}] 어제 리뷰 피드백: {report.lessons_learned[:200]}",
                     )
         except Exception as e:
-            logger.debug("어제 리뷰 로드 실패: {}", str(e))
+            logger.debug("[{}] 어제 리뷰 로드 실패: {}", market, str(e))
 
         # 3. 오버나이트 포지션 점검 (스윙 모드)
         if not settings.DAY_TRADING_ONLY:
-            await self._check_overnight_positions()
+            await self._check_overnight_positions(market)
 
         # 4. 활성 트레이딩 규칙 로드 + 적용 (일일 리뷰 피드백 자동 학습)
         try:
@@ -272,7 +311,7 @@ class TradingScheduler:
                 )
                 await activity_logger.log(
                     ActivityType.TRADING_RULE, ActivityPhase.COMPLETE,
-                    f"📋 트레이딩 규칙 {len(rules)}건 적용: {rule_summary}",
+                    f"📋 [{market}] 트레이딩 규칙 {len(rules)}건 적용: {rule_summary}",
                 )
                 await trading_rule_engine.record_application(
                     [r.id for r in rules]
@@ -280,12 +319,12 @@ class TradingScheduler:
 
             expired = await trading_rule_engine.expire_old_rules()
             if expired:
-                logger.info("만료된 트레이딩 규칙 {}건 비활성화", expired)
+                logger.info("[{}] 만료된 트레이딩 규칙 {}건 비활성화", market, expired)
         except Exception as e:
-            logger.warning("트레이딩 규칙 로드 실패: {}", str(e))
+            logger.warning("[{}] 트레이딩 규칙 로드 실패: {}", market, str(e))
 
-    async def _market_open_scan(self) -> None:
-        """장 시작 직후 (09:05) — 전체 시장 스캔 → 종목 선정 → 매매
+    async def _market_open_scan(self, market: str) -> None:
+        """장 시작 직후 — 전체 시장 스캔 → 종목 선정 → 매매
 
         AI Agent가 전체 시장 데이터를 받아서 어떤 종목에 투자할지 판단하고,
         선정된 종목을 WebSocket 실시간 구독에 등록하여 이후 이벤트 기반 매매.
@@ -294,34 +333,34 @@ class TradingScheduler:
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
 
-        if market_calendar.is_primary_market_holiday():
-            logger.info("휴장일 — 장 시작 스캔 스킵")
+        if market_calendar.is_holiday(market):
+            logger.info("[{}] 휴장일 — 장 시작 스캔 스킵", market)
             return
 
-        logger.info("=== 장 시작 첫 스캔 (09:05) — 전체 시장 분석 + 매매 시작 ===")
+        logger.info("=== [{}] 장 시작 첫 스캔 — 전체 시장 분석 + 매매 시작 ===", market)
         await activity_logger.log(
             ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-            "\U0001f514 장 시작! 전체 시장 스캔 → AI 종목 선정 → 분석/매매 시작",
+            f"\U0001f514 [{market}] 장 시작! 전체 시장 스캔 → AI 종목 선정 → 분석/매매 시작",
         )
 
         try:
             # 0. 오버나이트 포지션 갭 체크 (스윙 모드)
             if not settings.DAY_TRADING_ONLY:
-                await self._check_overnight_gap()
+                await self._check_overnight_gap(market)
 
             # 1. AI Agent 매매 사이클 실행 (전체 시장 스캔 → 분석 → 매매)
-            result = await trading_agent.run_cycle()
+            result = await trading_agent.run_cycle(market=market)
 
             # 2. 선정 종목 + 보유종목을 WebSocket 실시간 구독
             selected = result.get("selected_symbols", [])
 
             # 보유종목 추가
             from trading.account_manager import account_manager
-            holdings = await account_manager.get_holdings(settings.primary_market_code)
+            holdings = await account_manager.get_holdings(market)
             holding_symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
 
             # 합치기 (중복 제거, 최대 41)
-            all_symbols = list({(market, symbol): (symbol, market) for symbol, market in selected + holding_symbols}.values())[:41]
+            all_symbols = list({(m, symbol): (symbol, m) for symbol, m in selected + holding_symbols}.values())[:41]
 
             if all_symbols:
                 from realtime.stream_manager import stream_manager
@@ -329,15 +368,15 @@ class TradingScheduler:
 
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                f"\u2705 장 시작 완료 — 분석 {result.get('analyzed', 0)}건, "
+                f"\u2705 [{market}] 장 시작 완료 — 분석 {result.get('analyzed', 0)}건, "
                 f"매매 {result.get('executed', 0)}건, "
                 f"실시간 감시 {len(all_symbols)}종목 → 모니터링 돌입",
             )
         except Exception as e:
-            logger.error("장 시작 스캔 오류: {}", str(e))
+            logger.error("[{}] 장 시작 스캔 오류: {}", market, str(e))
 
-    async def _intraday_rescan(self) -> None:
-        """장중 재스캔 (11:00, 13:00) — 새로운 기회 탐색
+    async def _intraday_rescan(self, market: str) -> None:
+        """장중 재스캔 — 새로운 기회 탐색
 
         기존 run_cycle()을 재사용하여 시장 재스캔 → 분석 → 매매.
         cycle_lock이 잡혀있으면 자동 스킵.
@@ -346,90 +385,101 @@ class TradingScheduler:
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
         from util.time_util import now_kst
+        from trading.market_profile import market_timezone
+        from zoneinfo import ZoneInfo
 
-        if market_calendar.is_primary_market_holiday():
+        if market_calendar.is_holiday(market):
             return
 
         # 매수 마감 시간 이후면 재스캔 불필요
         if settings.DAY_TRADING_ONLY:
             from datetime import time as _time
-            cutoff = _time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
-            if now_kst().time() >= cutoff:
-                logger.info("매수 마감 시간 경과 → 장중 재스캔 스킵")
+            mkt_cfg = settings.get_market_config(market)
+            cutoff = _time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
+            tz = ZoneInfo(market_timezone(market))
+            market_now = now_kst().astimezone(tz)
+            if market_now.time() >= cutoff:
+                logger.info("[{}] 매수 마감 시간 경과 → 장중 재스캔 스킵", market)
                 return
 
-        logger.info("=== 장중 재스캔 시작 ({}) ===", now_kst().strftime("%H:%M"))
+        tz = ZoneInfo(market_timezone(market))
+        market_now = now_kst().astimezone(tz)
+        logger.info("=== [{}] 장중 재스캔 시작 ({}) ===", market, market_now.strftime("%H:%M"))
         await activity_logger.log(
             ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-            f"\U0001f504 장중 재스캔 시작 ({now_kst().strftime('%H:%M')}) — 새로운 기회 탐색",
+            f"\U0001f504 [{market}] 장중 재스캔 시작 ({market_now.strftime('%H:%M')}) — 새로운 기회 탐색",
         )
 
         try:
-            result = await trading_agent.run_cycle()
+            result = await trading_agent.run_cycle(market=market)
 
             # 선정 종목 WebSocket 구독 갱신
             selected = result.get("selected_symbols", [])
             if selected:
                 from trading.account_manager import account_manager
                 from realtime.stream_manager import stream_manager
-                holdings = await account_manager.get_holdings(settings.primary_market_code)
+                holdings = await account_manager.get_holdings(market)
                 holding_symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
-                all_symbols = list({(market, symbol): (symbol, market) for symbol, market in selected + holding_symbols}.values())[:41]
+                all_symbols = list({(m, symbol): (symbol, m) for symbol, m in selected + holding_symbols}.values())[:41]
                 if all_symbols:
                     await stream_manager.update_subscriptions(all_symbols)
 
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                f"\u2705 장중 재스캔 완료 — 분석 {result.get('analyzed', 0)}건, "
+                f"\u2705 [{market}] 장중 재스캔 완료 — 분석 {result.get('analyzed', 0)}건, "
                 f"매매 {result.get('executed', 0)}건",
             )
         except Exception as e:
-            logger.error("장중 재스캔 오류: {}", str(e))
+            logger.error("[{}] 장중 재스캔 오류: {}", market, str(e))
 
-    async def _update_realtime_subscriptions(self) -> None:
+    async def _update_realtime_subscriptions(self, market: str) -> None:
         """보유종목 WebSocket 구독 갱신 (임계값은 AI가 설정)"""
         try:
             from trading.account_manager import account_manager
             from realtime.stream_manager import stream_manager
 
-            holdings = await account_manager.get_holdings(settings.primary_market_code)
+            holdings = await account_manager.get_holdings(market)
             if holdings:
                 symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
                 await stream_manager.update_subscriptions(symbols)
-                logger.info("WebSocket 구독 갱신: {}종목", len(symbols))
+                logger.info("[{}] WebSocket 구독 갱신: {}종목", market, len(symbols))
         except Exception as e:
-            logger.warning("WebSocket 구독 갱신 실패: {}", str(e))
+            logger.warning("[{}] WebSocket 구독 갱신 실패: {}", market, str(e))
 
-    async def _holdings_check(self) -> None:
+    async def _holdings_check(self, market: str) -> None:
         """보유종목 현재가 점검 — WebSocket 보완용 안전망 + 시간 기반 조기 청산
 
         WebSocket 끊김이나 누락 대비, MCP로 보유종목 현재가를 직접 조회하여
         손절/익절 조건을 체크한다. 데이트레이딩 모드에서는 잔여 시간에 따라
-        조기 익절/손절도 실행한다. KRX 장중(09:00~15:30)에만 작동.
+        조기 익절/손절도 실행한다. 해당 시장 장중에만 작동.
         """
         from scheduler.market_calendar import market_calendar
-        if not market_calendar.is_primary_market_trading_hours():
+        if not market_calendar.is_trading_hours(market):
             return
 
         from services.activity_logger import activity_logger
         from util.time_util import now_kst
+        from trading.market_profile import market_timezone
+        from zoneinfo import ZoneInfo
 
         try:
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
 
-            holdings = await account_manager.get_holdings(settings.primary_market_code)
+            holdings = await account_manager.get_holdings(market)
             if not holdings:
                 return
 
             # 구독 갱신 (WebSocket 연결 복원 대비)
-            await self._update_realtime_subscriptions()
+            await self._update_realtime_subscriptions(market)
 
-            # 강제 청산까지 남은 시간 계산
-            now = now_kst()
+            # 강제 청산까지 남은 시간 계산 (시장 현지 시간 기준)
+            mkt_cfg = settings.get_market_config(market)
+            tz = ZoneInfo(market_timezone(market))
+            now = now_kst().astimezone(tz)
             close_time = now.replace(
-                hour=settings.FORCE_LIQUIDATION_HOUR,
-                minute=settings.FORCE_LIQUIDATION_MINUTE,
+                hour=mkt_cfg["force_liquidation_hour"],
+                minute=mkt_cfg["force_liquidation_minute"],
                 second=0, microsecond=0,
             )
             minutes_left = max(0, int((close_time - now).total_seconds() / 60))
@@ -506,59 +556,70 @@ class TradingScheduler:
             if alerts:
                 await activity_logger.log(
                     ActivityType.HOLDINGS_CHECK, ActivityPhase.PROGRESS,
-                    f"\U0001f50d 보유종목 점검 (잔여 {minutes_left}분):\n" + "\n".join(alerts),
+                    f"\U0001f50d [{market}] 보유종목 점검 (잔여 {minutes_left}분):\n" + "\n".join(alerts),
                 )
         except Exception as e:
-            logger.warning("보유종목 점검 오류: {}", str(e))
+            logger.warning("[{}] 보유종목 점검 오류: {}", market, str(e))
 
-    async def _post_market(self) -> None:
-        """장 마감 성과 리뷰 (15:40, KRX 종가 기반)"""
+    async def _post_market(self, market: str) -> None:
+        """장 마감 성과 리뷰"""
         from agent.trading_agent import trading_agent
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
 
-        if market_calendar.is_primary_market_holiday():
-            logger.info("휴장일 — 장 마감 리뷰 스킵")
+        if market_calendar.is_holiday(market):
+            logger.info("[{}] 휴장일 — 장 마감 리뷰 스킵", market)
             return
 
-        logger.info("=== 장 마감 리뷰 시작 (15:40) ===")
+        logger.info("=== [{}] 장 마감 리뷰 시작 ===", market)
         await activity_logger.log(
             ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-            "\U0001f319 장 마감 — 오늘 매매 성과 리뷰 시작",
+            f"\U0001f319 [{market}] 장 마감 — 오늘 매매 성과 리뷰 시작",
         )
 
         try:
-            await trading_agent.run_cycle()  # 장외이므로 자동으로 _run_after_hours_cycle 실행
+            await trading_agent.run_cycle(market=market)  # 장외이므로 자동으로 _run_after_hours_cycle 실행
         except Exception as e:
-            logger.error("장 마감 리뷰 오류: {}", str(e))
+            logger.error("[{}] 장 마감 리뷰 오류: {}", market, str(e))
 
     async def _post_market_if_needed(self) -> None:
-        """장외 기동 시 오늘 리뷰가 아직 안 되었으면 실행"""
-        try:
-            from util.time_util import now_kst
-            from core.database import AsyncSessionLocal
-            from repositories.daily_report_repository import DailyReportRepository
+        """장외 기동 시 오늘 리뷰가 아직 안 되었으면 각 시장별로 실행"""
+        from trading.market_profile import normalize_market
 
-            today = now_kst().date()
-            async with AsyncSessionLocal() as session:
-                repo = DailyReportRepository(session)
-                existing = await repo.get_by_date(today)
-                if existing:
-                    logger.info("오늘 리포트 이미 존재 — 장외 리뷰 스킵")
-                    return
+        for market_group in settings.enabled_market_groups:
+            market = normalize_market(market_group)
+            try:
+                await self._post_market_if_needed_for(market)
+            except Exception as e:
+                logger.warning("[{}] 장외 리뷰 체크 실패: {}", market, str(e))
 
-            # 거래일이고 15:30 이후면 리뷰 실행
-            now = now_kst()
-            from datetime import time
-            from scheduler.market_calendar import market_calendar
-            if market_calendar.is_trading_day(settings.primary_market_code, now) and now.time() > time(15, 30):
-                logger.info("오늘 리뷰 미완료 — 장외 리뷰 실행")
-                from agent.trading_agent import trading_agent
-                await trading_agent.run_cycle()
-        except Exception as e:
-            logger.warning("장외 리뷰 체크 실패: {}", str(e))
+    async def _post_market_if_needed_for(self, market: str) -> None:
+        """특정 시장의 장외 리뷰가 아직 안 되었으면 실행"""
+        from util.time_util import now_kst
+        from core.database import AsyncSessionLocal
+        from repositories.daily_report_repository import DailyReportRepository
+        from scheduler.market_calendar import market_calendar
+        from trading.market_profile import market_timezone
+        from zoneinfo import ZoneInfo
 
-    async def _force_liquidation(self) -> None:
+        tz = ZoneInfo(market_timezone(market))
+        market_now = now_kst().astimezone(tz)
+        today = market_now.date()
+
+        async with AsyncSessionLocal() as session:
+            repo = DailyReportRepository(session)
+            existing = await repo.get_by_date(today)
+            if existing:
+                logger.info("[{}] 오늘 리포트 이미 존재 — 장외 리뷰 스킵", market)
+                return
+
+        # 거래일이고 장 마감 이후면 리뷰 실행
+        if market_calendar.is_trading_day(market, market_now) and not market_calendar.is_trading_hours(market):
+            logger.info("[{}] 오늘 리뷰 미완료 — 장외 리뷰 실행", market)
+            from agent.trading_agent import trading_agent
+            await trading_agent.run_cycle(market=market)
+
+    async def _force_liquidation(self, market: str) -> None:
         """장 마감 전 청산
 
         DAY_TRADING_ONLY=True: 보유종목 전량 시장가 매도 (기존 동작)
@@ -568,22 +629,22 @@ class TradingScheduler:
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
 
-        if market_calendar.is_primary_market_holiday():
+        if market_calendar.is_holiday(market):
             return
 
         if not settings.TRADING_ENABLED:
-            logger.info("매매 비활성 — 청산 스킵")
+            logger.info("[{}] 매매 비활성 — 청산 스킵", market)
             return
 
         try:
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
 
-            holdings = await account_manager.get_holdings(settings.primary_market_code)
+            holdings = await account_manager.get_holdings(market)
             if not holdings:
                 await activity_logger.log(
                     ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                    "\u2705 보유종목 없음 — 청산 불필요",
+                    f"\u2705 [{market}] 보유종목 없음 — 청산 불필요",
                 )
                 return
 
@@ -593,17 +654,17 @@ class TradingScheduler:
 
             # 스윙 모드: 종목별 HOLD/SELL 판정
             if not settings.DAY_TRADING_ONLY:
-                to_sell, to_hold = await self._smart_liquidation(sellable)
+                to_sell, to_hold = await self._smart_liquidation(sellable, market)
             else:
                 to_sell = sellable
                 to_hold = []
 
             mode_label = "스마트 청산" if not settings.DAY_TRADING_ONLY else "강제 청산"
-            logger.warning("=== 장 마감 전 {} 시작 (매도 {}건, HOLD {}건) ===",
-                           mode_label, len(to_sell), len(to_hold))
+            logger.warning("=== [{}] 장 마감 전 {} 시작 (매도 {}건, HOLD {}건) ===",
+                           market, mode_label, len(to_sell), len(to_hold))
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                f"\U0001f6a8 {mode_label} — 매도 {len(to_sell)}건, HOLD {len(to_hold)}건",
+                f"\U0001f6a8 [{market}] {mode_label} — 매도 {len(to_sell)}건, HOLD {len(to_hold)}건",
             )
 
             if not to_sell:
@@ -628,8 +689,8 @@ class TradingScheduler:
             failed_holdings = []
 
             for r in results:
-                if isinstance(r, Exception):
-                    logger.error("청산 주문 오류: {}", str(r))
+                if isinstance(r, BaseException):
+                    logger.error("[{}] 청산 주문 오류: {}", market, str(r))
                     continue
 
                 resp, h = r
@@ -638,28 +699,28 @@ class TradingScheduler:
                     pnl_text = f"{h.pnl_rate:+.1f}%" if hasattr(h, "pnl_rate") else ""
                     await activity_logger.log(
                         ActivityType.ORDER, ActivityPhase.COMPLETE,
-                        f"\U0001f6a8 청산: {h.name}({h.symbol}) "
+                        f"\U0001f6a8 [{market}] 청산: {h.name}({h.symbol}) "
                         f"{h.quantity}주 시장가 매도 {pnl_text}",
                         symbol=h.symbol,
                     )
                 else:
                     failed_holdings.append(h)
                     logger.error(
-                        "청산 실패: {}({}) — {}",
-                        h.name, h.symbol, resp.error or "알 수 없는 오류",
+                        "[{}] 청산 실패: {}({}) — {}",
+                        market, h.name, h.symbol, resp.error or "알 수 없는 오류",
                     )
                     await activity_logger.log(
                         ActivityType.ORDER, ActivityPhase.ERROR,
-                        f"\u274c 청산 실패: {h.name}({h.symbol}) — {resp.error or ''}",
+                        f"\u274c [{market}] 청산 실패: {h.name}({h.symbol}) — {resp.error or ''}",
                         symbol=h.symbol,
                     )
 
             # 실패 종목 2차 재시도 (5초 후)
             if failed_holdings:
-                logger.warning("청산 {}건 실패 → 5초 후 재시도", len(failed_holdings))
+                logger.warning("[{}] 청산 {}건 실패 → 5초 후 재시도", market, len(failed_holdings))
                 await activity_logger.log(
                     ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                    f"\u26a0\ufe0f 청산 {len(failed_holdings)}건 실패 → 5초 후 재시도",
+                    f"\u26a0\ufe0f [{market}] 청산 {len(failed_holdings)}건 실패 → 5초 후 재시도",
                 )
                 await asyncio.sleep(5)
                 retry_results = await asyncio.gather(
@@ -667,17 +728,17 @@ class TradingScheduler:
                     return_exceptions=True,
                 )
                 for r in retry_results:
-                    if isinstance(r, Exception):
-                        logger.error("청산 재시도 오류: {}", str(r))
+                    if isinstance(r, BaseException):
+                        logger.error("[{}] 청산 재시도 오류: {}", market, str(r))
                         continue
                     resp, h = r
                     if resp.success:
                         sold_count += 1
-                        logger.info("청산 재시도 성공: {}({})", h.name, h.symbol)
+                        logger.info("[{}] 청산 재시도 성공: {}({})", market, h.name, h.symbol)
                     else:
-                        logger.error("청산 재시도 실패: {}({}) — {}", h.name, h.symbol, resp.error or "")
+                        logger.error("[{}] 청산 재시도 실패: {}({}) — {}", market, h.name, h.symbol, resp.error or "")
 
-            summary = f"\U0001f6a8 {mode_label} 완료: {sold_count}건 매도"
+            summary = f"\U0001f6a8 [{market}] {mode_label} 완료: {sold_count}건 매도"
             if to_hold:
                 hold_names = ", ".join(f"{h.name}" for h in to_hold)
                 summary += f" | HOLD {len(to_hold)}건: {hold_names}"
@@ -693,13 +754,13 @@ class TradingScheduler:
                     event_detector.remove_levels(h.symbol, market=h.market)
 
         except Exception as e:
-            logger.error("청산 오류: {}", str(e))
+            logger.error("[{}] 청산 오류: {}", market, str(e))
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.ERROR,
-                f"\u274c 청산 오류: {str(e)[:100]}",
+                f"\u274c [{market}] 청산 오류: {str(e)[:100]}",
             )
 
-    async def _smart_liquidation(self, sellable: list) -> tuple[list, list]:
+    async def _smart_liquidation(self, sellable: list, market: str) -> tuple[list, list]:
         """스윙 모드: 종목별 HOLD/SELL 판정 (코드 룰 기반)
 
         Returns:
@@ -726,7 +787,7 @@ class TradingScheduler:
 
                     if current_price <= 0:
                         to_sell.append(h)
-                        logger.warning("현재가 조회 실패 {} → SELL", h.symbol)
+                        logger.warning("[{}] 현재가 조회 실패 {} → SELL", market, h.symbol)
                         continue
 
                     # TradeResult (미청산 매수)
@@ -738,18 +799,18 @@ class TradingScheduler:
 
                     if decision.action == "HOLD":
                         to_hold.append(h)
-                        logger.info("스마트 청산 HOLD: {} — {}", h.symbol, decision.reason)
+                        logger.info("[{}] 스마트 청산 HOLD: {} — {}", market, h.symbol, decision.reason)
                     else:
                         to_sell.append(h)
-                        logger.info("스마트 청산 SELL: {} — {}", h.symbol, decision.reason)
+                        logger.info("[{}] 스마트 청산 SELL: {} — {}", market, h.symbol, decision.reason)
                 except Exception as e:
                     to_sell.append(h)
-                    logger.warning("스마트 청산 판정 오류 {} → SELL: {}", h.symbol, str(e))
+                    logger.warning("[{}] 스마트 청산 판정 오류 {} → SELL: {}", market, h.symbol, str(e))
 
         return to_sell, to_hold
 
-    async def _check_overnight_positions(self) -> None:
-        """오버나이트 포지션 프리마켓 점검 (08:50)
+    async def _check_overnight_positions(self, market: str) -> None:
+        """오버나이트 포지션 프리마켓 점검
 
         서버 재시작 대비 event_detector 임계값 재설정 + 보유일 경고.
         """
@@ -789,7 +850,7 @@ class TradingScheduler:
                         f"{tr.stock_name}({tr.stock_symbol}): 보유 {hold_days}일 ≥ 최대 {max_days}일"
                     )
 
-            msg = f"\U0001f30d 오버나이트 포지션 {len(open_positions)}건 점검"
+            msg = f"\U0001f30d [{market}] 오버나이트 포지션 {len(open_positions)}건 점검"
             if restored:
                 msg += f" | 임계값 복원 {restored}건"
             if warnings:
@@ -800,10 +861,10 @@ class TradingScheduler:
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS, msg,
             )
         except Exception as e:
-            logger.warning("오버나이트 포지션 점검 오류: {}", str(e))
+            logger.warning("[{}] 오버나이트 포지션 점검 오류: {}", market, str(e))
 
-    async def _check_overnight_gap(self) -> None:
-        """장 시작 갭 체크 (09:05) — 오버나이트 포지션 손절/익절 즉시 처리"""
+    async def _check_overnight_gap(self, market: str) -> None:
+        """장 시작 갭 체크 — 오버나이트 포지션 손절/익절 즉시 처리"""
         from services.activity_logger import activity_logger
 
         try:
@@ -812,7 +873,7 @@ class TradingScheduler:
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
 
-            holdings = await account_manager.get_holdings(settings.primary_market_code)
+            holdings = await account_manager.get_holdings(market)
             if not holdings:
                 return
 
@@ -865,13 +926,13 @@ class TradingScheduler:
                     alerts.append(f"\u26a0\ufe0f {h.name}({h.symbol}): {reason} (TRADING_ENABLED=false)")
 
             if alerts:
-                msg = "\U0001f30d 오버나이트 갭 체크:\n" + "\n".join(alerts)
+                msg = f"\U0001f30d [{market}] 오버나이트 갭 체크:\n" + "\n".join(alerts)
                 logger.info(msg)
                 await activity_logger.log(
                     ActivityType.SCHEDULE, ActivityPhase.PROGRESS, msg,
                 )
         except Exception as e:
-            logger.warning("오버나이트 갭 체크 오류: {}", str(e))
+            logger.warning("[{}] 오버나이트 갭 체크 오류: {}", market, str(e))
 
     async def _expire_recommendations(self) -> None:
         """만료된 추천 처리"""
