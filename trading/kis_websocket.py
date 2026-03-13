@@ -38,7 +38,11 @@ class KISWebSocket:
     async def connect(self) -> None:
         """WebSocket 연결 시작"""
         self._running = True
+        self._approval_key = None
         await self._get_approval_key()
+        if not self._approval_key:
+            self._running = False
+            raise ConnectionError("WebSocket approval key 발급 실패")
         logger.info("KIS WebSocket 연결 시작")
 
     async def disconnect(self) -> None:
@@ -55,19 +59,39 @@ class KISWebSocket:
     async def _get_approval_key(self) -> None:
         """WebSocket 접속 키 발급"""
         import httpx
+
+        base_url = (
+            "https://openapivts.koreainvestment.com:29443"
+            if settings.is_paper_trading
+            else "https://openapi.koreainvestment.com:9443"
+        )
+        if settings.is_paper_trading:
+            app_key = settings.KIS_PAPER_APP_KEY or settings.KIS_APP_KEY
+            app_secret = settings.KIS_PAPER_APP_SECRET or settings.KIS_APP_SECRET
+        else:
+            app_key = settings.KIS_APP_KEY
+            app_secret = settings.KIS_APP_SECRET
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/plain",
+            "charset": "UTF-8",
+        }
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    "https://openapi.koreainvestment.com:9443/oauth2/Approval",
+                    f"{base_url}/oauth2/Approval",
+                    headers=headers,
                     json={
                         "grant_type": "client_credentials",
-                        "appkey": settings.KIS_PAPER_APP_KEY if settings.is_paper_trading else settings.KIS_APP_KEY,
-                        "secretkey": settings.KIS_PAPER_APP_SECRET if settings.is_paper_trading else settings.KIS_APP_SECRET,
+                        "appkey": app_key,
+                        "secretkey": app_secret,
                     },
                 )
                 if resp.status_code == 200:
                     self._approval_key = resp.json().get("approval_key")
                     logger.debug("WebSocket approval key 발급 완료")
+                else:
+                    logger.warning("WebSocket approval key 발급 실패: HTTP {} - {}", resp.status_code, resp.text[:200])
         except Exception as e:
             logger.warning("WebSocket approval key 발급 실패: {}", str(e))
 

@@ -28,7 +28,9 @@ class StreamManager:
             self._listen_task = asyncio.create_task(self._run_listener())
             logger.info("스트림 매니저 시작")
         except Exception as e:
+            self._running = False
             logger.warning("WebSocket 연결 실패 (나중에 재시도): {}", str(e))
+            raise
 
     async def stop(self) -> None:
         """스트림 관리 중지"""
