@@ -2,6 +2,7 @@
 import asyncio
 import json
 from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import pandas as pd
 from loguru import logger
@@ -27,6 +28,22 @@ from strategy.stable_short import StableShortStrategy
 from trading.enums import ActivityPhase, ActivityType, LLMTier, SignalAction, SignalUrgency
 from trading.market_profile import market_currency, market_timezone, normalize_market
 from trading.mcp_client import mcp_client
+from trading.product_policy import (
+    classification_from_metadata,
+    coerce_strategy_for_product,
+    is_product_trade_allowed,
+)
+
+
+@dataclass
+class MarketState:
+    """시장별 격리 상태 (KRX/US 동시 운영 지원)"""
+    market_context: str = ""
+    market_regime: str = ""
+    trading_context: str = ""
+    daily_start_balance: float = 0.0
+    available_cash: float = 0.0
+    last_session_id: str | None = None
 
 
 class TradingAgent:
@@ -50,19 +67,47 @@ class TradingAgent:
         self._analyzing: set[str] = set()
         self._cooldowns: dict[str, float] = {}  # symbol -> last_trigger_time
         self.EVENT_COOLDOWN_SEC = 120  # 동일 종목 재분석 최소 간격 (초)
-        # 사이클 내 시장 컨텍스트 캐시 (Tier1/Tier2에 전달)
-        self._market_context: str = ""
-        # 시장 국면 (전략/리스크에 전달)
-        self._market_regime: str = ""
-        # 데이트레이딩 컨텍스트 캐시 (시간/손익/매매성적)
-        self._trading_context: str = ""
-        # 데이트레이딩 일일 기준 자산 (손익 계산용)
-        self._daily_start_balance: float = 0.0
-        # LLM 세션 ID (장중 → 장외 이어받기용)
-        self._last_session_id: str | None = None
-        # 병렬/다중경로 매수 시 잔고 이중사용 방지
-        self._available_cash: float = 0.0
+        # 시장별 격리 상태 (KRX/US 동시 운영 지원)
+        self._market_states: dict[str, MarketState] = {}
+        # 병렬/다중경로 매수 시 잔고 이중사용 방지 (시간대 겹침 없으므로 글로벌)
         self._cash_lock = asyncio.Lock()
+        # 종목별 상품 메타데이터 캐시 (실시간 이벤트 경로 재사용)
+        self._product_metadata: dict[str, dict] = {}
+
+    @staticmethod
+    def _instrument_key(symbol: str, market: str) -> str:
+        return f"{normalize_market(market)}:{str(symbol).upper()}"
+
+    def _get_product_metadata(self, symbol: str, market: str) -> dict:
+        return dict(self._product_metadata.get(self._instrument_key(symbol, market), {}))
+
+    def _remember_product_metadata(self, symbol: str, market: str, metadata: dict | None) -> None:
+        if not symbol or not metadata:
+            return
+
+        key = self._instrument_key(symbol, market)
+        current = self._product_metadata.get(key, {})
+        merged = {**current}
+        for field_name in (
+            "name",
+            "category",
+            "product_type",
+            "is_leveraged",
+            "is_inverse",
+            "classification_source",
+        ):
+            value = metadata.get(field_name)
+            if value not in (None, ""):
+                merged[field_name] = value
+        if merged:
+            self._product_metadata[key] = merged
+
+    def _get_state(self, market: str) -> MarketState:
+        """시장별 격리 상태 조회 (없으면 자동 생성)"""
+        m = normalize_market(market)
+        if m not in self._market_states:
+            self._market_states[m] = MarketState()
+        return self._market_states[m]
 
     async def start(self) -> None:
         """에이전트 시작 - 실시간 이벤트 구독"""
@@ -80,14 +125,16 @@ class TradingAgent:
         self._analyzing.clear()
         logger.info("AI Trading Agent 중지")
 
-    async def run_cycle(self) -> dict:
+    async def run_cycle(self, market: str | None = None) -> dict:
         """에이전트 1회 실행 사이클 — 장중이면 매매, 장외면 리뷰"""
         if self._cycle_lock.locked():
             logger.warning("사이클 이미 실행 중 — 중복 트리거 무시")
             return {"skipped": True, "reason": "cycle_already_running"}
 
+        target = normalize_market(market or settings.primary_market_code)
+
         async with self._cycle_lock:
-            if market_calendar.is_primary_market_trading_hours():
+            if market_calendar.is_trading_hours(target):
                 # 데이트레이딩 모드: 매수 마감 시간 이후 신규 매수 차단
                 # 스윙 모드: 오버나이트 보유 가능 → 장 마감(15:20)까지 매수 허용
                 if settings.DAY_TRADING_ONLY:
@@ -95,8 +142,9 @@ class TradingAgent:
                     from util.time_util import now_kst
                     from zoneinfo import ZoneInfo
 
-                    cutoff = _time(settings.BUY_CUTOFF_HOUR, settings.BUY_CUTOFF_MINUTE)
-                    market_now = now_kst().astimezone(ZoneInfo(market_timezone(settings.primary_market_code)))
+                    mkt_cfg = settings.get_market_config(target)
+                    cutoff = _time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
+                    market_now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
                     if market_now.time() >= cutoff:
                         logger.info("매수 마감 시간({}) 경과 → 신규 매매 사이클 스킵", cutoff)
                         await activity_logger.log(
@@ -105,12 +153,15 @@ class TradingAgent:
                             "신규 매수 차단, 보유종목 모니터링만 유지",
                         )
                         return {"skipped": True, "reason": "buy_cutoff"}
-                return await self._run_trading_cycle()
+                return await self._run_trading_cycle(target)
             else:
-                return await self._run_after_hours_cycle()
+                return await self._run_after_hours_cycle(target)
 
-    async def _run_trading_cycle(self) -> dict:
+    async def _run_trading_cycle(self, market: str | None = None) -> dict:
         """장중 사이클: 스캔 → 분석 → 매매"""
+        target = normalize_market(market or settings.primary_market_code)
+        state = self._get_state(target)
+
         llm_factory.start_session()
 
         cycle_id = activity_logger.start_cycle()
@@ -134,6 +185,7 @@ class TradingAgent:
             try:
                 from strategy.ai_risk_tuner import ai_risk_tuner
                 dynamic_limits = await ai_risk_tuner.compute_limits(
+                    market=target,
                     risk_appetite=settings.RISK_APPETITE,
                     cycle_id=cycle_id,
                 )
@@ -142,7 +194,7 @@ class TradingAgent:
 
         try:
             # 1. 시장 스캔 + 종목 선별 (통합 1회 LLM 호출)
-            scan_result = await market_scanner.scan(cycle_id=cycle_id, dynamic_limits=dynamic_limits)
+            scan_result = await market_scanner.scan(market=target, cycle_id=cycle_id, dynamic_limits=dynamic_limits)
             candidates = scan_result.get("selected", [])
             results["scanned"] = len(candidates)
 
@@ -157,11 +209,11 @@ class TradingAgent:
                 return results
 
             # 1b. 시장 국면 + 컨텍스트 빌드 (Tier1/Tier2/전략/리스크에 전달)
-            self._market_regime = scan_result.get("market_regime", "")
-            self._market_context = self._build_market_context(scan_result)
+            state.market_regime = scan_result.get("market_regime", "")
+            state.market_context = self._build_market_context(scan_result)
 
             # 1c. 데이트레이딩 컨텍스트 빌드 (시간/손익/매매성적)
-            self._trading_context = await self._build_trading_context()
+            state.trading_context = await self._build_trading_context(target)
 
             # 선정 종목을 결과에 저장 (WebSocket 구독용)
             results["selected_symbols"] = [
@@ -179,7 +231,7 @@ class TradingAgent:
                 "holding_count": 0, "today_trade_count": 0,
             }
             try:
-                balance, holdings = await account_manager.get_account_snapshot(settings.primary_market_code)
+                balance, holdings = await account_manager.get_account_snapshot(target)
                 if not balance.is_valid:
                     logger.error("계좌 조회 실패 → 매매 사이클 중단")
                     await activity_logger.log(
@@ -188,20 +240,26 @@ class TradingAgent:
                         cycle_id=cycle_id,
                     )
                     return results
-                snapshot["cash"] = balance.cash
+                snapshot["cash"] = balance.effective_cash
                 snapshot["total_asset"] = balance.total_asset
                 snapshot["holding_count"] = len(holdings)
                 snapshot["holding_symbols"] = [(h.market, h.symbol) for h in holdings]
                 snapshot["today_trade_count"] = await self._get_today_trade_count()
+                for holding in holdings:
+                    self._remember_product_metadata(
+                        holding.symbol,
+                        holding.market,
+                        {"name": holding.name},
+                    )
                 # 인스턴스 레벨 현금 트래커 갱신
                 async with self._cash_lock:
-                    self._available_cash = balance.cash
+                    state.available_cash = balance.effective_cash
             except Exception as e:
                 logger.warning("포트폴리오 스냅샷 조회 실패, 기본값 사용: {}", str(e))
 
             # 일일 기준 자산 설정 (첫 사이클에서만)
-            if self._daily_start_balance == 0 and snapshot["total_asset"] > 0:
-                self._daily_start_balance = snapshot["total_asset"]
+            if state.daily_start_balance == 0 and snapshot["total_asset"] > 0:
+                state.daily_start_balance = snapshot["total_asset"]
 
             # 4. 후보 종목별 심층 분석 + 전략 평가 + 매매 (병렬)
             # 세션 일시 중지 → 각 종목 분석은 독립 호출 (병렬 가능)
@@ -222,14 +280,14 @@ class TradingAgent:
                 async with semaphore:
                     # 잔고 사전 확인 — 최소 주문금액 미달 시 스킵
                     async with self._cash_lock:
-                        if self._available_cash < eff_min_order_amount:
+                        if state.available_cash < eff_min_order_amount:
                             logger.info(
                                 "[{}] 현금 부족으로 스킵: {:,.0f} < {:,.0f}",
                                 stock_info.get("symbol", "?"),
-                                self._available_cash, eff_min_order_amount,
+                                state.available_cash, eff_min_order_amount,
                             )
                             return {"skipped": True, "reason": "현금 부족"}
-                        local_snapshot = {**snapshot, "cash": self._available_cash}
+                        local_snapshot = {**snapshot, "cash": state.available_cash}
 
                     r = await self._analyze_and_trade(
                         stock_info, cycle_id,
@@ -243,11 +301,11 @@ class TradingAgent:
                         order_amount = r.get("order_amount", 0)
                         if order_amount > 0:
                             async with self._cash_lock:
-                                self._available_cash -= order_amount
+                                state.available_cash -= order_amount
                                 logger.debug(
                                     "[{}] 주문 {:,.0f}원 차감 → 잔여 현금 {:,.0f}원",
                                     stock_info.get("symbol", "?"),
-                                    order_amount, self._available_cash,
+                                    order_amount, state.available_cash,
                                 )
                     return r
 
@@ -304,7 +362,7 @@ class TradingAgent:
             execution_time_ms=elapsed,
         )
         # 세션 종료 (세션 ID 보존 — 장외 사이클에서 재개 가능)
-        self._last_session_id = llm_factory.end_session()
+        state.last_session_id = llm_factory.end_session()
 
         logger.info("=== Agent 장중 사이클 종료: {} ===", results)
         return results
@@ -320,6 +378,7 @@ class TradingAgent:
         name = stock_info.get("name", symbol)
         strategy_type = stock_info.get("strategy_type", "STABLE_SHORT")
         market_code = normalize_market(stock_info.get("market", settings.primary_market_code))
+        cached_product = self._get_product_metadata(symbol, market_code)
 
         result = {"symbol": symbol, "signal": False, "executed": False}
 
@@ -353,11 +412,66 @@ class TradingAgent:
         price_krw = 0.0
         if price_resp.success and price_resp.data:
             current_price = float(price_resp.data.get("price", price_resp.data.get("current_price", 0)))
+            name = str(price_resp.data.get("name") or cached_product.get("name") or name)
             currency = price_resp.data.get("currency", currency)
             exchange_rate_to_krw = float(price_resp.data.get("exchange_rate_to_krw", 1.0) or 1.0)
             price_krw = float(price_resp.data.get("price_krw", current_price * exchange_rate_to_krw) or 0.0)
         else:
             logger.warning("[{}] 현재가 조회 실패: {}", symbol, price_resp.error or "응답 없음")
+
+        product_metadata = {
+            **cached_product,
+            "name": stock_info.get("name") or cached_product.get("name") or name,
+            "category": stock_info.get("category") or cached_product.get("category")
+            or ((price_resp.data or {}).get("category") if price_resp.success and price_resp.data else ""),
+            "product_type": stock_info.get("product_type") or cached_product.get("product_type"),
+            "is_leveraged": stock_info.get("is_leveraged", cached_product.get("is_leveraged")),
+            "is_inverse": stock_info.get("is_inverse", cached_product.get("is_inverse")),
+            "classification_source": stock_info.get("classification_source")
+            or cached_product.get("classification_source"),
+        }
+        classification = classification_from_metadata(symbol, market_code, product_metadata)
+        product_metadata = {
+            **product_metadata,
+            **classification.to_metadata(),
+            "name": classification.name or name,
+            "category": classification.category,
+        }
+        self._remember_product_metadata(symbol, market_code, product_metadata)
+        stock_info.update(product_metadata)
+        name = product_metadata.get("name", name) or name
+
+        effective_strategy = coerce_strategy_for_product(strategy_type, classification)
+        if not effective_strategy:
+            await activity_logger.log(
+                ActivityType.RISK_GATE, ActivityPhase.SKIP,
+                f"🚫 [{name}] 제한 상품 허용 전략 미설정",
+                cycle_id=cycle_id, symbol=symbol,
+                detail=product_metadata,
+            )
+            return result
+
+        if effective_strategy != strategy_type:
+            logger.info(
+                "제한 상품 전략 조정: {} {} {} → {}",
+                market_code, symbol, strategy_type, effective_strategy,
+            )
+            strategy_type = effective_strategy
+            stock_info["strategy_type"] = effective_strategy
+
+        allowed, policy_reason = is_product_trade_allowed(
+            classification,
+            strategy_type=strategy_type,
+            session=market_calendar.get_market_session(market=market_code),
+        )
+        if not allowed:
+            await activity_logger.log(
+                ActivityType.RISK_GATE, ActivityPhase.SKIP,
+                f"🚫 [{name}] 제한 상품 정책 차단: {policy_reason}",
+                cycle_id=cycle_id, symbol=symbol,
+                detail=product_metadata,
+            )
+            return result
 
         # 3b. DataFrame 변환 + 차트 종합 분석
         daily_df = pd.DataFrame()
@@ -684,6 +798,7 @@ class TradingAgent:
                     "currency": currency,
                     "exchange_rate_to_krw": exchange_rate_to_krw,
                     "price_krw": price_krw or (final["entry_price"] * exchange_rate_to_krw),
+                    **classification.to_metadata(),
                 },
             )
 
@@ -707,6 +822,7 @@ class TradingAgent:
                 "currency": currency,
                 "exchange_rate_to_krw": exchange_rate_to_krw,
                 "price_krw": price_krw,
+                **classification.to_metadata(),
             }
 
             if not strategy:
@@ -738,6 +854,11 @@ class TradingAgent:
                 signal.target_price = final["target_price"]
             if final.get("stop_loss_price"):
                 signal.stop_loss_price = final["stop_loss_price"]
+
+            signal.metadata = {
+                **(signal.metadata or {}),
+                **classification.to_metadata(),
+            }
 
         # AI가 결정한 손절/익절/트레일링 스탑을 event_detector에 설정
         self._apply_trade_thresholds(symbol, analysis, final, market=market_code)
@@ -789,6 +910,9 @@ class TradingAgent:
             "market": market_code,
             "currency": currency,
             "exchange_rate_to_krw": exchange_rate_to_krw,
+            "product_type": product_metadata.get("product_type", "COMMON"),
+            "is_leveraged": bool(product_metadata.get("is_leveraged")),
+            "is_inverse": bool(product_metadata.get("is_inverse")),
         }
         exec_result = await decision_maker.execute(
             signal, cycle_id=cycle_id, analysis_context=analysis_context,
@@ -830,9 +954,10 @@ class TradingAgent:
             # 2. 포트폴리오 현황 (데이트레이딩이면 청산 완료 상태)
             balance = await account_manager.get_balance(settings.primary_market_code)
 
+            effective_cash = balance.effective_cash
             cash_ratio = 0.0
             if balance.total_asset > 0:
-                cash_ratio = (balance.cash / balance.total_asset) * 100
+                cash_ratio = (effective_cash / balance.total_asset) * 100
 
             # 3. 오늘 활동 집계
             today_date = now_kst().date()
@@ -923,7 +1048,7 @@ class TradingAgent:
                 surge_data=surge_data,
                 drop_data=drop_data,
                 total_asset=balance.total_asset,
-                cash=balance.cash,
+                cash=effective_cash,
                 cash_ratio=cash_ratio,
                 stock_value=balance.stock_value,
                 total_pnl=balance.total_pnl,
@@ -1333,6 +1458,7 @@ class TradingAgent:
             symbol = c.get("symbol", "")
             market_code = normalize_market(c.get("market", settings.primary_market_code))
             monitoring = c.get("monitoring")
+            self._remember_product_metadata(symbol, market_code, c)
             if not symbol or not isinstance(monitoring, dict):
                 continue
 
@@ -1582,12 +1708,14 @@ class TradingAgent:
             # 실시간 이벤트에서도 트레이딩 컨텍스트 갱신
             self._trading_context = await self._build_trading_context()
 
+            product_metadata = self._get_product_metadata(symbol, market_code)
             stock_info = {
                 "symbol": symbol,
-                "name": event.data.get("name", symbol),
+                "name": product_metadata.get("name") or event.data.get("name", symbol),
                 "market": market_code,
                 "strategy_type": "AGGRESSIVE_SHORT" if abs(change_rate) >= 5 else "STABLE_SHORT",
                 "trigger": event_type,
+                **product_metadata,
             }
             cycle_id = activity_logger.start_cycle()
 
@@ -1606,6 +1734,12 @@ class TradingAgent:
                 snapshot["holding_count"] = len(holdings)
                 snapshot["holding_symbols"] = [(h.market, h.symbol) for h in holdings]
                 snapshot["today_trade_count"] = await self._get_today_trade_count()
+                for holding in holdings:
+                    self._remember_product_metadata(
+                        holding.symbol,
+                        holding.market,
+                        {"name": holding.name},
+                    )
             except Exception as e:
                 logger.warning("실시간 이벤트 포트폴리오 스냅샷 조회 실패: {}", str(e))
 

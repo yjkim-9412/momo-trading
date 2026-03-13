@@ -116,7 +116,7 @@ class DecisionMaker:
             # 매매불가 종목 → 런타임 블록리스트 등록 (이후 스캔에서 제외)
             if "매매불가" in error_msg:
                 from agent.market_scanner import market_scanner
-                market_scanner.add_untradeable(signal.symbol)
+                market_scanner.add_untradeable(signal.symbol, market=market)
                 logger.warning("매매불가 종목 블록리스트 등록: {} → 이후 스캔에서 제외", signal.symbol)
             await activity_logger.log(
                 ActivityType.DECISION, ActivityPhase.ERROR,
@@ -371,6 +371,9 @@ class DecisionMaker:
             "analysis_id": analysis_id,
             "market": signal.metadata.get("market", "KRX"),
             "currency": signal.metadata.get("currency", "KRW"),
+            "product_type": signal.metadata.get("product_type", "COMMON"),
+            "is_leveraged": bool(signal.metadata.get("is_leveraged")),
+            "is_inverse": bool(signal.metadata.get("is_inverse")),
             "action": signal.action.value,
             "suggested_price": signal.suggested_price or 0,
             "suggested_quantity": signal.suggested_quantity or 0,

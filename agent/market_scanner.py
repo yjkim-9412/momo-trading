@@ -12,11 +12,17 @@ from analysis.llm.prompts.market_scan import (
     get_market_scan_system,
 )
 from core.database import AsyncSessionLocal
+from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
 from trading.market_profile import is_us_market, normalize_market
 from trading.mcp_client import mcp_client
+from trading.product_policy import (
+    classify_product,
+    coerce_strategy_for_product,
+    is_product_trade_allowed,
+)
 
 # 모의투자 매매불가 종목 필터 키워드
 _EXCLUDE_NAME_KEYWORDS = ("ETN", "스팩", "SPAC")
@@ -29,20 +35,29 @@ class MarketScanner:
     """
 
     def __init__(self):
-        self._untradeable_symbols: set[str] = set()
+        self._untradeable_symbols: dict[str, set[str]] = {}
 
-    def add_untradeable(self, symbol: str) -> None:
+    def add_untradeable(self, symbol: str, market: str = "KRX") -> None:
         """매매불가 종목을 런타임 블록리스트에 등록 (당일 스캔에서 제외)"""
-        self._untradeable_symbols.add(symbol)
-        logger.info("매매불가 블록리스트 등록: {} (총 {}건)", symbol, len(self._untradeable_symbols))
+        m = normalize_market(market)
+        self._untradeable_symbols.setdefault(m, set()).add(symbol)
+        logger.info(
+            "매매불가 블록리스트 등록: {}:{} (총 {}건)",
+            m, symbol, sum(len(v) for v in self._untradeable_symbols.values()),
+        )
 
-    def _filter_untradeable(self, stocks: list[dict]) -> list[dict]:
-        """매매불가 종목 필터링 (런타임 블록리스트 + 이름 키워드)"""
+    def _filter_untradeable(self, stocks: list[dict], market: str = "KRX") -> list[dict]:
+        """매매불가 종목 필터링 (런타임 블록리스트 + 이름 키워드)
+
+        Each stock's own ``market`` field is checked first; ``market`` param is the fallback.
+        """
         filtered = []
         for s in stocks:
             name = s.get("name", "")
             symbol = s.get("symbol", "")
-            if symbol in self._untradeable_symbols:
+            item_market = normalize_market(s.get("market", market))
+            blocked = self._untradeable_symbols.get(item_market, set())
+            if symbol in blocked:
                 continue
             if any(kw in name for kw in _EXCLUDE_NAME_KEYWORDS):
                 continue
@@ -51,9 +66,61 @@ class MarketScanner:
             logger.info("매매불가 종목 필터: {}건 → {}건", len(stocks), len(filtered))
         return filtered
 
-    async def scan(self, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
+    def _apply_product_policy(self, selected: list[dict]) -> list[dict]:
+        """레버리지/인버스 상품 정책 적용"""
+        filtered: list[dict] = []
+        dropped = 0
+        adjusted = 0
+
+        for item in selected:
+            symbol = item.get("symbol", "")
+            market_code = normalize_market(item.get("market", settings.primary_market_code))
+            classification = classify_product(
+                symbol=symbol,
+                market=market_code,
+                name=item.get("name", ""),
+                category=item.get("category", ""),
+            )
+            strategy_type = str(item.get("strategy_type") or "STABLE_SHORT").upper()
+            effective_strategy = coerce_strategy_for_product(strategy_type, classification)
+            enriched = {
+                **item,
+                "market": market_code,
+                "strategy_type": effective_strategy or strategy_type,
+                **classification.to_metadata(),
+            }
+
+            allowed, reason = is_product_trade_allowed(
+                classification,
+                strategy_type=effective_strategy or strategy_type,
+                session=market_calendar.get_market_session(market=market_code),
+            )
+            if not allowed:
+                dropped += 1
+                logger.info("상품 정책 제외: {} {} - {}", market_code, symbol, reason)
+                continue
+
+            if effective_strategy and effective_strategy != strategy_type:
+                adjusted += 1
+                logger.info(
+                    "상품 정책 전략 조정: {} {} {} → {}",
+                    market_code, symbol, strategy_type, effective_strategy,
+                )
+                enriched["strategy_type"] = effective_strategy
+
+            filtered.append(enriched)
+
+        if dropped or adjusted:
+            logger.info(
+                "상품 정책 적용: {}건 → {}건 (제외 {}건, 전략 조정 {}건)",
+                len(selected), len(filtered), dropped, adjusted,
+            )
+        return filtered
+
+    async def scan(self, market: str | None = None, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
         """시장 스캔 + 종목 선별 통합 실행"""
-        primary_market = settings.primary_market_code
+        target = normalize_market(market or settings.primary_market_code)
+        primary_market = target
         if is_us_market(primary_market) and not settings.US_TRADING_ENABLED:
             logger.info("미국장 비활성화 → 시장 스캔 스킵")
             return {"selected": [], "market_summary": "미국장 비활성화", "available_cash": 0}
@@ -67,7 +134,7 @@ class MarketScanner:
             cycle_id=cycle_id,
         )
 
-        scan_markets = settings.scan_markets
+        scan_markets = settings.scan_markets_for(target)
         (
             account_snapshot,
             volume_rank,
@@ -75,14 +142,14 @@ class MarketScanner:
             drop_data,
             performance_summary,
         ) = await asyncio.gather(
-            account_manager.get_account_snapshot(primary_market),
+            account_manager.get_account_snapshot(target),
             self._get_volume_rank(scan_markets),
             self._get_fluctuation_rank(scan_markets, "top"),
             self._get_fluctuation_rank(scan_markets, "bottom"),
             self._get_performance_summary(),
         )
         balance, holdings = account_snapshot
-        available_cash = balance.cash
+        available_cash = balance.effective_cash
         max_pos_pct = 0.2
         if dynamic_limits:
             max_pos_pct = dynamic_limits.get("max_position_pct", 20.0) / 100
@@ -97,10 +164,11 @@ class MarketScanner:
         from zoneinfo import ZoneInfo
         from trading.market_profile import market_timezone
 
-        now = now_kst().astimezone(ZoneInfo(market_timezone(primary_market)))
+        now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
+        mkt_cfg = _settings.get_market_config(target)
         cutoff_time = now.replace(
-            hour=_settings.BUY_CUTOFF_HOUR,
-            minute=_settings.BUY_CUTOFF_MINUTE,
+            hour=mkt_cfg["buy_cutoff_hour"],
+            minute=mkt_cfg["buy_cutoff_minute"],
             second=0, microsecond=0,
         )
         minutes_until_cutoff = max(0, int((cutoff_time - now).total_seconds() / 60))
@@ -127,6 +195,7 @@ class MarketScanner:
             selected = parsed.get("selected", [])
             for item in selected:
                 item["market"] = normalize_market(item.get("market", primary_market), default=primary_market)
+            selected = self._apply_product_policy(selected)
             elapsed = activity_logger.elapsed_ms(timer)
 
             logger.info(

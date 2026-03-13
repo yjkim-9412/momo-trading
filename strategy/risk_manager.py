@@ -5,6 +5,7 @@ from core.config import settings
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, SignalAction
+from trading.product_policy import classification_from_metadata, is_product_trade_allowed
 
 
 class RiskManager:
@@ -101,6 +102,27 @@ class RiskManager:
             result = {"approved": False, "reason": "가격 또는 수량이 유효하지 않습니다"}
             await self._log_result(symbol, result, today_trade_count, cycle_id)
             return result
+
+        metadata = signal.metadata or {}
+        market_code = str(metadata.get("market") or "KRX")
+        classification = classification_from_metadata(symbol, market_code, metadata)
+        allowed, policy_reason = is_product_trade_allowed(
+            classification,
+            strategy_type=signal.strategy_type,
+            session=str(metadata.get("session") or ""),
+            side=signal.action.value,
+        )
+        if not allowed:
+            result = {"approved": False, "reason": policy_reason}
+            await self._log_result(symbol, result, today_trade_count, cycle_id)
+            return result
+
+        if classification.is_restricted:
+            leverage_ratio = max(float(settings.US_LEVERAGE_MAX_SINGLE_ORDER_RATIO or 0), 0.0)
+            if eff_max_order > 0 and leverage_ratio > 0:
+                eff_max_order *= leverage_ratio
+            if leverage_ratio > 0:
+                eff_max_pos_pct *= leverage_ratio
 
         unit_price_krw = self._unit_price_krw(signal)
         total_amount = unit_price_krw * quantity
