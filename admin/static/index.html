@@ -19,243 +19,7 @@
       }
     }
   </script>
-  <style>
-    body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
-    .chat-bubble { animation: fadeIn 0.3s ease-out; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-    .detail-content { max-height: 0; overflow: hidden; transition: max-height 0.4s ease-out; }
-    .detail-content.open { max-height: 2000px; overflow-y: auto; }
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: #1a1b2e; }
-    ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-    .confidence-bar { transition: width 0.5s ease-out; }
-    .status-dot { animation: pulse 2s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-
-    /* LLM Conversation */
-    .llm-conversation { display: flex; flex-direction: column; gap: 8px; }
-    .llm-model-tag { display: inline-block; background: #1e293b; color: #94a3b8; font-size: 10px; padding: 2px 8px; border-radius: 4px; margin-bottom: 4px; }
-    .llm-msg { border-left: 3px solid; padding: 6px 10px; border-radius: 4px; }
-    .llm-system { border-color: #a78bfa; background: rgba(167,139,250,0.06); }
-    .llm-user { border-color: #60a5fa; background: rgba(96,165,250,0.06); }
-    .llm-assistant { border-color: #34d399; background: rgba(52,211,153,0.06); }
-    .llm-role { font-size: 10px; font-weight: 600; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
-    .llm-system .llm-role { color: #a78bfa; }
-    .llm-user .llm-role { color: #60a5fa; }
-    .llm-assistant .llm-role { color: #34d399; }
-    .llm-body { white-space: pre-wrap; word-break: break-all; color: #d1d5db; line-height: 1.5; max-height: 300px; overflow-y: auto; }
-
-    /* Progress spinner for in-progress activities */
-    .progress-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #4b5563; border-top-color: #60a5fa; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; vertical-align: middle; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    /* Stock group card & pulsing animation */
-    @keyframes pulseCardRed { 0% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.4); } 70% { box-shadow: 0 0 0 4px rgba(248, 113, 113, 0); } 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0); } }
-    @keyframes pulseCardBlue { 0% { box-shadow: 0 0 0 0 rgba(96, 165, 250, 0.4); } 70% { box-shadow: 0 0 0 4px rgba(96, 165, 250, 0); } 100% { box-shadow: 0 0 0 0 rgba(96, 165, 250, 0); } }
-    
-    .stock-card { border: 1px solid #374151; border-radius: 10px; margin: 4px 0; overflow: hidden; animation: fadeIn 0.3s ease-out; transition: display 0.2s; }
-    .stock-card.outcome-buy { border-left: 3px solid #f87171; animation: fadeIn 0.3s ease-out, pulseCardRed 2s infinite; }
-    .stock-card.outcome-sell { border-left: 3px solid #60a5fa; animation: fadeIn 0.3s ease-out, pulseCardBlue 2s infinite; }
-    .stock-card.outcome-hold { border-left: 3px solid #6b7280; opacity: 0.8; }
-    .stock-card.outcome-error { border-left: 3px solid #fbbf24; opacity: 0.9; }
-    .stock-card.outcome-progress { border-left: 3px solid #a78bfa; }
-    .stock-card-header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; user-select: none; transition: background 0.15s; }
-    .stock-card-header:hover { background: rgba(255,255,255,0.03); }
-    .stock-card-body { max-height: 0; overflow: hidden; transition: max-height 0.3s ease-out; }
-    .stock-card-body.open { max-height: 3000px; overflow-y: auto; }
-    .stock-card-steps { padding: 0 12px 8px 12px; }
-    .stock-step { display: flex; align-items: flex-start; gap: 8px; padding: 4px 0; border-top: 1px solid #1f2937; }
-    .stock-step:first-child { border-top: none; }
-
-    /* Cycle divider */
-    .cycle-divider { display: flex; align-items: center; gap: 8px; padding: 6px 12px; margin: 8px 0 4px 0; color: #6b7280; font-size: 12px; }
-    .cycle-divider::before, .cycle-divider::after { content: ''; flex: 1; height: 1px; background: #374151; }
-
-    /* Market segmented control */
-    .market-seg-track {
-      position: relative;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      background: #151627;
-      border: 1px solid #2a2d45;
-      border-radius: 8px;
-      padding: 3px;
-      gap: 2px;
-      margin-bottom: 6px;
-    }
-    .market-seg-indicator {
-      position: absolute;
-      top: 3px; left: 3px;
-      width: calc(50% - 4px);
-      height: calc(100% - 6px);
-      border-radius: 6px;
-      background: linear-gradient(135deg, #1e2340 0%, #252a4a 100%);
-      box-shadow: 0 0 12px rgba(96, 165, 250, 0.08), inset 0 1px 0 rgba(255,255,255,0.04);
-      transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
-      z-index: 0;
-    }
-    .market-seg-indicator.right {
-      transform: translateX(calc(100% + 2px));
-    }
-    .market-seg-btn {
-      position: relative;
-      z-index: 1;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 5px;
-      padding: 6px 0;
-      border: none;
-      background: transparent;
-      cursor: pointer;
-      border-radius: 6px;
-      transition: all 0.2s;
-    }
-    .market-seg-label {
-      font-size: 12px;
-      font-weight: 600;
-      color: #6b7280;
-      transition: color 0.25s;
-    }
-    .market-seg-sub {
-      font-size: 10px;
-      color: #4b5563;
-      letter-spacing: 0.04em;
-      transition: color 0.25s;
-    }
-    .market-seg-btn.active .market-seg-label { color: #e5e7eb; }
-    .market-seg-btn.active .market-seg-sub { color: #9ca3af; }
-    .market-seg-btn:not(.active):hover .market-seg-label { color: #9ca3af; }
-
-    /* Data transition on market switch */
-    .account-data-transition {
-      transition: opacity 0.18s ease;
-    }
-    .account-data-transition.switching {
-      opacity: 0.3;
-    }
-
-    /* Log Filter Control */
-    .log-filter-track {
-      display: flex;
-      background: #151627;
-      border: 1px solid #2a2d45;
-      border-radius: 8px;
-      padding: 3px;
-      gap: 2px;
-    }
-    .log-filter-btn {
-      flex: 1;
-      padding: 4px 12px;
-      border: none;
-      background: transparent;
-      color: #6b7280;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      border-radius: 6px;
-      transition: all 0.2s;
-    }
-    .log-filter-btn.active {
-      background: #252a4a;
-      color: #e5e7eb;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.2);
-    }
-    .log-filter-btn:not(.active):hover {
-      color: #9ca3af;
-      background: rgba(255,255,255,0.02);
-    }
-
-    /* Market Workspace Theme */
-    .workspace-krx .market-context-accent { border-color: #f87171; }
-    .workspace-krx .market-ctx-dot { background: #f87171; }
-    .workspace-krx .cycle-divider::before,
-    .workspace-krx .cycle-divider::after { background: rgba(248,113,113,0.15); }
-    .workspace-us .market-context-accent { border-color: #60a5fa; }
-    .workspace-us .market-ctx-dot { background: #60a5fa; }
-    .workspace-us .cycle-divider::before,
-    .workspace-us .cycle-divider::after { background: rgba(96,165,250,0.15); }
-
-    .market-context-bar {
-      background: #151627;
-      border-bottom: 1px solid #2a2d45;
-      padding: 4px 16px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 12px;
-      color: #9ca3af;
-      transition: border-color 0.2s;
-    }
-    .market-context-accent { border-left: 3px solid #6b7280; padding-left: 10px; transition: border-color 0.25s; }
-    .market-ctx-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; animation: pulse 2s infinite; transition: background 0.25s; }
-
-    .market-header-tabs {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      background: #151627;
-      border: 1px solid #2a2d45;
-      border-radius: 8px;
-      padding: 2px;
-      gap: 2px;
-      position: relative;
-      min-width: 200px;
-    }
-    .market-header-indicator {
-      position: absolute;
-      top: 2px; left: 2px;
-      width: calc(50% - 3px);
-      height: calc(100% - 4px);
-      border-radius: 6px;
-      background: linear-gradient(135deg, #1e2340 0%, #252a4a 100%);
-      box-shadow: 0 0 12px rgba(96,165,250,0.08), inset 0 1px 0 rgba(255,255,255,0.04);
-      transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
-      z-index: 0;
-    }
-    .market-header-indicator.right { transform: translateX(calc(100% + 2px)); }
-    .market-header-btn {
-      position: relative; z-index: 1;
-      display: flex; align-items: center; justify-content: center; gap: 6px;
-      padding: 5px 8px;
-      border: none; background: transparent; cursor: pointer;
-      border-radius: 6px; transition: all 0.2s;
-    }
-    .market-header-label { font-size: 12px; font-weight: 600; color: #6b7280; transition: color 0.25s; }
-    .market-header-sub { font-size: 10px; color: #4b5563; letter-spacing: 0.04em; transition: color 0.25s; }
-    .market-header-btn.active .market-header-label { color: #e5e7eb; }
-    .market-header-btn.active .market-header-sub { color: #9ca3af; }
-    .market-header-btn:not(.active):hover .market-header-label { color: #9ca3af; }
-    .market-badge-new {
-      font-size: 10px; font-weight: 700;
-      min-width: 16px; height: 16px;
-      display: inline-flex; align-items: center; justify-content: center;
-      border-radius: 8px; padding: 0 4px;
-      background: #dc2626; color: #fff;
-      animation: fadeIn 0.3s ease-out;
-    }
-
-    .feed-transition { transition: opacity 0.18s ease; }
-    .feed-transition.switching { opacity: 0.3; }
-
-    /* Technical Snapshot Table */
-    .tech-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 11px;
-      margin-top: 6px;
-      border: 1px solid #374151;
-      border-radius: 6px;
-      overflow: hidden;
-    }
-    .tech-table th, .tech-table td {
-      border: 1px solid #374151;
-      padding: 4px 8px;
-      text-align: right;
-    }
-    .tech-table th { background: #1f2937; color: #9ca3af; text-align: center; }
-    .tech-table tr:nth-child(even) { background: #1a1b2e; }
-    .tech-table .label { text-align: left; color: #d1d5db; font-weight: 500; }
-  </style>
+  <link rel="stylesheet" href="/admin/static/css/admin.css">
 </head>
 <body class="dark bg-dark-900 text-gray-200 h-screen flex flex-col overflow-hidden">
   <!-- Header -->
@@ -306,7 +70,11 @@
   <!-- Main Content -->
   <div class="flex flex-1 overflow-hidden">
     <!-- Left Sidebar -->
-    <aside class="w-64 bg-dark-800 border-r border-gray-700 flex flex-col shrink-0">
+    <aside id="left-sidebar" class="sidebar-left w-64 bg-dark-800 border-r border-gray-700 flex flex-col shrink-0 relative">
+      <button onclick="toggleLeftSidebar()" class="sidebar-toggle-btn sidebar-toggle-left" aria-label="사이드바 접기/펼치기">
+        <i data-lucide="panel-left-close" class="w-3 h-3 sidebar-collapse-icon"></i>
+      </button>
+      <div class="sidebar-content flex flex-col flex-1 overflow-hidden">
       <!-- Navigation -->
       <nav class="p-3 space-y-1">
         <button onclick="switchView('live')" id="nav-live" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm font-medium bg-blue-900/30 text-blue-300 flex items-center gap-2">
@@ -325,30 +93,39 @@
 
       <!-- Account Info -->
       <div class="p-3 space-y-2 flex-1 overflow-y-auto">
-        <div class="flex items-center justify-between">
-          <div class="text-xs text-gray-500 font-medium">계좌 잔고</div>
-          <span id="cash-source-badge" class="hidden px-2 py-0.5 rounded-full text-[10px] bg-sky-950/70 text-sky-300"></span>
-        </div>
-        <div id="account-info" class="text-xs space-y-1 account-data-transition">
-          <div class="text-gray-600">로딩 중...</div>
+        <!-- Balance (sticky) -->
+        <div class="sticky top-0 bg-dark-800 z-[1] pb-1">
+          <div class="flex items-center justify-between">
+            <div class="text-xs text-gray-500 font-medium">계좌 잔고</div>
+            <span id="cash-source-badge" class="hidden px-2 py-0.5 rounded-full text-[10px] bg-sky-950/70 text-sky-300"></span>
+          </div>
+          <div id="account-info" class="text-xs space-y-1 account-data-transition">
+            <div class="text-gray-600">로딩 중...</div>
+          </div>
         </div>
 
-        <!-- 보유종목 -->
+        <!-- 보유종목 (collapsible) -->
         <div id="holdings-section">
-          <div id="holdings-header" class="flex items-center justify-between mt-3 mb-1">
-            <span class="text-xs text-green-400 font-medium">보유종목</span>
+          <button onclick="toggleAccountSection('holdings')" class="flex items-center justify-between mt-3 mb-1 w-full text-left" aria-expanded="true">
+            <span class="flex items-center gap-1">
+              <span class="section-toggle-icon" id="holdings-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+              <span class="text-xs text-green-400 font-medium">보유종목</span>
+            </span>
             <span id="holdings-count" class="text-xs text-gray-600">0종목</span>
-          </div>
-          <div id="holdings-info" class="text-xs space-y-1 max-h-60 overflow-y-auto account-data-transition"></div>
+          </button>
+          <div id="holdings-info" class="account-section-body text-xs space-y-1 max-h-60 overflow-y-auto account-data-transition" style="max-height:240px"></div>
         </div>
 
-        <!-- 미체결 주문 -->
+        <!-- 미체결 주문 (collapsible) -->
         <div id="pending-section">
-          <div id="pending-header" class="flex items-center justify-between mt-3 mb-1">
-            <span class="text-xs text-yellow-400 font-medium">미체결 주문</span>
+          <button onclick="toggleAccountSection('pending')" class="flex items-center justify-between mt-3 mb-1 w-full text-left" aria-expanded="true">
+            <span class="flex items-center gap-1">
+              <span class="section-toggle-icon" id="pending-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+              <span class="text-xs text-yellow-400 font-medium">미체결 주문</span>
+            </span>
             <span id="pending-count" class="text-xs text-gray-600">0건</span>
-          </div>
-          <div id="pending-orders-info" class="text-xs space-y-1 max-h-40 overflow-y-auto account-data-transition"></div>
+          </button>
+          <div id="pending-orders-info" class="account-section-body text-xs space-y-1 max-h-40 overflow-y-auto account-data-transition" style="max-height:160px"></div>
         </div>
       </div>
 
@@ -356,14 +133,15 @@
 
       <!-- Settings (접이식) -->
       <div class="p-3 shrink-0">
-        <button onclick="toggleSettings()" class="flex items-center justify-between w-full text-xs text-gray-500 font-medium hover:text-gray-300 transition">
+        <button onclick="toggleSettings()" class="flex items-center justify-between w-full text-xs text-gray-500 font-medium hover:text-gray-300 transition" aria-expanded="false" id="settings-toggle-btn">
           <span class="flex items-center gap-1.5"><i data-lucide="settings" class="w-4 h-4"></i> 설정</span>
-          <span id="settings-arrow" class="transition-transform" style="transform:rotate(-90deg)"><i data-lucide="chevron-down" class="w-4 h-4"></i></span>
+          <span id="settings-arrow" style="transition:transform 0.2s ease; transform:rotate(-90deg)"><i data-lucide="chevron-down" class="w-4 h-4"></i></span>
         </button>
         <div id="settings-body" class="space-y-3 mt-2 hidden">
           <label class="flex items-center justify-between">
             <span class="text-sm">매매 활성화</span>
-            <input type="checkbox" id="set-trading" onchange="updateSetting('TRADING_ENABLED', this.checked)"
+            <input type="checkbox" id="set-trading" role="switch" onchange="updateSetting('TRADING_ENABLED', this.checked); this.setAttribute('aria-checked', this.checked)"
+              aria-checked="false" aria-label="매매 활성화"
               class="w-9 h-5 rounded-full appearance-none bg-gray-600 checked:bg-green-500 relative cursor-pointer
               after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform checked:after:translate-x-4">
           </label>
@@ -390,7 +168,9 @@
           <div class="border-t border-gray-700 pt-2">
             <div class="text-xs text-gray-500 font-medium mb-1">LLM</div>
             <div class="text-xs text-gray-400">선택된 로컬 CLI Provider</div>
-            <div id="llm-tier1-model" class="text-xs text-gray-500 mt-0.5 truncate"></div>
+            <div id="llm-agent-summary" class="mt-1 space-y-1.5">
+              <div class="text-xs text-gray-600">로딩 중...</div>
+            </div>
           </div>
         </div>
       </div>
@@ -410,6 +190,7 @@
           <i data-lucide="file-text" class="w-4 h-4"></i> 리포트 생성
         </button>
       </div>
+      </div><!-- /sidebar-content -->
     </aside>
 
     <!-- Chat Area -->
@@ -424,7 +205,7 @@
       </div>
 
       <!-- Chat messages -->
-      <div id="chat-container" class="flex-1 overflow-y-auto p-4 space-y-2">
+      <div id="chat-container" class="flex-1 overflow-y-auto p-4 space-y-2" aria-live="polite" aria-atomic="false">
         <div class="text-center text-gray-500 text-sm py-8">
           &#xc5f0;&#xacb0; &#xc911;...
         </div>
@@ -435,17 +216,28 @@
         <span id="status-text">&#xc5f0;&#xacb0; &#xb300;&#xae30;</span>
         <div class="flex items-center gap-3">
           <span id="activity-count">0&#xac74;</span>
-          <button onclick="clearChat()" title="&#xd654;&#xba74; &#xbe44;&#xc6b0;&#xae30; (DB &#xc720;&#xc9c0;)"
+          <button onclick="clearChat()" title="화면 비우기 (DB 유지)" aria-label="활동 피드 클리어"
             class="text-gray-500 hover:text-gray-300 transition flex items-center gap-1.5"><i data-lucide="trash-2" class="w-4 h-4"></i> 클리어</button>
-          <button onclick="loadTodayActivities()" title="&#xc624;&#xb298; &#xd65c;&#xb3d9; &#xb2e4;&#xc2dc; &#xbd88;&#xb7ec;&#xc624;&#xae30;"
+          <button onclick="loadTodayActivities()" title="오늘 활동 다시 불러오기" aria-label="활동 새로고침"
             class="text-gray-500 hover:text-gray-300 transition flex items-center gap-1.5"><i data-lucide="refresh-cw" class="w-4 h-4"></i> 새로고침</button>
         </div>
       </div>
     </main>
 
     <!-- Right Sidebar: LLM Usage -->
-    <aside class="w-64 bg-dark-800 border-l border-gray-700 flex flex-col shrink-0 overflow-y-auto">
+    <aside id="right-sidebar" class="sidebar-right w-64 bg-dark-800 border-l border-gray-700 flex flex-col shrink-0 relative">
+      <button onclick="toggleRightSidebar()" class="sidebar-toggle-btn sidebar-toggle-right" aria-label="LLM 사이드바 접기/펼치기">
+        <i data-lucide="panel-right-close" class="w-3 h-3 sidebar-collapse-icon"></i>
+      </button>
+      <div class="sidebar-content overflow-y-auto flex-1">
       <div class="p-3 space-y-3">
+        <div>
+          <div class="text-xs text-gray-500 font-medium mb-2">분석 에이전트</div>
+          <div id="llm-agent-guide" class="space-y-2">
+            <div class="text-gray-600 text-xs">로딩 중...</div>
+          </div>
+        </div>
+
         <div class="text-xs text-gray-500 font-medium">LLM Usage</div>
 
         <!-- Summary -->
@@ -471,6 +263,7 @@
           <div id="usage-chart" class="space-y-1"></div>
         </div>
       </div>
+      </div><!-- /sidebar-content -->
     </aside>
   </div>
 

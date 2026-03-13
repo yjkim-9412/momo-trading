@@ -8,11 +8,54 @@ let accountPollTimer = null;
 let currentMarket = 'KRX';
 let enabledMarkets = ['KRX'];
 let currentLogFilter = 'ALL';
+const LLM_AGENT_DEFAULTS = {
+  tier1: {
+    display_name: '후보 분석 에이전트',
+    short_label: '후보 분석',
+    description: '차트·시장 컨텍스트를 바탕으로 매수 후보와 목표/손절을 1차 판단',
+    icon: 'search',
+  },
+  tier2: {
+    display_name: '최종 검토 에이전트',
+    short_label: '최종 검토',
+    description: '1차 분석 결과를 리스크·포트폴리오 관점에서 재검증해 주문 승인 여부를 결정',
+    icon: 'shield-check',
+  },
+};
+const ADMIN_AGENT_LABELS = {
+  TIER1: LLM_AGENT_DEFAULTS.tier1.display_name,
+  TIER2: LLM_AGENT_DEFAULTS.tier2.display_name,
+};
 
 function refreshIcons() {
   if (typeof lucide !== 'undefined') {
     requestAnimationFrame(() => lucide.createIcons());
   }
+}
+
+function formatAdminAgentText(text) {
+  if (text == null) return '';
+
+  return String(text)
+    .replace(/\[TIER1\]/g, `[${ADMIN_AGENT_LABELS.TIER1}]`)
+    .replace(/\[TIER2\]/g, `[${ADMIN_AGENT_LABELS.TIER2}]`)
+    .replace(/\bTIER1\b/g, ADMIN_AGENT_LABELS.TIER1)
+    .replace(/\bTIER2\b/g, ADMIN_AGENT_LABELS.TIER2)
+    .replace(/\bTier 1\b/g, ADMIN_AGENT_LABELS.TIER1)
+    .replace(/\bTier1\b/g, ADMIN_AGENT_LABELS.TIER1)
+    .replace(/\bTier 2\b/g, ADMIN_AGENT_LABELS.TIER2)
+    .replace(/\bTier2\b/g, ADMIN_AGENT_LABELS.TIER2);
+}
+
+function transformAdminAgentValue(value) {
+  if (typeof value === 'string') return formatAdminAgentText(value);
+  if (Array.isArray(value)) return value.map(transformAdminAgentValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entryValue]) => [key, transformAdminAgentValue(entryValue)])
+    );
+  }
+  return value;
 }
 
 // ── Per-market state management ──
@@ -51,13 +94,42 @@ document.addEventListener('DOMContentLoaded', async () => {
   setInterval(loadLLMUsage, 60000);
 });
 
+// ── Toast Notifications ──
+function showToast(message, type = 'info', duration = 3000) {
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.classList.add('toast-fade-out'), duration - 300);
+  setTimeout(() => toast.remove(), duration);
+}
+
+// ── HTTP Helper ──
+async function fetchJSON(url, options = {}) {
+  const resp = await fetch(url, options);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return resp.json();
+}
+
 // ── SSE Connection ──
+let currentEventSource = null;
+
+window.addEventListener('beforeunload', () => {
+  if (currentEventSource) currentEventSource.close();
+});
+
 function connectSSE() {
+  if (currentEventSource) {
+    currentEventSource.close();
+    currentEventSource = null;
+  }
   const es = new EventSource(`${API}/stream`);
+  currentEventSource = es;
 
   es.onopen = () => {
     setStatus('connected', 'SSE 연결됨');
     updateBadge('badge-sse', '연결', 'green');
+    removeSSEDisconnectBanner();
   };
 
   es.onmessage = (e) => {
@@ -95,6 +167,7 @@ function connectSSE() {
   es.onerror = () => {
     setStatus('disconnected', 'SSE 재연결 중...');
     updateBadge('badge-sse', '끊김', 'red');
+    showSSEDisconnectBanner();
     setTimeout(() => {
       if (es.readyState === EventSource.CLOSED) connectSSE();
     }, 3000);
@@ -198,6 +271,7 @@ function saveMarketFeed(scope) {
   const container = document.getElementById('chat-container');
   const state = marketState[scope];
   state.scrollPos = container.scrollTop;
+  pauseMarketTimers(scope);
   // Detach all children into a fragment
   const frag = document.createDocumentFragment();
   while (container.firstChild) {
@@ -289,8 +363,7 @@ async function loadMarketAccountInfo() {
   const market = currentMarket;
   const marketParam = market === 'KRX' ? '' : `?market=${market}`;
   try {
-    const resp = await fetch(`${API}/account/overview${marketParam}`);
-    const json = await resp.json();
+    const json = await fetchJSON(`${API}/account/overview${marketParam}`);
     const overview = json.data || {};
     renderBalance(overview.balance, market);
     renderHoldings(overview.holdings || [], market);
@@ -454,10 +527,10 @@ function renderHoldings(data, market) {
     const evalAmt = h.current_price * h.quantity;
     const card = document.createElement('div');
     if (isUS) {
-      card.className = 'rounded-lg border border-sky-950/70 bg-slate-950/60 p-2 space-y-1';
+      card.className = 'sidebar-card sidebar-card-us space-y-1';
       _buildUSHoldingCard(card, h, pnlColor, currency, evalAmt);
     } else {
-      card.className = 'border border-gray-700 rounded p-1.5 space-y-0.5';
+      card.className = 'sidebar-card space-y-0.5';
       _buildKRXHoldingCard(card, h, pnlColor, currency, evalAmt);
     }
     el.appendChild(card);
@@ -579,10 +652,10 @@ function renderPendingOrders(data, market) {
       ? `${o.order_time.slice(0, 2)}:${o.order_time.slice(2, 4)}:${o.order_time.slice(4, 6)}` : '';
     const card = document.createElement('div');
     if (isUS) {
-      card.className = 'rounded-lg border border-amber-900/50 bg-amber-950/10 p-2 space-y-1';
+      card.className = 'sidebar-card sidebar-card-pending-us space-y-1';
       _buildUSPendingCard(card, o, sideColor, currency, orderAmt, timeStr);
     } else {
-      card.className = 'border border-yellow-700/60 bg-yellow-900/10 rounded p-1.5 space-y-0.5';
+      card.className = 'sidebar-card sidebar-card-pending space-y-0.5';
       _buildKRXPendingCard(card, o, sideColor, currency, orderAmt, timeStr);
     }
     el.appendChild(card);
@@ -637,10 +710,12 @@ function _buildKRXPendingCard(card, o, sideColor, currency, orderAmt, timeStr) {
 function toggleSettings() {
   const body = document.getElementById('settings-body');
   const arrow = document.getElementById('settings-arrow');
+  const toggleBtn = document.getElementById('settings-toggle-btn');
   if (!body) return;
   const isHidden = body.classList.contains('hidden');
   body.classList.toggle('hidden');
-  if (arrow) arrow.style.transform = isHidden ? '' : 'rotate(-90deg)';
+  if (arrow) arrow.style.transform = isHidden ? 'rotate(0deg)' : 'rotate(-90deg)';
+  if (toggleBtn) toggleBtn.setAttribute('aria-expanded', String(isHidden));
 }
 
 function truncateNumber(value, digits = 0) {
@@ -768,14 +843,15 @@ function appendActivity(data) {
  */
 function createCycleDivider(data, isStart) {
   const div = document.createElement('div');
-  div.className = 'cycle-divider';
+  div.className = isStart ? 'cycle-divider cycle-start' : 'cycle-divider cycle-end';
+  const summary = formatAdminAgentText(data.summary);
   if (isStart) {
     div.setAttribute('data-cycle-start', `cycle-start-${data.cycle_id}`);
-    div.innerHTML = `<span class="progress-spinner"></span><span class="cycle-text">${escapeHtml(data.summary)}</span>`;
+    div.innerHTML = `<span class="progress-spinner"></span><span class="cycle-text">${escapeHtml(summary)}</span>`;
   } else {
     const time = formatTime(data.created_at);
     const elapsed = data.execution_time_ms ? ` (${(data.execution_time_ms / 1000).toFixed(1)}초)` : '';
-    div.innerHTML = `<span>${escapeHtml(data.summary)}${elapsed}</span><span class="text-gray-600">${time}</span>`;
+    div.innerHTML = `<span>${escapeHtml(summary)}${elapsed}</span><span class="text-gray-600">${time}</span>`;
   }
   return div;
 }
@@ -862,7 +938,7 @@ function addStepToCard(card, data) {
     step.className = 'stock-step';
     step.setAttribute('data-progress-key', progressKey);
     const time = formatTime(data.created_at);
-    const label = (data.summary || '').replace(/시작$/, '').trim();
+    const label = formatAdminAgentText((data.summary || '').replace(/시작$/, '').trim());
     step.innerHTML = `
       <span class="text-xs text-gray-600 shrink-0 w-14">${time}</span>
       <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px"></span>
@@ -888,7 +964,7 @@ function addStepToCard(card, data) {
   let html = `
     <span class="text-xs text-gray-600 shrink-0 w-14">${time}</span>
     <div class="flex-1 min-w-0">
-      <div class="text-xs">${escapeHtml(data.summary)}</div>`;
+      <div class="text-xs">${escapeHtml(formatAdminAgentText(data.summary))}</div>`;
 
   // Meta line
   const meta = [];
@@ -917,7 +993,7 @@ function addStepToCard(card, data) {
 
   // Error
   if (data.error_message) {
-    html += `<div class="text-xs text-red-400 mt-0.5">${escapeHtml(data.error_message)}</div>`;
+    html += `<div class="text-xs text-red-400 mt-0.5">${escapeHtml(formatAdminAgentText(data.error_message))}</div>`;
   }
 
   html += '</div>';
@@ -1098,7 +1174,7 @@ function toggleCardBody(card) {
   card.isOpen = !card.isOpen;
   card.bodyEl.classList.toggle('open', card.isOpen);
   const arrow = card.headerEl.querySelector('.stock-expand');
-  if (arrow) arrow.style.transform = card.isOpen ? '' : 'rotate(-90deg)';
+  if (arrow) arrow.style.transform = card.isOpen ? 'rotate(0deg)' : 'rotate(-90deg)';
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1116,7 +1192,7 @@ function createBubble(data) {
     <div class="flex items-start gap-2 px-3 py-1.5 rounded-lg hover:bg-dark-700/50 transition group">
       <span class="text-xs text-gray-500 mt-0.5 shrink-0 w-14">${time}</span>
       <div class="flex-1 min-w-0">
-        <div class="text-sm whitespace-pre-wrap">${escapeHtml(data.summary)}</div>`;
+        <div class="text-sm whitespace-pre-wrap">${escapeHtml(formatAdminAgentText(data.summary))}</div>`;
 
   const meta = [];
   if (data.llm_provider) meta.push(`<span class="text-${typeColor}-400">${data.llm_provider}</span>`);
@@ -1142,7 +1218,7 @@ function createBubble(data) {
   }
 
   if (data.error_message) {
-    html += `<div class="text-xs text-red-400 mt-1">${escapeHtml(data.error_message)}</div>`;
+    html += `<div class="text-xs text-red-400 mt-1">${escapeHtml(formatAdminAgentText(data.error_message))}</div>`;
   }
 
   html += `</div></div>`;
@@ -1152,7 +1228,13 @@ function createBubble(data) {
 
 function toggleDetail(id) {
   const el = document.getElementById(id);
-  if (el) el.classList.toggle('open');
+  if (!el) return;
+  el.classList.toggle('open');
+  // Update aria-expanded on the trigger button
+  const btn = el.previousElementSibling;
+  if (btn && btn.tagName === 'BUTTON') {
+    btn.setAttribute('aria-expanded', String(el.classList.contains('open')));
+  }
 }
 
 // ── View Switching ──
@@ -1171,6 +1253,7 @@ function switchView(view) {
     activeBtn.className = 'nav-btn w-full text-left px-3 py-2 rounded-lg text-sm font-medium bg-blue-900/30 text-blue-300';
   }
   if (view === 'live') {
+    removeBackToLiveBar();
     restoreMarketFeed(currentScope());
     flushBuffer(currentScope());
   } else if (view === 'today') {
@@ -1187,13 +1270,12 @@ function switchToReport(dateStr) {
 async function loadTodayActivities() {
   const scope = currentScope();
   const container = document.getElementById('chat-container');
-  container.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">불러오는 중...</div>';
+  renderPlaceholder(container, 'loading', '불러오는 중...');
   // Clear card tracking for current market
   cleanupStockCards();
 
   try {
-    const resp = await fetch(`${API}/activities?limit=500&market_scope=${encodeURIComponent(scope)}`);
-    const json = await resp.json();
+    const json = await fetchJSON(`${API}/activities?limit=500&market_scope=${encodeURIComponent(scope)}`);
     container.innerHTML = '';
     setActivityCount(0);
 
@@ -1225,12 +1307,12 @@ async function loadTodayActivities() {
         container.scrollTop = container.scrollHeight;
       });
     } else {
-      container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">아직 활동 기록이 없습니다</div>';
+      renderPlaceholder(container, 'empty', '아직 활동 기록이 없습니다');
     }
     marketState[scope].loaded = true;
     refreshIcons();
   } catch (err) {
-    container.innerHTML = `<div class="text-center text-red-400 text-sm py-8">로드 실패: ${err.message}</div>`;
+    renderPlaceholder(container, 'error', `로드 실패: ${err.message}`);
   }
 }
 
@@ -1255,6 +1337,7 @@ function getProgressKey(data) {
 
 // ── Clear Chat ──
 function clearChat() {
+  if (!confirm('화면을 비울까요? (DB는 유지됩니다)')) return;
   const scope = currentScope();
   const container = document.getElementById('chat-container');
   container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">화면을 비웠습니다. 새 활동이 들어오면 여기에 표시됩니다.</div>';
@@ -1279,14 +1362,14 @@ function cleanupStockCards() {
 async function loadReport(dateStr) {
   const container = document.getElementById('chat-container');
   container.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">리포트 불러오는 중...</div>';
+  insertBackToLiveBar(container);
   cleanupStockCards();
 
   try {
     let url = `${API}/reports/latest`;
     if (dateStr && dateStr !== 'today') url = `${API}/reports/${dateStr}`;
     url += `${url.includes('?') ? '&' : '?'}market_scope=${encodeURIComponent(currentMarket)}`;
-    const resp = await fetch(url);
-    const json = await resp.json();
+    const json = await fetchJSON(url);
     const report = json.data;
 
     if (!report) {
@@ -1305,14 +1388,13 @@ async function loadReport(dateStr) {
 
 async function loadDateActivities(dateStr, container) {
   try {
-    const resp = await fetch(`${API}/activities?target_date=${dateStr}&limit=500&market_scope=${encodeURIComponent(currentMarket)}`);
-    const json = await resp.json();
+    const json = await fetchJSON(`${API}/activities?target_date=${dateStr}&limit=500&market_scope=${encodeURIComponent(currentMarket)}`);
     if (json.data && json.data.length) {
       const section = document.createElement('div');
       section.className = 'mt-4 border-t border-gray-800';
       const toggleBtn = document.createElement('button');
       toggleBtn.className = 'w-full text-center text-gray-500 hover:text-gray-300 text-xs py-3 flex items-center justify-center gap-2 transition';
-      toggleBtn.innerHTML = `<span class="activity-toggle-icon">▶</span> ${dateStr} 활동 로그 (${json.data.length}건)`;
+      toggleBtn.innerHTML = `<span class="activity-toggle-icon"><i data-lucide="chevron-right" class="w-3 h-3 inline-block"></i></span> ${dateStr} 활동 로그 (${json.data.length}건)`;
       const logContainer = document.createElement('div');
       logContainer.className = 'hidden';
       logContainer.style.maxHeight = '600px';
@@ -1321,7 +1403,8 @@ async function loadDateActivities(dateStr, container) {
       toggleBtn.onclick = () => {
         const isHidden = logContainer.classList.contains('hidden');
         logContainer.classList.toggle('hidden');
-        toggleBtn.querySelector('.activity-toggle-icon').innerHTML = isHidden ? '▼' : '▶';
+        toggleBtn.querySelector('.activity-toggle-icon').innerHTML = isHidden ? '<i data-lucide="chevron-down" class="w-3 h-3 inline-block"></i>' : '<i data-lucide="chevron-right" class="w-3 h-3 inline-block"></i>';
+        refreshIcons();
       };
       section.appendChild(toggleBtn);
       section.appendChild(logContainer);
@@ -1407,8 +1490,7 @@ function createReportCard(report) {
 // ── Settings ──
 async function loadSettings() {
   try {
-    const resp = await fetch(`${API}/settings`);
-    const json = await resp.json();
+    const json = await fetchJSON(`${API}/settings`);
     const s = json.data;
     if (!s) return;
     document.getElementById('set-trading').checked = s.TRADING_ENABLED;
@@ -1431,40 +1513,37 @@ async function loadSettings() {
 }
 
 async function updateSetting(key, value) {
+  const controls = document.querySelectorAll('#settings-body input, #settings-body select');
+  controls.forEach(c => c.disabled = true);
   try {
-    await fetch(`${API}/settings`, {
+    await fetchJSON(`${API}/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ [key]: value }),
     });
-    loadSettings();
+    showToast('설정 저장됨', 'success');
+    await loadSettings();
     loadSystemStatus();
   } catch (err) {
     console.error('Setting update error:', err);
+    showToast(`설정 저장 실패: ${err.message}`, 'error');
+    await loadSettings(); // UI 롤백
+  } finally {
+    controls.forEach(c => c.disabled = false);
   }
 }
 
 // ── LLM Status ──
 async function loadLLMStatus() {
   try {
-    const resp = await fetch(`${API}/llm/status`);
-    const json = await resp.json();
+    const json = await fetchJSON(`${API}/llm/status`);
     const s = json.data;
     if (!s) return;
     const providerId = s.selected_provider || (s.tier1 && s.tier1.provider);
     const providerLabel = s.provider_name || formatProviderLabel(providerId);
-    const t1Effort = formatReasoningEffortLabel(
-      s.tier1 && s.tier1.reasoning_effort,
-      providerId
-    );
-    const t2Effort = formatReasoningEffortLabel(
-      s.tier2 && s.tier2.reasoning_effort,
-      providerId
-    );
-    const t1Model = document.getElementById('llm-tier1-model');
-    if (t1Model) {
-      t1Model.textContent = `${providerLabel} · T1 ${s.tier1.model}${t1Effort} · T2 ${s.tier2.model}${t2Effort}`;
-    }
+    renderLLMAgentSummary(s, providerId, providerLabel);
+    renderLLMAgentGuide(s, providerId, providerLabel);
+    refreshIcons();
   } catch (err) {
     console.error('LLM status error:', err);
   }
@@ -1473,8 +1552,7 @@ async function loadLLMStatus() {
 // ── LLM Usage ──
 async function loadLLMUsage() {
   try {
-    const resp = await fetch(`${API}/llm/usage`);
-    const json = await resp.json();
+    const json = await fetchJSON(`${API}/llm/usage`);
     const d = json.data;
     if (!d) {
       document.getElementById('usage-summary').innerHTML = '<div class="text-gray-600 text-xs">데이터 없음</div>';
@@ -1528,38 +1606,10 @@ async function loadLLMUsage() {
       appEl.innerHTML = '<div class="text-gray-600">아직 호출 없음</div>';
     }
     const modelsEl = document.getElementById('usage-models');
-    if (d.model_usage && Object.keys(d.model_usage).length) {
-      let html = '';
-        for (const [model, usage] of Object.entries(d.model_usage)) {
-        const shortModel = model.replace('claude-', '').replace(/-\d{8}$/, '');
-        html += `<div class="bg-dark-900 rounded p-2 mb-1">
-          <div class="text-gray-300 font-medium mb-1" title="${model}">${shortModel}</div>
-          <div class="grid grid-cols-2 gap-x-2 gap-y-0.5 text-gray-500">
-            <span>입력</span><span class="text-right text-gray-400">${formatTokens(usage.inputTokens)}</span>
-            <span>출력</span><span class="text-right text-green-400">${formatTokens(usage.outputTokens)}</span>
-            <span>캐시읽기</span><span class="text-right text-blue-400">${formatTokens(usage.cacheReadInputTokens)}</span>
-            <span>캐시생성</span><span class="text-right text-purple-400">${formatTokens(usage.cacheCreationInputTokens)}</span>
-          </div>
-        </div>`;
-      }
-      modelsEl.innerHTML = html;
-    } else if (app.by_model && Object.keys(app.by_model).length) {
-      let html = '';
-      for (const [model, usage] of Object.entries(app.by_model)) {
-        const shortModel = model.replace('codex:', '').replace('claude-', '');
-        html += `<div class="bg-dark-900 rounded p-2 mb-1">
-          <div class="text-gray-300 font-medium mb-1" title="${model}">${shortModel}</div>
-          <div class="grid grid-cols-2 gap-x-2 gap-y-0.5 text-gray-500">
-            <span>입력</span><span class="text-right text-gray-400">${formatTokens(usage.input_tokens)}</span>
-            <span>출력</span><span class="text-right text-green-400">${formatTokens(usage.output_tokens)}</span>
-            <span>캐시입력</span><span class="text-right text-blue-400">${formatTokens(usage.cached_input_tokens ?? usage.cache_read ?? 0)}</span>
-          </div>
-        </div>`;
-      }
-      modelsEl.innerHTML = html;
-    } else {
-      modelsEl.innerHTML = '<div class="text-gray-600">데이터 없음</div>';
-    }
+    const modelData = d.model_usage && Object.keys(d.model_usage).length
+      ? d.model_usage
+      : (app.by_model && Object.keys(app.by_model).length ? app.by_model : null);
+    renderModelCards(modelData, modelsEl);
     const chartEl = document.getElementById('usage-chart');
     const dailyTokens = (d.daily_model_tokens || []).slice(-7);
     if (dailyTokens.length) {
@@ -1597,6 +1647,31 @@ function formatTokens(n) {
   return n.toLocaleString();
 }
 
+function renderModelCards(models, targetEl) {
+  if (!models || !Object.keys(models).length) {
+    targetEl.innerHTML = '<div class="text-gray-600">데이터 없음</div>';
+    return;
+  }
+  let html = '';
+  for (const [model, u] of Object.entries(models)) {
+    const short = model.replace('claude-', '').replace('codex:', '').replace(/-\d{8,}$/, '');
+    const input = u.inputTokens ?? u.input_tokens ?? 0;
+    const output = u.outputTokens ?? u.output_tokens ?? 0;
+    const cached = u.cacheReadInputTokens ?? u.cached_input_tokens ?? u.cache_read ?? 0;
+    const creation = u.cacheCreationInputTokens ?? 0;
+    html += `<div class="bg-dark-900 rounded p-2 mb-1">
+      <div class="text-gray-300 font-medium mb-1" title="${model}">${short}</div>
+      <div class="grid grid-cols-2 gap-x-2 gap-y-0.5 text-gray-500">
+        <span>입력</span><span class="text-right text-gray-400">${formatTokens(input)}</span>
+        <span>출력</span><span class="text-right text-green-400">${formatTokens(output)}</span>
+        <span>캐시읽기</span><span class="text-right text-blue-400">${formatTokens(cached)}</span>
+        ${creation ? `<span>캐시생성</span><span class="text-right text-purple-400">${formatTokens(creation)}</span>` : ''}
+      </div>
+    </div>`;
+  }
+  targetEl.innerHTML = html;
+}
+
 function formatProviderLabel(provider) {
   if (!provider) return 'LLM';
   if (provider === 'CLAUDE_CODE') return 'Claude Code';
@@ -1604,21 +1679,73 @@ function formatProviderLabel(provider) {
   return provider.replaceAll('_', ' ');
 }
 
-function formatReasoningEffortLabel(effort, provider) {
-  if (effort) return ` [${effort}]`;
-  if (provider === 'CODEX_CLI') return ' [global]';
+function getLLMAgentConfig(status, tierKey) {
+  return {
+    ...LLM_AGENT_DEFAULTS[tierKey],
+    ...((status && status[tierKey]) || {}),
+  };
+}
+
+function formatReasoningEffortText(effort, provider) {
+  if (effort) return `추론 ${effort}`;
+  if (provider === 'CODEX_CLI') return '추론 global';
   return '';
+}
+
+function formatAgentMeta(tierConfig, providerId, providerLabel) {
+  const pieces = [providerLabel || formatProviderLabel(providerId), tierConfig.model || '-'];
+  const effortText = formatReasoningEffortText(tierConfig.reasoning_effort, providerId);
+  if (effortText) pieces.push(effortText);
+  return pieces.filter(Boolean).map(item => escapeHtml(item)).join(' · ');
+}
+
+function renderLLMAgentSummary(status, providerId, providerLabel) {
+  const summaryEl = document.getElementById('llm-agent-summary');
+  if (!summaryEl) return;
+
+  summaryEl.innerHTML = ['tier1', 'tier2'].map(tierKey => {
+    const tierConfig = getLLMAgentConfig(status, tierKey);
+    return `
+      <div class="agent-summary-row">
+        <div class="text-xs text-gray-200">${escapeHtml(tierConfig.display_name)}</div>
+        <div class="text-[11px] text-gray-500 leading-4 mt-1">${escapeHtml(tierConfig.description)}</div>
+        <div class="text-[11px] text-gray-500 mt-1 truncate">${formatAgentMeta(tierConfig, providerId, providerLabel)}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderLLMAgentGuide(status, providerId, providerLabel) {
+  const guideEl = document.getElementById('llm-agent-guide');
+  if (!guideEl) return;
+
+  guideEl.innerHTML = ['tier1', 'tier2'].map(tierKey => {
+    const tierConfig = getLLMAgentConfig(status, tierKey);
+    const toneClass = tierKey === 'tier1' ? 'agent-guide-tier1' : 'agent-guide-tier2';
+    return `
+      <div class="agent-guide-card ${toneClass}">
+        <div class="agent-guide-head">
+          <div class="min-w-0">
+            <div class="agent-guide-kicker">${escapeHtml(tierConfig.short_label)}</div>
+            <div class="agent-guide-title">${escapeHtml(tierConfig.display_name)}</div>
+          </div>
+          <i data-lucide="${escapeHtml(tierConfig.icon)}" class="w-4 h-4 text-gray-500 shrink-0"></i>
+        </div>
+        <div class="agent-guide-desc">${escapeHtml(tierConfig.description)}</div>
+        <div class="agent-guide-meta">${formatAgentMeta(tierConfig, providerId, providerLabel)}</div>
+      </div>
+    `;
+  }).join('');
 }
 
 // ── System Status ──
 async function loadSystemStatus() {
   try {
-    const resp = await fetch(`${API}/system/status?market=${currentMarket}`);
-    const json = await resp.json();
+    const json = await fetchJSON(`${API}/system/status?market=${currentMarket}`);
     const s = json.data;
     if (!s) return;
     updateBadge('badge-trading', s.trading_enabled ? '매매:ON' : '매매:OFF', s.trading_enabled ? 'green' : 'red');
-    updateBadge('badge-mcp', s.mcp_connected ? 'MCP:✓' : 'MCP:✗', s.mcp_connected ? 'green' : 'red');
+    updateBadge('badge-mcp', s.mcp_connected ? 'MCP:ON' : 'MCP:OFF', s.mcp_connected ? 'green' : 'red');
     const statusEl = document.getElementById('sys-status');
     const isHoliday = !!s.market_holiday;
     const marketLabel = s.market_open ? '장중' : (isHoliday ? `휴장 (${s.market_holiday})` : '장외');
@@ -1667,8 +1794,7 @@ async function loadSystemStatus() {
 // ── Report List ──
 async function loadReportList() {
   try {
-    const resp = await fetch(`${API}/reports?limit=10&market_scope=${encodeURIComponent(currentMarket)}`);
-    const json = await resp.json();
+    const json = await fetchJSON(`${API}/reports?limit=10&market_scope=${encodeURIComponent(currentMarket)}`);
     const listEl = document.getElementById('report-list');
     listEl.innerHTML = '';
     if (json.data && json.data.length) {
@@ -1692,21 +1818,42 @@ let triggerPending = false;
 async function triggerCycle() {
   if (triggerPending) return;
   triggerPending = true;
+  const btn = document.querySelector('[onclick="triggerCycle()"]');
+  const originalHTML = btn ? btn.innerHTML : '';
+  if (btn) { btn.innerHTML = '<span class="progress-spinner"></span> 실행 중...'; btn.disabled = true; }
   try {
-    await fetch(`${API}/agent/trigger?market=${currentMarket}`, { method: 'POST' });
+    await fetchJSON(`${API}/agent/trigger?market=${currentMarket}`, { method: 'POST' });
+    showToast('사이클 실행 요청됨', 'success');
   } catch (err) {
     console.error('Trigger error:', err);
+    showToast(`실행 실패: ${err.message}`, 'error');
   } finally {
-    setTimeout(() => { triggerPending = false; }, 3000);
+    setTimeout(() => {
+      if (btn) { btn.innerHTML = originalHTML; btn.disabled = false; refreshIcons(); }
+      triggerPending = false;
+    }, 3000);
   }
 }
 
+let reportPending = false;
 async function generateReport() {
+  if (reportPending) return;
+  reportPending = true;
+  const btn = document.querySelector('[onclick="generateReport()"]');
+  const originalHTML = btn ? btn.innerHTML : '';
+  if (btn) { btn.innerHTML = '<span class="progress-spinner"></span> 생성 중...'; btn.disabled = true; }
   try {
-    await fetch(`${API}/reports/generate?market_scope=${encodeURIComponent(currentMarket)}`, { method: 'POST' });
+    await fetchJSON(`${API}/reports/generate?market_scope=${encodeURIComponent(currentMarket)}`, { method: 'POST' });
+    showToast('리포트 생성 요청됨', 'success');
     loadReportList();
   } catch (err) {
     console.error('Report gen error:', err);
+    showToast(`리포트 생성 실패: ${err.message}`, 'error');
+  } finally {
+    setTimeout(() => {
+      if (btn) { btn.innerHTML = originalHTML; btn.disabled = false; refreshIcons(); }
+      reportPending = false;
+    }, 3000);
   }
 }
 
@@ -1722,7 +1869,7 @@ function formatTime(ts) {
 function formatDetail(detail, activityType = null) {
   if (!detail) return '';
   try {
-    const obj = typeof detail === 'string' ? JSON.parse(detail) : detail;
+    const obj = transformAdminAgentValue(typeof detail === 'string' ? JSON.parse(detail) : detail);
     
     // TIER1_ANALYSIS: Try to extract technical indicators into a mini-table
     if (activityType === 'TIER1_ANALYSIS' && obj.market_context && obj.market_context.indicators) {
@@ -1730,7 +1877,7 @@ function formatDetail(detail, activityType = null) {
       const recentPrice = obj.market_context.current_price ? formatAmount(obj.market_context.current_price) : '-';
       return `
         <table class="tech-table mb-2">
-          <tr><th colspan="4" class="text-left font-bold text-gray-300 bg-dark-800">📊 Technical Snapshot</th></tr>
+          <tr><th colspan="4" class="text-left font-bold text-gray-300 bg-dark-800"><i data-lucide="bar-chart-2" class="w-4 h-4 inline-block mr-1 align-text-bottom"></i>Technical Snapshot</th></tr>
           <tr>
             <td class="label">Price</td><td>${recentPrice}</td>
             <td class="label">RSI(14)</td><td>${ind.rsi ? Number(ind.rsi).toFixed(1) : '-'}</td>
@@ -1750,7 +1897,7 @@ function formatDetail(detail, activityType = null) {
     
     return `<pre class="whitespace-pre-wrap">${escapeHtml(JSON.stringify(obj, null, 2))}</pre>`;
   } catch {
-    return `<pre class="whitespace-pre-wrap">${escapeHtml(String(detail))}</pre>`;
+    return `<pre class="whitespace-pre-wrap">${escapeHtml(formatAdminAgentText(String(detail)))}</pre>`;
   }
 }
 
@@ -1776,7 +1923,8 @@ function formatLLMConversation(detail) {
   let obj = detail;
   try {
     if (typeof detail === 'string') obj = JSON.parse(detail);
-  } catch { return `<pre class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${escapeHtml(String(detail))}</pre>`; }
+    obj = transformAdminAgentValue(obj);
+  } catch { return `<pre class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${escapeHtml(formatAdminAgentText(String(detail)))}</pre>`; }
   const sys = obj.llm_system_prompt || '';
   const prompt = obj.llm_prompt || '';
   const response = obj.llm_response || '';
@@ -1790,7 +1938,13 @@ function formatLLMConversation(detail) {
 }
 
 function getPhaseIcon(phase) {
-  return { START: '▶', PROGRESS: '◆', COMPLETE: '✓', ERROR: '✗' }[phase] || '•';
+  const icons = {
+    START: '<i data-lucide="play" class="w-3 h-3 inline-block"></i>',
+    PROGRESS: '<i data-lucide="loader" class="w-3 h-3 inline-block"></i>',
+    COMPLETE: '<i data-lucide="check" class="w-3 h-3 inline-block"></i>',
+    ERROR: '<i data-lucide="x" class="w-3 h-3 inline-block"></i>',
+  };
+  return icons[phase] || '<i data-lucide="circle" class="w-3 h-3 inline-block"></i>';
 }
 
 function updateBadge(id, text, color) {
@@ -1810,6 +1964,106 @@ function updateBadge(id, text, color) {
 function setStatus(state, text) {
   const el = document.getElementById('status-text');
   if (el) el.textContent = text;
+}
+
+// ── Collapsible Sidebars ──
+function toggleLeftSidebar() {
+  const sidebar = document.getElementById('left-sidebar');
+  if (!sidebar) return;
+  sidebar.classList.toggle('collapsed');
+  const collapsed = sidebar.classList.contains('collapsed');
+  localStorage.setItem('momo-left-sidebar-collapsed', collapsed ? '1' : '');
+}
+
+function toggleRightSidebar() {
+  const sidebar = document.getElementById('right-sidebar');
+  if (!sidebar) return;
+  sidebar.classList.toggle('collapsed');
+  const collapsed = sidebar.classList.contains('collapsed');
+  localStorage.setItem('momo-right-sidebar-collapsed', collapsed ? '1' : '');
+}
+
+// Restore sidebar state on load
+(function restoreSidebarState() {
+  if (localStorage.getItem('momo-left-sidebar-collapsed') === '1') {
+    const ls = document.getElementById('left-sidebar');
+    if (ls) ls.classList.add('collapsed');
+  }
+  if (localStorage.getItem('momo-right-sidebar-collapsed') === '1') {
+    const rs = document.getElementById('right-sidebar');
+    if (rs) rs.classList.add('collapsed');
+  }
+})();
+
+// ── Collapsible Account Sections (Holdings / Pending) ──
+function toggleAccountSection(section) {
+  const bodyEl = document.getElementById(section === 'holdings' ? 'holdings-info' : 'pending-orders-info');
+  const arrowEl = document.getElementById(section === 'holdings' ? 'holdings-arrow' : 'pending-arrow');
+  const toggleBtn = bodyEl && bodyEl.previousElementSibling
+    ? bodyEl.closest(`#${section}-section`).querySelector('button')
+    : null;
+  if (!bodyEl) return;
+  const isCollapsed = bodyEl.classList.toggle('collapsed-section');
+  if (arrowEl) arrowEl.classList.toggle('collapsed-icon', isCollapsed);
+  if (toggleBtn) toggleBtn.setAttribute('aria-expanded', String(!isCollapsed));
+}
+
+// ── SSE Disconnect Banner ──
+function showSSEDisconnectBanner() {
+  if (document.getElementById('sse-disconnect-banner')) return;
+  const main = document.querySelector('main');
+  if (!main) return;
+  const banner = document.createElement('div');
+  banner.id = 'sse-disconnect-banner';
+  banner.className = 'sse-disconnect-banner shrink-0';
+  banner.innerHTML = '<i data-lucide="wifi-off" class="w-4 h-4"></i> 실시간 연결이 끊겼습니다. 재연결 중...';
+  main.insertBefore(banner, main.children[1]); // After filter bar
+  refreshIcons();
+}
+
+function removeSSEDisconnectBanner() {
+  const banner = document.getElementById('sse-disconnect-banner');
+  if (banner) banner.remove();
+}
+
+// ── Back to Live Button ──
+function insertBackToLiveBar(container) {
+  // Remove existing if any
+  const existing = document.getElementById('back-to-live-bar');
+  if (existing) existing.remove();
+  const bar = document.createElement('div');
+  bar.id = 'back-to-live-bar';
+  bar.className = 'back-to-live-bar';
+  bar.innerHTML = '<button class="back-to-live-btn" onclick="switchView(\'live\')"><i data-lucide="arrow-left" class="w-3 h-3"></i> 실시간으로 돌아가기</button>';
+  container.parentNode.insertBefore(bar, container);
+  refreshIcons();
+}
+
+function removeBackToLiveBar() {
+  const bar = document.getElementById('back-to-live-bar');
+  if (bar) bar.remove();
+}
+
+// ── Common Placeholder Renderer ──
+function renderPlaceholder(container, type, message) {
+  let html = '';
+  if (type === 'loading') {
+    html = `<div class="text-center text-gray-500 text-sm py-4 flex items-center justify-center gap-2">
+      <span class="progress-spinner"></span> ${escapeHtml(message || '불러오는 중...')}
+    </div>`;
+  } else if (type === 'empty') {
+    html = `<div class="text-center text-gray-500 text-sm py-8">
+      <i data-lucide="inbox" class="w-6 h-6 mx-auto mb-2 opacity-50"></i>
+      <div>${escapeHtml(message || '데이터가 없습니다')}</div>
+    </div>`;
+  } else if (type === 'error') {
+    html = `<div class="text-center text-red-400 text-sm py-8">
+      <i data-lucide="alert-triangle" class="w-6 h-6 mx-auto mb-2 opacity-60"></i>
+      <div>${escapeHtml(message || '오류가 발생했습니다')}</div>
+    </div>`;
+  }
+  container.innerHTML = html;
+  refreshIcons();
 }
 
 // Auto-scroll detection
