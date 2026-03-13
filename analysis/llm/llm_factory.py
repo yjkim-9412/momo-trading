@@ -68,6 +68,8 @@ class LLMFactory:
         tier: LLMTier = LLMTier.TIER1,
         system_prompt: str = "",
         *,
+        scope: str | None = None,
+        phase: str = "cycle",
         symbol: str | None = None,
         cycle_id: str | None = None,
     ) -> tuple[str, str]:
@@ -85,7 +87,12 @@ class LLMFactory:
         for attempt in range(2):
             try:
                 start = time.time()
-                result = await provider.generate(prompt, system_prompt)
+                result = await provider.generate(
+                    prompt,
+                    system_prompt,
+                    scope=scope,
+                    phase=phase,
+                )
                 elapsed_ms = int((time.time() - start) * 1000)
                 provider_name = provider.provider.value
                 model_id = provider.model_id
@@ -155,42 +162,62 @@ class LLMFactory:
         prompt: str,
         system_prompt: str = "",
         *,
+        scope: str | None = None,
+        phase: str = "cycle",
         symbol: str | None = None,
         cycle_id: str | None = None,
     ) -> tuple[str, str]:
         """Tier 1 (빠른 분석용)"""
-        return await self.generate(prompt, LLMTier.TIER1, system_prompt, symbol=symbol, cycle_id=cycle_id)
+        return await self.generate(
+            prompt,
+            LLMTier.TIER1,
+            system_prompt,
+            scope=scope,
+            phase=phase,
+            symbol=symbol,
+            cycle_id=cycle_id,
+        )
 
     async def generate_tier2(
         self,
         prompt: str,
         system_prompt: str = "",
         *,
+        scope: str | None = None,
+        phase: str = "cycle",
         symbol: str | None = None,
         cycle_id: str | None = None,
     ) -> tuple[str, str]:
         """Tier 2 (프리미엄 분석용)"""
-        return await self.generate(prompt, LLMTier.TIER2, system_prompt, symbol=symbol, cycle_id=cycle_id)
+        return await self.generate(
+            prompt,
+            LLMTier.TIER2,
+            system_prompt,
+            scope=scope,
+            phase=phase,
+            symbol=symbol,
+            cycle_id=cycle_id,
+        )
 
-    def start_session(self) -> str | None:
+    def start_session(self, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """선택된 provider 세션 시작"""
-        return self._get_session_provider_class().start_session()
+        return self._get_session_provider_class().start_session(scope, phase)
 
-    def end_session(self) -> str | None:
+    def end_session(self, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """선택된 provider 세션 종료"""
-        return self._get_session_provider_class().end_session()
+        return self._get_session_provider_class().end_session(scope, phase)
 
-    def pause_session(self) -> str | None:
+    def pause_session(self, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """선택된 provider 세션 일시 중지"""
-        return self._get_session_provider_class().pause_session()
+        return self._get_session_provider_class().pause_session(scope, phase)
 
-    def resume_session(self, session_id: str) -> None:
+    def resume_session(self, session_id: str, scope: str = "KRX", phase: str = "cycle") -> None:
         """선택된 provider 세션 재개"""
-        self._get_session_provider_class().resume_session(session_id)
+        self._get_session_provider_class().resume_session(session_id, scope, phase)
 
-    def get_session_id(self) -> str | None:
+    def get_session_id(self, scope: str | None = None, phase: str = "cycle") -> str | None:
         """선택된 provider 세션 ID 반환"""
-        return self._get_session_provider_class().get_session_id()
+        return self._get_session_provider_class().get_session_id(scope, phase)
 
     def get_llm_usage(self) -> dict[str, Any]:
         """선택된 provider 사용량 반환"""

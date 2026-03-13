@@ -21,9 +21,9 @@ class FeedbackContextBuilder:
     def __init__(self, session: AsyncSession):
         self.tracker = PerformanceTracker(session)
 
-    async def build_strategy_context(self, strategy_type: str) -> str:
+    async def build_strategy_context(self, strategy_type: str, market_scope: str | None = None) -> str:
         """전략별 성과 컨텍스트"""
-        stat = await self.tracker.get_strategy_stats(strategy_type)
+        stat = await self.tracker.get_strategy_stats(strategy_type, market_scope=market_scope)
         if stat.total_trades == 0:
             return f"[{strategy_type}] 아직 매매 이력 없음 (신규 전략)"
 
@@ -36,9 +36,9 @@ class FeedbackContextBuilder:
             f"평균 보유 {stat.avg_hold_days:.1f}일"
         )
 
-    async def build_symbol_context(self, symbol: str) -> str:
+    async def build_symbol_context(self, symbol: str, market_scope: str | None = None) -> str:
         """종목별 과거 거래 이력 컨텍스트"""
-        stat = await self.tracker.get_symbol_stats(symbol)
+        stat = await self.tracker.get_symbol_stats(symbol, market_scope=market_scope)
         if stat.total_trades == 0:
             return f"[{symbol}] 과거 매매 이력 없음 (처음 분석하는 종목)"
 
@@ -49,9 +49,9 @@ class FeedbackContextBuilder:
             f"총 손익 {stat.total_pnl:+,.0f}원"
         )
 
-    async def build_loss_context(self, limit: int = 5) -> str:
+    async def build_loss_context(self, limit: int = 5, market_scope: str | None = None) -> str:
         """최근 실패 사례 컨텍스트 (AI 실수 반복 방지)"""
-        losses = await self.tracker.get_recent_losses(limit=limit)
+        losses = await self.tracker.get_recent_losses(limit=limit, market_scope=market_scope)
         if not losses:
             return "[최근 손실 거래] 없음"
 
@@ -66,9 +66,9 @@ class FeedbackContextBuilder:
             )
         return "\n".join(lines)
 
-    async def build_win_context(self, limit: int = 5) -> str:
+    async def build_win_context(self, limit: int = 5, market_scope: str | None = None) -> str:
         """최근 성공 사례 컨텍스트 (AI 성공 패턴 강화)"""
-        wins = await self.tracker.get_recent_wins(limit=limit)
+        wins = await self.tracker.get_recent_wins(limit=limit, market_scope=market_scope)
         if not wins:
             return "[최근 성공 거래] 없음"
 
@@ -83,9 +83,9 @@ class FeedbackContextBuilder:
             )
         return "\n".join(lines)
 
-    async def build_consecutive_loss_warning(self) -> str:
+    async def build_consecutive_loss_warning(self, market_scope: str | None = None) -> str:
         """연속 손실 경고 (과매매 방지)"""
-        count = await self.tracker.get_consecutive_losses()
+        count = await self.tracker.get_consecutive_losses(market_scope=market_scope)
         if count == 0:
             return ""
         if count >= 5:
@@ -102,9 +102,9 @@ class FeedbackContextBuilder:
             )
         return ""
 
-    async def build_regime_context(self, current_regime: str) -> str:
+    async def build_regime_context(self, current_regime: str, market_scope: str | None = None) -> str:
         """현재 시장 국면 기반 성과 컨텍스트"""
-        stat = await self.tracker.get_market_regime_stats(current_regime)
+        stat = await self.tracker.get_market_regime_stats(current_regime, market_scope=market_scope)
         if stat.total_trades == 0:
             return f"[{current_regime} 시장에서의 이력] 데이터 없음"
 
@@ -114,7 +114,7 @@ class FeedbackContextBuilder:
             f"평균 수익률 {stat.avg_return:+.2f}%"
         )
 
-    async def build_rsi_context(self, current_rsi: float | None) -> str:
+    async def build_rsi_context(self, current_rsi: float | None, market_scope: str | None = None) -> str:
         """현재 RSI 구간 기반 과거 성과"""
         if current_rsi is None:
             return ""
@@ -122,7 +122,11 @@ class FeedbackContextBuilder:
         # RSI를 10 단위 구간으로
         rsi_low = (int(current_rsi) // 10) * 10
         rsi_high = rsi_low + 10
-        stat = await self.tracker.get_rsi_range_stats(float(rsi_low), float(rsi_high))
+        stat = await self.tracker.get_rsi_range_stats(
+            float(rsi_low),
+            float(rsi_high),
+            market_scope=market_scope,
+        )
         if stat.total_trades == 0:
             return ""
 
@@ -138,38 +142,39 @@ class FeedbackContextBuilder:
         symbol: str,
         current_regime: str = "",
         current_rsi: float | None = None,
+        market_scope: str | None = None,
     ) -> str:
         """모든 컨텍스트를 통합하여 프롬프트에 삽입할 텍스트 생성"""
         parts = []
 
         # 연속 손실 경고 (최상단 배치 — 가장 중요)
-        consecutive_warning = await self.build_consecutive_loss_warning()
+        consecutive_warning = await self.build_consecutive_loss_warning(market_scope=market_scope)
         if consecutive_warning:
             parts.append(consecutive_warning)
 
         # 전략 성과
-        strategy_ctx = await self.build_strategy_context(strategy_type)
+        strategy_ctx = await self.build_strategy_context(strategy_type, market_scope=market_scope)
         parts.append(strategy_ctx)
 
         # 종목 이력
-        symbol_ctx = await self.build_symbol_context(symbol)
+        symbol_ctx = await self.build_symbol_context(symbol, market_scope=market_scope)
         parts.append(symbol_ctx)
 
         # 최근 성공 패턴 (AI가 좋은 패턴 반복하도록)
-        win_ctx = await self.build_win_context()
+        win_ctx = await self.build_win_context(market_scope=market_scope)
         parts.append(win_ctx)
 
         # 최근 손실 패턴 (AI가 나쁜 패턴 회피하도록)
-        loss_ctx = await self.build_loss_context()
+        loss_ctx = await self.build_loss_context(market_scope=market_scope)
         parts.append(loss_ctx)
 
         # 시장 국면
         if current_regime:
-            regime_ctx = await self.build_regime_context(current_regime)
+            regime_ctx = await self.build_regime_context(current_regime, market_scope=market_scope)
             parts.append(regime_ctx)
 
         # RSI 구간
-        rsi_ctx = await self.build_rsi_context(current_rsi)
+        rsi_ctx = await self.build_rsi_context(current_rsi, market_scope=market_scope)
         if rsi_ctx:
             parts.append(rsi_ctx)
 

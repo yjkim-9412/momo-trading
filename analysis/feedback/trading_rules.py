@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import AsyncSessionLocal
 from models.trading_rule import TradingRule
+from trading.market_profile import normalize_market_scope
 from util.time_util import now_kst
 
 # ──────────────────────────────────────────────
@@ -51,7 +52,10 @@ class TradingRuleEngine:
     # 규칙 생성
     # ──────────────────────────────────────────
     async def generate_rules_from_review(
-        self, parsed_review: dict, report_date,
+        self,
+        parsed_review: dict,
+        report_date,
+        market_scope: str = "KRX",
     ) -> list[TradingRule]:
         """장 마감 리뷰 LLM 출력에서 action_items 파싱 → TradingRule 생성"""
         action_items = parsed_review.get("action_items") or []
@@ -59,6 +63,7 @@ class TradingRuleEngine:
             logger.info("[TradingRule] action_items 없음 — 규칙 생성 스킵")
             return []
 
+        scope = normalize_market_scope(market_scope)
         now = now_kst()
         rules: list[TradingRule] = []
 
@@ -78,6 +83,7 @@ class TradingRuleEngine:
                 )
 
             rule = TradingRule(
+                market_scope=scope,
                 rule_type=item.get("rule_type", "PARAM_OVERRIDE"),
                 strategy_type=item.get("strategy_type", "ALL"),
                 param_name=param_name,
@@ -100,6 +106,7 @@ class TradingRuleEngine:
                 await session.execute(
                     update(TradingRule)
                     .where(
+                        TradingRule.market_scope == scope,
                         TradingRule.param_name == r.param_name,
                         TradingRule.strategy_type == r.strategy_type,
                         TradingRule.is_active.is_(True),
@@ -111,7 +118,10 @@ class TradingRuleEngine:
             # 활성 규칙 상한 체크
             active_count = len(
                 (await session.execute(
-                    select(TradingRule).where(TradingRule.is_active.is_(True))
+                    select(TradingRule).where(
+                        TradingRule.market_scope == scope,
+                        TradingRule.is_active.is_(True),
+                    )
                 )).scalars().all()
             )
             if active_count > MAX_ACTIVE_RULES:
@@ -123,6 +133,7 @@ class TradingRuleEngine:
                     await session.execute(
                         select(TradingRule)
                         .where(TradingRule.is_active.is_(True))
+                        .where(TradingRule.market_scope == scope)
                         .order_by(
                             # LOW 먼저 제거, 그 다음 오래된 순
                             TradingRule.priority.desc(),
@@ -142,7 +153,7 @@ class TradingRuleEngine:
     # ──────────────────────────────────────────
     # 규칙 로드
     # ──────────────────────────────────────────
-    async def load_active_rules(self) -> dict:
+    async def load_active_rules(self, market_scope: str = "KRX") -> dict:
         """활성 규칙 로드 → 적용 가능한 구조로 변환
 
         Returns:
@@ -154,13 +165,15 @@ class TradingRuleEngine:
             }
         """
         now = now_kst()
+        scope = normalize_market_scope(market_scope)
 
         async with AsyncSessionLocal() as session:
             # 부트스트랩 규칙 확인 + 생성
-            await self._ensure_bootstrap_rules(session)
+            await self._ensure_bootstrap_rules(session, scope)
 
             result = await session.execute(
                 select(TradingRule).where(
+                    TradingRule.market_scope == scope,
                     TradingRule.is_active.is_(True),
                     TradingRule.expires_at > now,
                 )
@@ -225,43 +238,46 @@ class TradingRuleEngine:
     # ──────────────────────────────────────────
     # 적용 기록 + 만료 정리
     # ──────────────────────────────────────────
-    async def record_application(self, rule_ids: list[str]) -> None:
+    async def record_application(self, rule_ids: list[str], market_scope: str | None = None) -> None:
         """적용 횟수 증가 (감사 추적)"""
         if not rule_ids:
             return
+        scope = normalize_market_scope(market_scope) if market_scope else None
         async with AsyncSessionLocal() as session:
             for rid in rule_ids:
+                stmt = update(TradingRule).where(TradingRule.id == rid)
+                if scope:
+                    stmt = stmt.where(TradingRule.market_scope == scope)
                 await session.execute(
-                    update(TradingRule)
-                    .where(TradingRule.id == rid)
-                    .values(applied_count=TradingRule.applied_count + 1)
+                    stmt.values(applied_count=TradingRule.applied_count + 1)
                 )
             await session.commit()
 
-    async def expire_old_rules(self) -> int:
+    async def expire_old_rules(self, market_scope: str | None = None) -> int:
         """만료된 규칙 비활성화"""
         now = now_kst()
+        scope = normalize_market_scope(market_scope) if market_scope else None
         async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                update(TradingRule)
-                .where(
-                    TradingRule.is_active.is_(True),
-                    TradingRule.expires_at <= now,
-                )
-                .values(is_active=False)
+            stmt = update(TradingRule).where(
+                TradingRule.is_active.is_(True),
+                TradingRule.expires_at <= now,
             )
+            if scope:
+                stmt = stmt.where(TradingRule.market_scope == scope)
+            result = await session.execute(stmt.values(is_active=False))
             await session.commit()
             return result.rowcount  # type: ignore[return-value]
 
     # ──────────────────────────────────────────
     # 부트스트랩 규칙
     # ──────────────────────────────────────────
-    async def _ensure_bootstrap_rules(self, session: AsyncSession) -> None:
+    async def _ensure_bootstrap_rules(self, session: AsyncSession, market_scope: str) -> None:
         """상시 활성화 부트스트랩 규칙 확인 — 없으면 생성"""
         now = now_kst()
         for tmpl in BOOTSTRAP_RULES:
             existing = await session.execute(
                 select(TradingRule).where(
+                    TradingRule.market_scope == market_scope,
                     TradingRule.param_name == tmpl["param_name"],
                     TradingRule.rule_type == tmpl["rule_type"],
                     TradingRule.is_active.is_(True),
@@ -271,6 +287,7 @@ class TradingRuleEngine:
                 continue
 
             rule = TradingRule(
+                market_scope=market_scope,
                 rule_type=tmpl["rule_type"],
                 param_name=tmpl["param_name"],
                 param_value=tmpl["param_value"],
