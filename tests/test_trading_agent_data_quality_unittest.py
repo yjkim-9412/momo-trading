@@ -61,13 +61,35 @@ class TradingAgentDataQualityTest(unittest.TestCase):
     def test_stock_analysis_prompt_uses_trend_summary_label(self):
         self.assertIn("### 추세 분석 요약", STOCK_ANALYSIS_PROMPT)
         self.assertNotIn("### 최근 일봉 데이터", STOCK_ANALYSIS_PROMPT)
+        self.assertIn("### 상품 특성", STOCK_ANALYSIS_PROMPT)
+        self.assertIn("{product_context}", STOCK_ANALYSIS_PROMPT)
 
     def test_final_review_prompt_requires_market_currency_for_price_fields(self):
         from analysis.llm.prompts.final_review import FINAL_REVIEW_PROMPT
 
+        self.assertIn("### 상품 특성", FINAL_REVIEW_PROMPT)
+        self.assertIn("배수(1x/2x/3x)", FINAL_REVIEW_PROMPT)
         self.assertIn("환산 참고: 1{currency}", FINAL_REVIEW_PROMPT)
         self.assertIn("stop_loss_price: 손절 기준가 ({currency})", FINAL_REVIEW_PROMPT)
         self.assertIn("가격 필드에 넣지 마세요", FINAL_REVIEW_PROMPT)
+
+    def test_should_skip_tier2_blocks_restricted_products(self):
+        self.assertFalse(
+            TradingAgent._should_skip_tier2(
+                is_restricted_product=True,
+                tier1_confidence=0.95,
+                market_regime="BULL",
+                recommendation="BUY",
+            )
+        )
+        self.assertTrue(
+            TradingAgent._should_skip_tier2(
+                is_restricted_product=False,
+                tier1_confidence=0.95,
+                market_regime="BULL",
+                recommendation="BUY",
+            )
+        )
 
 
 if __name__ == "__main__":

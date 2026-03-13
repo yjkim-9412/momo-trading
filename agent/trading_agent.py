@@ -19,6 +19,7 @@ from analysis.llm.prompts.stock_analysis import STOCK_ANALYSIS_PROMPT, STOCK_ANA
 from core.config import settings
 from core.database import AsyncSessionLocal
 from core.events import Event, EventType, event_bus
+from admin.sse_manager import sse_manager
 from realtime.event_detector import event_detector
 from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
@@ -43,6 +44,7 @@ from trading.market_profile import (
 )
 from trading.mcp_client import mcp_client
 from trading.product_policy import (
+    build_product_context,
     classification_from_metadata,
     coerce_strategy_for_product,
     is_product_trade_allowed,
@@ -78,6 +80,7 @@ class MarketState:
     cash_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     strategies: dict[str, object] = field(default_factory=_default_strategies)
     last_completed_review_date: date | None = None
+    _pipeline_snapshot: dict = field(default_factory=dict)
 
 
 class TradingAgent:
@@ -121,6 +124,9 @@ class TradingAgent:
             "product_type",
             "is_leveraged",
             "is_inverse",
+            "leverage_multiplier",
+            "signed_exposure",
+            "restricted_product",
             "classification_source",
         ):
             value = metadata.get(field_name)
@@ -128,6 +134,63 @@ class TradingAgent:
                 merged[field_name] = value
         if merged:
             self._product_metadata[key] = merged
+
+    @staticmethod
+    def _enrich_activity_detail(detail: dict | None, product_context: dict | None) -> dict | None:
+        if not detail and not product_context:
+            return None
+
+        enriched = dict(detail or {})
+        if product_context:
+            enriched["product_context"] = dict(product_context)
+        return enriched
+
+    @staticmethod
+    def _format_product_context_for_prompt(product_context: dict | None) -> str:
+        context = product_context or {}
+        product_type = str(context.get("product_type") or "COMMON")
+        is_leveraged = bool(context.get("is_leveraged"))
+        is_inverse = bool(context.get("is_inverse"))
+        restricted = bool(context.get("restricted_product"))
+        multiplier = float(context.get("leverage_multiplier") or 1.0)
+        if is_inverse:
+            exposure_text = f"-{multiplier:g}x"
+        elif is_leveraged:
+            exposure_text = f"+{multiplier:g}x"
+        else:
+            exposure_text = "1x"
+
+        restriction_text = "제한 상품" if restricted else "일반 종목"
+        guidance = (
+            "레버리지/인버스 특성상 일반 종목보다 더 강한 추세·거래량 확인, 더 보수적인 수량 판단, "
+            "더 타이트한 손절과 장마감 전 청산 가능성을 우선 검토하세요."
+            if restricted
+            else "일반 종목 기준으로 평가하되, 별도 배수 리스크는 없습니다."
+        )
+        return "\n".join(
+            [
+                f"- 상품 유형: {product_type}",
+                f"- 노출 배수: {exposure_text}",
+                f"- 제한 상품 여부: {restriction_text}",
+                f"- 분류 근거: {context.get('classification_source') or 'default'}",
+                f"- 분석 메모: {guidance}",
+            ]
+        )
+
+    @staticmethod
+    def _should_skip_tier2(
+        *,
+        is_restricted_product: bool,
+        tier1_confidence: float,
+        market_regime: str,
+        recommendation: str,
+    ) -> bool:
+        return (
+            not is_restricted_product
+            and tier1_confidence >= 0.80
+            and market_regime in ("THEME", "BULL")
+            and recommendation == "BUY"
+        )
 
     @staticmethod
     def _sort_market_data_frame(df: pd.DataFrame, time_column: str) -> pd.DataFrame:
@@ -535,6 +598,28 @@ class TradingAgent:
                 for c in candidates if c.get("symbol")
             ]
 
+            # 파이프라인 모니터 상태 업데이트 + SSE 브로드캐스트
+            from util.time_util import now_kst as _now_kst
+            selected_syms = [
+                {"symbol": c.get("symbol", ""), "name": c.get("name", "")}
+                for c in candidates if c.get("symbol")
+            ]
+            state._pipeline_snapshot = {
+                "cycle_id": cycle_id,
+                "started_at": _now_kst().isoformat(),
+                "scanned_count": len(candidates),
+                "analyzed_count": 0,
+                "selected_symbols": selected_syms,
+            }
+            await sse_manager.broadcast({
+                "type": "agent_state",
+                "data": {
+                    "market_scope": scope,
+                    "cycle_active": True,
+                    **state._pipeline_snapshot,
+                },
+            })
+
             # AI가 결정한 모니터링 임계값을 event_detector에 설정
             self._apply_scan_thresholds(candidates)
 
@@ -675,6 +760,20 @@ class TradingAgent:
             detail=results,
             execution_time_ms=elapsed,
         )
+        # 파이프라인 모니터 — 사이클 종료 브로드캐스트
+        state._pipeline_snapshot = {}
+        await sse_manager.broadcast({
+            "type": "agent_state",
+            "data": {
+                "market_scope": scope,
+                "cycle_active": False,
+                "cycle_id": cycle_id,
+                "scanned_count": results.get("scanned", 0),
+                "analyzed_count": results.get("analyzed", 0),
+                "selected_symbols": [],
+            },
+        })
+
         # 세션 종료 (세션 ID 보존 — 장외 사이클에서 재개 가능)
         state.session_ids["cycle"] = llm_factory.end_session(scope=scope, phase="cycle")
 
@@ -756,6 +855,7 @@ class TradingAgent:
         self._remember_product_metadata(symbol, market_code, product_metadata)
         stock_info.update(product_metadata)
         name = product_metadata.get("name", name) or name
+        product_context = build_product_context(symbol, market_code, product_metadata)
 
         effective_strategy = coerce_strategy_for_product(strategy_type, classification)
         if not effective_strategy:
@@ -763,7 +863,10 @@ class TradingAgent:
                 ActivityType.RISK_GATE, ActivityPhase.SKIP,
                 f"🚫 [{name}] 제한 상품 허용 전략 미설정",
                 cycle_id=cycle_id, symbol=symbol,
-                detail=product_metadata,
+                detail=self._enrich_activity_detail(
+                    {"reason": "제한 상품 허용 전략 미설정"},
+                    product_context,
+                ),
             )
             return result
 
@@ -785,7 +888,10 @@ class TradingAgent:
                 ActivityType.RISK_GATE, ActivityPhase.SKIP,
                 f"🚫 [{name}] 제한 상품 정책 차단: {policy_reason}",
                 cycle_id=cycle_id, symbol=symbol,
-                detail=product_metadata,
+                detail=self._enrich_activity_detail(
+                    {"reason": policy_reason},
+                    product_context,
+                ),
             )
             return result
 
@@ -832,12 +938,15 @@ class TradingAgent:
                 ActivityType.TIER1_ANALYSIS, ActivityPhase.SKIP,
                 f"⚠️ [{name}] 데이터 부족으로 분석 스킵 ({'·'.join(missing_fields)} 조회 실패)",
                 cycle_id=cycle_id, symbol=symbol,
-                detail={
-                    "missing_fields": missing_fields,
-                    "live_quote": round(current_price, 4),
-                    "latest_daily_close": float(daily_df['close'].iloc[-1]) if not daily_df.empty and "close" in daily_df.columns else None,
-                    "latest_minute_close": float(minute_df['close'].iloc[-1]) if minute_df is not None and not minute_df.empty and "close" in minute_df.columns else None,
-                },
+                detail=self._enrich_activity_detail(
+                    {
+                        "missing_fields": missing_fields,
+                        "live_quote": round(current_price, 4),
+                        "latest_daily_close": float(daily_df["close"].iloc[-1]) if not daily_df.empty and "close" in daily_df.columns else None,
+                        "latest_minute_close": float(minute_df["close"].iloc[-1]) if minute_df is not None and not minute_df.empty and "close" in minute_df.columns else None,
+                    },
+                    product_context,
+                ),
             )
             return result
 
@@ -861,7 +970,7 @@ class TradingAgent:
                 f"⚠️ [{name}] 데이터 정합성 차단 ({anchor_label} 대비 괴리 {consistency_issue['gap_pct']:.1%})",
                 cycle_id=cycle_id,
                 symbol=symbol,
-                detail=consistency_issue,
+                detail=self._enrich_activity_detail(consistency_issue, product_context),
             )
             return result
 
@@ -890,11 +999,13 @@ class TradingAgent:
             ActivityType.TIER1_ANALYSIS, ActivityPhase.START,
             f"\U0001f4ca [{name}] Tier1 분석 시작",
             cycle_id=cycle_id, symbol=symbol,
+            detail=self._enrich_activity_detail(None, product_context),
         )
 
         analysis = await self._tier1_analysis(
             symbol, name, current_price, chart_result,
             price_resp.data or {}, feedback_context,
+            product_context=product_context,
             market_context=mkt_state.market_context,
             trading_context=mkt_state.trading_context,
             cycle_id=cycle_id,
@@ -906,6 +1017,7 @@ class TradingAgent:
                 ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
                 f"\U0001f4ca [{name}] Tier1: 분석 실패 (응답 파싱 불가)",
                 cycle_id=cycle_id, symbol=symbol,
+                detail=self._enrich_activity_detail({"reason": "응답 파싱 불가"}, product_context),
                 llm_tier="TIER1",
                 execution_time_ms=t1_elapsed,
             )
@@ -921,11 +1033,14 @@ class TradingAgent:
                 ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
                 f"\U0001f4ca [{name}] Tier1: SELL → 스캔 경로에서 매도 스킵 | {reason[:100]}",
                 cycle_id=cycle_id, symbol=symbol,
-                detail={
-                    "recommendation": "SELL",
-                    "reason": reason,
-                    "confidence": analysis.get("confidence") or 0,
-                },
+                detail=self._enrich_activity_detail(
+                    {
+                        "recommendation": "SELL",
+                        "reason": reason,
+                        "confidence": analysis.get("confidence") or 0,
+                    },
+                    product_context,
+                ),
                 llm_provider=analysis.get("provider"),
                 llm_tier="TIER1",
                 execution_time_ms=t1_elapsed,
@@ -939,12 +1054,15 @@ class TradingAgent:
                 ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
                 f"\U0001f4ca [{name}] Tier1: HOLD → 스킵 | {reason[:100]}",
                 cycle_id=cycle_id, symbol=symbol,
-                detail={
-                    "recommendation": "HOLD",
-                    "reason": reason,
-                    "confidence": analysis.get("confidence") or 0,
-                    "key_factors": analysis.get("key_factors", []),
-                },
+                detail=self._enrich_activity_detail(
+                    {
+                        "recommendation": "HOLD",
+                        "reason": reason,
+                        "confidence": analysis.get("confidence") or 0,
+                        "key_factors": analysis.get("key_factors", []),
+                    },
+                    product_context,
+                ),
                 llm_provider=analysis.get("provider"),
                 llm_tier="TIER1",
                 execution_time_ms=t1_elapsed,
@@ -957,12 +1075,15 @@ class TradingAgent:
             f"\U0001f4ca [{name}] Tier1 완료: {analysis.get('recommendation', '')} "
             f"| 신뢰도 {(analysis.get('confidence') or 0):.0%}",
             cycle_id=cycle_id, symbol=symbol,
-            detail={
-                "recommendation": analysis.get("recommendation"),
-                "reason": analysis.get("reason") or analysis.get("summary", ""),
-                "target_price": analysis.get("target_price"),
-                "stop_loss": analysis.get("stop_loss_price"),
-            },
+            detail=self._enrich_activity_detail(
+                {
+                    "recommendation": analysis.get("recommendation"),
+                    "reason": analysis.get("reason") or analysis.get("summary", ""),
+                    "target_price": analysis.get("target_price"),
+                    "stop_loss": analysis.get("stop_loss_price"),
+                },
+                product_context,
+            ),
             llm_provider=analysis.get("provider"),
             llm_tier="TIER1",
             execution_time_ms=t1_elapsed,
@@ -1041,10 +1162,11 @@ class TradingAgent:
                     return result
 
         # 3d. Tier 2 최종 검토 (또는 fast-path 스킵)
-        skip_tier2 = (
-            tier1_confidence >= 0.80
-            and mkt_state.market_regime in ("THEME", "BULL")
-            and analysis.get("recommendation") == "BUY"
+        skip_tier2 = self._should_skip_tier2(
+            is_restricted_product=classification.is_restricted,
+            tier1_confidence=tier1_confidence,
+            market_regime=mkt_state.market_regime,
+            recommendation=str(analysis.get("recommendation") or ""),
         )
 
         if skip_tier2:
@@ -1065,7 +1187,10 @@ class TradingAgent:
                 f"\u26a1 [{name}] Tier2 스킵: fast-path "
                 f"(신뢰도 {tier1_confidence:.0%}, {mkt_state.market_regime} 국면)",
                 cycle_id=cycle_id, symbol=symbol,
-                detail={"approved": True, "skip_reason": "fast-path"},
+                detail=self._enrich_activity_detail(
+                    {"approved": True, "skip_reason": "fast-path"},
+                    product_context,
+                ),
                 llm_tier="TIER2",
             )
         else:
@@ -1074,11 +1199,13 @@ class TradingAgent:
                 ActivityType.TIER2_REVIEW, ActivityPhase.START,
                 f"\U0001f9e0 [{name}] Tier2 최종 검토 시작",
                 cycle_id=cycle_id, symbol=symbol,
+                detail=self._enrich_activity_detail(None, product_context),
             )
 
             final = await self._tier2_review(
                 symbol, name, current_price, strategy_type, analysis,
                 feedback_context=feedback_context,
+                product_context=product_context,
                 chart_result=chart_result,
                 dynamic_limits=dynamic_limits,
                 market_context=mkt_state.market_context,
@@ -1094,6 +1221,13 @@ class TradingAgent:
                     ActivityType.TIER2_REVIEW, ActivityPhase.COMPLETE,
                     f"\U0001f9e0 [{name}] Tier2: 미승인 - {reason[:80]}",
                     cycle_id=cycle_id, symbol=symbol,
+                    detail=self._enrich_activity_detail(
+                        {
+                            "approved": False,
+                            "reason": reason,
+                        },
+                        product_context,
+                    ),
                     llm_provider=final.get("provider") if final else None,
                     llm_tier="TIER2",
                     execution_time_ms=t2_elapsed,
@@ -1106,18 +1240,21 @@ class TradingAgent:
                 f"\U0001f9e0 [{name}] Tier2: \u2705 승인"
                 + (f" | 수량 {final.get('suggested_quantity')}주" if final.get("suggested_quantity") else ""),
                 cycle_id=cycle_id, symbol=symbol,
-                detail={
-                    "approved": True,
-                    "reason": final.get("reason", ""),
-                    "suggested_quantity": final.get("suggested_quantity"),
-                    "entry_price": final.get("entry_price"),
-                    "entry_price_currency": currency,
-                    "entry_price_krw": final.get("entry_price_krw"),
-                    "target_price": final.get("target_price"),
-                    "target_price_currency": currency,
-                    "target_price_krw": final.get("target_price_krw"),
-                    "normalized_price_fields": final.get("normalized_price_fields"),
-                },
+                detail=self._enrich_activity_detail(
+                    {
+                        "approved": True,
+                        "reason": final.get("reason", ""),
+                        "suggested_quantity": final.get("suggested_quantity"),
+                        "entry_price": final.get("entry_price"),
+                        "entry_price_currency": currency,
+                        "entry_price_krw": final.get("entry_price_krw"),
+                        "target_price": final.get("target_price"),
+                        "target_price_currency": currency,
+                        "target_price_krw": final.get("target_price_krw"),
+                        "normalized_price_fields": final.get("normalized_price_fields"),
+                    },
+                    product_context,
+                ),
                 llm_provider=final.get("provider"),
                 llm_tier="TIER2",
                 execution_time_ms=t2_elapsed,
@@ -1174,13 +1311,16 @@ class TradingAgent:
                 f"\U0001f4c8 [{name}] Tier2 승인 기반 시그널: {action.value} "
                 f"{signal.suggested_quantity}주 @{signal.suggested_price:,.2f}{currency}",
                 cycle_id=cycle_id, symbol=symbol,
-                detail={
-                    "action": action.value,
-                    "suggested_quantity": signal.suggested_quantity,
-                    "entry_price": signal.suggested_price,
-                    "currency": currency,
-                    "entry_price_krw": signal.metadata.get("entry_price_krw"),
-                },
+                detail=self._enrich_activity_detail(
+                    {
+                        "action": action.value,
+                        "suggested_quantity": signal.suggested_quantity,
+                        "entry_price": signal.suggested_price,
+                        "currency": currency,
+                        "entry_price_krw": signal.metadata.get("entry_price_krw"),
+                    },
+                    product_context,
+                ),
             )
         else:
             # Tier2가 구체적 수량/가격을 제시하지 않은 경우 → 전략 평가로 폴백
@@ -1207,6 +1347,7 @@ class TradingAgent:
                     ActivityType.STRATEGY_EVAL, ActivityPhase.COMPLETE,
                     f"\U0001f4c8 [{name}] 전략 평가: HOLD → 스킵",
                     cycle_id=cycle_id, symbol=symbol,
+                    detail=self._enrich_activity_detail({"action": "HOLD"}, product_context),
                 )
                 return result
 
@@ -1216,6 +1357,15 @@ class TradingAgent:
                 f"\U0001f4c8 [{name}] 전략({strategy_type}): {signal.action.value} "
                 f"{signal.suggested_quantity or 0}주 @{(signal.suggested_price or 0):,.0f}원",
                 cycle_id=cycle_id, symbol=symbol,
+                detail=self._enrich_activity_detail(
+                    {
+                        "action": signal.action.value,
+                        "suggested_quantity": signal.suggested_quantity or 0,
+                        "entry_price": signal.suggested_price or 0,
+                        "currency": currency,
+                    },
+                    product_context,
+                ),
             )
 
             # Tier 2에서 제안한 값이 있으면 적용
@@ -1251,6 +1401,10 @@ class TradingAgent:
                     ActivityType.RISK_CHECK, ActivityPhase.SKIP,
                     f"🚫 [{name}] 미보유 종목 매도 차단",
                     cycle_id=cycle_id, symbol=symbol,
+                    detail=self._enrich_activity_detail(
+                        {"reason": "미보유 종목 매도 차단"},
+                        product_context,
+                    ),
                 )
                 return result
 
@@ -1292,6 +1446,10 @@ class TradingAgent:
             "product_type": product_metadata.get("product_type", "COMMON"),
             "is_leveraged": bool(product_metadata.get("is_leveraged")),
             "is_inverse": bool(product_metadata.get("is_inverse")),
+            "leverage_multiplier": float(product_context.get("leverage_multiplier") or 1.0),
+            "signed_exposure": float(product_context.get("signed_exposure") or 1.0),
+            "restricted_product": bool(product_context.get("restricted_product")),
+            "classification_source": product_context.get("classification_source"),
         }
         exec_result = await decision_maker.execute(
             signal, cycle_id=cycle_id, analysis_context=analysis_context,
@@ -1961,6 +2119,7 @@ class TradingAgent:
         self, symbol: str, name: str, current_price: float,
         chart_result: ChartAnalysisResult, price_data: dict,
         feedback_context: str = "",
+        product_context: dict | None = None,
         market_context: str = "",
         trading_context: str = "",
         cycle_id: str | None = None,
@@ -1984,6 +2143,7 @@ class TradingAgent:
             technical_indicators=chart_result.indicators_text or "지표 데이터 없음",
             chart_patterns=chart_result.patterns_text or "차트 패턴 데이터 없음",
             daily_data=chart_result.trend_text or "추세 데이터 없음",
+            product_context=self._format_product_context_for_prompt(product_context),
             per=price_data.get("per", "N/A"),
             pbr=price_data.get("pbr", "N/A"),
             market_cap=price_data.get("market_cap", "N/A"),
@@ -2009,6 +2169,7 @@ class TradingAgent:
                 parsed["currency"] = currency
                 parsed["exchange_rate_to_krw"] = float(price_data.get("exchange_rate_to_krw", 1.0) or 1.0)
                 parsed["price_krw"] = float(price_data.get("price_krw", current_price) or 0.0)
+                parsed["product_context"] = dict(product_context or {})
             return parsed
         except Exception as e:
             logger.error("Tier 1 분석 실패 ({}): {}", symbol, str(e))
@@ -2018,6 +2179,7 @@ class TradingAgent:
         self, symbol: str, name: str, current_price: float,
         strategy_type: str, tier1_analysis: dict,
         feedback_context: str = "",
+        product_context: dict | None = None,
         chart_result: ChartAnalysisResult | None = None,
         dynamic_limits: dict | None = None,
         market_context: str = "",
@@ -2069,6 +2231,7 @@ class TradingAgent:
             symbol=symbol,
             market=market_code,
             currency=currency,
+            product_context=self._format_product_context_for_prompt(product_context),
             current_price_text=current_price_text,
             exchange_rate_to_krw=exchange_rate_to_krw,
             strategy_type=strategy_type,
@@ -2099,6 +2262,7 @@ class TradingAgent:
                 parsed["provider"] = provider
                 parsed["market"] = market_code
                 parsed["currency"] = currency
+                parsed["product_context"] = dict(product_context or {})
                 parsed = self._normalize_tier2_price_fields(
                     parsed,
                     current_price=current_price,

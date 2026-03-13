@@ -16,6 +16,7 @@ from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, AutonomyMode, OrderSource, RecommendationStatus
 from trading.market_profile import is_us_market, normalize_market
 from trading.mcp_client import mcp_client
+from trading.product_policy import build_product_context
 from scheduler.market_calendar import market_calendar
 from util.time_util import now_kst
 
@@ -100,6 +101,18 @@ class DecisionMaker:
             "currency": signal.metadata.get("currency", "USD"),
         }
 
+    @staticmethod
+    def _signal_product_context(signal: TradeSignal) -> dict:
+        metadata = signal.metadata or {}
+        market_code = normalize_market(metadata.get("market", "KRX"))
+        return build_product_context(signal.symbol, market_code, metadata)
+
+    @classmethod
+    def _enrich_detail(cls, signal: TradeSignal, detail: dict | None = None) -> dict:
+        enriched = dict(detail or {})
+        enriched["product_context"] = cls._signal_product_context(signal)
+        return enriched
+
     async def execute(
         self, signal: TradeSignal, analysis_id: str = "", cycle_id: str | None = None,
         analysis_context: dict | None = None,
@@ -142,15 +155,18 @@ class DecisionMaker:
             f"{self._price_display(price, currency, price_krw)}",
             cycle_id=cycle_id,
             symbol=signal.symbol,
-            detail={
-                "market": market_code,
-                "currency": currency,
-                "requested_quantity": qty,
-                "requested_price": price,
-                "requested_price_krw": round(price_krw, 4),
-                "live_price": signal.metadata.get("live_price"),
-                "live_price_krw": signal.metadata.get("live_price_krw"),
-            },
+            detail=self._enrich_detail(
+                signal,
+                {
+                    "market": market_code,
+                    "currency": currency,
+                    "requested_quantity": qty,
+                    "requested_price": price,
+                    "requested_price_krw": round(price_krw, 4),
+                    "live_price": signal.metadata.get("live_price"),
+                    "live_price_krw": signal.metadata.get("live_price_krw"),
+                },
+            ),
         )
 
         sanity_issue = self._detect_order_price_sanity_issue(signal)
@@ -170,7 +186,7 @@ class DecisionMaker:
                 cycle_id=cycle_id,
                 symbol=signal.symbol,
                 error_message=sanity_issue["reason"],
-                detail=sanity_issue,
+                detail=self._enrich_detail(signal, sanity_issue),
             )
             await event_bus.publish(Event(
                 type=EventType.ORDER_EXECUTED,
@@ -187,7 +203,7 @@ class DecisionMaker:
                 cycle_id=cycle_id,
                 symbol=signal.symbol,
                 error_message=paper_session_block["reason"],
-                detail=paper_session_block,
+                detail=self._enrich_detail(signal, paper_session_block),
             )
             recommendation = await self._create_recommendation(signal, analysis_id, cycle_id)
             recommendation["mode"] = "AUTONOMOUS_FALLBACK"
@@ -227,7 +243,7 @@ class DecisionMaker:
                 ActivityType.DECISION, ActivityPhase.COMPLETE,
                 f"\u2705 [{signal.symbol}] 주문 접수 완료 (체결 대기) — 주문번호: {order_id}",
                 cycle_id=cycle_id, symbol=signal.symbol,
-                detail=result,
+                detail=self._enrich_detail(signal, result),
             )
             # 체결 확인 + TradeResult 기록 (백그라운드, 매매 흐름 차단 안 함)
             task = asyncio.create_task(
@@ -256,11 +272,14 @@ class DecisionMaker:
                 f"\u274c [{signal.symbol}] 주문 실패: {error_msg}",
                 cycle_id=cycle_id, symbol=signal.symbol,
                 error_message=error_msg,
-                detail={
-                    **result,
-                    "market": market_code,
-                    "response_success": response.success,
-                },
+                detail=self._enrich_detail(
+                    signal,
+                    {
+                        **result,
+                        "market": market_code,
+                        "response_success": response.success,
+                    },
+                ),
             )
 
         await event_bus.publish(Event(
@@ -512,6 +531,9 @@ class DecisionMaker:
             "product_type": signal.metadata.get("product_type", "COMMON"),
             "is_leveraged": bool(signal.metadata.get("is_leveraged")),
             "is_inverse": bool(signal.metadata.get("is_inverse")),
+            "leverage_multiplier": float(signal.metadata.get("leverage_multiplier") or 1.0),
+            "signed_exposure": float(signal.metadata.get("signed_exposure") or 1.0),
+            "restricted_product": bool(signal.metadata.get("restricted_product")),
             "action": signal.action.value,
             "suggested_price": signal.suggested_price or 0,
             "suggested_quantity": signal.suggested_quantity or 0,
@@ -539,7 +561,7 @@ class DecisionMaker:
             cycle_id=cycle_id,
             symbol=signal.symbol,
             confidence=signal.confidence,
-            detail=rec_data,
+            detail=self._enrich_detail(signal, rec_data),
         )
 
         await event_bus.publish(Event(

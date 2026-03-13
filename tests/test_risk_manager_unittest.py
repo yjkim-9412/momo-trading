@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from core.config import settings
 from strategy.risk_manager import RiskManager
@@ -51,13 +52,14 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await manager.check(
-            signal=signal,
-            portfolio_cash=50000,
-            portfolio_budget=100000,
-            today_trade_count=0,
-            current_holding_count=0,
-        )
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50000,
+                portfolio_budget=100000,
+                today_trade_count=0,
+                current_holding_count=0,
+            )
 
         self.assertTrue(result["approved"])
         self.assertEqual(result["adjusted_quantity"], 30)
@@ -82,13 +84,14 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-        result = await manager.check(
-            signal=signal,
-            portfolio_cash=50000,
-            portfolio_budget=100000,
-            today_trade_count=0,
-            current_holding_count=0,
-        )
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50000,
+                portfolio_budget=100000,
+                today_trade_count=0,
+                current_holding_count=0,
+            )
 
         self.assertFalse(result["approved"])
         self.assertIn("US_REGULAR", result["reason"])
