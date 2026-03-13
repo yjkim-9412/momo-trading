@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from core.config import settings
 from trading.account_manager import AccountManager
-from trading.models import HoldingInfo, MCPResponse
+from trading.models import AccountBalance, HoldingInfo, MCPResponse, PendingOrderInfo
 
 
 class AccountManagerBalanceTest(unittest.TestCase):
@@ -155,6 +155,76 @@ def test_get_account_snapshot_returns_invalid_balance_on_mcp_failure():
     assert balance.total_asset == 0.0
     assert holdings == []
     assert "INVALID INPUT_FILED_SIZE" in balance.status_message
+
+
+def test_get_account_overview_uses_sequential_snapshot_then_orders():
+    async def scenario():
+        manager = AccountManager()
+        calls: list[tuple[str, str | None]] = []
+        expected_balance = AccountBalance(
+            total_asset=1000,
+            cash=100,
+            raw_cash=100,
+            effective_cash=100,
+            cash_source="BROKER",
+            stock_value=900,
+            total_pnl=10,
+            total_pnl_rate=1,
+            market="NASDAQ",
+            currency="KRW",
+            exchange_rate_to_krw=1450.0,
+        )
+        expected_holdings = [
+            HoldingInfo(
+                symbol="NVDA",
+                name="NVIDIA",
+                market="NASDAQ",
+                currency="USD",
+                quantity=1,
+                avg_buy_price=100.0,
+                current_price=110.0,
+                pnl=10.0,
+                pnl_rate=10.0,
+                exchange_rate_to_krw=1450.0,
+            )
+        ]
+        expected_orders = [
+            PendingOrderInfo(
+                order_id="A1",
+                symbol="NVDA",
+                name="NVIDIA",
+                market="NASDAQ",
+                currency="USD",
+                side="BUY",
+                order_qty=1,
+                filled_qty=0,
+                remaining_qty=1,
+                order_price=109.0,
+                order_time="093000",
+                exchange_rate_to_krw=1450.0,
+            )
+        ]
+
+        async def fake_snapshot(market=None):
+            calls.append(("snapshot", market))
+            return expected_balance, expected_holdings
+
+        async def fake_orders(market=None):
+            calls.append(("orders", market))
+            return expected_orders
+
+        with patch.object(manager, "get_account_snapshot", AsyncMock(side_effect=fake_snapshot)):
+            with patch.object(manager, "get_pending_orders", AsyncMock(side_effect=fake_orders)):
+                overview = await manager.get_account_overview("NASDAQ")
+
+        return overview, calls
+
+    overview, calls = asyncio.run(scenario())
+
+    assert calls == [("snapshot", "NASDAQ"), ("orders", "NASDAQ")]
+    assert overview.balance.total_asset == 1000
+    assert overview.holdings[0].symbol == "NVDA"
+    assert overview.pending_orders[0].order_id == "A1"
 
 
 if __name__ == "__main__":
