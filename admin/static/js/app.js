@@ -95,13 +95,124 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 // ── Toast Notifications ──
-function showToast(message, type = 'info', duration = 3000) {
+function showToast(message, optsOrType = 'info', legacyDuration) {
+  // Backward compat: showToast('msg', 'success', 3000)
+  const opts = typeof optsOrType === 'string'
+    ? { type: optsOrType, duration: legacyDuration }
+    : optsOrType;
+  const { type = 'info', level, duration, persistent = false, onClick } = opts;
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+
   const toast = document.createElement('div');
-  toast.className = `toast toast-${type}`;
-  toast.textContent = message;
-  document.body.appendChild(toast);
-  setTimeout(() => toast.classList.add('toast-fade-out'), duration - 300);
-  setTimeout(() => toast.remove(), duration);
+  const cls = level === 'CRITICAL' ? 'toast-critical' : level === 'HIGH' ? 'toast-high' : `toast-${type}`;
+  toast.className = `toast ${cls}`;
+
+  const dur = persistent ? 0 : (duration || (level === 'HIGH' ? 8000 : 3000));
+
+  if (persistent || onClick) {
+    toast.innerHTML = `<div class="flex items-center justify-between gap-2"><span class="flex-1">${escapeHtml(message)}</span>${persistent ? '<button class="toast-dismiss text-white/60 hover:text-white ml-2">\u2715</button>' : ''}</div>`;
+  } else {
+    toast.textContent = message;
+  }
+
+  if (onClick) { toast.style.cursor = 'pointer'; toast.addEventListener('click', (e) => { if (!e.target.closest('.toast-dismiss')) onClick(); }); }
+  if (persistent) {
+    const btn = toast.querySelector('.toast-dismiss');
+    if (btn) btn.addEventListener('click', (e) => { e.stopPropagation(); _removeToast(toast); });
+  }
+
+  container.prepend(toast);
+  while (container.children.length > 5) _removeToast(container.lastChild);
+
+  if (dur > 0) {
+    setTimeout(() => toast.classList.add('toast-fade-out'), dur - 300);
+    setTimeout(() => _removeToast(toast), dur);
+  }
+}
+function _removeToast(el) { if (el && el.parentNode) el.remove(); }
+
+// ── Importance Classification ──
+function classifyImportance(data) {
+  const t = data.activity_type;
+  const p = data.phase;
+  const s = (data.summary || '').toUpperCase();
+
+  if ((t === 'ORDER' || t === 'TRADE_RESULT') && p === 'COMPLETE')
+    return { level: 'CRITICAL', title: (s.includes('매도') || s.includes('SELL')) ? '매도 체결' : '매수 체결', body: `${data.symbol || ''} — ${data.summary || ''}` };
+
+  if (t === 'TIER1_ANALYSIS' && p === 'COMPLETE' && (s.includes('BUY') || s.includes('SELL')))
+    return { level: 'HIGH', title: s.includes('BUY') ? '매수 신호' : '매도 신호', body: `${data.symbol || ''} — ${data.summary || ''}` };
+
+  if (t === 'TIER2_REVIEW' && p === 'COMPLETE' && s.includes('미승인'))
+    return { level: 'HIGH', title: 'TIER2 미승인', body: `${data.symbol || ''} — ${data.summary || ''}` };
+
+  if (t === 'DECISION' && p === 'COMPLETE')
+    return { level: 'HIGH', title: '주문 실행', body: `${data.symbol || ''} — ${data.summary || ''}` };
+
+  return { level: 'NONE' };
+}
+
+// ── Browser Notification ──
+function sendBrowserNotification(info) {
+  if (!document.hidden) return;
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  try {
+    const n = new Notification(info.title, {
+      body: info.body,
+      tag: `momo-${info.level}-${Date.now()}`,
+      requireInteraction: info.level === 'CRITICAL',
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch (e) { /* Notification not supported */ }
+}
+function requestNotificationPermission() {
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+// ── Tab Title Flash ──
+let _titleFlashInterval = null;
+const ORIGINAL_TITLE = document.title || 'MOMO Trading Admin';
+function flashTitle(alertText) {
+  if (_titleFlashInterval) return;
+  let show = true;
+  _titleFlashInterval = setInterval(() => {
+    document.title = show ? alertText : ORIGINAL_TITLE;
+    show = !show;
+  }, 1000);
+}
+function stopTitleFlash() {
+  if (_titleFlashInterval) {
+    clearInterval(_titleFlashInterval);
+    _titleFlashInterval = null;
+    document.title = ORIGINAL_TITLE;
+  }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) stopTitleFlash(); });
+
+// ── Card Highlight & Navigation ──
+function highlightCard(data) {
+  if (!data.symbol) return;
+  const cards = getStockCards();
+  let card = null;
+  for (const c of Object.values(cards)) {
+    if (c.symbol === data.symbol) { card = c; break; }
+  }
+  if (!card || !card.element) return;
+  card.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.element.classList.add('highlighted');
+  setTimeout(() => card.element.classList.remove('highlighted'), 3000);
+}
+function navigateToCard(data) {
+  if (!data) return;
+  const eventScope = (data.market_scope || 'KRX') === 'KRX' ? 'KRX' : 'US';
+  const myScope = currentScope();
+  if (eventScope !== myScope) {
+    switchMarket(eventScope === 'KRX' ? 'KRX' : 'NASDAQ');
+  }
+  setTimeout(() => highlightCard(data), eventScope !== myScope ? 500 : 50);
 }
 
 // ── HTTP Helper ──
@@ -130,30 +241,57 @@ function connectSSE() {
     setStatus('connected', 'SSE 연결됨');
     updateBadge('badge-sse', '연결', 'green');
     removeSSEDisconnectBanner();
+    requestNotificationPermission();
   };
 
   es.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'connected') return;
-      if (msg.type === 'activity' && currentView === 'live') {
+      if (msg.type === 'activity') {
         const eventScope = (msg.data && msg.data.market_scope) || 'KRX';
+        const scopeKey = eventScope === 'KRX' ? 'KRX' : 'US';
         const myScope = currentScope();
-        if (eventScope === myScope) {
-          appendActivity(msg.data);
-        } else {
-          // Buffer for background market
-          const buf = activityBuffer[eventScope];
-          if (buf) {
-            buf.push(msg.data);
-            if (buf.length > BUFFER_MAX) buf.splice(0, buf.length - BUFFER_MAX);
-            updateBackgroundBadge(eventScope, buf.length);
+
+        // ① Importance classification (all markets)
+        const importance = classifyImportance(msg.data);
+        if (importance.level !== 'NONE') {
+          const scopeLabel = scopeKey === 'KRX' ? '국내' : '해외';
+          const fullTitle = `[${scopeLabel}] ${importance.title}`;
+
+          showToast(`${fullTitle}: ${msg.data.symbol || ''} ${msg.data.summary || ''}`, {
+            level: importance.level,
+            persistent: importance.level === 'CRITICAL',
+            onClick: () => navigateToCard(msg.data),
+          });
+
+          if (document.hidden) {
+            sendBrowserNotification({ ...importance, title: fullTitle });
+            flashTitle(`${importance.level === 'CRITICAL' ? '\uD83D\uDD34' : '\uD83D\uDFE1'} ${fullTitle}`);
           }
         }
+
+        // ② Activity feed routing (existing logic)
+        if (currentView === 'live') {
+          if (scopeKey === myScope) {
+            appendActivity(msg.data);
+            if (importance.level === 'CRITICAL' || importance.level === 'HIGH') {
+              setTimeout(() => highlightCard(msg.data), 100);
+            }
+          } else {
+            const buf = activityBuffer[scopeKey];
+            if (buf) {
+              buf.push(msg.data);
+              if (buf.length > BUFFER_MAX) buf.splice(0, buf.length - BUFFER_MAX);
+              updateBackgroundBadge(scopeKey, buf.length);
+            }
+          }
+        }
+
+        // ③ Account refresh on trade events
         if (msg.data && msg.data.phase === 'COMPLETE' &&
             ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
-          // Only refresh account if event is for current market
-          if (eventScope === myScope) setTimeout(loadMarketAccountInfo, 2000);
+          if (scopeKey === myScope) setTimeout(loadMarketAccountInfo, 2000);
         }
       }
       if (msg.type === 'account_changed') {
@@ -1743,17 +1881,31 @@ function formatAgentMeta(tierConfig, providerId, providerLabel) {
   return pieces.filter(Boolean).map(item => escapeHtml(item)).join(' · ');
 }
 
+function formatTier1ProfileMeta(status, providerId) {
+  const profiles = (status && status.tier1_profiles) || {};
+  const orderedKeys = ['scan', 'analysis'].filter(key => profiles[key]);
+  if (!orderedKeys.length) return '';
+  return orderedKeys.map(key => {
+    const profile = profiles[key];
+    const label = profile.short_label || profile.display_name || key;
+    const effort = profile.reasoning_effort || '-';
+    return escapeHtml(`${label} ${effort}`);
+  }).join(' · ');
+}
+
 function renderLLMAgentSummary(status, providerId, providerLabel) {
   const summaryEl = document.getElementById('llm-agent-summary');
   if (!summaryEl) return;
 
   summaryEl.innerHTML = ['tier1', 'tier2'].map(tierKey => {
     const tierConfig = getLLMAgentConfig(status, tierKey);
+    const tier1ProfileMeta = tierKey === 'tier1' ? formatTier1ProfileMeta(status, providerId) : '';
     return `
       <div class="agent-summary-row">
         <div class="text-xs text-gray-200">${escapeHtml(tierConfig.display_name)}</div>
         <div class="text-[11px] text-gray-500 leading-4 mt-1">${escapeHtml(tierConfig.description)}</div>
         <div class="text-[11px] text-gray-500 mt-1 truncate">${formatAgentMeta(tierConfig, providerId, providerLabel)}</div>
+        ${tier1ProfileMeta ? `<div class="text-[11px] text-gray-500 mt-1">프로필 · ${tier1ProfileMeta}</div>` : ''}
       </div>
     `;
   }).join('');
@@ -1766,6 +1918,7 @@ function renderLLMAgentGuide(status, providerId, providerLabel) {
   guideEl.innerHTML = ['tier1', 'tier2'].map(tierKey => {
     const tierConfig = getLLMAgentConfig(status, tierKey);
     const toneClass = tierKey === 'tier1' ? 'agent-guide-tier1' : 'agent-guide-tier2';
+    const tier1ProfileMeta = tierKey === 'tier1' ? formatTier1ProfileMeta(status, providerId) : '';
     return `
       <div class="agent-guide-card ${toneClass}">
         <div class="agent-guide-head">
@@ -1777,6 +1930,7 @@ function renderLLMAgentGuide(status, providerId, providerLabel) {
         </div>
         <div class="agent-guide-desc">${escapeHtml(tierConfig.description)}</div>
         <div class="agent-guide-meta">${formatAgentMeta(tierConfig, providerId, providerLabel)}</div>
+        ${tier1ProfileMeta ? `<div class="agent-guide-meta">프로필 · ${tier1ProfileMeta}</div>` : ''}
       </div>
     `;
   }).join('');
