@@ -19,8 +19,67 @@ from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
 from trading.mcp_client import mcp_client
+from trading.models import AccountBalance, HoldingInfo, PendingOrderInfo
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+def _serialize_balance(balance: AccountBalance) -> dict[str, object]:
+    return {
+        "total_asset": balance.total_asset,
+        "cash": balance.cash,
+        "raw_cash": balance.raw_cash,
+        "effective_cash": balance.effective_cash,
+        "cash_source": balance.cash_source,
+        "stock_value": balance.stock_value,
+        "total_pnl": balance.total_pnl,
+        "total_pnl_rate": balance.total_pnl_rate,
+        "raw_total_pnl": balance.raw_total_pnl,
+        "raw_total_pnl_rate": balance.raw_total_pnl_rate,
+        "pnl_source": balance.pnl_source,
+        "market": balance.market,
+        "currency": balance.currency,
+        "exchange_rate_to_krw": balance.exchange_rate_to_krw,
+        "status_message": balance.status_message,
+        "is_valid": balance.is_valid,
+    }
+
+
+def _serialize_holdings(holdings: list[HoldingInfo]) -> list[dict[str, object]]:
+    return [
+        {
+            "symbol": h.symbol,
+            "name": h.name,
+            "market": h.market,
+            "currency": h.currency,
+            "quantity": h.quantity,
+            "avg_buy_price": h.avg_buy_price,
+            "current_price": h.current_price,
+            "pnl": h.pnl,
+            "pnl_rate": h.pnl_rate,
+            "exchange_rate_to_krw": h.exchange_rate_to_krw,
+        }
+        for h in holdings
+    ]
+
+
+def _serialize_pending_orders(orders: list[PendingOrderInfo]) -> list[dict[str, object]]:
+    return [
+        {
+            "order_id": o.order_id,
+            "symbol": o.symbol,
+            "name": o.name,
+            "market": o.market,
+            "currency": o.currency,
+            "side": o.side,
+            "order_qty": o.order_qty,
+            "filled_qty": o.filled_qty,
+            "remaining_qty": o.remaining_qty,
+            "order_price": o.order_price,
+            "order_time": o.order_time,
+        }
+        for o in orders
+    ]
 
 
 # ── SSE 실시간 스트림 ──
@@ -60,6 +119,7 @@ async def get_activities(
     target_date: str | None = Query(None, description="YYYY-MM-DD"),
     cycle_id: str | None = Query(None),
     activity_type: str | None = Query(None),
+    market_scope: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_async_db),
@@ -71,12 +131,12 @@ async def get_activities(
         activities = await repo.get_by_cycle(cycle_id)
     elif target_date:
         d = date.fromisoformat(target_date)
-        activities = await repo.get_by_date(d, limit=limit, offset=offset)
+        activities = await repo.get_by_date(d, limit=limit, offset=offset, market_scope=market_scope)
     elif activity_type:
-        activities = await repo.get_by_type(activity_type, limit=limit)
+        activities = await repo.get_by_type(activity_type, limit=limit, market_scope=market_scope)
     else:
         from util.time_util import now_kst
-        activities = await repo.get_by_date(now_kst().date(), limit=limit, offset=offset)
+        activities = await repo.get_by_date(now_kst().date(), limit=limit, offset=offset, market_scope=market_scope)
 
     return SuccessResponse(data=activities)
 
@@ -85,11 +145,12 @@ async def get_activities(
 @router.get("/cycles", response_model=SuccessResponse[list[CycleResponse]])
 async def get_cycles(
     limit: int = Query(20, ge=1, le=100),
+    market_scope: str | None = Query(None),
     db: AsyncSession = Depends(get_async_db),
 ):
     """최근 사이클 목록"""
     repo = AgentActivityRepository(db)
-    cycles = await repo.get_recent_cycles(limit)
+    cycles = await repo.get_recent_cycles(limit, market_scope=market_scope)
     return SuccessResponse(data=cycles)
 
 
@@ -109,32 +170,37 @@ async def get_cycle_timeline(
 @router.get("/reports", response_model=SuccessResponse[list[DailyReportResponse]])
 async def get_reports(
     limit: int = Query(30, ge=1, le=100),
+    market_scope: str | None = Query(None),
     db: AsyncSession = Depends(get_async_db),
 ):
     """일일 리포트 목록"""
     repo = DailyReportRepository(db)
-    reports = await repo.get_reports(limit)
+    reports = await repo.get_reports(limit, market_scope=market_scope)
     return SuccessResponse(data=reports)
 
 
 # ── 특정 날짜 리포트 ──
 @router.get("/reports/latest", response_model=SuccessResponse[DailyReportResponse | None])
-async def get_latest_report(db: AsyncSession = Depends(get_async_db)):
+async def get_latest_report(
+    market_scope: str | None = Query(None),
+    db: AsyncSession = Depends(get_async_db),
+):
     """최신 리포트"""
     repo = DailyReportRepository(db)
-    report = await repo.get_latest()
+    report = await repo.get_latest(market_scope=market_scope or settings.primary_market_code)
     return SuccessResponse(data=report)
 
 
 @router.get("/reports/{report_date}", response_model=SuccessResponse[DailyReportResponse | None])
 async def get_report_by_date(
     report_date: str,
+    market_scope: str | None = Query(None),
     db: AsyncSession = Depends(get_async_db),
 ):
     """특정 날짜 리포트"""
     repo = DailyReportRepository(db)
     d = date.fromisoformat(report_date)
-    report = await repo.get_by_date(d)
+    report = await repo.get_by_date(d, market_scope=market_scope or settings.primary_market_code)
     return SuccessResponse(data=report)
 
 
@@ -145,24 +211,7 @@ async def get_account_balance(market: str | None = Query(None)):
     try:
         market_code = market or settings.primary_market_code
         balance = await account_manager.get_balance(market_code)
-        return SuccessResponse(data={
-            "total_asset": balance.total_asset,
-            "cash": balance.cash,
-            "raw_cash": balance.raw_cash,
-            "effective_cash": balance.effective_cash,
-            "cash_source": balance.cash_source,
-            "stock_value": balance.stock_value,
-            "total_pnl": balance.total_pnl,
-            "total_pnl_rate": balance.total_pnl_rate,
-            "raw_total_pnl": balance.raw_total_pnl,
-            "raw_total_pnl_rate": balance.raw_total_pnl_rate,
-            "pnl_source": balance.pnl_source,
-            "market": balance.market,
-            "currency": balance.currency,
-            "exchange_rate_to_krw": balance.exchange_rate_to_krw,
-            "status_message": balance.status_message,
-            "is_valid": balance.is_valid,
-        })
+        return SuccessResponse(data=_serialize_balance(balance))
     except Exception as e:
         logger.error("계좌 잔고 조회 실패: {}", str(e))
         return SuccessResponse(data=None, message=f"잔고 조회 실패: {str(e)[:100]}")
@@ -173,21 +222,7 @@ async def get_account_holdings(market: str | None = Query(None)):
     """보유 종목 조회"""
     try:
         holdings = await account_manager.get_holdings(market or settings.primary_market_code)
-        return SuccessResponse(data=[
-            {
-                "symbol": h.symbol,
-                "name": h.name,
-                "market": h.market,
-                "currency": h.currency,
-                "quantity": h.quantity,
-                "avg_buy_price": h.avg_buy_price,
-                "current_price": h.current_price,
-                "pnl": h.pnl,
-                "pnl_rate": h.pnl_rate,
-                "exchange_rate_to_krw": h.exchange_rate_to_krw,
-            }
-            for h in holdings
-        ])
+        return SuccessResponse(data=_serialize_holdings(holdings))
     except Exception as e:
         logger.error("보유 종목 조회 실패: {}", str(e))
         return SuccessResponse(data=[], message=f"보유 종목 조회 실패: {str(e)[:100]}")
@@ -198,25 +233,32 @@ async def get_pending_orders(market: str | None = Query(None)):
     """미체결 주문 조회"""
     try:
         orders = await account_manager.get_pending_orders(market or settings.primary_market_code)
-        return SuccessResponse(data=[
-            {
-                "order_id": o.order_id,
-                "symbol": o.symbol,
-                "name": o.name,
-                "market": o.market,
-                "currency": o.currency,
-                "side": o.side,
-                "order_qty": o.order_qty,
-                "filled_qty": o.filled_qty,
-                "remaining_qty": o.remaining_qty,
-                "order_price": o.order_price,
-                "order_time": o.order_time,
-            }
-            for o in orders
-        ])
+        return SuccessResponse(data=_serialize_pending_orders(orders))
     except Exception as e:
         logger.error("미체결 주문 조회 실패: {}", str(e))
         return SuccessResponse(data=[], message=f"미체결 주문 조회 실패: {str(e)[:100]}")
+
+
+@router.get("/account/overview")
+async def get_account_overview(market: str | None = Query(None)):
+    """계좌 overview 조회"""
+    try:
+        overview = await account_manager.get_account_overview(market or settings.primary_market_code)
+        return SuccessResponse(data={
+            "balance": _serialize_balance(overview.balance),
+            "holdings": _serialize_holdings(overview.holdings),
+            "pending_orders": _serialize_pending_orders(overview.pending_orders),
+        })
+    except Exception as e:
+        logger.error("계좌 overview 조회 실패: {}", str(e))
+        return SuccessResponse(
+            data={
+                "balance": None,
+                "holdings": [],
+                "pending_orders": [],
+            },
+            message=f"계좌 overview 조회 실패: {str(e)[:100]}",
+        )
 
 
 # ── 설정 조회/변경 ──
@@ -337,11 +379,17 @@ async def trigger_agent_cycle(market: str | None = Query(None)):
 
 # ── 수동 일일 리포트 생성 ──
 @router.post("/reports/generate")
-async def generate_report(target_date: str | None = Query(None)):
+async def generate_report(
+    target_date: str | None = Query(None),
+    market_scope: str | None = Query(None),
+):
     """수동 일일 리포트 생성"""
     from services.daily_report_service import daily_report_service
     d = date.fromisoformat(target_date) if target_date else None
-    report = await daily_report_service.generate_daily_report(d)
+    report = await daily_report_service.generate_daily_report(
+        d,
+        market_scope=market_scope or settings.primary_market_code,
+    )
     if report:
         return SuccessResponse(
             data=DailyReportResponse.model_validate(report),

@@ -7,7 +7,7 @@ from core.config import settings
 from scheduler.market_calendar import market_calendar
 from trading.mcp_client import mcp_client
 from trading.market_profile import is_us_market, market_currency, normalize_market
-from trading.models import AccountBalance, HoldingInfo, PendingOrderInfo
+from trading.models import AccountBalance, AccountOverview, HoldingInfo, PendingOrderInfo
 
 
 class AccountManager:
@@ -467,6 +467,17 @@ class AccountManager:
         orders = self._parse_pending_orders(data, market=market_code)
         self._pending_orders_cache[market_code] = orders
         return orders
+
+    async def get_account_overview(self, market: str | None = None) -> AccountOverview:
+        """관리자 대시보드용 계좌 overview를 직렬 호출로 조회한다."""
+        market_code = normalize_market(market or settings.primary_market_code)
+        balance, holdings = await self.get_account_snapshot(market=market_code)
+        pending_orders = await self.get_pending_orders(market=market_code)
+        return AccountOverview(
+            balance=balance,
+            holdings=holdings,
+            pending_orders=pending_orders,
+        )
 
     async def get_available_cash(self, market: str | None = None) -> float:
         """투자 가용 현금 조회"""
