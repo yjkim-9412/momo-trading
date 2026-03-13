@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     APP_VERSION: str = "0.1.0"
     ENVIRONMENT: str = "local"  # local | staging | production
 
-    DATABASE_URL: str = "sqlite:///./app.db"
+    DATABASE_URL: str = "sqlite:///./data/app.db"
     LOG_LEVEL: str = "DEBUG"
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:8000"]
 
@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     KIS_HTS_ID: str = ""
     KIS_ACCT_STOCK: str = ""
     KIS_PAPER_STOCK: str = ""
-    KIS_PROD_TYPE: str = "01"
+    KIS_PROD_TYPE: str = ""
     KIS_ACCOUNT_TYPE: str = "VIRTUAL"
 
     # KIS WebSocket

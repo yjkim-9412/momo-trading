@@ -55,13 +55,29 @@ def _get_app_secret() -> str:
     return settings.KIS_APP_SECRET
 
 
-def _get_account_parts() -> tuple[str, str]:
-    """KIS 계좌번호를 8자리/2자리로 분리"""
-    raw = settings.KIS_PAPER_STOCK if settings.is_paper_trading else settings.KIS_ACCT_STOCK
+def _resolve_account_parts(raw: str, prod_type_override: str = "") -> tuple[str, str]:
+    """KIS 계좌번호를 CANO/상품코드로 정규화"""
     digits = "".join(ch for ch in raw if ch.isdigit())
-    if len(digits) < 10:
-        raise ValueError("KIS 계좌번호가 올바르지 않습니다. 10자리 계좌번호를 설정하세요.")
-    return digits[:8], digits[8:10]
+    prod_digits = "".join(ch for ch in prod_type_override if ch.isdigit())
+
+    if prod_digits and len(prod_digits) != 2:
+        raise ValueError("KIS_PROD_TYPE 는 2자리여야 합니다.")
+
+    if len(digits) == 10:
+        return digits[:8], prod_digits or digits[8:10]
+
+    if len(digits) == 8 and prod_digits:
+        return digits, prod_digits
+
+    raise ValueError(
+        "KIS 계좌번호는 10자리 전체 또는 CANO 8자리 + KIS_PROD_TYPE 이 필요합니다."
+    )
+
+
+def _get_account_parts() -> tuple[str, str]:
+    """활성 계좌번호를 CANO/상품코드로 분리"""
+    raw = settings.KIS_PAPER_STOCK if settings.is_paper_trading else settings.KIS_ACCT_STOCK
+    return _resolve_account_parts(raw, settings.KIS_PROD_TYPE)
 
 
 def _request_headers(token: str, tr_id: str, tr_cont: str = "") -> dict[str, str]:

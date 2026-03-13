@@ -16,7 +16,7 @@ def test_configure_runtime_env_splits_virtual_account_and_promotes_paper_credent
         "KIS_ACCOUNT_TYPE": "VIRTUAL",
         "KIS_PAPER_APP_KEY": "paper-key",
         "KIS_PAPER_APP_SECRET": "paper-secret",
-        "KIS_PAPER_CANO": "1234567801",
+        "KIS_PAPER_STOCK": "1234567801",
     }
 
     ENTRYPOINT.configure_runtime_env(env)
@@ -30,8 +30,21 @@ def test_configure_runtime_env_splits_virtual_account_and_promotes_paper_credent
 def test_configure_runtime_env_requires_product_code_when_account_is_only_cano():
     env = {
         "KIS_ACCOUNT_TYPE": "REAL",
-        "KIS_CANO": "12345678",
+        "KIS_ACCT_STOCK": "12345678",
     }
 
     with pytest.raises(ValueError, match="KIS_PROD_TYPE"):
         ENTRYPOINT.configure_runtime_env(env)
+
+
+def test_configure_runtime_env_accepts_cano_with_explicit_prod_type():
+    env = {
+        "KIS_ACCOUNT_TYPE": "REAL",
+        "KIS_ACCT_STOCK": "12345678",
+        "KIS_PROD_TYPE": "02",
+    }
+
+    ENTRYPOINT.configure_runtime_env(env)
+
+    assert env["KIS_CANO"] == "12345678"
+    assert env["KIS_PROD_TYPE"] == "02"

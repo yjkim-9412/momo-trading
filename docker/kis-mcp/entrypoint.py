@@ -7,9 +7,26 @@ import sys
 
 def _split_account_number(raw: str) -> tuple[str, str]:
     digits = "".join(ch for ch in raw if ch.isdigit())
-    if len(digits) < 10:
+    if len(digits) != 10:
         raise ValueError("KIS 계좌번호는 10자리 전체 또는 CANO 8자리 + KIS_PROD_TYPE 이 필요합니다.")
     return digits[:8], digits[8:10]
+
+
+def _resolve_account_parts(raw: str, prod_type_override: str = "") -> tuple[str, str]:
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    prod_digits = "".join(ch for ch in prod_type_override if ch.isdigit())
+
+    if prod_digits and len(prod_digits) != 2:
+        raise ValueError("KIS_PROD_TYPE 는 2자리여야 합니다.")
+
+    if len(digits) == 10:
+        cano, default_prod_type = _split_account_number(raw)
+        return cano, prod_digits or default_prod_type
+
+    if len(digits) == 8 and prod_digits:
+        return digits, prod_digits
+
+    raise ValueError("KIS 계좌번호는 10자리 전체 또는 CANO 8자리 + KIS_PROD_TYPE 이 필요합니다.")
 
 
 def configure_runtime_env(env: MutableMapping[str, str] | None = None) -> None:
@@ -25,22 +42,16 @@ def configure_runtime_env(env: MutableMapping[str, str] | None = None) -> None:
             if value:
                 target[real] = value
 
-    raw_account = target.get("KIS_PAPER_CANO") if account_type == "VIRTUAL" else target.get("KIS_CANO")
-    if not raw_account:
-        raise ValueError("활성 KIS 계좌번호가 없습니다. KIS_CANO 또는 KIS_PAPER_CANO 를 설정하세요.")
-
-    digits = "".join(ch for ch in raw_account if ch.isdigit())
-    if len(digits) >= 10:
-        cano, prod_type = _split_account_number(raw_account)
-        target["KIS_CANO"] = cano
-        target["KIS_PROD_TYPE"] = target.get("KIS_PROD_TYPE") or prod_type
+    if account_type == "VIRTUAL":
+        raw_account = target.get("KIS_PAPER_STOCK") or target.get("KIS_PAPER_CANO")
     else:
-        target["KIS_CANO"] = digits or raw_account
-        if not target.get("KIS_PROD_TYPE"):
-            raise ValueError("KIS_PROD_TYPE 가 없으면 계좌번호는 10자리 전체 형식이어야 합니다.")
+        raw_account = target.get("KIS_ACCT_STOCK") or target.get("KIS_CANO")
+    if not raw_account:
+        raise ValueError("활성 KIS 계좌번호가 없습니다. KIS_ACCT_STOCK 또는 KIS_PAPER_STOCK 를 설정하세요.")
 
-    if not target.get("KIS_PROD_TYPE"):
-        raise ValueError("KIS_PROD_TYPE 를 결정할 수 없습니다.")
+    cano, prod_type = _resolve_account_parts(raw_account, target.get("KIS_PROD_TYPE", ""))
+    target["KIS_CANO"] = cano
+    target["KIS_PROD_TYPE"] = prod_type
 
 
 def configure_logging() -> None:
