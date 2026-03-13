@@ -15,13 +15,13 @@ document.addEventListener('DOMContentLoaded', () => {
   loadSettings();
   loadSystemStatus();
   loadReportList();
-  loadAccountInfo();
+  loadAllAccountInfo();
   loadLLMStatus();
   loadLLMUsage();
   connectSSE();
   loadTodayActivities();
   setInterval(loadSystemStatus, 15000);
-  accountPollTimer = setInterval(loadAccountInfo, 30000);
+  accountPollTimer = setInterval(loadAllAccountInfo, 30000);
   setInterval(loadLLMUsage, 60000);
 });
 
@@ -42,11 +42,11 @@ function connectSSE() {
         appendActivity(msg.data);
         if (msg.data && msg.data.phase === 'COMPLETE' &&
             ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
-          setTimeout(loadAccountInfo, 2000);
+          setTimeout(loadAllAccountInfo, 2000);
         }
       }
       if (msg.type === 'account_changed') {
-        loadAccountInfo();
+        loadAllAccountInfo();
       }
     } catch (err) {
       console.error('SSE parse error', err);
@@ -63,6 +63,11 @@ function connectSSE() {
 }
 
 // ── Account Info ──
+function loadAllAccountInfo() {
+  loadAccountInfo();
+  loadUsAccountInfo();
+}
+
 async function loadAccountInfo() {
   try {
     const [balResp, holdResp, pendResp] = await Promise.all([
@@ -83,33 +88,95 @@ async function loadAccountInfo() {
   }
 }
 
+async function loadUsAccountInfo() {
+  try {
+    const [balResp, holdResp, pendResp] = await Promise.all([
+      fetch(`${API}/account/balance?market=NASDAQ`),
+      fetch(`${API}/account/holdings?market=NASDAQ`),
+      fetch(`${API}/account/pending-orders?market=NASDAQ`),
+    ]);
+    const balJson = await balResp.json();
+    const holdJson = await holdResp.json();
+    const pendJson = await pendResp.json();
+    renderUsAccountBalance(balJson.data);
+    renderUsAccountHoldings(holdJson.data);
+    renderUsPendingOrders(pendJson.data);
+  } catch (err) {
+    console.error('US account info error:', err);
+    const balanceEl = document.getElementById('us-account-info');
+    const holdingsEl = document.getElementById('us-holdings-info');
+    const pendingEl = document.getElementById('us-pending-orders-info');
+    if (balanceEl) balanceEl.innerHTML = '<div class="text-gray-600">조회 실패</div>';
+    if (holdingsEl) holdingsEl.innerHTML = '<div class="text-gray-600">조회 실패</div>';
+    if (pendingEl) pendingEl.innerHTML = '<div class="text-gray-600">조회 실패</div>';
+  }
+}
+
+function hasMeaningfulDiff(left, right, threshold = 1) {
+  return Math.abs(Number(left || 0) - Number(right || 0)) >= threshold;
+}
+
+function shouldShowRawPnl(data) {
+  if (!data || data.pnl_source !== 'HOLDINGS_SUM') return false;
+  return hasMeaningfulDiff(data.raw_total_pnl, data.total_pnl, 1)
+    || hasMeaningfulDiff(data.raw_total_pnl_rate, data.total_pnl_rate, 0.01);
+}
+
 function renderAccountBalance(data) {
   const el = document.getElementById('account-info');
   if (!el || !data) {
     if (el) el.innerHTML = '<div class="text-gray-600">계좌 미연결</div>';
     return;
   }
-  const pnlColor = data.total_pnl >= 0 ? 'text-green-400' : 'text-red-400';
+  const effectiveCash = Number(data.effective_cash ?? data.cash ?? 0);
+  const rawCash = Number(data.raw_cash ?? data.cash ?? 0);
+  const totalPnl = Number(data.total_pnl ?? 0);
+  const totalPnlRate = Number(data.total_pnl_rate ?? 0);
+  const rawTotalPnl = Number(data.raw_total_pnl ?? totalPnl);
+  const rawTotalPnlRate = Number(data.raw_total_pnl_rate ?? totalPnlRate);
+  const pnlColor = totalPnl >= 0 ? 'text-green-400' : 'text-red-400';
   const cashRatio = data.total_asset > 0
-    ? ((data.cash / data.total_asset) * 100).toFixed(1)
+    ? ((effectiveCash / data.total_asset) * 100).toFixed(1)
     : '0.0';
+  const rawCashRow = Math.abs(effectiveCash - rawCash) >= 1
+    ? `<div class="flex justify-between">
+        <span class="text-gray-500">브로커 현금</span>
+        <span>${formatAmount(rawCash, 'KRW')}</span>
+      </div>`
+    : '';
+  const rawPnlRow = shouldShowRawPnl(data)
+    ? `<div class="flex justify-between">
+        <span class="text-gray-500">브로커 요약 손익</span>
+        <span class="text-gray-500">${formatSignedAmount(rawTotalPnl, 'KRW')} (${formatSignedAmount(rawTotalPnlRate, 'PCT')})</span>
+      </div>`
+    : '';
+  const proxyNote = data.cash_source === 'TOTAL_ASSET_PROXY'
+    ? `<div class="text-[11px] text-sky-300 leading-4">미국 모의투자 기준: 총자산 - 주식평가액으로 주문가능 현금을 추정합니다.</div>`
+    : '';
+  const pnlNote = data.pnl_source === 'HOLDINGS_SUM'
+    ? `<div class="text-[11px] text-sky-300 leading-4">해외 모의투자 손익은 보유종목 기준으로 재계산합니다.</div>`
+    : '';
   el.innerHTML = `
     <div class="flex justify-between">
       <span class="text-gray-400">총자산</span>
       <span class="text-white font-medium">${formatKRW(data.total_asset)}</span>
     </div>
     <div class="flex justify-between">
-      <span class="text-gray-400">현금</span>
-      <span>${formatKRW(data.cash)} <span class="text-gray-600">(${cashRatio}%)</span></span>
+      <span class="text-gray-400">실주문 기준 현금</span>
+      <span>${formatAmount(effectiveCash, 'KRW')} <span class="text-gray-600">(${cashRatio}%)</span></span>
     </div>
+    ${rawCashRow}
     <div class="flex justify-between">
       <span class="text-gray-400">주식</span>
       <span>${formatKRW(data.stock_value)}</span>
     </div>
     <div class="flex justify-between">
       <span class="text-gray-400">손익</span>
-      <span class="${pnlColor}">${data.total_pnl >= 0 ? '+' : ''}${formatKRW(data.total_pnl)} (${data.total_pnl_rate >= 0 ? '+' : ''}${data.total_pnl_rate.toFixed(2)}%)</span>
-    </div>`;
+      <span class="${pnlColor}">${totalPnl >= 0 ? '+' : ''}${formatKRW(totalPnl)} (${totalPnlRate >= 0 ? '+' : ''}${totalPnlRate.toFixed(2)}%)</span>
+    </div>
+    ${rawPnlRow}
+    ${proxyNote}
+    ${pnlNote}`;
 }
 
 function renderAccountHoldings(data) {
@@ -125,19 +192,26 @@ function renderAccountHoldings(data) {
   if (countEl) countEl.textContent = `${data.length}종목`;
   el.innerHTML = data.map(h => {
     const pnlColor = h.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
+    const currency = h.currency || 'KRW';
     const evalAmt = h.current_price * h.quantity;
+    const evalSecondary = currency === 'KRW'
+      ? ''
+      : `<span class="text-gray-600">${formatAmount(evalAmt * (h.exchange_rate_to_krw || 0), 'KRW')}</span>`;
+    const pnlSecondary = currency === 'KRW'
+      ? ''
+      : `<span class="text-gray-600">${formatAmount(h.pnl * (h.exchange_rate_to_krw || 0), 'KRW')}</span>`;
     return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5">
       <div class="flex justify-between items-center">
         <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}</span>
         <span class="${pnlColor} font-medium">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
       </div>
       <div class="flex justify-between text-gray-500">
-        <span>${h.quantity}주 | 평단 ${Number(h.avg_buy_price).toLocaleString()}원</span>
-        <span>현재 ${Number(h.current_price).toLocaleString()}원</span>
+        <span>${h.quantity}주 | 평단 ${formatAmount(h.avg_buy_price, currency)}</span>
+        <span>현재 ${formatAmount(h.current_price, currency)}</span>
       </div>
       <div class="flex justify-between text-gray-500">
-        <span>평가 ${formatKRW(evalAmt)}</span>
-        <span class="${pnlColor}">${h.pnl >= 0 ? '+' : ''}${formatKRW(h.pnl)}</span>
+        <span>평가 ${formatAmount(evalAmt, currency)} ${evalSecondary}</span>
+        <span class="${pnlColor}">${formatSignedAmount(h.pnl, currency)} ${pnlSecondary}</span>
       </div>
     </div>`;
   }).join('');
@@ -155,13 +229,18 @@ function renderPendingOrders(data) {
   if (sectionEl) sectionEl.style.display = '';
   if (countEl) {
     const totalAmt = data.reduce((s, o) => s + o.order_price * o.remaining_qty, 0);
-    countEl.textContent = `${data.length}건 (${formatKRW(totalAmt)})`;
+    const currency = data[0]?.currency || 'KRW';
+    countEl.textContent = `${data.length}건 (${formatAmount(totalAmt, currency)})`;
   }
   el.innerHTML = data.map(o => {
     const sideColor = o.side === '매수' ? 'text-red-400' : 'text-blue-400';
     const borderColor = o.side === '매수' ? 'border-yellow-700/60' : 'border-yellow-700/60';
+    const currency = o.currency || 'KRW';
     const orderAmt = o.order_price * o.remaining_qty;
     const timeStr = o.order_time ? o.order_time.slice(0,2) + ':' + o.order_time.slice(2,4) + ':' + o.order_time.slice(4,6) : '';
+    const converted = currency === 'KRW'
+      ? ''
+      : `<span class="text-gray-600">${formatAmount(orderAmt * (o.exchange_rate_to_krw || 0), 'KRW')}</span>`;
     return `<div class="border ${borderColor} bg-yellow-900/10 rounded p-1.5 space-y-0.5">
       <div class="flex justify-between items-center">
         <span class="text-gray-200 font-medium truncate" title="${o.symbol}">${o.name}</span>
@@ -169,10 +248,178 @@ function renderPendingOrders(data) {
       </div>
       <div class="flex justify-between text-gray-500">
         <span>미체결 ${o.remaining_qty}주 / ${o.order_qty}주</span>
-        <span>${Number(o.order_price).toLocaleString()}원</span>
+        <span>${formatAmount(o.order_price, currency)}</span>
       </div>
       <div class="flex justify-between text-gray-500">
-        <span>${formatKRW(orderAmt)}</span>
+        <span>${formatAmount(orderAmt, currency)} ${converted}</span>
+        <span>${timeStr}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderUsAccountBalance(data) {
+  const el = document.getElementById('us-account-info');
+  const badgeEl = document.getElementById('us-cash-source-badge');
+  if (!el || !badgeEl || !data) {
+    if (el) el.innerHTML = '<div class="text-gray-600">미국 계좌 미연결</div>';
+    return;
+  }
+
+  const exchangeRate = Number(data.exchange_rate_to_krw || 0);
+  const effectiveCash = Number(data.effective_cash ?? data.cash ?? 0);
+  const rawCash = Number(data.raw_cash ?? data.cash ?? 0);
+  const totalPnl = Number(data.total_pnl ?? 0);
+  const totalPnlRate = Number(data.total_pnl_rate ?? 0);
+  const rawTotalPnl = Number(data.raw_total_pnl ?? totalPnl);
+  const rawTotalPnlRate = Number(data.raw_total_pnl_rate ?? totalPnlRate);
+  const totalAssetUsd = convertKrwToUsd(data.total_asset, exchangeRate);
+  const effectiveCashUsd = convertKrwToUsd(effectiveCash, exchangeRate);
+  const rawCashUsd = convertKrwToUsd(rawCash, exchangeRate);
+  const stockValueUsd = convertKrwToUsd(data.stock_value, exchangeRate);
+  const pnlColor = totalPnl >= 0 ? 'text-green-400' : 'text-red-400';
+
+  badgeEl.textContent = data.cash_source === 'TOTAL_ASSET_PROXY' ? '총자산 프록시' : '브로커 현금';
+  badgeEl.className = data.cash_source === 'TOTAL_ASSET_PROXY'
+    ? 'px-2 py-0.5 rounded-full text-[10px] bg-sky-500/15 text-sky-300'
+    : 'px-2 py-0.5 rounded-full text-[10px] bg-slate-800 text-gray-300';
+
+  const rawCashRow = Math.abs(effectiveCash - rawCash) >= 1
+    ? `<div class="flex justify-between gap-3">
+        <span class="text-gray-500">브로커 현금</span>
+        <div class="text-right">
+          <div class="text-gray-300">${formatAmount(rawCashUsd, 'USD')}</div>
+        <div class="text-gray-600">${formatAmount(rawCash, 'KRW')}</div>
+      </div>
+      </div>`
+    : '';
+  const rawPnlRow = shouldShowRawPnl(data)
+    ? `<div class="flex justify-between gap-3">
+        <span class="text-gray-500">브로커 요약 손익</span>
+        <div class="text-right">
+          <div class="text-gray-400">${formatSignedAmount(rawTotalPnlRate, 'PCT')}</div>
+          <div class="text-gray-500">${formatSignedAmount(rawTotalPnl, 'KRW')}</div>
+        </div>
+      </div>`
+    : '';
+  const pnlNote = data.pnl_source === 'HOLDINGS_SUM'
+    ? `<div class="text-[11px] leading-4 text-sky-300">모의투자 손익은 보유종목 기준으로 재계산합니다.</div>`
+    : '';
+  const statusRow = data.status_message
+    ? `<div class="text-[11px] leading-4 text-gray-500">${escapeHtml(data.status_message)}</div>`
+    : '';
+
+  el.innerHTML = `
+    <div class="flex justify-between gap-3">
+      <span class="text-gray-500">총자산</span>
+      <div class="text-right">
+        <div class="text-white font-medium">${formatAmount(totalAssetUsd, 'USD')}</div>
+        <div class="text-gray-600">${formatAmount(data.total_asset, 'KRW')}</div>
+      </div>
+    </div>
+    <div class="flex justify-between gap-3">
+      <span class="text-gray-500">실주문 기준 현금</span>
+      <div class="text-right">
+        <div class="text-sky-300 font-medium">${formatAmount(effectiveCashUsd, 'USD')}</div>
+        <div class="text-gray-600">${formatAmount(effectiveCash, 'KRW')}</div>
+      </div>
+    </div>
+    ${rawCashRow}
+    <div class="flex justify-between gap-3">
+      <span class="text-gray-500">주식 평가</span>
+      <div class="text-right">
+        <div class="text-gray-200">${formatAmount(stockValueUsd, 'USD')}</div>
+        <div class="text-gray-600">${formatAmount(data.stock_value, 'KRW')}</div>
+      </div>
+    </div>
+    <div class="flex justify-between gap-3">
+      <span class="text-gray-500">손익</span>
+      <div class="text-right">
+        <div class="${pnlColor}">${formatSignedAmount(totalPnlRate, 'PCT')}</div>
+        <div class="${pnlColor}">${formatSignedAmount(totalPnl, 'KRW')}</div>
+      </div>
+    </div>
+    ${rawPnlRow}
+    <div class="text-[11px] leading-4 text-sky-300">환율 ${exchangeRate ? exchangeRate.toFixed(2) : '-'} KRW/USD</div>
+    ${pnlNote}
+    ${statusRow}`;
+}
+
+function renderUsAccountHoldings(data) {
+  const el = document.getElementById('us-holdings-info');
+  const countEl = document.getElementById('us-holdings-count');
+  if (!el || !countEl) return;
+
+  if (!data || !data.length) {
+    countEl.textContent = '0종목';
+    el.innerHTML = '<div class="text-gray-600">보유 없음</div>';
+    return;
+  }
+
+  countEl.textContent = `${data.length}종목`;
+  el.innerHTML = data.map((holding) => {
+    const pnlColor = holding.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
+    const evalAmt = holding.current_price * holding.quantity;
+    const evalAmtKrw = evalAmt * (holding.exchange_rate_to_krw || 0);
+    const pnlKrw = holding.pnl * (holding.exchange_rate_to_krw || 0);
+    return `<div class="rounded-lg border border-sky-950/70 bg-slate-950/60 p-2 space-y-1">
+      <div class="flex justify-between items-center gap-2">
+        <div class="min-w-0">
+          <div class="text-gray-100 font-medium truncate" title="${holding.symbol}">${holding.name}</div>
+          <div class="text-[11px] text-gray-500">${holding.symbol} · ${holding.quantity}주</div>
+        </div>
+        <span class="${pnlColor} font-medium">${formatSignedAmount(holding.pnl_rate, 'PCT')}</span>
+      </div>
+      <div class="flex justify-between text-gray-400">
+        <span>평단 ${formatAmount(holding.avg_buy_price, holding.currency)}</span>
+        <span>현재 ${formatAmount(holding.current_price, holding.currency)}</span>
+      </div>
+      <div class="flex justify-between text-gray-500">
+        <span>평가 ${formatAmount(evalAmt, holding.currency)}</span>
+        <span>${formatAmount(evalAmtKrw, 'KRW')}</span>
+      </div>
+      <div class="flex justify-between text-gray-500">
+        <span class="${pnlColor}">${formatSignedAmount(holding.pnl, holding.currency)}</span>
+        <span class="${pnlColor}">${formatSignedAmount(pnlKrw, 'KRW')}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderUsPendingOrders(data) {
+  const el = document.getElementById('us-pending-orders-info');
+  const countEl = document.getElementById('us-pending-count');
+  if (!el || !countEl) return;
+
+  if (!data || !data.length) {
+    countEl.textContent = '0건';
+    el.innerHTML = '<div class="text-gray-600">미체결 없음</div>';
+    return;
+  }
+
+  const totalAmt = data.reduce((sum, order) => sum + (order.order_price * order.remaining_qty), 0);
+  countEl.textContent = `${data.length}건 (${formatAmount(totalAmt, data[0]?.currency || 'USD')})`;
+  el.innerHTML = data.map((order) => {
+    const sideColor = order.side === '매수' ? 'text-red-400' : 'text-blue-400';
+    const orderAmt = order.order_price * order.remaining_qty;
+    const orderAmtKrw = orderAmt * (order.exchange_rate_to_krw || 0);
+    const timeStr = order.order_time
+      ? `${order.order_time.slice(0, 2)}:${order.order_time.slice(2, 4)}:${order.order_time.slice(4, 6)}`
+      : '-';
+    return `<div class="rounded-lg border border-amber-900/50 bg-amber-950/10 p-2 space-y-1">
+      <div class="flex justify-between items-center gap-2">
+        <div class="min-w-0">
+          <div class="text-gray-100 font-medium truncate" title="${order.symbol}">${order.name || order.symbol}</div>
+          <div class="text-[11px] text-gray-500">${order.symbol}</div>
+        </div>
+        <span class="${sideColor} text-xs font-medium">${order.side}</span>
+      </div>
+      <div class="flex justify-between text-gray-400">
+        <span>미체결 ${order.remaining_qty}주 / ${order.order_qty}주</span>
+        <span>${formatAmount(order.order_price, order.currency || 'USD')}</span>
+      </div>
+      <div class="flex justify-between text-gray-500">
+        <span>${formatAmount(orderAmt, order.currency || 'USD')} · ${formatAmount(orderAmtKrw, 'KRW')}</span>
         <span>${timeStr}</span>
       </div>
     </div>`;
@@ -188,11 +435,48 @@ function toggleSettings() {
   if (arrow) arrow.style.transform = isHidden ? '' : 'rotate(-90deg)';
 }
 
+function truncateNumber(value, digits = 0) {
+  const factor = 10 ** digits;
+  if (value >= 0) return Math.floor(value * factor) / factor;
+  return Math.ceil(value * factor) / factor;
+}
+
 function formatKRW(amount) {
-  if (amount == null) return '-';
-  if (Math.abs(amount) >= 100000000) return (amount / 100000000).toFixed(1) + '억';
-  if (Math.abs(amount) >= 10000) return (amount / 10000).toFixed(0) + '만';
-  return amount.toLocaleString() + '원';
+  if (amount == null || Number.isNaN(Number(amount))) return '-';
+  const value = Number(amount);
+  if (Math.abs(value) >= 100000000) return truncateNumber(value / 100000000, 1).toFixed(1) + '억';
+  if (Math.abs(value) >= 10000) return truncateNumber(value / 10000, 0).toFixed(0) + '만';
+  return Math.trunc(value).toLocaleString() + '원';
+}
+
+function formatAmount(amount, currency = 'KRW') {
+  if (amount == null || Number.isNaN(Number(amount))) return '-';
+  if (currency === 'PCT') {
+    const value = Number(amount);
+    return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+  }
+  if (currency === 'USD') {
+    return `${Number(amount).toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })} USD`;
+  }
+  return formatKRW(Number(amount));
+}
+
+function formatSignedAmount(amount, currency = 'KRW') {
+  if (amount == null || Number.isNaN(Number(amount))) return '-';
+  if (currency === 'PCT') {
+    return formatAmount(amount, 'PCT');
+  }
+  const prefix = Number(amount) >= 0 ? '+' : '';
+  return `${prefix}${formatAmount(amount, currency)}`;
+}
+
+function convertKrwToUsd(amount, exchangeRate) {
+  const rate = Number(exchangeRate || 0);
+  if (!rate) return null;
+  return Number(amount) / rate;
 }
 
 // ══════════════════════════════════════════════════════════
@@ -806,11 +1090,11 @@ function createReportCard(report) {
     </div>
     <div class="grid grid-cols-2 gap-3 mb-4">
       <div class="bg-dark-900 rounded-lg p-3 text-center">
-        <div class="text-xl font-bold ${realizedPnlColor}">${report.total_pnl >= 0 ? '+' : ''}${report.total_pnl.toLocaleString()}원</div>
+        <div class="text-xl font-bold ${realizedPnlColor}">${formatSignedAmount(report.total_pnl, 'KRW')}</div>
         <div class="text-xs text-gray-500">실현 손익 (승률 ${winRate}%)</div>
       </div>
       <div class="bg-dark-900 rounded-lg p-3 text-center">
-        <div class="text-xl font-bold ${unrealizedPnlColor}">${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toLocaleString()}원</div>
+        <div class="text-xl font-bold ${unrealizedPnlColor}">${formatSignedAmount(unrealizedPnl, 'KRW')}</div>
         <div class="text-xs text-gray-500">미실현 손익</div>
       </div>
     </div>
@@ -881,9 +1165,20 @@ async function loadLLMStatus() {
     const json = await resp.json();
     const s = json.data;
     if (!s) return;
-    const providerLabel = s.provider_name || formatProviderLabel(s.selected_provider || (s.tier1 && s.tier1.provider));
+    const providerId = s.selected_provider || (s.tier1 && s.tier1.provider);
+    const providerLabel = s.provider_name || formatProviderLabel(providerId);
+    const t1Effort = formatReasoningEffortLabel(
+      s.tier1 && s.tier1.reasoning_effort,
+      providerId
+    );
+    const t2Effort = formatReasoningEffortLabel(
+      s.tier2 && s.tier2.reasoning_effort,
+      providerId
+    );
     const t1Model = document.getElementById('llm-tier1-model');
-    if (t1Model) t1Model.textContent = `${providerLabel} · T1 ${s.tier1.model}`;
+    if (t1Model) {
+      t1Model.textContent = `${providerLabel} · T1 ${s.tier1.model}${t1Effort} · T2 ${s.tier2.model}${t2Effort}`;
+    }
   } catch (err) {
     console.error('LLM status error:', err);
   }
@@ -1021,6 +1316,12 @@ function formatProviderLabel(provider) {
   if (provider === 'CLAUDE_CODE') return 'Claude Code';
   if (provider === 'CODEX_CLI') return 'Codex CLI';
   return provider.replaceAll('_', ' ');
+}
+
+function formatReasoningEffortLabel(effort, provider) {
+  if (effort) return ` [${effort}]`;
+  if (provider === 'CODEX_CLI') return ' [global]';
+  return '';
 }
 
 // ── System Status ──
