@@ -88,6 +88,13 @@ WebSocket → EventDetector → EventBus:
 
 장후 리뷰 → 성공/실패 패턴 추출 → 트레이딩 규칙 자동 생성 → 다음 날 적용
 
+## 분리된 장 구조
+
+- 운영 장은 `KRX` 와 `US` 두 runtime scope로 분리한다.
+- `market_scope` 는 스케줄, 리포트, 리스크, LLM 세션, 실시간 구독을 나누는 기준이다.
+- 실제 주문/시세용 `market` 코드는 `KRX`, `NASDAQ`, `NYSE`, `AMEX` 같은 거래소 코드를 그대로 유지한다.
+- 미국장은 거래소 단위로 주문하지만, 장중 런타임과 장후 리뷰는 `US` scope로 묶어 처리한다.
+
 ## 코드 컨벤션
 
 - Python 3.11+, async/await 기반
