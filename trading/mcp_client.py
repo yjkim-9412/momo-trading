@@ -2,6 +2,7 @@
 import asyncio
 import json
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -25,6 +26,8 @@ _SSE_MAX_RECONNECT_ATTEMPTS = 50  # 최대 재연결 시도 횟수
 _RATE_LIMIT_PER_SEC = 8
 _RATE_LIMIT_WINDOW = 1.0  # 초
 _MAX_CONCURRENT_CALLS = 3  # 동시 MCP 호출 상한
+_OVERSEAS_QUOTE_MIN_INTERVAL = 1.0  # 해외 시세는 더 보수적으로 직렬화
+_OVERSEAS_QUOTE_MAX_RETRIES = 2
 
 
 class MCPClient:
@@ -53,6 +56,9 @@ class MCPClient:
         self._rate_lock = asyncio.Lock()
         self._call_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
         self._fx_cache: dict[str, tuple[float, float]] = {}
+        self._overseas_quote_semaphore = asyncio.Semaphore(1)
+        self._overseas_quote_rate_lock = asyncio.Lock()
+        self._overseas_quote_last_call_at = 0.0
 
     @staticmethod
     def _extract_business_error(data: Any) -> tuple[str | None, str]:
@@ -333,6 +339,59 @@ class MCPClient:
                     logger.debug("KIS rate limit 대기: {:.2f}초", wait)
                     await asyncio.sleep(wait)
             self._call_timestamps.append(time.monotonic())
+
+    async def _rate_limit_overseas_quote(self) -> None:
+        """해외 시세 REST 호출은 계정 단위 한도가 엄격해 보수적으로 직렬화"""
+        async with self._overseas_quote_rate_lock:
+            now = time.monotonic()
+            wait = _OVERSEAS_QUOTE_MIN_INTERVAL - (now - self._overseas_quote_last_call_at)
+            if wait > 0:
+                logger.debug("해외 시세 rate limit 대기: {:.2f}초", wait)
+                await asyncio.sleep(wait)
+            self._overseas_quote_last_call_at = time.monotonic()
+
+    async def _call_overseas_quote(
+        self,
+        request_name: str,
+        request_factory: Callable[[], Awaitable[dict[str, Any]]],
+        _retry: int = 0,
+    ) -> MCPResponse:
+        """해외 시세 REST 호출 공통 게이트: 직렬화 + 간격 제한 + rate-limit 재시도"""
+        async with self._overseas_quote_semaphore:
+            await self._rate_limit_overseas_quote()
+            try:
+                result = await request_factory()
+            except Exception as e:
+                logger.error("해외 시세 호출 오류 ({}): {}", request_name, str(e))
+                return MCPResponse(success=False, error=str(e))
+
+        if not isinstance(result, dict):
+            return MCPResponse(success=False, error=f"잘못된 해외 시세 응답: {request_name}")
+
+        rt_cd, error_msg = self._extract_business_error(result)
+        if rt_cd is not None:
+            if "초당 거래건수" in error_msg and _retry < _OVERSEAS_QUOTE_MAX_RETRIES:
+                wait = max(_OVERSEAS_QUOTE_MIN_INTERVAL, 1.0 + _retry * 0.5)
+                logger.warning(
+                    "해외 시세 rate limit ({}) → {:.1f}초 대기 후 재시도 ({}/{})",
+                    request_name,
+                    wait,
+                    _retry + 1,
+                    _OVERSEAS_QUOTE_MAX_RETRIES,
+                )
+                await asyncio.sleep(wait)
+                return await self._call_overseas_quote(
+                    request_name,
+                    request_factory,
+                    _retry=_retry + 1,
+                )
+            return MCPResponse(success=False, error=error_msg[:200], data=result)
+
+        return MCPResponse(
+            success=result.get("success", False),
+            data=result,
+            error=result.get("error"),
+        )
 
     async def call_tool(
         self, tool_name: str, arguments: dict[str, Any] | None = None,
@@ -690,11 +749,9 @@ class MCPClient:
         else:
             from trading.kis_api import get_overseas_price
 
-            result = await get_overseas_price(symbol, market_code)
-            resp = MCPResponse(
-                success=result.get("success", False),
-                data=result,
-                error=result.get("error"),
+            resp = await self._call_overseas_quote(
+                f"{market_code}:{symbol}:price",
+                lambda: get_overseas_price(symbol, market_code),
             )
         if resp.success and resp.data:
             d = resp.data
@@ -818,11 +875,9 @@ class MCPClient:
         else:
             from trading.kis_api import get_overseas_daily_price
 
-            result = await get_overseas_daily_price(symbol, market_code)
-            resp = MCPResponse(
-                success=result.get("success", False),
-                data=result,
-                error=result.get("error"),
+            resp = await self._call_overseas_quote(
+                f"{market_code}:{symbol}:daily",
+                lambda: get_overseas_daily_price(symbol, market_code),
             )
 
         if resp.success and resp.data:
@@ -974,11 +1029,9 @@ class MCPClient:
         if not is_domestic_market(market_code):
             from trading.kis_api import get_overseas_minute_chart
 
-            result = await get_overseas_minute_chart(symbol, market_code, period=period)
-            response = MCPResponse(
-                success=result.get("success", False),
-                data=result,
-                error=result.get("error"),
+            response = await self._call_overseas_quote(
+                f"{market_code}:{symbol}:minute:{period}",
+                lambda: get_overseas_minute_chart(symbol, market_code, period=period),
             )
             if response.success and response.data:
                 items = (
