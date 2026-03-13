@@ -135,6 +135,22 @@ class TradingAgent:
 
         async with self._cycle_lock:
             if market_calendar.is_trading_hours(target):
+                if not mcp_client.is_connected:
+                    logger.warning("[{}] MCP 미연결 → 장중 매매 사이클 스킵", target)
+                    await activity_logger.log(
+                        ActivityType.CYCLE,
+                        ActivityPhase.ERROR,
+                        f"⚠️ [{target}] MCP 미연결 — 장중 매매 사이클 스킵",
+                    )
+                    return {
+                        "skipped": True,
+                        "reason": "mcp_unavailable",
+                        "scanned": 0,
+                        "analyzed": 0,
+                        "signals": 0,
+                        "executed": 0,
+                        "selected_symbols": [],
+                    }
                 # 데이트레이딩 모드: 매수 마감 시간 이후 신규 매수 차단
                 # 스윙 모드: 오버나이트 보유 가능 → 장 마감(15:20)까지 매수 허용
                 if settings.DAY_TRADING_ONLY:

@@ -205,16 +205,22 @@ class TradingScheduler:
         """서버 기동 시 현재 시간대에 맞는 초기 작업 실행"""
         import asyncio
         from scheduler.market_calendar import market_calendar
+        from trading.mcp_client import mcp_client
         from trading.market_profile import normalize_market
 
         # 기동 직후 약간의 딜레이 (MCP 연결 안정화)
         await asyncio.sleep(3)
+
+        mcp_available = mcp_client.is_connected
 
         # 활성 시장 중 현재 장중인 시장을 찾아 즉시 스캔
         found_open = False
         for market_group in settings.enabled_market_groups:
             market = normalize_market(market_group)
             if market_calendar.is_trading_hours(market):
+                if not mcp_available:
+                    logger.warning("[{}] 서버 기동: MCP 미연결 → 즉시 장중 스캔 스킵", market)
+                    continue
                 logger.info("서버 기동: {} 장중 → 즉시 시장 스캔 + 매매 시작", market)
                 asyncio.create_task(self._market_open_scan(market))
                 found_open = True
@@ -332,9 +338,19 @@ class TradingScheduler:
         from agent.trading_agent import trading_agent
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
+        from trading.mcp_client import mcp_client
 
         if market_calendar.is_holiday(market):
             logger.info("[{}] 휴장일 — 장 시작 스캔 스킵", market)
+            return
+
+        if not mcp_client.is_connected:
+            logger.warning("[{}] MCP 미연결 — 장 시작 스캔 스킵", market)
+            await activity_logger.log(
+                ActivityType.SCHEDULE,
+                ActivityPhase.ERROR,
+                f"⚠️ [{market}] MCP 미연결 — 장 시작 스캔 스킵",
+            )
             return
 
         logger.info("=== [{}] 장 시작 첫 스캔 — 전체 시장 분석 + 매매 시작 ===", market)
@@ -350,6 +366,14 @@ class TradingScheduler:
 
             # 1. AI Agent 매매 사이클 실행 (전체 시장 스캔 → 분석 → 매매)
             result = await trading_agent.run_cycle(market=market)
+            if result.get("skipped") and result.get("reason") == "mcp_unavailable":
+                logger.warning("[{}] MCP 미연결 — 장 시작 후속 작업 생략", market)
+                await activity_logger.log(
+                    ActivityType.SCHEDULE,
+                    ActivityPhase.ERROR,
+                    f"⚠️ [{market}] MCP 미연결 — 장 시작 후속 작업 생략",
+                )
+                return
 
             # 2. 선정 종목 + 보유종목을 WebSocket 실시간 구독
             selected = result.get("selected_symbols", [])
