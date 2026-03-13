@@ -130,6 +130,21 @@
           </button>
           <div id="pending-orders-info" class="account-section-body text-xs space-y-1 max-h-40 overflow-y-auto account-data-transition" style="max-height:160px"></div>
         </div>
+
+        <!-- AI 관심종목 (collapsible) -->
+        <div id="watchlist-section" style="display:none">
+          <button onclick="toggleAccountSection('watchlist')" class="flex items-center justify-between mt-3 mb-1 w-full text-left" aria-expanded="true">
+            <span class="flex items-center gap-1">
+              <span class="section-toggle-icon" id="watchlist-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+              <span class="text-xs text-purple-400 font-medium">AI 관심종목</span>
+            </span>
+            <span class="flex items-center gap-1.5">
+              <span id="watchlist-stream-dot" class="w-1.5 h-1.5 rounded-full bg-gray-600"></span>
+              <span id="watchlist-count" class="text-xs text-gray-500">0종목</span>
+            </span>
+          </button>
+          <div id="watchlist-info" class="account-section-body text-xs space-y-1 max-h-72 overflow-y-auto account-data-transition" style="max-height:288px"></div>
+        </div>
       </div>
 
       <div class="border-t border-gray-700 my-2"></div>
@@ -247,8 +262,10 @@
       </div>
 
       <!-- Scroll to bottom FAB -->
-      <button id="scroll-to-bottom" onclick="scrollToBottom()" class="scroll-fab hidden" aria-label="최하단으로 이동" title="최신 로그로 이동">
-        <i data-lucide="arrow-down" class="w-4 h-4"></i>
+      <button id="scroll-to-bottom" onclick="scrollToBottom()" class="scroll-fab hidden" aria-label="최하단으로 이동" title="최신 대화로 이동">
+        <i data-lucide="arrow-down" class="w-3.5 h-3.5"></i>
+        <span>최신 대화</span>
+        <span id="scroll-fab-badge" class="scroll-fab-badge"></span>
       </button>
 
       <!-- Bottom bar -->

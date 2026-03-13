@@ -4,6 +4,7 @@
 const API = '/api/v1/admin';
 let currentView = 'live';
 let autoScroll = true;
+let missedCount = 0;
 let accountPollTimer = null;
 let currentMarket = 'KRX';
 let enabledMarkets = ['KRX'];
@@ -419,6 +420,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadSystemStatus();
   loadReportList();
   loadMarketAccountInfo();
+  loadWatchlist();
   loadLLMStatus();
   loadLLMUsage();
   connectSSE();
@@ -426,6 +428,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   initAgentMonitor();
   setInterval(loadSystemStatus, 15000);
   accountPollTimer = setInterval(loadMarketAccountInfo, 30000);
+  setInterval(loadWatchlist, 30000);
   setInterval(loadLLMUsage, 60000);
 });
 
@@ -434,6 +437,19 @@ function scrollToBottom() {
   const container = document.getElementById('chat-container');
   container.scrollTop = container.scrollHeight;
   autoScroll = true;
+  missedCount = 0;
+  updateScrollBadge();
+}
+
+function updateScrollBadge() {
+  const badge = document.getElementById('scroll-fab-badge');
+  if (!badge) return;
+  if (missedCount > 0) {
+    badge.textContent = missedCount > 99 ? '99+' : missedCount;
+    badge.classList.add('visible');
+  } else {
+    badge.classList.remove('visible');
+  }
 }
 
 // ── Toast Notifications ──
@@ -645,9 +661,16 @@ function connectSSE() {
             ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
           if (scopeKey === myScope) setTimeout(loadMarketAccountInfo, 2000);
         }
+
+        // ④ Watchlist refresh on scan/cycle/decision events
+        if (msg.data && msg.data.phase === 'COMPLETE' &&
+            ['SCAN', 'CYCLE', 'DECISION'].includes(msg.data.activity_type)) {
+          if (scopeKey === myScope) setTimeout(loadWatchlist, 1500);
+        }
       }
       if (msg.type === 'account_changed') {
         loadMarketAccountInfo();
+        loadWatchlist();
       }
     } catch (err) {
       console.error('SSE parse error', err);
@@ -715,6 +738,7 @@ function switchMarket(market) {
       document.querySelectorAll('.account-data-transition').forEach(el => el.classList.remove('switching'));
     }, 60);
   });
+  loadWatchlist();
   loadSystemStatus();
   loadReportList();
 
@@ -1245,6 +1269,128 @@ function _buildKRXPendingCard(card, o, sideColor, currency, orderAmt, timeStr) {
   card.appendChild(_flexRow(r3Left + converted, timeStr, 'text-gray-500'));
 }
 
+// ── AI Watchlist ──
+async function loadWatchlist() {
+  const market = currentMarket;
+  const marketParam = market === 'KRX' ? '' : `?market=${market}`;
+  try {
+    const json = await fetchJSON(`${API}/watchlist${marketParam}`);
+    renderWatchlist(json.data);
+  } catch (err) {
+    console.error('Watchlist load error:', err);
+  }
+}
+
+function renderWatchlist(data) {
+  const el = document.getElementById('watchlist-info');
+  const countEl = document.getElementById('watchlist-count');
+  const sectionEl = document.getElementById('watchlist-section');
+  const dotEl = document.getElementById('watchlist-stream-dot');
+  if (!el) return;
+
+  const symbols = (data && data.symbols) || [];
+  const stream = data && data.stream_status;
+
+  if (!symbols.length) {
+    if (sectionEl) sectionEl.style.display = 'none';
+    return;
+  }
+
+  if (sectionEl) sectionEl.style.display = '';
+  if (countEl) countEl.textContent = `${symbols.length}종목`;
+  if (dotEl && stream) {
+    dotEl.className = stream.connected
+      ? 'w-1.5 h-1.5 rounded-full bg-green-400 status-dot'
+      : 'w-1.5 h-1.5 rounded-full bg-red-400';
+  }
+
+  el.replaceChildren();
+
+  // WS gauge bar
+  if (stream) {
+    const bar = document.createElement('div');
+    bar.className = 'watchlist-stream-bar';
+    const pct = stream.subscription_limit > 0
+      ? Math.round((stream.subscription_count / stream.subscription_limit) * 100) : 0;
+    bar.innerHTML = `<span class="ws-gauge"><span>WS</span><span class="ws-gauge-track"><span class="ws-gauge-fill" style="width:${pct}%"></span></span><span>${stream.subscription_count}/${stream.subscription_limit}</span></span>`
+      + `<span>${stream.connected ? '연결됨' : '끊김'}</span>`;
+    el.appendChild(bar);
+  }
+
+  const isUS = currentMarket !== 'KRX';
+
+  symbols.forEach(s => {
+    const card = document.createElement('div');
+    card.className = `watchlist-card ${s.is_holding ? 'wl-holding' : 'wl-watching'}`;
+
+    // Header: symbol + name + badge
+    const header = document.createElement('div');
+    header.className = 'wl-header';
+    const left = document.createElement('div');
+    left.className = 'flex items-center gap-1.5 min-w-0';
+    const symEl = document.createElement('span');
+    symEl.className = 'wl-symbol';
+    symEl.textContent = s.symbol;
+    left.appendChild(symEl);
+    if (s.name) {
+      const nameEl = document.createElement('span');
+      nameEl.className = 'wl-name';
+      nameEl.textContent = s.name;
+      nameEl.title = s.name;
+      left.appendChild(nameEl);
+    }
+    const badge = document.createElement('span');
+    if (s.is_holding) {
+      badge.className = 'wl-badge wl-badge-holding';
+      badge.textContent = '보유';
+    } else if (!s.is_subscribed) {
+      badge.className = 'wl-badge wl-badge-nosub';
+      badge.textContent = '대기';
+    } else {
+      badge.className = 'wl-badge wl-badge-watching';
+      badge.textContent = '감시';
+    }
+    header.appendChild(left);
+    header.appendChild(badge);
+    card.appendChild(header);
+
+    // Thresholds grid
+    const th = s.thresholds;
+    if (th) {
+      const grid = document.createElement('div');
+      grid.className = 'wl-thresholds';
+      const fmtPrice = (v) => {
+        if (!v || v <= 0) return '-';
+        return isUS ? `$${Number(v).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`
+          : Number(v).toLocaleString('ko-KR') + '원';
+      };
+      const items = [];
+      if (th.surge_pct != null) items.push({ label: '급등', value: `+${th.surge_pct}%`, cls: 'wl-th-val-surge' });
+      if (th.drop_pct != null) items.push({ label: '급락', value: `${th.drop_pct}%`, cls: 'wl-th-val-drop' });
+      if (th.volume_spike_ratio) items.push({ label: '거래량', value: `x${th.volume_spike_ratio}`, cls: '' });
+      if (th.trailing_stop_pct > 0) items.push({ label: 'Trail', value: `${th.trailing_stop_pct}%`, cls: '' });
+      if (th.stop_loss > 0) items.push({ label: 'SL', value: fmtPrice(th.stop_loss), cls: 'wl-th-val-sl' });
+      if (th.take_profit > 0) items.push({ label: 'TP', value: fmtPrice(th.take_profit), cls: 'wl-th-val-tp' });
+      items.forEach(item => {
+        const cell = document.createElement('div');
+        cell.className = 'wl-th';
+        cell.innerHTML = `<span class="wl-th-label">${item.label}</span><span class="${item.cls}">${item.value}</span>`;
+        grid.appendChild(cell);
+      });
+      card.appendChild(grid);
+    } else {
+      const tag = document.createElement('div');
+      tag.className = 'wl-default-tag';
+      tag.textContent = '기본 임계값';
+      card.appendChild(tag);
+    }
+
+    el.appendChild(card);
+  });
+
+  refreshIcons();
+}
+
 function toggleSettings() {
   const body = document.getElementById('settings-body');
   const arrow = document.getElementById('settings-arrow');
@@ -1359,6 +1505,8 @@ function appendActivity(data) {
     }
 
     if (!card) {
+      // LLM_CALL은 서브 단계 → 카드 생성 X, 기존 카드에만 합류
+      if (isLLMCall) return;
       card = createStockCard(symbol, data);
       cards[cardKey] = card;
       container.appendChild(card.element);
@@ -1369,6 +1517,11 @@ function appendActivity(data) {
 
   incActivityCount();
   document.getElementById('activity-count').textContent = `${getActivityCount()}건`;
+
+  if (!autoScroll) {
+    missedCount++;
+    updateScrollBadge();
+  }
 
   if (autoScroll) {
     container.scrollTop = container.scrollHeight;
@@ -1436,7 +1589,9 @@ function createStockCard(symbol, firstActivity) {
 
   // Extract stock name from summary: [종목명] or [심볼]
   const nameMatch = (firstActivity.summary || '').match(/\[([^\]]+)\]/);
-  const stockName = nameMatch ? nameMatch[1] : symbol;
+  let stockName = nameMatch ? nameMatch[1] : symbol;
+  // 방어: TIER 라벨이 추출된 경우 symbol로 fallback
+  if (/^TIER\d/i.test(stockName)) stockName = symbol;
 
   const header = document.createElement('div');
   header.className = 'stock-card-header';
@@ -2600,9 +2755,11 @@ function toggleRightSidebar() {
 
 // ── Collapsible Account Sections (Holdings / Pending) ──
 function toggleAccountSection(section) {
-  const bodyEl = document.getElementById(section === 'holdings' ? 'holdings-info' : 'pending-orders-info');
-  const arrowEl = document.getElementById(section === 'holdings' ? 'holdings-arrow' : 'pending-arrow');
-  const toggleBtn = bodyEl && bodyEl.previousElementSibling
+  const idMap = { holdings: 'holdings-info', pending: 'pending-orders-info', watchlist: 'watchlist-info' };
+  const arrowMap = { holdings: 'holdings-arrow', pending: 'pending-arrow', watchlist: 'watchlist-arrow' };
+  const bodyEl = document.getElementById(idMap[section] || `${section}-info`);
+  const arrowEl = document.getElementById(arrowMap[section] || `${section}-arrow`);
+  const toggleBtn = bodyEl && bodyEl.closest(`#${section}-section`)
     ? bodyEl.closest(`#${section}-section`).querySelector('button')
     : null;
   if (!bodyEl) return;
@@ -2675,4 +2832,8 @@ document.getElementById('chat-container').addEventListener('scroll', function() 
   autoScroll = (el.scrollHeight - el.scrollTop - el.clientHeight) < 50;
   const fab = document.getElementById('scroll-to-bottom');
   if (fab) fab.classList.toggle('hidden', autoScroll);
+  if (autoScroll) {
+    missedCount = 0;
+    updateScrollBadge();
+  }
 });

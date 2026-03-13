@@ -18,6 +18,7 @@ from schemas.daily_report_schema import DailyReportResponse
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
+from trading.market_profile import normalize_market_scope
 from trading.mcp_client import mcp_client
 from trading.models import AccountBalance, HoldingInfo, PendingOrderInfo
 
@@ -80,6 +81,94 @@ def _serialize_pending_orders(orders: list[PendingOrderInfo]) -> list[dict[str, 
         }
         for o in orders
     ]
+
+
+# ── AI 관심종목 (WebSocket 구독 + 임계값) ──
+@router.get("/watchlist")
+async def get_watchlist(market: str | None = Query(None)):
+    """AI가 실시간 감시 중인 종목 목록 + 임계값"""
+    from dataclasses import asdict
+
+    from agent.trading_agent import trading_agent
+    from realtime.event_detector import DEFAULT_THRESHOLDS, event_detector
+    from realtime.stream_manager import stream_manager
+
+    market_code = market or settings.primary_market_code
+    scope = normalize_market_scope(market_code)
+
+    # 1) 보유종목 이름 맵
+    holding_map: dict[str, str] = {}
+    try:
+        holdings = await account_manager.get_holdings(market_code)
+        for h in holdings:
+            if h.symbol:
+                holding_map[h.symbol.upper()] = h.name or ""
+    except Exception:
+        pass
+
+    # 2) 파이프라인 스냅샷에서 종목명 보충
+    name_map: dict[str, str] = dict(holding_map)
+    state = trading_agent._market_states.get(scope)
+    if state:
+        pipeline = getattr(state, "_pipeline_snapshot", None) or {}
+        for sym_info in pipeline.get("selected_symbols", []):
+            if isinstance(sym_info, dict):
+                sym = str(sym_info.get("symbol", "")).upper()
+                if sym and sym not in name_map:
+                    name_map[sym] = sym_info.get("name", "")
+
+    # 3) scope에 해당하는 desired 종목 수집
+    desired_set = stream_manager._desired_by_scope.get(scope, set())
+    active_set = set(stream_manager._active_symbols.keys())
+
+    # 4) event_detector 임계값 중 이 scope에 해당하는 것
+    scope_prefixes = (f"{scope}:",) if scope == "KRX" else ("NASDAQ:", "NYSE:", "AMEX:", "US:")
+    threshold_keys = [
+        k for k in event_detector._thresholds
+        if any(k.startswith(p) for p in scope_prefixes)
+    ]
+
+    # 5) 합집합 구성
+    all_symbols: dict[tuple[str, str], bool] = {}  # (market, symbol) -> is_subscribed
+    for market_sym, symbol_upper in desired_set:
+        all_symbols[(market_sym, symbol_upper)] = (market_sym, symbol_upper) in active_set
+    for key in threshold_keys:
+        parts = key.split(":", 1)
+        if len(parts) == 2:
+            mk, sym = parts
+            if (mk, sym) not in all_symbols:
+                all_symbols[(mk, sym)] = (mk, sym) in active_set
+
+    # 6) 직렬화
+    default_dict = asdict(DEFAULT_THRESHOLDS)
+    symbols_list = []
+    for (mk, sym), is_sub in all_symbols.items():
+        th = event_detector._thresholds.get(f"{mk}:{sym}")
+        th_data = None
+        if th:
+            th_dict = asdict(th)
+            if th_dict != default_dict:
+                th_data = th_dict
+        symbols_list.append({
+            "symbol": sym,
+            "market": mk,
+            "name": name_map.get(sym, ""),
+            "is_holding": sym in holding_map,
+            "is_subscribed": is_sub,
+            "thresholds": th_data,
+        })
+
+    # 보유종목 우선, 그 다음 임계값 있는 것, 나머지
+    symbols_list.sort(key=lambda s: (not s["is_holding"], s["thresholds"] is None, s["symbol"]))
+
+    return SuccessResponse(data={
+        "symbols": symbols_list,
+        "stream_status": {
+            "connected": stream_manager.is_connected,
+            "subscription_count": stream_manager.subscription_count,
+            "subscription_limit": 41,
+        },
+    })
 
 
 # ── SSE 실시간 스트림 ──

@@ -323,19 +323,46 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .tech-table tr:nth-child(even) { background: #1a1b2e; }
 .tech-table .label { text-align: left; color: #d1d5db; font-weight: 500; }
 
-/* ── Scroll to Bottom FAB ── */
+/* ── Scroll to Bottom FAB — Ambient Glow Pill ── */
 .scroll-fab {
-  position: absolute; bottom: 48px; right: 16px; z-index: 10;
-  width: 36px; height: 36px; border-radius: 50%;
-  background: #252744; border: 1px solid #374151;
-  color: #9ca3af; cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  transition: opacity 0.2s, background 0.15s, color 0.15s;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-  opacity: 1;
+  position: absolute; bottom: 56px; right: 20px; z-index: 10;
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 14px 8px 12px;
+  border-radius: 20px;
+  background: rgba(30, 32, 58, 0.85);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(96, 165, 250, 0.2);
+  color: #94a3b8; cursor: pointer;
+  font-size: 12px; font-weight: 500; font-family: inherit;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  transition: transform 0.3s cubic-bezier(0.34,1.56,0.64,1),
+              opacity 0.25s ease,
+              box-shadow 0.3s ease,
+              border-color 0.3s ease;
+  transform: translateY(0); opacity: 1;
 }
-.scroll-fab:hover { background: #374151; color: #e5e7eb; }
-.scroll-fab.hidden { opacity: 0; pointer-events: none; }
+.scroll-fab:hover {
+  color: #e2e8f0;
+  border-color: rgba(96, 165, 250, 0.45);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.5), 0 0 12px rgba(96,165,250,0.15);
+  transform: translateY(-1px);
+}
+.scroll-fab:active { transform: translateY(1px); }
+.scroll-fab.hidden { opacity: 0; pointer-events: none; transform: translateY(12px); }
+
+/* Badge (new message count) */
+.scroll-fab-badge {
+  display: none; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 9px; background: #3b82f6;
+  color: #fff; font-size: 10px; font-weight: 700; line-height: 1;
+  animation: badgePulse 2s ease-in-out infinite;
+}
+.scroll-fab-badge.visible { display: flex; }
+@keyframes badgePulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(59,130,246,0.5); }
+  50% { box-shadow: 0 0 8px 2px rgba(59,130,246,0.3); }
+}
 
 /* ── Toast Notifications ── */
 #toast-container { pointer-events: none; }
@@ -495,3 +522,48 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 @media (max-width: 600px) {
   .agent-monitor-slots { grid-template-columns: 1fr; }
 }
+
+/* ── AI Watchlist ── */
+.watchlist-stream-bar {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 10px; color: #6b7280; padding: 2px 4px 4px;
+}
+.watchlist-stream-bar .ws-gauge {
+  display: flex; align-items: center; gap: 4px;
+}
+.watchlist-stream-bar .ws-gauge-track {
+  width: 48px; height: 3px; background: #1f2937; border-radius: 2px; overflow: hidden;
+}
+.watchlist-stream-bar .ws-gauge-fill {
+  height: 100%; border-radius: 2px; background: #a78bfa; transition: width 0.3s ease;
+}
+.watchlist-card {
+  border: 1px solid #30344f; border-radius: 8px; padding: 6px 8px;
+  margin-bottom: 4px; background: rgba(26, 27, 46, 0.5); transition: background 0.15s;
+}
+.watchlist-card:hover { background: rgba(37, 39, 68, 0.6); }
+.watchlist-card.wl-holding { border-left: 2px solid rgba(52, 211, 153, 0.5); }
+.watchlist-card.wl-watching { border-left: 2px solid rgba(167, 139, 250, 0.4); }
+.watchlist-card .wl-header {
+  display: flex; align-items: center; justify-content: space-between; gap: 4px;
+}
+.watchlist-card .wl-symbol { font-weight: 600; color: #e5e7eb; font-size: 11px; }
+.watchlist-card .wl-name { color: #9ca3af; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 90px; }
+.wl-badge {
+  display: inline-flex; align-items: center; font-size: 9px; font-weight: 600;
+  padding: 0 4px; border-radius: 3px; line-height: 16px;
+}
+.wl-badge-holding { background: rgba(52,211,153,0.12); color: #34d399; border: 1px solid rgba(52,211,153,0.25); }
+.wl-badge-watching { background: rgba(167,139,250,0.10); color: #a78bfa; border: 1px solid rgba(167,139,250,0.20); }
+.wl-badge-nosub { background: rgba(107,114,128,0.12); color: #6b7280; border: 1px solid rgba(107,114,128,0.20); }
+.watchlist-card .wl-thresholds {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 1px 6px;
+  margin-top: 4px; font-size: 10px; color: #6b7280;
+}
+.wl-thresholds .wl-th { display: flex; justify-content: space-between; }
+.wl-thresholds .wl-th-label { color: #4b5563; }
+.wl-thresholds .wl-th-val-sl { color: #f87171; }
+.wl-thresholds .wl-th-val-tp { color: #34d399; }
+.wl-thresholds .wl-th-val-surge { color: #fbbf24; }
+.wl-thresholds .wl-th-val-drop { color: #60a5fa; }
+.wl-default-tag { color: #4b5563; font-size: 10px; font-style: italic; margin-top: 3px; }
