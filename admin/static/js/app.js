@@ -3,18 +3,42 @@
  */
 const API = '/api/v1/admin';
 let currentView = 'live';
-let activityCount = 0;
 let autoScroll = true;
 let accountPollTimer = null;
 let currentMarket = 'KRX';
 let enabledMarkets = ['KRX'];
+let currentLogFilter = 'ALL';
 
-// Stock card tracking: key = "cycleId:symbol" → { element, headerEl, bodyEl, stepsEl, activities[], outcome }
-let stockCards = {};
+function refreshIcons() {
+  if (typeof lucide !== 'undefined') {
+    requestAnimationFrame(() => lucide.createIcons());
+  }
+}
+
+// ── Per-market state management ──
+function currentScope() {
+  return currentMarket === 'KRX' ? 'KRX' : 'US';
+}
+let marketState = {
+  KRX: { stockCards: {}, activityCount: 0, loaded: false, fragment: null, scrollPos: 0 },
+  US:  { stockCards: {}, activityCount: 0, loaded: false, fragment: null, scrollPos: 0 },
+};
+let activityBuffer = { KRX: [], US: [] };
+const BUFFER_MAX = 300;
+
+// Convenience accessors for current market's stockCards
+function getStockCards() { return marketState[currentScope()].stockCards; }
+function getActivityCount() { return marketState[currentScope()].activityCount; }
+function setActivityCount(v) { marketState[currentScope()].activityCount = v; }
+function incActivityCount() { marketState[currentScope()].activityCount++; }
+
+// Legacy alias — many functions reference this directly
+let stockCards = marketState.KRX.stockCards;
 
 // ── Init ──
 document.addEventListener('DOMContentLoaded', async () => {
   await loadSettings();
+  applyWorkspaceTheme();
   loadSystemStatus();
   loadReportList();
   loadMarketAccountInfo();
@@ -41,10 +65,23 @@ function connectSSE() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'connected') return;
       if (msg.type === 'activity' && currentView === 'live') {
-        appendActivity(msg.data);
+        const eventScope = (msg.data && msg.data.market_scope) || 'KRX';
+        const myScope = currentScope();
+        if (eventScope === myScope) {
+          appendActivity(msg.data);
+        } else {
+          // Buffer for background market
+          const buf = activityBuffer[eventScope];
+          if (buf) {
+            buf.push(msg.data);
+            if (buf.length > BUFFER_MAX) buf.splice(0, buf.length - BUFFER_MAX);
+            updateBackgroundBadge(eventScope, buf.length);
+          }
+        }
         if (msg.data && msg.data.phase === 'COMPLETE' &&
             ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
-          setTimeout(loadMarketAccountInfo, 2000);
+          // Only refresh account if event is for current market
+          if (eventScope === myScope) setTimeout(loadMarketAccountInfo, 2000);
         }
       }
       if (msg.type === 'account_changed') {
@@ -67,15 +104,46 @@ function connectSSE() {
 // ── Market Switching ──
 function switchMarket(market) {
   if (market === currentMarket) return;
-  currentMarket = market;
+  const oldScope = currentScope();
 
-  // Update segmented control
-  const indicator = document.getElementById('market-seg-indicator');
-  const btns = document.querySelectorAll('.market-seg-btn');
+  // 1. Save current feed state
+  if (currentView === 'live') {
+    saveMarketFeed(oldScope);
+  }
+
+  // 2. Pause live timers for old market
+  pauseMarketTimers(oldScope);
+
+  currentMarket = market;
+  const newScope = currentScope();
+
+  // 3. Point stockCards alias to new market
+  stockCards = marketState[newScope].stockCards;
+
+  // 4. Apply workspace theme
+  applyWorkspaceTheme();
+
+  // 5. Update header tabs
+  const indicator = document.getElementById('market-header-indicator');
+  const btns = document.querySelectorAll('.market-header-btn');
   btns.forEach(btn => btn.classList.toggle('active', btn.dataset.market === market));
   if (indicator) indicator.classList.toggle('right', market !== 'KRX');
 
-  // Fade out data, reload, fade in
+  // 6. Restore or load new market feed
+  if (currentView === 'live') {
+    restoreMarketFeed(newScope);
+  }
+
+  // 7. Flush SSE buffer for new market
+  flushBuffer(newScope);
+
+  // 8. Reset background badge for new market
+  updateBackgroundBadge(newScope, 0);
+
+  // 9. Update activity count display
+  document.getElementById('activity-count').textContent = `${getActivityCount()}건`;
+
+  // 10. Fade out data, reload account/status/reports, fade in
   document.querySelectorAll('.account-data-transition').forEach(el => el.classList.add('switching'));
   loadMarketAccountInfo().then(() => {
     setTimeout(() => {
@@ -83,20 +151,136 @@ function switchMarket(market) {
     }, 60);
   });
   loadSystemStatus();
+  loadReportList();
 }
 
 function setupMarketTabs() {
-  const tabsEl = document.getElementById('market-tabs');
+  const tabsEl = document.getElementById('market-header-tabs');
+  const ctxBar = document.getElementById('market-context-bar');
   if (!tabsEl) return;
   if (enabledMarkets.length > 1) {
     tabsEl.classList.remove('hidden');
-    // Ensure correct initial state
-    const btns = document.querySelectorAll('.market-seg-btn');
+    if (ctxBar) ctxBar.classList.remove('hidden');
+    const btns = document.querySelectorAll('.market-header-btn');
     btns.forEach(btn => btn.classList.toggle('active', btn.dataset.market === currentMarket));
-    const indicator = document.getElementById('market-seg-indicator');
+    const indicator = document.getElementById('market-header-indicator');
     if (indicator) indicator.classList.toggle('right', currentMarket !== 'KRX');
   } else {
     tabsEl.classList.add('hidden');
+    if (ctxBar) ctxBar.classList.add('hidden');
+  }
+}
+
+// ── Workspace Theme ──
+function applyWorkspaceTheme() {
+  const scope = currentScope();
+  const body = document.body;
+  body.classList.remove('workspace-krx', 'workspace-us');
+  body.classList.add(scope === 'KRX' ? 'workspace-krx' : 'workspace-us');
+
+  // Update feed label
+  const feedLabel = document.getElementById('feed-market-label');
+  if (feedLabel) {
+    if (enabledMarkets.length > 1) {
+      feedLabel.textContent = scope === 'KRX' ? '— KRX 국내' : '— US 해외';
+    } else {
+      feedLabel.textContent = '';
+    }
+  }
+
+  // Update context bar
+  const ctxLabel = document.getElementById('ctx-market-label');
+  if (ctxLabel) ctxLabel.textContent = scope === 'KRX' ? 'KRX 국내주식' : 'US 해외주식';
+}
+
+// ── Feed State Preservation ──
+function saveMarketFeed(scope) {
+  const container = document.getElementById('chat-container');
+  const state = marketState[scope];
+  state.scrollPos = container.scrollTop;
+  // Detach all children into a fragment
+  const frag = document.createDocumentFragment();
+  while (container.firstChild) {
+    frag.appendChild(container.firstChild);
+  }
+  state.fragment = frag;
+}
+
+function restoreMarketFeed(scope) {
+  const container = document.getElementById('chat-container');
+  const state = marketState[scope];
+
+  if (state.fragment) {
+    // Restore saved DOM
+    container.innerHTML = '';
+    container.appendChild(state.fragment);
+    state.fragment = null;
+    requestAnimationFrame(() => { container.scrollTop = state.scrollPos; });
+  } else if (!state.loaded) {
+    // First visit — load from API
+    loadTodayActivities();
+  } else {
+    // Loaded but empty
+    container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">아직 활동 기록이 없습니다</div>';
+  }
+}
+
+function flushBuffer(scope) {
+  const buf = activityBuffer[scope];
+  if (!buf || !buf.length) return;
+
+  // Insert divider if many buffered events
+  if (buf.length > 5) {
+    const container = document.getElementById('chat-container');
+    const divider = document.createElement('div');
+    divider.className = 'cycle-divider';
+    divider.innerHTML = `<span class="text-gray-500">${buf.length}건의 새 활동</span>`;
+    container.appendChild(divider);
+  }
+
+  buf.forEach(data => appendActivity(data));
+  activityBuffer[scope] = [];
+}
+
+function pauseMarketTimers(scope) {
+  const cards = marketState[scope].stockCards;
+  for (const card of Object.values(cards)) {
+    if (card.liveTimer) {
+      clearInterval(card.liveTimer);
+      card.liveTimer = null;
+    }
+  }
+}
+
+function updateBackgroundBadge(scope, count) {
+  const badge = document.getElementById(`market-badge-${scope}`);
+  if (!badge) return;
+  if (count > 0) {
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.style.display = '';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+function updateMarketContextBar(statusData) {
+  if (!statusData) return;
+  const isHoliday = !!statusData.market_holiday;
+  const statusText = statusData.market_open ? '장중' : (isHoliday ? `휴장` : '장외');
+  const statusEl = document.getElementById('ctx-market-status');
+  if (statusEl) statusEl.textContent = statusText;
+
+  const dateEl = document.getElementById('ctx-trading-date');
+  if (dateEl) {
+    const today = new Date().toLocaleDateString('ko-KR', { timeZone: 'Asia/Seoul' });
+    dateEl.textContent = today;
+  }
+
+  const lastEl = document.getElementById('ctx-last-cycle');
+  if (lastEl) {
+    lastEl.textContent = statusData.last_cycle_time
+      ? `마지막 사이클: ${formatTime(statusData.last_cycle_time)}`
+      : '';
   }
 }
 
@@ -105,17 +289,12 @@ async function loadMarketAccountInfo() {
   const market = currentMarket;
   const marketParam = market === 'KRX' ? '' : `?market=${market}`;
   try {
-    const [balResp, holdResp, pendResp] = await Promise.all([
-      fetch(`${API}/account/balance${marketParam}`),
-      fetch(`${API}/account/holdings${marketParam}`),
-      fetch(`${API}/account/pending-orders${marketParam}`),
-    ]);
-    const balJson = await balResp.json();
-    const holdJson = await holdResp.json();
-    const pendJson = await pendResp.json();
-    renderBalance(balJson.data, market);
-    renderHoldings(holdJson.data, market);
-    renderPendingOrders(pendJson.data, market);
+    const resp = await fetch(`${API}/account/overview${marketParam}`);
+    const json = await resp.json();
+    const overview = json.data || {};
+    renderBalance(overview.balance, market);
+    renderHoldings(overview.holdings || [], market);
+    renderPendingOrders(overview.pending_orders || [], market);
   } catch (err) {
     console.error('Account info error:', err);
     const el = document.getElementById('account-info');
@@ -551,15 +730,16 @@ function appendActivity(data) {
     }
   } else {
     // Symbol-specific → route to stock card
+    const cards = getStockCards();
     const cardKey = `${data.cycle_id || 'ev'}:${symbol}`;
-    let card = stockCards[cardKey];
+    let card = cards[cardKey];
 
     // 정확한 키 매칭 실패 시 → 같은 종목의 진행 중인 카드에 합류
     if (!card) {
-      for (const [key, existing] of Object.entries(stockCards)) {
+      for (const [key, existing] of Object.entries(cards)) {
         if (key.endsWith(':' + symbol) && (!existing.outcome || existing.outcome === 'progress')) {
           card = existing;
-          stockCards[cardKey] = card;  // alias 등록
+          cards[cardKey] = card;  // alias 등록
           break;
         }
       }
@@ -567,19 +747,20 @@ function appendActivity(data) {
 
     if (!card) {
       card = createStockCard(symbol, data);
-      stockCards[cardKey] = card;
+      cards[cardKey] = card;
       container.appendChild(card.element);
     }
     addStepToCard(card, data);
     updateCardHeader(card);
   }
 
-  activityCount++;
-  document.getElementById('activity-count').textContent = `${activityCount}건`;
+  incActivityCount();
+  document.getElementById('activity-count').textContent = `${getActivityCount()}건`;
 
   if (autoScroll) {
     container.scrollTop = container.scrollHeight;
   }
+  refreshIcons();
 }
 
 /**
@@ -610,19 +791,18 @@ function createStockCard(symbol, firstActivity) {
   const nameMatch = (firstActivity.summary || '').match(/\[([^\]]+)\]/);
   const stockName = nameMatch ? nameMatch[1] : symbol;
 
-  // Header
   const header = document.createElement('div');
   header.className = 'stock-card-header';
   header.innerHTML = `
-    <span class="text-sm">📊</span>
+    <i data-lucide="bar-chart-2" class="w-4 h-4 text-gray-400 shrink-0"></i>
     <span class="text-sm font-medium text-white flex-1 truncate">
       ${escapeHtml(stockName)} <span class="text-gray-500 text-xs">${escapeHtml(symbol)}</span>
     </span>
-    <span class="stock-outcome text-xs px-2 py-0.5 rounded bg-purple-900/40 text-purple-300">
-      <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:4px"></span>분석 중
+    <span class="stock-outcome flex items-center gap-1 text-xs px-2 py-0.5 rounded bg-purple-900/40 text-purple-300">
+      <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:2px"></span>분석 중
     </span>
     <span class="stock-elapsed text-xs text-gray-600"></span>
-    <span class="stock-expand text-gray-500 text-xs transition-transform" style="transform:rotate(-90deg)">▼</span>
+    <span class="stock-expand text-gray-500 text-xs transition-transform" style="transform:rotate(-90deg)"><i data-lucide="chevron-down" class="w-4 h-4"></i></span>
   `;
   header.onclick = () => toggleCardBody(card);
 
@@ -727,11 +907,11 @@ function addStepToCard(card, data) {
     const detailId = 'sd-' + Math.random().toString(36).substr(2, 6);
     const isLLMCall = data.activity_type === 'LLM_CALL';
     html += `
-      <button onclick="event.stopPropagation(); toggleDetail('${detailId}')" class="text-xs text-gray-600 hover:text-gray-400 mt-0.5">
-        ${isLLMCall ? '💬 LLM 대화' : '▸ 상세'}
+      <button onclick="event.stopPropagation(); toggleDetail('${detailId}')" class="text-xs text-gray-500 hover:text-gray-300 mt-0.5 flex items-center gap-1">
+        ${isLLMCall ? '<i data-lucide="message-square" class="w-3 h-3"></i> LLM 대화' : '<i data-lucide="chevron-down" class="w-3 h-3"></i> 상세'}
       </button>
       <div id="${detailId}" class="detail-content mt-1 text-xs bg-dark-900/50 rounded p-2 text-gray-400">
-        ${isLLMCall ? formatLLMConversation(data.detail) : `<pre class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${formatDetail(data.detail)}</pre>`}
+        ${isLLMCall ? formatLLMConversation(data.detail) : `<div class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${formatDetail(data.detail, data.activity_type)}</div>`}
       </div>`;
   }
 
@@ -751,7 +931,7 @@ function addStepToCard(card, data) {
 function updateCardHeader(card) {
   const acts = card.activities;
   let outcome = 'progress';
-  let outcomeText = '<span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:4px"></span>분석 중';
+  let outcomeText = '<span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:2px"></span>분석 중';
   let outcomeBg = 'bg-purple-900/40 text-purple-300';
   let totalMs = 0;
 
@@ -761,14 +941,14 @@ function updateCardHeader(card) {
     // Error
     if (a.phase === 'ERROR' || a.error_message) {
       outcome = 'error';
-      outcomeText = '❌ 오류';
+      outcomeText = '<i data-lucide="x-circle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 오류';
       outcomeBg = 'bg-yellow-900/40 text-yellow-300';
     }
 
     // SKIP (데이터 부족, 리스크 차단 등) → HOLD 처리
     if (a.phase === 'SKIP' && outcome !== 'error') {
       outcome = 'hold';
-      outcomeText = '⏭ 스킵';
+      outcomeText = '<i data-lucide="skip-forward" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 스킵';
       outcomeBg = 'bg-gray-700/60 text-gray-400';
     }
 
@@ -777,15 +957,15 @@ function updateCardHeader(card) {
       const summ = a.summary || '';
       if (summ.includes('HOLD') || summ.includes('실패')) {
         outcome = 'hold';
-        outcomeText = summ.includes('실패') ? '⚠ 분석 실패' : '⏸ HOLD';
+        outcomeText = summ.includes('실패') ? '<i data-lucide="alert-triangle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 분석 실패' : '<i data-lucide="pause-circle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> HOLD';
         outcomeBg = 'bg-gray-700/60 text-gray-400';
       } else if (summ.includes('BUY')) {
         outcome = 'buy';
-        outcomeText = '📈 매수';
+        outcomeText = '<i data-lucide="trending-up" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매수';
         outcomeBg = 'bg-red-900/40 text-red-300';
       } else if (summ.includes('SELL')) {
         outcome = 'sell';
-        outcomeText = '📉 매도';
+        outcomeText = '<i data-lucide="trending-down" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매도';
         outcomeBg = 'bg-blue-900/40 text-blue-300';
       }
     }
@@ -795,7 +975,7 @@ function updateCardHeader(card) {
       const summ = a.summary || '';
       if (summ.includes('미승인')) {
         outcome = outcome !== 'error' ? 'hold' : outcome;
-        outcomeText = '⛔ 미승인';
+        outcomeText = '<i data-lucide="minus-circle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 미승인';
         outcomeBg = 'bg-gray-700/60 text-gray-400';
       }
     }
@@ -805,7 +985,7 @@ function updateCardHeader(card) {
       const summ = a.summary || '';
       if ((summ.includes('HOLD') || summ.includes('스킵')) && outcome !== 'error') {
         outcome = 'hold';
-        outcomeText = '⏸ HOLD';
+        outcomeText = '<i data-lucide="pause-circle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> HOLD';
         outcomeBg = 'bg-gray-700/60 text-gray-400';
       }
     }
@@ -816,13 +996,13 @@ function updateCardHeader(card) {
       const isSell = outcome === 'sell' || summ.includes('SELL') || summ.includes('매도');
       if (a.phase === 'COMPLETE' && (summ.includes('주문 접수') || summ.includes('체결'))) {
         outcome = isSell ? 'sell' : 'buy';
-        outcomeText = isSell ? '📉 매도 완료' : '📈 매수 완료';
+        outcomeText = isSell ? '<i data-lucide="trending-down" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매도 완료' : '<i data-lucide="trending-up" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매수 완료';
         outcomeBg = isSell ? 'bg-blue-900/40 text-blue-300' : 'bg-red-900/40 text-red-300';
       } else if (summ.includes('주문 실행')) {
         // 주문 접수 전 — 방향만 표시
         if (outcome !== 'buy' && outcome !== 'sell') {
           outcome = isSell ? 'sell' : 'buy';
-          outcomeText = isSell ? '📉 매도' : '📈 매수';
+          outcomeText = isSell ? '<i data-lucide="trending-down" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매도' : '<i data-lucide="trending-up" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매수';
           outcomeBg = isSell ? 'bg-blue-900/40 text-blue-300' : 'bg-red-900/40 text-red-300';
         }
       }
@@ -840,7 +1020,7 @@ function updateCardHeader(card) {
   // Update outcome badge
   const outcomeEl = card.headerEl.querySelector('.stock-outcome');
   if (outcomeEl) {
-    outcomeEl.className = `stock-outcome text-xs px-2 py-0.5 rounded ${outcomeBg}`;
+    outcomeEl.className = `stock-outcome flex items-center gap-1.5 text-xs px-2 py-0.5 rounded ${outcomeBg}`;
     outcomeEl.innerHTML = outcomeText;
   }
 
@@ -858,6 +1038,57 @@ function updateCardHeader(card) {
 
   // Update card border color
   card.element.className = `stock-card outcome-${outcome}`;
+
+  // Apply log filter visually
+  applyFilterToCard(card);
+}
+
+/**
+ * 로그 필터 적용 (개별 카드)
+ */
+function applyFilterToCard(card) {
+  if (currentLogFilter === 'ALL') {
+    card.element.style.display = '';
+  } else if (currentLogFilter === 'SIGNAL') {
+    if (['buy', 'sell', 'hold'].includes(card.outcome)) {
+      card.element.style.display = '';
+    } else {
+      card.element.style.display = 'none';
+    }
+  }
+}
+
+/**
+ * 로그 필터 변경 (전체 적용)
+ */
+function setLogFilter(filter) {
+  if (currentLogFilter === filter) return;
+  currentLogFilter = filter;
+  
+  // Update buttons
+  document.querySelectorAll('.log-filter-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.filter === filter);
+  });
+
+  // Apply to all tracked cards
+  for (const card of Object.values(getStockCards())) {
+    applyFilterToCard(card);
+  }
+  
+  // Also apply to legacy bubbles if needed (though mostly cards)
+  document.querySelectorAll('.chat-bubble').forEach(el => {
+     if (filter === 'SIGNAL') {
+       el.style.display = el.textContent.includes('매수') || el.textContent.includes('매도') || el.textContent.includes('BUY') || el.textContent.includes('SELL') ? '' : 'none';
+     } else {
+       el.style.display = '';
+     }
+  });
+
+  // Scroll to bottom after filter change
+  if (autoScroll) {
+    const container = document.getElementById('chat-container');
+    container.scrollTop = container.scrollHeight;
+  }
 }
 
 /**
@@ -902,11 +1133,11 @@ function createBubble(data) {
     const detailId = 'detail-' + (data.id || Math.random().toString(36).substr(2, 6));
     const isLLMCall = data.activity_type === 'LLM_CALL';
     html += `
-      <button onclick="toggleDetail('${detailId}')" class="text-xs text-gray-500 hover:text-gray-300 mt-1">
-        ${isLLMCall ? '💬 LLM 대화 보기' : '▼ 상세 보기'}
+      <button onclick="toggleDetail('${detailId}')" class="text-xs text-gray-500 hover:text-gray-300 mt-1 flex items-center gap-1">
+        ${isLLMCall ? '<i data-lucide="message-square" class="w-3 h-3"></i> LLM 대화 보기' : '<i data-lucide="chevron-down" class="w-3 h-3"></i> 상세 보기'}
       </button>
       <div id="${detailId}" class="detail-content mt-1 text-xs bg-dark-900 rounded p-2 text-gray-400">
-        ${isLLMCall ? formatLLMConversation(data.detail) : `<pre class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${formatDetail(data.detail)}</pre>`}
+        ${isLLMCall ? formatLLMConversation(data.detail) : `<div class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${formatDetail(data.detail, data.activity_type)}</div>`}
       </div>`;
   }
 
@@ -926,6 +1157,11 @@ function toggleDetail(id) {
 
 // ── View Switching ──
 function switchView(view) {
+  const wasLive = currentView === 'live';
+  // Save feed state if leaving live view
+  if (wasLive && view !== 'live') {
+    saveMarketFeed(currentScope());
+  }
   currentView = view;
   document.querySelectorAll('.nav-btn').forEach(b => {
     b.className = 'nav-btn w-full text-left px-3 py-2 rounded-lg text-sm text-gray-400 hover:bg-dark-700';
@@ -935,7 +1171,8 @@ function switchView(view) {
     activeBtn.className = 'nav-btn w-full text-left px-3 py-2 rounded-lg text-sm font-medium bg-blue-900/30 text-blue-300';
   }
   if (view === 'live') {
-    loadTodayActivities();
+    restoreMarketFeed(currentScope());
+    flushBuffer(currentScope());
   } else if (view === 'today') {
     loadReport('today');
   }
@@ -948,16 +1185,17 @@ function switchToReport(dateStr) {
 
 // ── Data Loading ──
 async function loadTodayActivities() {
+  const scope = currentScope();
   const container = document.getElementById('chat-container');
   container.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">불러오는 중...</div>';
-  // Clear card tracking
+  // Clear card tracking for current market
   cleanupStockCards();
 
   try {
-    const resp = await fetch(`${API}/activities?limit=500`);
+    const resp = await fetch(`${API}/activities?limit=500&market_scope=${encodeURIComponent(scope)}`);
     const json = await resp.json();
     container.innerHTML = '';
-    activityCount = 0;
+    setActivityCount(0);
 
     if (json.data && json.data.length) {
       // Pre-process: filter resolved STARTs
@@ -965,7 +1203,8 @@ async function loadTodayActivities() {
       activities.forEach(a => appendActivity(a));
 
       // History load: stop all timers and finalize stuck cards
-      for (const card of Object.values(stockCards)) {
+      const cards = getStockCards();
+      for (const card of Object.values(cards)) {
         if (card.liveTimer) {
           clearInterval(card.liveTimer);
           card.liveTimer = null;
@@ -975,8 +1214,8 @@ async function loadTodayActivities() {
           card.outcome = 'hold';
           const outcomeEl = card.headerEl.querySelector('.stock-outcome');
           if (outcomeEl) {
-            outcomeEl.className = 'stock-outcome text-xs px-2 py-0.5 rounded bg-gray-700/60 text-gray-400';
-            outcomeEl.innerHTML = '⏸ 완료';
+            outcomeEl.className = 'stock-outcome flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-gray-700/60 text-gray-400';
+            outcomeEl.innerHTML = '<i data-lucide="check-circle" class="w-3 h-3"></i> 완료';
           }
           card.element.className = 'stock-card outcome-hold';
         }
@@ -988,6 +1227,8 @@ async function loadTodayActivities() {
     } else {
       container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">아직 활동 기록이 없습니다</div>';
     }
+    marketState[scope].loaded = true;
+    refreshIcons();
   } catch (err) {
     container.innerHTML = `<div class="text-center text-red-400 text-sm py-8">로드 실패: ${err.message}</div>`;
   }
@@ -1014,18 +1255,24 @@ function getProgressKey(data) {
 
 // ── Clear Chat ──
 function clearChat() {
+  const scope = currentScope();
   const container = document.getElementById('chat-container');
   container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">화면을 비웠습니다. 새 활동이 들어오면 여기에 표시됩니다.</div>';
-  activityCount = 0;
+  setActivityCount(0);
   document.getElementById('activity-count').textContent = '0건';
   cleanupStockCards();
+  // Also clear any saved fragment
+  marketState[scope].fragment = null;
 }
 
 function cleanupStockCards() {
-  for (const card of Object.values(stockCards)) {
+  const scope = currentScope();
+  const cards = marketState[scope].stockCards;
+  for (const card of Object.values(cards)) {
     if (card.liveTimer) clearInterval(card.liveTimer);
   }
-  stockCards = {};
+  marketState[scope].stockCards = {};
+  stockCards = marketState[scope].stockCards;
 }
 
 // ── Reports ──
@@ -1037,6 +1284,7 @@ async function loadReport(dateStr) {
   try {
     let url = `${API}/reports/latest`;
     if (dateStr && dateStr !== 'today') url = `${API}/reports/${dateStr}`;
+    url += `${url.includes('?') ? '&' : '?'}market_scope=${encodeURIComponent(currentMarket)}`;
     const resp = await fetch(url);
     const json = await resp.json();
     const report = json.data;
@@ -1049,6 +1297,7 @@ async function loadReport(dateStr) {
     container.innerHTML = '';
     container.appendChild(createReportCard(report));
     if (report.report_date) await loadDateActivities(report.report_date, container);
+    refreshIcons();
   } catch (err) {
     container.innerHTML = `<div class="text-center text-red-400 text-sm py-8">리포트 로드 실패: ${err.message}</div>`;
   }
@@ -1056,7 +1305,7 @@ async function loadReport(dateStr) {
 
 async function loadDateActivities(dateStr, container) {
   try {
-    const resp = await fetch(`${API}/activities?target_date=${dateStr}&limit=500`);
+    const resp = await fetch(`${API}/activities?target_date=${dateStr}&limit=500&market_scope=${encodeURIComponent(currentMarket)}`);
     const json = await resp.json();
     if (json.data && json.data.length) {
       const section = document.createElement('div');
@@ -1102,7 +1351,7 @@ function createReportCard(report) {
   } catch(e) {}
 
   div.innerHTML = `
-    <div class="text-lg font-bold text-white mb-4">📋 ${report.report_date} 일일 리포트</div>
+    <div class="flex items-center gap-2 text-lg font-bold text-white mb-4"><i data-lucide="clipboard-list" class="w-5 h-5"></i> ${report.report_date} 일일 리포트 <span class="text-xs text-gray-500">(${report.market_scope || currentMarket})</span></div>
     <div class="grid grid-cols-3 gap-3 mb-3">
       <div class="bg-dark-900 rounded-lg p-3 text-center">
         <div class="text-2xl font-bold text-blue-400">${report.total_cycles}</div>
@@ -1129,27 +1378,27 @@ function createReportCard(report) {
     </div>
     ${report.market_summary ? `
     <div class="mb-3">
-      <div class="text-sm font-medium text-gray-300 mb-1">📝 오늘 리뷰</div>
+      <div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="edit-3" class="w-4 h-4"></i> 오늘 리뷰</div>
       <div class="text-sm text-gray-400 bg-dark-900 rounded p-3 whitespace-pre-wrap">${escapeHtml(report.market_summary)}</div>
     </div>` : ''}
     ${report.performance_review ? `
     <div class="mb-3">
-      <div class="text-sm font-medium text-gray-300 mb-1">📊 포트폴리오 진단</div>
+      <div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="pie-chart" class="w-4 h-4"></i> 포트폴리오 진단</div>
       <div class="text-sm text-gray-400 bg-dark-900 rounded p-3 whitespace-pre-wrap">${escapeHtml(report.performance_review)}</div>
     </div>` : ''}
     ${report.lessons_learned ? `
     <div class="mb-3">
-      <div class="text-sm font-medium text-gray-300 mb-1">🔮 내일 전망</div>
+      <div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="compass" class="w-4 h-4"></i> 내일 전망</div>
       <div class="text-sm text-gray-400 bg-dark-900 rounded p-3 whitespace-pre-wrap">${escapeHtml(report.lessons_learned)}</div>
     </div>` : ''}
     ${report.next_day_plan ? `
     <div class="mb-3">
-      <div class="text-sm font-medium text-gray-300 mb-1">📈 액션 플랜</div>
+      <div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="target" class="w-4 h-4"></i> 액션 플랜</div>
       <div class="text-sm text-gray-400 bg-dark-900 rounded p-3 whitespace-pre-wrap">${escapeHtml(report.next_day_plan)}</div>
     </div>` : ''}
     ${topPicks ? `
     <div class="mb-2">
-      <div class="text-sm font-medium text-gray-300 mb-1">🎯 관심 종목</div>
+      <div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="crosshairs" class="w-4 h-4"></i> 관심 종목</div>
       <div class="text-xs text-gray-400 bg-dark-900 rounded p-2">${escapeHtml(topPicks)}</div>
     </div>` : ''}`;
   return div;
@@ -1173,6 +1422,8 @@ async function loadSettings() {
       enabledMarkets = s.ENABLED_MARKET_GROUPS;
       if (!enabledMarkets.includes(currentMarket)) currentMarket = enabledMarkets[0];
     }
+    // Ensure stockCards alias points to current scope
+    stockCards = marketState[currentScope()].stockCards;
     setupMarketTabs();
   } catch (err) {
     console.error('Settings load error:', err);
@@ -1392,9 +1643,21 @@ async function loadSystemStatus() {
       </div>
       ${s.last_cycle_time ? `<div class="text-gray-600">마지막: ${formatTime(s.last_cycle_time)}</div>` : ''}
       <div class="text-gray-600">SSE: ${s.sse_clients}명</div>`;
+    // Update market context bar
+    updateMarketContextBar(s);
+
+    const scope = currentScope();
+    const scopeLabel = scope === 'KRX' ? 'KRX' : 'US';
     const triggerBtn = document.querySelector('[onclick="triggerCycle()"]');
     if (triggerBtn) {
-      triggerBtn.textContent = s.market_open ? '▶ 매매 사이클 실행' : '▶ 장마감 리뷰 실행';
+      const action = s.market_open ? '매매 사이클 실행' : '장마감 리뷰 실행';
+      triggerBtn.innerHTML = `<i data-lucide="play" class="w-4 h-4 fill-current"></i> ${enabledMarkets.length > 1 ? scopeLabel + ' ' : ''}${action}`;
+      refreshIcons();
+    }
+    const reportBtn = document.querySelector('[onclick="generateReport()"]');
+    if (reportBtn && enabledMarkets.length > 1) {
+      reportBtn.innerHTML = `<i data-lucide="file-text" class="w-4 h-4"></i> ${scopeLabel} 리포트 생성`;
+      refreshIcons();
     }
   } catch (err) {
     console.error('Status load error:', err);
@@ -1404,7 +1667,7 @@ async function loadSystemStatus() {
 // ── Report List ──
 async function loadReportList() {
   try {
-    const resp = await fetch(`${API}/reports?limit=10`);
+    const resp = await fetch(`${API}/reports?limit=10&market_scope=${encodeURIComponent(currentMarket)}`);
     const json = await resp.json();
     const listEl = document.getElementById('report-list');
     listEl.innerHTML = '';
@@ -1412,7 +1675,7 @@ async function loadReportList() {
       json.data.forEach(r => {
         const btn = document.createElement('button');
         btn.className = 'w-full text-left px-3 py-1 text-xs text-gray-400 hover:bg-dark-700 rounded';
-        btn.textContent = r.report_date;
+        btn.textContent = `${r.report_date} (${r.market_scope || currentMarket})`;
         btn.onclick = () => switchToReport(r.report_date);
         listEl.appendChild(btn);
       });
@@ -1440,7 +1703,7 @@ async function triggerCycle() {
 
 async function generateReport() {
   try {
-    await fetch(`${API}/reports/generate`, { method: 'POST' });
+    await fetch(`${API}/reports/generate?market_scope=${encodeURIComponent(currentMarket)}`, { method: 'POST' });
     loadReportList();
   } catch (err) {
     console.error('Report gen error:', err);
@@ -1456,13 +1719,38 @@ function formatTime(ts) {
   } catch { return ts; }
 }
 
-function formatDetail(detail) {
+function formatDetail(detail, activityType = null) {
   if (!detail) return '';
   try {
     const obj = typeof detail === 'string' ? JSON.parse(detail) : detail;
-    return JSON.stringify(obj, null, 2);
+    
+    // TIER1_ANALYSIS: Try to extract technical indicators into a mini-table
+    if (activityType === 'TIER1_ANALYSIS' && obj.market_context && obj.market_context.indicators) {
+      const ind = obj.market_context.indicators;
+      const recentPrice = obj.market_context.current_price ? formatAmount(obj.market_context.current_price) : '-';
+      return `
+        <table class="tech-table mb-2">
+          <tr><th colspan="4" class="text-left font-bold text-gray-300 bg-dark-800">📊 Technical Snapshot</th></tr>
+          <tr>
+            <td class="label">Price</td><td>${recentPrice}</td>
+            <td class="label">RSI(14)</td><td>${ind.rsi ? Number(ind.rsi).toFixed(1) : '-'}</td>
+          </tr>
+          <tr>
+            <td class="label">MACD</td><td>${ind.macd ? Number(ind.macd).toFixed(2) : '-'} / Sig: ${ind.macd_signal ? Number(ind.macd_signal).toFixed(2) : '-'}</td>
+            <td class="label">Bollinger</td><td>${ind.bollinger_band_position ? (Number(ind.bollinger_band_position) * 100).toFixed(1) + '%' : '-'}</td>
+          </tr>
+          <tr>
+            <td class="label">Vol Ratio</td><td>${ind.volume_ratio ? Number(ind.volume_ratio).toFixed(1) + 'x' : '-'}</td>
+            <td class="label">SMA</td><td>5: ${ind.sma_5 ? Number(ind.sma_5).toFixed(0) : '-'} | 20: ${ind.sma_20 ? Number(ind.sma_20).toFixed(0) : '-'}</td>
+          </tr>
+        </table>
+        <pre class="bg-dark-900/50 p-2 rounded text-gray-500 whitespace-pre-wrap">${escapeHtml(JSON.stringify(obj, null, 2))}</pre>
+      `;
+    }
+    
+    return `<pre class="whitespace-pre-wrap">${escapeHtml(JSON.stringify(obj, null, 2))}</pre>`;
   } catch {
-    return String(detail);
+    return `<pre class="whitespace-pre-wrap">${escapeHtml(String(detail))}</pre>`;
   }
 }
 
