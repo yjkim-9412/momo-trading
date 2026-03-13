@@ -28,6 +28,10 @@ class DummyCodexProvider:
         return "gpt-5.4"
 
     @property
+    def configured_reasoning_effort(self) -> str | None:
+        return "medium" if self._tier == LLMTier.TIER1 else "high"
+
+    @property
     def model_id(self) -> str:
         return f"dummy:{self._tier.value}"
 
@@ -131,7 +135,9 @@ async def test_get_llm_status_uses_selected_provider(monkeypatch):
     assert status["tier1"] == {
         "provider": LLMProvider.CODEX_CLI.value,
         "model": "gpt-5.4",
+        "reasoning_effort": "medium",
     }
+    assert status["tier2"]["reasoning_effort"] == "high"
     assert status["session_id"] == "dummy-session"
     assert any(
         item["id"] == LLMProvider.CODEX_CLI.value and item["selected"]

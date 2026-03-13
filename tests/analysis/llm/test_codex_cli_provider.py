@@ -1,4 +1,8 @@
+import os
+
 from analysis.llm.codex_cli_provider import CodexCLIProvider
+from core.config import settings
+from trading.enums import LLMTier
 
 
 def test_parse_event_stream_extracts_session_usage_and_text():
@@ -18,3 +22,65 @@ def test_parse_event_stream_extracts_session_usage_and_text():
         "cached_input_tokens": 4,
         "output_tokens": 3,
     }
+
+
+def test_build_command_adds_reasoning_effort_on_first_session_call(monkeypatch):
+    monkeypatch.setattr(settings, "CODEX_MODEL", "gpt-5.4")
+    monkeypatch.setattr(settings, "CODEX_MODEL_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT", "HIGH")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER2", "")
+    monkeypatch.setattr(CodexCLIProvider, "_session_enabled", True)
+    monkeypatch.setattr(CodexCLIProvider, "_session_initialized", False)
+    monkeypatch.setattr(CodexCLIProvider, "_active_session_id", None)
+
+    provider = CodexCLIProvider(LLMTier.TIER1)
+    cmd, output_path = provider._build_command("/tmp/codex")
+
+    try:
+        assert cmd[:2] == ["/tmp/codex", "exec"]
+        assert "model_reasoning_effort=high" in cmd
+        assert cmd[-1] == "-"
+    finally:
+        os.remove(output_path)
+
+
+def test_build_command_adds_reasoning_effort_on_resume(monkeypatch):
+    monkeypatch.setattr(settings, "CODEX_MODEL", "gpt-5.4")
+    monkeypatch.setattr(settings, "CODEX_MODEL_TIER2", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER2", "xhigh")
+    monkeypatch.setattr(CodexCLIProvider, "_session_enabled", True)
+    monkeypatch.setattr(CodexCLIProvider, "_session_initialized", True)
+    monkeypatch.setattr(CodexCLIProvider, "_active_session_id", "thread-123")
+
+    provider = CodexCLIProvider(LLMTier.TIER2)
+    cmd, output_path = provider._build_command("/tmp/codex")
+
+    try:
+        assert cmd[:3] == ["/tmp/codex", "exec", "resume"]
+        assert "model_reasoning_effort=xhigh" in cmd
+        assert cmd[-2:] == ["thread-123", "-"]
+    finally:
+        os.remove(output_path)
+
+
+def test_build_command_skips_reasoning_effort_when_not_configured(monkeypatch):
+    monkeypatch.setattr(settings, "CODEX_MODEL", "gpt-5.4")
+    monkeypatch.setattr(settings, "CODEX_MODEL_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER2", "")
+    monkeypatch.setattr(CodexCLIProvider, "_session_enabled", False)
+    monkeypatch.setattr(CodexCLIProvider, "_session_initialized", False)
+    monkeypatch.setattr(CodexCLIProvider, "_active_session_id", None)
+
+    provider = CodexCLIProvider(LLMTier.TIER1)
+    cmd, output_path = provider._build_command("/tmp/codex")
+
+    try:
+        assert "model_reasoning_effort=" not in " ".join(cmd)
+        assert "--ephemeral" in cmd
+    finally:
+        os.remove(output_path)

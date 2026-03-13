@@ -42,6 +42,10 @@ class ClaudeCodeProvider:
         self._tier = tier
         self._claude_path: str | None = None
         self._model = settings.get_llm_model(LLMProvider.CLAUDE_CODE, tier)
+        self._reasoning_effort = settings.get_llm_reasoning_effort(
+            LLMProvider.CLAUDE_CODE,
+            tier,
+        )
         self._resolved_model: str = ""
 
     @classmethod
@@ -113,6 +117,10 @@ class ClaudeCodeProvider:
         return self._model
 
     @property
+    def configured_reasoning_effort(self) -> str | None:
+        return self._reasoning_effort
+
+    @property
     def model_id(self) -> str:
         return self._resolved_model or f"claude-code:{self._model}"
 
@@ -142,7 +150,7 @@ class ClaudeCodeProvider:
             raise RuntimeError("claude CLI를 찾을 수 없습니다 (PATH 확인)")
 
         # Tier별 effort: TIER1(스캔/분석)=medium, TIER2(최종검토)=high
-        effort = "medium" if self._tier == LLMTier.TIER1 else "high"
+        effort = self._reasoning_effort or "medium"
 
         cmd = [
             claude, "-p",

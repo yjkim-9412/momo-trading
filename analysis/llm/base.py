@@ -23,6 +23,9 @@ class LLMProviderProtocol(Protocol):
     def configured_model(self) -> str: ...
 
     @property
+    def configured_reasoning_effort(self) -> str | None: ...
+
+    @property
     def model_id(self) -> str: ...
 
     async def generate(self, prompt: str, system_prompt: str = "") -> str:

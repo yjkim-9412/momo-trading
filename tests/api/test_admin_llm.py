@@ -11,8 +11,8 @@ async def test_admin_llm_status_endpoint(client, monkeypatch):
             "selected_provider": "CODEX_CLI",
             "provider": "CODEX_CLI",
             "provider_name": "Codex CLI (로컬)",
-            "tier1": {"provider": "CODEX_CLI", "model": "gpt-5.4"},
-            "tier2": {"provider": "CODEX_CLI", "model": "gpt-5.4"},
+            "tier1": {"provider": "CODEX_CLI", "model": "gpt-5.4", "reasoning_effort": "medium"},
+            "tier2": {"provider": "CODEX_CLI", "model": "gpt-5.4", "reasoning_effort": "high"},
             "available_providers": [],
             "session_id": None,
         }

@@ -28,6 +28,10 @@ class CodexCLIProvider:
         self._tier = tier
         self._codex_path: str | None = None
         self._model = settings.get_llm_model(LLMProvider.CODEX_CLI, tier)
+        self._reasoning_effort = settings.get_llm_reasoning_effort(
+            LLMProvider.CODEX_CLI,
+            tier,
+        )
         self._resolved_model = f"codex:{self._model}" if self._model else "codex"
 
     @classmethod
@@ -96,6 +100,10 @@ class CodexCLIProvider:
         return self._model
 
     @property
+    def configured_reasoning_effort(self) -> str | None:
+        return self._reasoning_effort
+
+    @property
     def model_id(self) -> str:
         return self._resolved_model
 
@@ -130,6 +138,11 @@ class CodexCLIProvider:
             return prompt
         return f"[역할]\n{system_prompt}\n\n[요청]\n{prompt}"
 
+    def _append_reasoning_effort(self, cmd: list[str]) -> None:
+        """Codex reasoning effort override 추가"""
+        if self._reasoning_effort:
+            cmd.extend(["-c", f"model_reasoning_effort={self._reasoning_effort}"])
+
     def _build_command(self, codex_path: str) -> tuple[list[str], str]:
         """세션 상태에 맞는 Codex CLI 명령 구성"""
         fd, output_path = tempfile.mkstemp(prefix="codex-llm-", suffix=".txt")
@@ -148,6 +161,7 @@ class CodexCLIProvider:
                 ]
                 if self._model:
                     cmd.extend(["--model", self._model])
+                self._append_reasoning_effort(cmd)
                 cmd.extend([self.__class__._active_session_id, "-"])
                 return cmd, output_path
 
@@ -163,6 +177,7 @@ class CodexCLIProvider:
             ]
             if self._model:
                 cmd.extend(["--model", self._model])
+            self._append_reasoning_effort(cmd)
             cmd.append("-")
             return cmd, output_path
 
@@ -179,6 +194,7 @@ class CodexCLIProvider:
         ]
         if self._model:
             cmd.extend(["--model", self._model])
+        self._append_reasoning_effort(cmd)
         cmd.append("-")
         return cmd, output_path
 

@@ -53,6 +53,15 @@ class LLMFactory:
         provider = self._get_provider(LLMTier.TIER1)
         return cast(type[LLMSessionProtocol], type(provider))
 
+    @staticmethod
+    def _serialize_tier_status(provider: LLMProviderProtocol) -> dict[str, Any]:
+        """Tier별 provider 상태 직렬화"""
+        return {
+            "provider": provider.provider.value,
+            "model": provider.configured_model,
+            "reasoning_effort": provider.configured_reasoning_effort,
+        }
+
     async def generate(
         self,
         prompt: str,
@@ -202,10 +211,13 @@ class LLMFactory:
     async def get_llm_status(self) -> dict[str, Any]:
         """현재 LLM 설정 상태 반환 (Admin API용)"""
         selected_provider = settings.llm_provider
+        selected_tier1 = self._get_provider(LLMTier.TIER1)
+        selected_tier2 = self._get_provider(LLMTier.TIER2)
         available_providers = []
 
         for provider_enum, provider_class in self.PROVIDER_CLASSES.items():
             provider_tier1 = provider_class(LLMTier.TIER1)
+            provider_tier2 = provider_class(LLMTier.TIER2)
             available_providers.append({
                 "id": provider_enum.value,
                 "name": provider_tier1.display_name,
@@ -214,6 +226,10 @@ class LLMFactory:
                 "models": {
                     "tier1": settings.get_llm_model(provider_enum, LLMTier.TIER1),
                     "tier2": settings.get_llm_model(provider_enum, LLMTier.TIER2),
+                },
+                "reasoning_efforts": {
+                    "tier1": provider_tier1.configured_reasoning_effort,
+                    "tier2": provider_tier2.configured_reasoning_effort,
                 },
                 "has_key": True,
             })
@@ -224,14 +240,8 @@ class LLMFactory:
             "provider": selected_provider.value,
             "provider_name": self.PROVIDER_LABELS[selected_provider],
             "session_id": self.get_session_id(),
-            "tier1": {
-                "provider": selected_provider.value,
-                "model": settings.get_llm_model(selected_provider, LLMTier.TIER1),
-            },
-            "tier2": {
-                "provider": selected_provider.value,
-                "model": settings.get_llm_model(selected_provider, LLMTier.TIER2),
-            },
+            "tier1": self._serialize_tier_status(selected_tier1),
+            "tier2": self._serialize_tier_status(selected_tier2),
             "available_providers": available_providers,
         }
 
