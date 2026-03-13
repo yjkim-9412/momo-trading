@@ -347,7 +347,9 @@ class MarketScanner:
             *[mcp_client.get_volume_rank(market=market) for market in markets],
             return_exceptions=True,
         )
-        return self._merge_scan_stocks(markets, responses)
+        stocks = self._merge_scan_stocks(markets, responses)
+        stocks.sort(key=lambda item: float(item.get("volume", 0)), reverse=True)
+        return stocks[:30]
 
     async def _get_fluctuation_rank(self, markets: list[str], sort: str) -> list[dict]:
         responses = await asyncio.gather(

@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 from agent.market_scanner import MarketScanner
 from trading.models import AccountBalance
+from trading.models import MCPResponse
 from core.config import settings
 
 
@@ -103,6 +104,35 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
 
         snapshot_mock.assert_not_awaited()
         self.assertEqual(result["available_cash"], 700000)
+
+
+class MarketScannerRankTest(unittest.IsolatedAsyncioTestCase):
+    async def test_get_volume_rank_sorts_across_markets(self):
+        scanner = MarketScanner()
+        responses = [
+            MCPResponse(
+                success=True,
+                data={
+                    "stocks": [
+                        {"symbol": "AAPL", "market": "NASDAQ", "volume": 100},
+                        {"symbol": "MSFT", "market": "NASDAQ", "volume": 90},
+                    ],
+                },
+            ),
+            MCPResponse(
+                success=True,
+                data={
+                    "stocks": [
+                        {"symbol": "BAC", "market": "NYSE", "volume": 1000},
+                    ],
+                },
+            ),
+        ]
+
+        with patch("agent.market_scanner.mcp_client.get_volume_rank", new=AsyncMock(side_effect=responses)):
+            stocks = await scanner._get_volume_rank(["NASDAQ", "NYSE"])
+
+        self.assertEqual([item["symbol"] for item in stocks[:3]], ["BAC", "AAPL", "MSFT"])
 
 
 if __name__ == "__main__":

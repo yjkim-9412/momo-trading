@@ -259,7 +259,7 @@ class MCPClientTest(unittest.IsolatedAsyncioTestCase):
 class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
     """US 동적 발굴 + 워치리스트 하이브리드 병합 테스트"""
 
-    def _make_stock(self, symbol, volume=100, change_rate=1.0):
+    def _make_stock(self, symbol, volume=100, change_rate=1.0, scan_source="WATCHLIST"):
         return {
             "symbol": symbol,
             "name": symbol,
@@ -270,6 +270,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
             "change": 0.5,
             "change_rate": change_rate,
             "volume": volume,
+            "scan_source": scan_source,
         }
 
     async def test_hybrid_volume_rank_merges_discovery_and_watchlist(self):
@@ -337,18 +338,45 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
     async def test_merge_deduplicates_symbols(self):
         """동적 발굴과 워치리스트에 같은 심볼이 있으면 중복 없이 병합"""
         discovery = [
-            {"symbol": "AAPL", "volume": 1000},
-            {"symbol": "TSLA", "volume": 900},
+            {"symbol": "AAPL", "volume": 1000, "scan_source": "DISCOVERY"},
+            {"symbol": "TSLA", "volume": 900, "scan_source": "DISCOVERY"},
         ]
         watchlist = [
-            {"symbol": "AAPL", "volume": 500},  # 중복
-            {"symbol": "SOFI", "volume": 400},
+            {"symbol": "AAPL", "volume": 500, "scan_source": "WATCHLIST"},  # 중복
+            {"symbol": "SOFI", "volume": 400, "scan_source": "WATCHLIST"},
         ]
         merged = MCPClient._merge_discovery_and_watchlist(discovery, watchlist)
         symbols = [s["symbol"] for s in merged]
         self.assertEqual(symbols, ["AAPL", "TSLA", "SOFI"])
         # AAPL은 discovery 버전 유지 (volume=1000)
         self.assertEqual(merged[0]["volume"], 1000)
+        self.assertEqual(merged[0]["scan_source"], "DISCOVERY")
+
+    async def test_hybrid_volume_rank_applies_cap_after_sorting(self):
+        """미국 거래량 스캔은 병합 후 정렬하고 마지막에만 cap을 적용한다"""
+        client = MCPClient()
+        discovery_items = [
+            {"symb": f"D{i:02d}", "last": "10", "tvol": str(500 - i), "rate": "1.0"}
+            for i in range(35)
+        ]
+        watchlist_stocks = [self._make_stock("SOFI", volume=9999)]
+
+        with (
+            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
+                success=True,
+                data={"output1": discovery_items},
+            ))),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch("trading.mcp_client.settings") as mock_settings,
+        ):
+            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
+            response = await client.get_volume_rank(market="NASDAQ")
+
+        self.assertTrue(response.success)
+        stocks = response.data["stocks"]
+        self.assertEqual(len(stocks), 30)
+        self.assertEqual(stocks[0]["symbol"], "SOFI")
+        self.assertEqual(stocks[0]["scan_source"], "WATCHLIST")
 
     async def test_hybrid_fluctuation_rank_merges_and_sorts(self):
         """등락률 하이브리드 스캔: 병합 후 change_rate 기준 정렬"""
@@ -372,6 +400,32 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         stocks = response.data["stocks"]
         # change_rate 내림차순: RIOT(8.0) > MARA(5.0)
         self.assertEqual(stocks[0]["symbol"], "RIOT")
+
+    async def test_hybrid_fluctuation_rank_applies_cap_after_sorting(self):
+        """미국 등락률 스캔도 병합 후 정렬하고 마지막에만 cap을 적용한다"""
+        client = MCPClient()
+        discovery_items = [
+            {"symb": f"M{i:02d}", "last": "10", "tvol": "1000", "rate": str(50 - i)}
+            for i in range(35)
+        ]
+        watchlist_stocks = [self._make_stock("AAPL", volume=1200, change_rate=99.0)]
+
+        with (
+            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
+                success=True,
+                data={"output1": discovery_items},
+            ))),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch("trading.mcp_client.settings") as mock_settings,
+        ):
+            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
+            response = await client.get_fluctuation_rank(market="NASDAQ", sort="top")
+
+        self.assertTrue(response.success)
+        stocks = response.data["stocks"]
+        self.assertEqual(len(stocks), 30)
+        self.assertEqual(stocks[0]["symbol"], "AAPL")
+        self.assertEqual(stocks[0]["scan_source"], "WATCHLIST")
 
 
 if __name__ == "__main__":

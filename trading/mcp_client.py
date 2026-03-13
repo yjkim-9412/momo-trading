@@ -30,6 +30,7 @@ _OVERSEAS_QUOTE_MIN_INTERVAL = 1.0  # 해외 시세는 더 보수적으로 직�
 _OVERSEAS_QUOTE_MAX_RETRIES = 2
 _OVERSEAS_BALANCE_MIN_INTERVAL = 1.0  # 해외 잔고도 계정 단위로 직렬화
 _OVERSEAS_BALANCE_MAX_RETRIES = 2
+_US_SCAN_RESULT_LIMIT = 30
 
 
 class MCPClient:
@@ -854,6 +855,7 @@ class MCPClient:
                 "change": self._to_float(data.get("change", 0)),
                 "change_rate": self._to_float(data.get("change_rate", 0)),
                 "volume": self._to_int(data.get("volume", 0)),
+                "scan_source": "WATCHLIST",
             })
         return stocks
 
@@ -861,7 +863,6 @@ class MCPClient:
     def _merge_discovery_and_watchlist(
         discovery_stocks: list[dict[str, Any]],
         watchlist_stocks: list[dict[str, Any]],
-        limit: int = 30,
     ) -> list[dict[str, Any]]:
         """동적 발굴 + 워치리스트 결과 병합 (심볼 기준 중복 제거)"""
         seen: set[str] = set()
@@ -876,7 +877,43 @@ class MCPClient:
             if sym and sym not in seen:
                 seen.add(sym)
                 merged.append(stock)
-        return merged[:limit]
+        return merged
+
+    @staticmethod
+    def _count_non_watchlist_symbols(
+        stocks: list[dict[str, Any]],
+        watchlist_stocks: list[dict[str, Any]],
+    ) -> int:
+        watchlist_symbols = {
+            str(stock.get("symbol", "")).upper()
+            for stock in watchlist_stocks
+            if stock.get("symbol")
+        }
+        return sum(
+            1
+            for stock in stocks
+            if str(stock.get("symbol", "")).upper() not in watchlist_symbols
+        )
+
+    def _log_us_rank_summary(
+        self,
+        market: str,
+        rank_name: str,
+        discovery_stocks: list[dict[str, Any]],
+        watchlist_stocks: list[dict[str, Any]],
+        merged_stocks: list[dict[str, Any]],
+        returned_stocks: list[dict[str, Any]],
+    ) -> None:
+        logger.info(
+            "[{}] 미국장 {} 하이브리드 스캔: discovery {}건, watchlist {}건, merged {}건, returned {}건, watchlist 밖 {}건",
+            market,
+            rank_name,
+            len(discovery_stocks),
+            len(watchlist_stocks),
+            len(merged_stocks),
+            len(returned_stocks),
+            self._count_non_watchlist_symbols(returned_stocks, watchlist_stocks),
+        )
 
     def _normalize_stock_item(self, item: dict[str, Any], market: str) -> dict[str, Any]:
         """시장 스캔용 종목 데이터 정규화"""
@@ -954,6 +991,7 @@ class MCPClient:
             "change": change_val,
             "change_rate": change_rate_val,
             "volume": volume_val,
+            "scan_source": str(item.get("scan_source", "DISCOVERY")).upper() or "DISCOVERY",
         }
 
     # === 편의 메서드: KIS MCP 도구 래퍼 ===
@@ -1347,7 +1385,16 @@ class MCPClient:
             watchlist_stocks = await self._build_watchlist_scan(market_code)
             merged = self._merge_discovery_and_watchlist(discovery_stocks, watchlist_stocks)
             merged.sort(key=lambda item: item.get("volume", 0), reverse=True)
-            return MCPResponse(success=bool(merged), data={"stocks": merged[:30]})
+            ranked = merged[:_US_SCAN_RESULT_LIMIT]
+            self._log_us_rank_summary(
+                market_code,
+                "거래량순위",
+                discovery_stocks,
+                watchlist_stocks,
+                merged,
+                ranked,
+            )
+            return MCPResponse(success=bool(ranked), data={"stocks": ranked})
 
         market_code = "J" if market_code in ("KOSPI", "KOSDAQ", "KRX") else market_code
         try:
@@ -1428,7 +1475,17 @@ class MCPClient:
             watchlist_stocks = await self._build_watchlist_scan(market_code)
             merged = self._merge_discovery_and_watchlist(discovery_stocks, watchlist_stocks)
             merged.sort(key=lambda item: item.get("change_rate", 0), reverse=(sort != "bottom"))
-            return MCPResponse(success=bool(merged), data={"stocks": merged[:30]})
+            ranked = merged[:_US_SCAN_RESULT_LIMIT]
+            rank_name = "등락률상위" if sort != "bottom" else "등락률하위"
+            self._log_us_rank_summary(
+                market_code,
+                rank_name,
+                discovery_stocks,
+                watchlist_stocks,
+                merged,
+                ranked,
+            )
+            return MCPResponse(success=bool(ranked), data={"stocks": ranked})
 
         market_code = "J" if market_code in ("KOSPI", "KOSDAQ", "KRX") else market_code
         try:
