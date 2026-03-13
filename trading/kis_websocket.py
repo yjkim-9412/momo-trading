@@ -1,13 +1,19 @@
 """KIS WebSocket 실시간 시세 스트리밍"""
 import asyncio
 import json
-from typing import Callable, Coroutine, Any
+from typing import Any, Callable, Coroutine
 
 import websockets
 from loguru import logger
 
 from core.config import settings
 from trading.market_profile import build_ws_key, is_domestic_market, normalize_market
+
+
+_WS_RECORD_SIZES: dict[str, tuple[int, ...]] = {
+    "H0STCNT0": (46,),
+    "HDFSCNT0": (26, 25),
+}
 
 
 def _ws_is_closed(ws) -> bool:
@@ -229,9 +235,10 @@ class KISWebSocket:
                     tr_id = parts[1]
                     data_count = int(parts[2])
                     data_str = parts[3]
-                    price_data = self._parse_price_data(tr_id, data_str)
-                    if price_data and self._on_price_callback:
-                        await self._on_price_callback(price_data)
+                    price_rows = self._parse_price_rows(tr_id, data_str, data_count)
+                    if price_rows and self._on_price_callback:
+                        for price_data in price_rows:
+                            await self._on_price_callback(price_data)
             else:
                 # JSON 형태 응답 (구독 확인 등)
                 data = json.loads(raw_msg)
@@ -241,57 +248,125 @@ class KISWebSocket:
         except Exception as e:
             logger.debug("메시지 파싱 오류 (무시): {}", str(e))
 
-    def _parse_price_data(self, tr_id: str, data_str: str) -> dict | None:
-        """체결 데이터 파싱"""
+    def _parse_price_rows(self, tr_id: str, data_str: str, data_count: int) -> list[dict]:
+        """TR별 실시간 payload를 레코드 단위로 분리 후 파싱"""
+        records = self._split_records(tr_id, data_str, data_count)
+        parsed_rows: list[dict] = []
+        for fields in records:
+            try:
+                parsed = self._parse_price_fields(tr_id, fields)
+            except Exception as e:
+                logger.debug("실시간 레코드 파싱 오류 (무시): tr_id={} err={}", tr_id, str(e))
+                continue
+            if parsed:
+                parsed_rows.append(parsed)
+        return parsed_rows
+
+    def _split_records(self, tr_id: str, data_str: str, data_count: int) -> list[list[str]]:
+        """TR별 payload를 data_count 기준 개별 레코드로 분리"""
+        if data_count <= 0:
+            return []
+
+        record_sizes = _WS_RECORD_SIZES.get(tr_id)
+        if not record_sizes:
+            return []
+
         fields = data_str.split("^")
-        if not fields:
-            return None
+        total_fields = len(fields)
+        for record_size in record_sizes:
+            if total_fields == record_size * data_count:
+                return [
+                    fields[index:index + record_size]
+                    for index in range(0, total_fields, record_size)
+                ]
 
-        def _parse_overseas_symbol(raw_symbol: str) -> tuple[str, str, str]:
-            token = raw_symbol.upper()
-            prefixes = {
-                "DNAS": ("NASDAQ", token[4:], "US_DELAYED"),
-                "DNYS": ("NYSE", token[4:], "US_DELAYED"),
-                "DAMS": ("AMEX", token[4:], "US_DELAYED"),
-                "RBAQ": ("NASDAQ", token[4:], "US_DAYTIME"),
-                "RBAY": ("NYSE", token[4:], "US_DAYTIME"),
-                "RBAA": ("AMEX", token[4:], "US_DAYTIME"),
-            }
-            for prefix, parsed in prefixes.items():
-                if token.startswith(prefix):
-                    return parsed
-            return "NASDAQ", token, ""
+        logger.debug(
+            "실시간 payload 필드 수 불일치: tr_id={} count={} fields={} candidates={}",
+            tr_id,
+            data_count,
+            total_fields,
+            ",".join(str(size) for size in record_sizes),
+        )
+        return []
 
-        if tr_id in ("H0STCNT0",):  # 국내 실시간 체결
-            if len(fields) < 20:
-                return None
+    def _parse_price_fields(self, tr_id: str, fields: list[str]) -> dict | None:
+        """단일 레코드 필드 파싱"""
+        if tr_id == "H0STCNT0":  # 국내 실시간 체결
             return {
                 "market": "KRX",
                 "symbol": fields[0],
                 "time": fields[1],
-                "price": float(fields[2]) if fields[2] else 0,
-                "change": float(fields[4]) if fields[4] else 0,
-                "change_rate": float(fields[5]) if fields[5] else 0,
-                "volume": int(fields[12]) if fields[12] else 0,
-                "cumulative_volume": int(fields[13]) if fields[13] else 0,
+                "price": self._to_float(fields[2]),
+                "change": self._to_float(fields[4]),
+                "change_rate": self._to_float(fields[5]),
+                "volume": self._to_int(fields[12]),
+                "cumulative_volume": self._to_int(fields[13]),
             }
-        elif tr_id in ("HDFSCNT0",):  # 해외 실시간 체결
-            if len(fields) < 10:
-                return None
-            market, symbol, session = _parse_overseas_symbol(fields[0])
-            return {
-                "market": market,
-                "symbol": symbol,
-                "session": session,
-                "currency": "USD",
-                "time": fields[1],
-                "price": float(fields[2]) if fields[2] else 0,
-                "change": float(fields[6]) if fields[6] else 0,
-                "change_rate": float(fields[7]) if fields[7] else 0,
-                "volume": int(fields[8]) if fields[8] else 0,
-                "cumulative_volume": int(fields[9]) if fields[9] else 0,
-            }
+
+        if tr_id == "HDFSCNT0":  # 해외 실시간 체결
+            raw_symbol = fields[0]
+            market, derived_symbol, session = self._parse_overseas_symbol(raw_symbol)
+
+            if len(fields) == 26:
+                symbol = fields[1].strip().upper() or derived_symbol
+                return {
+                    "market": market,
+                    "symbol": symbol,
+                    "session": session,
+                    "currency": "USD",
+                    "time": fields[7],
+                    "price": self._to_float(fields[11]),
+                    "change": self._to_float(fields[13]),
+                    "change_rate": self._to_float(fields[14]),
+                    "volume": self._to_int(fields[19]),
+                    "cumulative_volume": self._to_int(fields[20]),
+                }
+
+            if len(fields) == 25:
+                return {
+                    "market": market,
+                    "symbol": derived_symbol,
+                    "session": session,
+                    "currency": "USD",
+                    "time": fields[6],
+                    "price": self._to_float(fields[10]),
+                    "change": self._to_float(fields[12]),
+                    "change_rate": self._to_float(fields[13]),
+                    "volume": self._to_int(fields[18]),
+                    "cumulative_volume": self._to_int(fields[19]),
+                }
+
         return None
+
+    @staticmethod
+    def _parse_overseas_symbol(raw_symbol: str) -> tuple[str, str, str]:
+        token = (raw_symbol or "").strip().upper()
+        prefixes = {
+            "DNAS": ("NASDAQ", token[4:], "US_DELAYED"),
+            "DNYS": ("NYSE", token[4:], "US_DELAYED"),
+            "DAMS": ("AMEX", token[4:], "US_DELAYED"),
+            "RBAQ": ("NASDAQ", token[4:], "US_DAYTIME"),
+            "RBAY": ("NYSE", token[4:], "US_DAYTIME"),
+            "RBAA": ("AMEX", token[4:], "US_DAYTIME"),
+        }
+        for prefix, parsed in prefixes.items():
+            if token.startswith(prefix):
+                return parsed
+        return "NASDAQ", token, ""
+
+    @staticmethod
+    def _to_float(value: str) -> float:
+        normalized = (value or "").strip()
+        if not normalized:
+            return 0.0
+        return float(normalized)
+
+    @staticmethod
+    def _to_int(value: str) -> int:
+        normalized = (value or "").strip()
+        if not normalized:
+            return 0
+        return int(float(normalized))
 
     @property
     def subscription_count(self) -> int:
