@@ -3,7 +3,7 @@ from datetime import date
 
 from uuid import uuid4
 
-from sqlalchemy import Date, Float, Integer, String, Text
+from sqlalchemy import Date, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, TimestampMixin
@@ -11,9 +11,13 @@ from models.base import Base, TimestampMixin
 
 class DailyReport(Base, TimestampMixin):
     __tablename__ = "daily_reports"
+    __table_args__ = (
+        UniqueConstraint("market_scope", "report_date", name="uq_daily_reports_market_scope_report_date"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    report_date: Mapped[date] = mapped_column(Date, unique=True, nullable=False, index=True)
+    market_scope: Mapped[str] = mapped_column(String(10), default="KRX", nullable=False, index=True)
+    report_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
 
     # 오늘 성과
     total_cycles: Mapped[int] = mapped_column(Integer, default=0)

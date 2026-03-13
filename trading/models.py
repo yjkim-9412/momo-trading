@@ -113,3 +113,10 @@ class PendingOrderInfo(BaseModel):
     order_price: float      # 주문단가
     order_time: str         # 주문시각
     exchange_rate_to_krw: float = 1.0
+
+
+class AccountOverview(BaseModel):
+    """관리자 계좌 overview 응답"""
+    balance: AccountBalance
+    holdings: list[HoldingInfo]
+    pending_orders: list[PendingOrderInfo]

@@ -5,6 +5,9 @@ from typing import Iterable
 
 from trading.enums import Market
 
+MARKET_SCOPE_KRX = "KRX"
+MARKET_SCOPE_US = "US"
+
 
 @dataclass(frozen=True)
 class MarketProfile:
@@ -89,6 +92,8 @@ _MARKET_ALIASES = {
 }
 
 _US_SCAN_TARGETS = ("NASDAQ", "NYSE", "AMEX")
+_KR_SCOPE_MARKETS = ("KRX", "KOSPI", "KOSDAQ")
+_US_SCOPE_MARKETS = ("NASDAQ", "NYSE", "AMEX")
 _ORDER_EXCHANGE_CODES = {
     "NASDAQ": "NASD",
     "NYSE": "NYSE",
@@ -137,6 +142,28 @@ def is_domestic_market(market: str | Market | None) -> bool:
 def is_us_market(market: str | Market | None) -> bool:
     """미국 시장 여부"""
     return get_market_profile(market).region == "US"
+
+
+def normalize_market_scope(scope_or_market: str | Market | None, default: str = MARKET_SCOPE_KRX) -> str:
+    """시장 scope를 KRX/US 중 하나로 정규화"""
+    raw = str(scope_or_market or default).strip().upper()
+    if raw in {MARKET_SCOPE_KRX, MARKET_SCOPE_US}:
+        return raw
+    normalized = normalize_market(raw or default)
+    return MARKET_SCOPE_US if is_us_market(normalized) else MARKET_SCOPE_KRX
+
+
+def market_scope(market: str | Market | None) -> str:
+    """실제 시장 코드를 runtime/report용 scope로 매핑"""
+    return normalize_market_scope(market)
+
+
+def markets_for_scope(scope_or_market: str | Market | None) -> tuple[str, ...]:
+    """scope에 속한 실제 시장 코드 목록"""
+    normalized_scope = normalize_market_scope(scope_or_market)
+    if normalized_scope == MARKET_SCOPE_US:
+        return _US_SCOPE_MARKETS
+    return _KR_SCOPE_MARKETS
 
 
 def market_currency(market: str | Market | None) -> str:

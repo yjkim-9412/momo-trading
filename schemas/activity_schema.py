@@ -1,5 +1,5 @@
 """활동 로그 스키마"""
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from pydantic import BaseModel, field_validator
@@ -10,6 +10,8 @@ from util.time_util import ensure_kst
 class ActivityResponse(BaseModel):
     id: str
     cycle_id: Optional[str] = None
+    market_scope: Optional[str] = None
+    trading_date: Optional[date] = None
     activity_type: str
     phase: str
     stock_id: Optional[str] = None
@@ -33,6 +35,7 @@ class ActivityResponse(BaseModel):
 
 class CycleResponse(BaseModel):
     cycle_id: str
+    market_scope: Optional[str] = None
     started_at: datetime
     ended_at: Optional[datetime] = None
     activity_count: int
