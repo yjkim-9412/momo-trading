@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from core.config import settings
 from scheduler.market_calendar import market_calendar
 from trading.market_profile import is_us_market, normalize_market
 
 _RESTRICTED_PRODUCT_TYPES = {"LEVERAGED_ETF", "INVERSE_ETF"}
+_LEVERAGE_MULTIPLIER_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
+    (re.compile(r"(?<!\d)3(?:\s|-)?X\b"), 3.0),
+    (re.compile(r"(?<!\d)2(?:\s|-)?X\b"), 2.0),
+    (re.compile(r"(?<!\d)1(?:\s|-)?X\b"), 1.0),
+)
+_TRIPLE_LEVERAGE_HINTS = ("ULTRAPRO", "TRIPLE")
+_DOUBLE_LEVERAGE_HINTS = ("ULTRA", "DOUBLE")
 
 
 @dataclass(frozen=True)
@@ -20,11 +28,17 @@ class ProductClassification:
     product_type: str = "COMMON"
     is_leveraged: bool = False
     is_inverse: bool = False
+    leverage_multiplier: float = 1.0
     classification_source: str = "default"
 
     @property
     def is_restricted(self) -> bool:
         return self.product_type in _RESTRICTED_PRODUCT_TYPES
+
+    @property
+    def signed_exposure(self) -> float:
+        base = self.leverage_multiplier if self.leverage_multiplier > 0 else 1.0
+        return -base if self.is_inverse else base
 
     def to_metadata(self) -> dict:
         """시그널/이벤트 메타데이터로 직렬화"""
@@ -32,6 +46,9 @@ class ProductClassification:
             "product_type": self.product_type,
             "is_leveraged": self.is_leveraged,
             "is_inverse": self.is_inverse,
+            "leverage_multiplier": self.leverage_multiplier,
+            "signed_exposure": self.signed_exposure,
+            "restricted_product": self.is_restricted,
             "classification_source": self.classification_source,
             "category": self.category,
             "name": self.name,
@@ -51,6 +68,7 @@ def _build_classification(
     product_type: str = "COMMON",
     is_leveraged: bool = False,
     is_inverse: bool = False,
+    leverage_multiplier: float = 1.0,
     classification_source: str = "default",
 ) -> ProductClassification:
     return ProductClassification(
@@ -61,8 +79,48 @@ def _build_classification(
         product_type=product_type,
         is_leveraged=is_leveraged,
         is_inverse=is_inverse,
+        leverage_multiplier=leverage_multiplier,
         classification_source=classification_source,
     )
+
+
+def _infer_leverage_multiplier(
+    text: str,
+    *,
+    is_leveraged: bool = False,
+    is_inverse: bool = False,
+) -> float:
+    normalized = str(text or "").upper()
+    for pattern, multiplier in _LEVERAGE_MULTIPLIER_PATTERNS:
+        if pattern.search(normalized):
+            return multiplier
+
+    if any(keyword in normalized for keyword in _TRIPLE_LEVERAGE_HINTS):
+        return 3.0
+    if any(keyword in normalized for keyword in _DOUBLE_LEVERAGE_HINTS):
+        return 2.0
+    if is_inverse:
+        return 1.0
+    if is_leveraged:
+        return 2.0
+    return 1.0
+
+
+def build_product_context(
+    symbol: str,
+    market: str,
+    metadata: dict | None = None,
+) -> dict:
+    classification = classification_from_metadata(symbol, market, metadata)
+    return {
+        "product_type": classification.product_type,
+        "is_leveraged": classification.is_leveraged,
+        "is_inverse": classification.is_inverse,
+        "leverage_multiplier": classification.leverage_multiplier,
+        "signed_exposure": classification.signed_exposure,
+        "restricted_product": classification.is_restricted,
+        "classification_source": classification.classification_source,
+    }
 
 
 def _classify_from_text(
@@ -77,6 +135,7 @@ def _classify_from_text(
     name_upper = str(name or "").upper()
     category_upper = str(category or "").upper()
     merged = " ".join(part for part in (category_upper, name_upper) if part).strip()
+    default_multiplier = _infer_leverage_multiplier(merged)
 
     if "ETN" in merged:
         return _build_classification(
@@ -96,6 +155,7 @@ def _classify_from_text(
             category=category,
             product_type="INVERSE_ETF",
             is_inverse=True,
+            leverage_multiplier=_infer_leverage_multiplier(merged, is_inverse=True),
             classification_source="name_or_category",
         )
 
@@ -107,6 +167,7 @@ def _classify_from_text(
             category=category,
             product_type="LEVERAGED_ETF",
             is_leveraged=True,
+            leverage_multiplier=_infer_leverage_multiplier(merged, is_leveraged=True),
             classification_source="name_or_category",
         )
 
@@ -117,6 +178,7 @@ def _classify_from_text(
             name=name,
             category=category,
             product_type="ETF",
+            leverage_multiplier=default_multiplier,
             classification_source="name_or_category",
         )
 
@@ -125,6 +187,7 @@ def _classify_from_text(
         market_code,
         name=name,
         category=category,
+        leverage_multiplier=default_multiplier,
     )
 
 
@@ -149,6 +212,7 @@ def classify_product(
                 product_type=classification.product_type,
                 is_leveraged=classification.is_leveraged,
                 is_inverse=classification.is_inverse,
+                leverage_multiplier=classification.leverage_multiplier,
                 classification_source="denylist",
             )
         return _build_classification(
@@ -158,6 +222,7 @@ def classify_product(
             category=classification.category,
             product_type="LEVERAGED_ETF",
             is_leveraged=True,
+            leverage_multiplier=max(classification.leverage_multiplier, 2.0),
             classification_source="denylist",
         )
 
@@ -171,6 +236,7 @@ def classify_product(
                 product_type=classification.product_type,
                 is_leveraged=classification.is_leveraged,
                 is_inverse=classification.is_inverse,
+                leverage_multiplier=classification.leverage_multiplier,
                 classification_source="allowlist",
             )
         return _build_classification(
@@ -180,6 +246,7 @@ def classify_product(
             category=classification.category,
             product_type="LEVERAGED_ETF",
             is_leveraged=True,
+            leverage_multiplier=max(classification.leverage_multiplier, 2.0),
             classification_source="allowlist",
         )
 
@@ -195,14 +262,27 @@ def classification_from_metadata(
     data = metadata or {}
     product_type = str(data.get("product_type") or "").upper()
     if product_type:
+        name = str(data.get("name") or "")
+        category = str(data.get("category") or "")
+        merged = " ".join(part for part in (category, name) if part).strip()
+        is_leveraged = bool(data.get("is_leveraged"))
+        is_inverse = bool(data.get("is_inverse"))
         return _build_classification(
             symbol,
             market,
-            name=str(data.get("name") or ""),
-            category=str(data.get("category") or ""),
+            name=name,
+            category=category,
             product_type=product_type,
-            is_leveraged=bool(data.get("is_leveraged")),
-            is_inverse=bool(data.get("is_inverse")),
+            is_leveraged=is_leveraged,
+            is_inverse=is_inverse,
+            leverage_multiplier=float(
+                data.get("leverage_multiplier")
+                or _infer_leverage_multiplier(
+                    merged,
+                    is_leveraged=is_leveraged,
+                    is_inverse=is_inverse,
+                )
+            ),
             classification_source=str(data.get("classification_source") or "metadata"),
         )
     return classify_product(
