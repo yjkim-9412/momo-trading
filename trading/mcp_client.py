@@ -678,6 +678,15 @@ class MCPClient:
             d = resp.data
             source = d.get("output", d) if isinstance(d.get("output"), dict) else d
             exchange_rate = await self._get_exchange_rate_to_krw(market_code)
+            name = str(self._pick_first(
+                source,
+                "name",
+                "hts_kor_isnm",
+                "ovrs_item_name",
+                "prdt_name",
+                "item_name",
+                default=symbol,
+            ))
             price_val = (
                 self._to_float(self._pick_first(
                     source,
@@ -692,6 +701,8 @@ class MCPClient:
             resp.data = {
                 **d,
                 "market": market_code,
+                "name": name,
+                "category": str(self._pick_first(source, "category", "prdt_type", default="")),
                 "currency": market_currency(market_code),
                 "exchange_rate_to_krw": exchange_rate,
                 "price": price_val,
@@ -732,19 +743,38 @@ class MCPClient:
                 error=summary.get("error") or holdings.get("error") or "해외 잔고 조회 실패",
             )
 
-        summary_record = (summary.get("output2") or [{}])[0] if isinstance(summary.get("output2"), list) else summary
+        # output2는 통화별 리스트 → 대상 통화(USD 등) 레코드를 찾아 정규화
+        target_currency = market_currency(market_code)
+        currency_record: dict = {}
+        for rec in summary.get("output2") or []:
+            if isinstance(rec, dict) and rec.get("crcy_cd") == target_currency:
+                currency_record = rec
+                break
+
+        output3 = summary.get("output3") or {}
+
         fx_rate = self._to_float(self._pick_first(
-            summary_record,
-            "exchange_rate_to_krw",
+            currency_record,
             "frst_bltn_exrt",
             "bass_exrt",
         ), 1.0)
+
+        # _parse_balance가 기대하는 단일 요약 레코드로 정규화
+        normalized_summary = {
+            "frcr_dncl_amt_2": currency_record.get("frcr_dncl_amt_2", "0"),
+            "frcr_ord_psbl_amt1": currency_record.get("frcr_drwg_psbl_amt_1", "0"),
+            "ovrs_stck_evlu_amt": currency_record.get("frcr_evlu_amt2", "0"),
+            "tot_asst_amt": output3.get("tot_asst_amt", "0"),
+            "tot_evlu_pfls_amt": output3.get("tot_evlu_pfls_amt", "0"),
+            "evlu_pfls_rt": output3.get("evlu_erng_rt1", "0"),
+            "frst_bltn_exrt": str(fx_rate),
+        }
+
         combined = {
-            **summary,
             "output1": holdings.get("output1", []),
-            "output2": summary.get("output2", holdings.get("output2", [])),
+            "output2": [normalized_summary],
             "market": market_code,
-            "currency": market_currency(market_code),
+            "currency": target_currency,
             "exchange_rate_to_krw": fx_rate,
         }
         return MCPResponse(success=True, data=combined)

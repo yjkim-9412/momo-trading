@@ -22,15 +22,19 @@ class AIRiskTuner:
 
     async def compute_limits(
         self,
+        market: str | None = None,
         risk_appetite: str = "MODERATE",
         cycle_id: str | None = None,
     ) -> dict:
         """적정 한도 계산"""
+        from trading.market_profile import normalize_market
+
+        target = normalize_market(market or settings.primary_market_code)
         timer = activity_logger.timer()
 
         try:
             # 1. 계좌 잔고 조회
-            balance = await account_manager.get_balance(settings.primary_market_code)
+            balance = await account_manager.get_balance(target)
 
             # 2. 최근 매매 성과 조회
             performance_summary = "매매 이력 없음"
@@ -55,14 +59,15 @@ class AIRiskTuner:
             )
 
             # 4. 현금 비율 계산
+            effective_cash = balance.effective_cash
             cash_ratio = 0.0
             if balance.total_asset > 0:
-                cash_ratio = (balance.cash / balance.total_asset) * 100
+                cash_ratio = (effective_cash / balance.total_asset) * 100
 
             # 5. LLM에게 한도 요청
             prompt = RISK_TUNING_PROMPT.format(
                 total_asset=balance.total_asset,
-                cash=balance.cash,
+                cash=effective_cash,
                 stock_value=balance.stock_value,
                 cash_ratio=cash_ratio,
                 total_pnl=balance.total_pnl,

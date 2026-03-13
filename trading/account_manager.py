@@ -6,7 +6,7 @@ from loguru import logger
 from core.config import settings
 from scheduler.market_calendar import market_calendar
 from trading.mcp_client import mcp_client
-from trading.market_profile import market_currency, normalize_market
+from trading.market_profile import is_us_market, market_currency, normalize_market
 from trading.models import AccountBalance, HoldingInfo, PendingOrderInfo
 
 
@@ -58,11 +58,95 @@ class AccountManager:
             stock_value=0,
             total_pnl=0,
             total_pnl_rate=0,
+            raw_total_pnl=0,
+            raw_total_pnl_rate=0,
+            pnl_source="BROKER_SUMMARY",
             market=normalized_market,
             currency="KRW",
             exchange_rate_to_krw=1.0,
+            raw_cash=0,
+            effective_cash=0,
+            cash_source="BROKER",
             is_valid=False,
         )
+
+    @staticmethod
+    def _holding_amount_to_krw(holding: HoldingInfo, amount: float) -> float:
+        """보유 종목 금액을 KRW로 환산한다."""
+        if holding.currency == "KRW":
+            return amount
+        exchange_rate = holding.exchange_rate_to_krw if holding.exchange_rate_to_krw > 0 else 1.0
+        return amount * exchange_rate
+
+    def _resolve_total_pnl(
+        self,
+        market: str,
+        total_pnl: float,
+        total_pnl_rate: float,
+        holdings: list[HoldingInfo] | None,
+    ) -> tuple[float, float, float, float, str]:
+        """시장별 손익 표시 정책을 적용한다."""
+        raw_total_pnl = total_pnl
+        raw_total_pnl_rate = total_pnl_rate
+
+        if not settings.is_paper_trading or not is_us_market(market):
+            return total_pnl, total_pnl_rate, raw_total_pnl, raw_total_pnl_rate, "BROKER_SUMMARY"
+
+        if not holdings:
+            return 0.0, 0.0, raw_total_pnl, raw_total_pnl_rate, "HOLDINGS_SUM"
+
+        normalized_total_pnl = sum(
+            self._holding_amount_to_krw(holding, holding.pnl)
+            for holding in holdings
+        )
+        purchase_amount = sum(
+            self._holding_amount_to_krw(holding, holding.avg_buy_price * holding.quantity)
+            for holding in holdings
+        )
+        normalized_total_pnl_rate = (normalized_total_pnl / purchase_amount) * 100 if purchase_amount > 0 else 0.0
+
+        if abs(raw_total_pnl - normalized_total_pnl) >= 1:
+            logger.info(
+                "[{}] 해외 모의투자 손익 정규화: normalized={:,.3f}, raw={:,.3f}, holdings={}",
+                market,
+                normalized_total_pnl,
+                raw_total_pnl,
+                len(holdings),
+            )
+
+        return (
+            normalized_total_pnl,
+            normalized_total_pnl_rate,
+            raw_total_pnl,
+            raw_total_pnl_rate,
+            "HOLDINGS_SUM",
+        )
+
+    def _resolve_effective_cash(
+        self,
+        market: str,
+        cash: float,
+        total_asset: float,
+        stock_value: float,
+    ) -> tuple[float, str]:
+        """거래 판단에 사용할 현금을 시장별 정책으로 정규화한다."""
+        if not settings.is_paper_trading or not is_us_market(market):
+            return cash, "BROKER"
+
+        if cash > 0:
+            return cash, "BROKER"
+
+        proxy_cash = max(total_asset - stock_value, 0.0)
+        if proxy_cash > 0:
+            logger.info(
+                "[{}] 해외 모의투자 현금 프록시 사용: raw_cash={:,.0f}, effective_cash={:,.0f}",
+                market,
+                cash,
+                proxy_cash,
+            )
+            return proxy_cash, "TOTAL_ASSET_PROXY"
+
+        return cash, "BROKER"
 
     def _parse_balance(
         self,
@@ -133,10 +217,28 @@ class AccountManager:
             )
             if total_pnl_rate == 0.0 and purchase_amount > 0:
                 total_pnl_rate = (total_pnl / purchase_amount) * 100
+            (
+                total_pnl,
+                total_pnl_rate,
+                raw_total_pnl,
+                raw_total_pnl_rate,
+                pnl_source,
+            ) = self._resolve_total_pnl(
+                normalized_market,
+                total_pnl,
+                total_pnl_rate,
+                holdings,
+            )
 
             exchange_rate = self._to_float(
                 self._first_value(summary, "exchange_rate_to_krw", "bass_exrt", "frst_bltn_exrt"),
                 1.0,
+            )
+            effective_cash, cash_source = self._resolve_effective_cash(
+                normalized_market,
+                cash,
+                total_asset,
+                stock_value,
             )
 
             return AccountBalance(
@@ -145,20 +247,57 @@ class AccountManager:
                 stock_value=stock_value,
                 total_pnl=total_pnl,
                 total_pnl_rate=total_pnl_rate,
+                raw_total_pnl=raw_total_pnl,
+                raw_total_pnl_rate=raw_total_pnl_rate,
+                pnl_source=pnl_source,
                 market=normalized_market,
                 currency="KRW",
                 exchange_rate_to_krw=exchange_rate,
+                raw_cash=cash,
+                effective_cash=effective_cash,
+                cash_source=cash_source,
+                status_message=str(data.get("msg1") or ""),
             )
 
+        cash = self._to_float(data.get("cash", 0))
+        total_asset = self._to_float(data.get("total_asset", 0))
+        stock_value = self._to_float(data.get("stock_value", 0))
+        effective_cash, cash_source = self._resolve_effective_cash(
+            normalized_market,
+            cash,
+            total_asset,
+            stock_value,
+        )
+        total_pnl = self._to_float(data.get("total_pnl", 0))
+        total_pnl_rate = self._to_float(data.get("total_pnl_rate", 0))
+        (
+            total_pnl,
+            total_pnl_rate,
+            raw_total_pnl,
+            raw_total_pnl_rate,
+            pnl_source,
+        ) = self._resolve_total_pnl(
+            normalized_market,
+            total_pnl,
+            total_pnl_rate,
+            holdings,
+        )
         return AccountBalance(
-            total_asset=self._to_float(data.get("total_asset", 0)),
-            cash=self._to_float(data.get("cash", 0)),
-            stock_value=self._to_float(data.get("stock_value", 0)),
-            total_pnl=self._to_float(data.get("total_pnl", 0)),
-            total_pnl_rate=self._to_float(data.get("total_pnl_rate", 0)),
+            total_asset=total_asset,
+            cash=cash,
+            stock_value=stock_value,
+            total_pnl=total_pnl,
+            total_pnl_rate=total_pnl_rate,
+            raw_total_pnl=raw_total_pnl,
+            raw_total_pnl_rate=raw_total_pnl_rate,
+            pnl_source=pnl_source,
             market=normalized_market,
             currency=data.get("currency", "KRW"),
             exchange_rate_to_krw=self._to_float(data.get("exchange_rate_to_krw", 1.0), 1.0),
+            raw_cash=cash,
+            effective_cash=effective_cash,
+            cash_source=cash_source,
+            status_message=str(data.get("msg1") or ""),
         )
 
     def _parse_holdings(self, data: dict, market: str = "KRX") -> list[HoldingInfo]:
@@ -188,7 +327,8 @@ class AccountManager:
                     continue
 
                 holding_market = normalize_market(
-                    self._first_value(item, "market", "ovrs_excg_cd", "excg_dvsn_cd") or default_market
+                    self._first_value(item, "market", "ovrs_excg_cd", "excg_dvsn_cd") or default_market,
+                    default=default_market,
                 )
                 currency = self._first_value(item, "currency", "tr_crcy_cd", "crcy_cd") or market_currency(holding_market)
                 exchange_rate = self._to_float(
@@ -255,7 +395,10 @@ class AccountManager:
                 order_id=self._first_value(item, "odno", "order_id") or "",
                 symbol=self._first_value(item, "pdno", "ovrs_pdno", "symbol") or "",
                 name=self._first_value(item, "prdt_name", "ovrs_item_name", "name") or "",
-                market=normalize_market(self._first_value(item, "market", "ovrs_excg_cd") or market),
+                market=normalize_market(
+                    self._first_value(item, "market", "ovrs_excg_cd") or market,
+                    default=market,
+                ),
                 currency=self._first_value(item, "currency", "tr_crcy_cd", "crcy_cd") or market_currency(market),
                 side=side,
                 order_qty=self._to_int(self._first_value(item, "ord_qty", "order_qty")),
@@ -322,7 +465,7 @@ class AccountManager:
     async def get_available_cash(self, market: str | None = None) -> float:
         """투자 가용 현금 조회"""
         balance = await self.get_balance(market=market)
-        return balance.cash
+        return balance.effective_cash
 
 
 account_manager = AccountManager()

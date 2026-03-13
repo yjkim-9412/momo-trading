@@ -1,0 +1,42 @@
+import pytest
+
+from trading.account_manager import account_manager
+from trading.models import AccountBalance
+
+
+@pytest.mark.asyncio
+async def test_admin_account_balance_exposes_effective_cash(client, monkeypatch):
+    async def fake_get_balance(market=None):
+        return AccountBalance(
+            total_asset=369166161,
+            cash=0,
+            raw_cash=0,
+            effective_cash=368635000,
+            cash_source="TOTAL_ASSET_PROXY",
+            stock_value=531161,
+            total_pnl=-249.441,
+            total_pnl_rate=-0.05,
+            raw_total_pnl=7497.903,
+            raw_total_pnl_rate=1.23,
+            pnl_source="HOLDINGS_SUM",
+            market=market or "NASDAQ",
+            currency="KRW",
+            exchange_rate_to_krw=1450.0,
+            status_message="모의투자 조회할 내역(자료)이 없습니다.",
+        )
+
+    monkeypatch.setattr(account_manager, "get_balance", fake_get_balance)
+
+    response = await client.get("/api/v1/admin/account/balance?market=NASDAQ")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["cash"] == 0
+    assert payload["raw_cash"] == 0
+    assert payload["effective_cash"] == 368635000
+    assert payload["cash_source"] == "TOTAL_ASSET_PROXY"
+    assert payload["total_pnl"] == -249.441
+    assert payload["raw_total_pnl"] == 7497.903
+    assert payload["raw_total_pnl_rate"] == 1.23
+    assert payload["pnl_source"] == "HOLDINGS_SUM"
+    assert "모의투자" in payload["status_message"]

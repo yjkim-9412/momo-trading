@@ -72,9 +72,16 @@ class AccountBalance(BaseModel):
     stock_value: float
     total_pnl: float
     total_pnl_rate: float
+    raw_total_pnl: float = 0.0
+    raw_total_pnl_rate: float = 0.0
+    pnl_source: str = "BROKER_SUMMARY"
     market: str = "KRX"
     currency: str = "KRW"
     exchange_rate_to_krw: float = 1.0
+    raw_cash: float = 0.0
+    effective_cash: float = 0.0
+    cash_source: str = "BROKER"
+    status_message: str = ""
     is_valid: bool = True  # False이면 조회 실패 상태
 
 

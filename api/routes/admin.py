@@ -148,12 +148,19 @@ async def get_account_balance(market: str | None = Query(None)):
         return SuccessResponse(data={
             "total_asset": balance.total_asset,
             "cash": balance.cash,
+            "raw_cash": balance.raw_cash,
+            "effective_cash": balance.effective_cash,
+            "cash_source": balance.cash_source,
             "stock_value": balance.stock_value,
             "total_pnl": balance.total_pnl,
             "total_pnl_rate": balance.total_pnl_rate,
+            "raw_total_pnl": balance.raw_total_pnl,
+            "raw_total_pnl_rate": balance.raw_total_pnl_rate,
+            "pnl_source": balance.pnl_source,
             "market": balance.market,
             "currency": balance.currency,
             "exchange_rate_to_krw": balance.exchange_rate_to_krw,
+            "status_message": balance.status_message,
         })
     except Exception as e:
         logger.error("계좌 잔고 조회 실패: {}", str(e))
