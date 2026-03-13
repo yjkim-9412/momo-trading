@@ -25,6 +25,8 @@ SAFETY_BOUNDS: dict[str, tuple[float, float]] = {
 
 MAX_ACTIVE_RULES = 20
 DEFAULT_EXPIRY_DAYS = 5
+STRATEGY_SCOPES = {"ALL", "STABLE_SHORT", "AGGRESSIVE_SHORT"}
+REGIME_SCOPES = {"ALL", "BULL", "BEAR", "SIDEWAYS", "THEME"}
 
 # 부트스트랩: 항상 활성화해야 할 기본 검증 규칙
 BOOTSTRAP_RULES = [
@@ -47,6 +49,11 @@ BOOTSTRAP_RULES = [
 
 class TradingRuleEngine:
     """일일 리뷰 피드백 → 코드 강제 규칙 생성 + 적용"""
+
+    @staticmethod
+    def _normalize_scope_value(raw_value: str | None, fallback: str = "ALL") -> str:
+        value = str(raw_value or fallback).strip().upper()
+        return value or fallback
 
     # ──────────────────────────────────────────
     # 규칙 생성
@@ -73,6 +80,33 @@ class TradingRuleEngine:
                 logger.warning("[TradingRule] 미지원 파라미터: {}", param_name)
                 continue
 
+            raw_scope = (
+                item.get("apply_scope")
+                or item.get("market_regime")
+                or item.get("strategy_type")
+                or "ALL"
+            )
+            normalized_scope = self._normalize_scope_value(raw_scope)
+            if param_name == "rr_floor":
+                if normalized_scope not in REGIME_SCOPES:
+                    logger.warning(
+                        "[TradingRule] rr_floor 적용 범위 오류: {} (허용: {})",
+                        normalized_scope,
+                        ", ".join(sorted(REGIME_SCOPES)),
+                    )
+                    continue
+                target_scope = normalized_scope
+            else:
+                if normalized_scope not in STRATEGY_SCOPES:
+                    logger.warning(
+                        "[TradingRule] {} 적용 범위 오류: {} (허용: {})",
+                        param_name,
+                        normalized_scope,
+                        ", ".join(sorted(STRATEGY_SCOPES)),
+                    )
+                    continue
+                target_scope = normalized_scope
+
             raw_value = float(item.get("param_value", 0))
             lo, hi = SAFETY_BOUNDS[param_name]
             clamped = max(lo, min(hi, raw_value))
@@ -85,7 +119,7 @@ class TradingRuleEngine:
             rule = TradingRule(
                 market_scope=scope,
                 rule_type=item.get("rule_type", "PARAM_OVERRIDE"),
-                strategy_type=item.get("strategy_type", "ALL"),
+                strategy_type=target_scope,
                 param_name=param_name,
                 param_value=clamped,
                 source="DAILY_REVIEW",
@@ -160,7 +194,7 @@ class TradingRuleEngine:
             {
                 "param_overrides": {"STABLE_SHORT": {...}, "ALL": {...}},
                 "validation_flags": {"revalidate_rr_ratio": True, ...},
-                "rr_floor_overrides": {"THEME": 1.3, ...},
+                "rr_floor_overrides": {"ALL": 1.2, "THEME": 1.3, ...},
                 "rules": [TradingRule, ...],
             }
         """
@@ -189,7 +223,7 @@ class TradingRuleEngine:
             if r.rule_type == "VALIDATION_TOGGLE":
                 validation_flags[r.param_name] = r.param_value >= 1.0
             elif r.param_name == "rr_floor":
-                # strategy_type을 regime으로 사용 (ALL이면 기본 적용)
+                # strategy_type 컬럼을 rr_floor 적용 국면(BULL/THEME/...) 저장용으로 재사용
                 rr_floor_overrides[r.strategy_type] = r.param_value
             else:
                 scope = r.strategy_type or "ALL"

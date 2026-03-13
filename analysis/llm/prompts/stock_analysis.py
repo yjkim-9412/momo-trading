@@ -11,7 +11,7 @@ STOCK_ANALYSIS_SYSTEM = """당신은 한국/미국 주식 시장 단기 매매 �
 **Step 3. 리스크:보상** — 목표가 vs 손절가 비율 산출 (시장 국면별 기준 적용)
   - BULL/THEME 국면: 1.3:1 이상이면 적정
   - SIDEWAYS/BEAR 국면: 최소 1.5:1
-**Step 4. 종합 판단** — 과거 피드백 반영 + 데이트레이딩 상황 고려 → 최종 결론
+**Step 4. 종합 판단** — 과거 피드백 반영 + 현재 트레이딩 상황 고려 → 최종 결론
 
 ## 과매수 재해석 원칙
 - THEME/BULL 국면 + 거래량 평균 2배 이상 → RSI/Stochastic 과매수는 **모멘텀 확인 시그널**로 해석
@@ -30,7 +30,7 @@ STOCK_ANALYSIS_PROMPT = """## 종목 분석 요청: {stock_name} ({symbol})
 ### 시장 전체 상황
 {market_context}
 
-### 데이트레이딩 상황
+### 트레이딩 상황
 {trading_context}
 
 ### 상품 특성

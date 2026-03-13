@@ -23,7 +23,7 @@ MARKET_SCAN_SYSTEM = """당신은 한국 주식 시장(KOSPI/KOSDAQ) 전문 스�
 **Step 3. 시간대별 선정 기준**
   - 오전(~11:00): 추세 추종 + 돌파 종목 적극 선정
   - 오후(13:00~): 실시간 모니터링 활용, 단기 모멘텀 + 거래량 확인 종목 위주
-  - 매수 마감 임박(14:00~): 최소한의 고확률 종목만 선정
+  - 매수 마감 임박: 최소한의 고확률 종목만 선정, 적합한 후보가 없으면 0개도 허용
 
 ## 핵심 원칙
 - 제공된 데이터만 사용 (추측 금지)
@@ -35,9 +35,10 @@ MARKET_SCAN_SYSTEM = """당신은 한국 주식 시장(KOSPI/KOSDAQ) 전문 스�
 
 MARKET_SCAN_PROMPT = """## 시장 데이터
 
-현재 시각: {current_time} | 매수 마감까지: {minutes_until_cutoff}분
+현재 시각({timezone_label}): {current_time} | 현재 세션: {market_session} | 매수 마감까지: {minutes_until_cutoff}분
 투자 가용 현금: {available_cash:,.0f}원 | 종목당 최대: {max_per_stock:,.0f}원
 보유 종목 수: {holding_count}개
+이번 스캔 선정 목표: {selection_target_range}개 (적합한 후보가 없으면 0개 허용)
 
 ### 거래량 상위
 {volume_rank_data}
@@ -56,7 +57,7 @@ MARKET_SCAN_PROMPT = """## 시장 데이터
 
 ---
 
-위 데이터를 분석하여 시장 국면을 판단하고, **심층 분석할 종목 5~10개**를 직접 선정하세요.
+위 데이터를 분석하여 시장 국면을 판단하고, **심층 분석할 종목을 {selection_target_range}개 범위에서** 직접 선정하세요.
 각 종목에 적합한 전략(STABLE_SHORT/AGGRESSIVE_SHORT)을 배정하세요.
 
 JSON:
@@ -71,7 +72,6 @@ JSON:
       "name": "종목명",
       "strategy_type": "STABLE_SHORT 또는 AGGRESSIVE_SHORT",
       "reason": "선정 근거 1줄",
-      "direction": "BUY/SELL",
       "monitoring": {{"surge_pct": 3.0, "drop_pct": -3.0, "volume_spike_ratio": 3.0}}
     }}
   ]
@@ -105,9 +105,10 @@ US_MARKET_SCAN_SYSTEM = """당신은 미국 주식 시장(NASDAQ/NYSE/AMEX) 전�
 US_MARKET_SCAN_PROMPT = """## 시장 데이터
 
 시장: {market_label}
-현재 시각(KST): {current_time} | 매수 마감까지: {minutes_until_cutoff}분
+현재 시각({timezone_label}): {current_time} | 현재 세션: {market_session} | 매수 마감까지: {minutes_until_cutoff}분
 투자 가용 현금(리스크 기준 KRW): {available_cash:,.0f}원 | 종목당 최대: {max_per_stock:,.0f}원
 보유 종목 수: {holding_count}개
+이번 스캔 선정 목표: {selection_target_range}개 (적합한 후보가 없으면 0개 허용)
 
 ### 거래량/모멘텀 상위
 {volume_rank_data}
@@ -126,7 +127,7 @@ US_MARKET_SCAN_PROMPT = """## 시장 데이터
 
 ---
 
-위 데이터를 분석하여 미국장 기준으로 **심층 분석할 종목 5~10개**를 직접 선정하세요.
+위 데이터를 분석하여 미국장 기준으로 **심층 분석할 종목을 {selection_target_range}개 범위에서** 직접 선정하세요.
 각 종목에 적합한 전략(STABLE_SHORT/AGGRESSIVE_SHORT)을 배정하세요.
 
 JSON:
@@ -142,7 +143,6 @@ JSON:
       "market": "NASDAQ/NYSE/AMEX",
       "strategy_type": "STABLE_SHORT 또는 AGGRESSIVE_SHORT",
       "reason": "선정 근거 1줄",
-      "direction": "BUY/SELL",
       "monitoring": {{"surge_pct": 2.5, "drop_pct": -2.5, "volume_spike_ratio": 2.0}}
     }}
   ]

@@ -25,7 +25,6 @@ Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매
 ## 데이트레이딩 판단 기준
 - 강제 청산까지 2시간 미만 → 목표가 축소, 포지션 사이즈 축소
 - 오늘 누적 손실 -2% 이상 → 매우 보수적으로, -3% 이상 → 매수 자제
-- 분할 청산이 유리하면 partial_exit_plan에 계획 기록
 - 제한 상품 주의: 레버리지/인버스 상품은 배수만큼 갭 리스크가 확대될 수 있으므로 일반 종목보다 더 타이트한 손절, 더 보수적인 수량, 세션 종료 전 청산 가능성을 우선 검토하세요
 
 ## 거부(REJECT) 기준
@@ -41,11 +40,15 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 ### 시장 전체 상황
 {market_context}
 
-### 데이트레이딩 상황
+### 트레이딩 상황
 {trading_context}
 
 ### Tier 1 AI 분석 결과
 {tier1_analysis}
+
+### 원본 차트 요약
+{chart_snapshot}
+
 
 ### 상품 특성
 {product_context}
@@ -110,9 +113,6 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 JSON 형식으로 답변:
 ```json
 {{
-  "checklist_pass": [1, 2, 3],
-  "checklist_fail": [],
-  "checklist_notes": "체크리스트 검토 내용",
   "stress_test": {{
     "worst_case": "갭 하락 시나리오 결과",
     "expected": "목표가 도달 시나리오 결과",
@@ -124,15 +124,10 @@ JSON 형식으로 답변:
   "entry_price": 0,
   "target_price": 0,
   "stop_loss_price": 0,
+  "take_profit_price": 0,
   "trailing_stop_pct": 0.0,
   "suggested_quantity": 0,
   "reason": "위 체크리스트와 스트레스 테스트 기반 최종 판단 이유",
-  "risk_warnings": ["위 분석에서 도출한 리스크"],
-  "review_notes": "Tier 1 분석 대비 조정 사항",
-  "feedback_applied": "과거 매매 성과 참고 내용",
-  "partial_exit_plan": {{
-    "enabled": false,
-    "plan": "불필요 / 또는 50%@목표가 + 50%트레일링2%"
-  }}
+  "risk_warnings": ["위 분석에서 도출한 리스크"]
 }}
 ```"""

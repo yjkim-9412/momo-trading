@@ -117,6 +117,22 @@ class MarketScanner:
             )
         return filtered
 
+    @staticmethod
+    def _selection_target_range(
+        market: str,
+        session: str,
+        minutes_until_cutoff: int,
+    ) -> str:
+        market_code = normalize_market(market)
+        session_code = str(session or "").upper()
+        if is_us_market(market_code) and session_code == "US_PRE":
+            return "3~6"
+        if minutes_until_cutoff <= 30:
+            return "0~3"
+        if minutes_until_cutoff <= 90:
+            return "3~5"
+        return "5~8"
+
     async def scan(self, market: str | None = None, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
         """시장 스캔 + 종목 선별 통합 실행"""
         target = normalize_market(market or settings.primary_market_code)
@@ -172,11 +188,20 @@ class MarketScanner:
             second=0, microsecond=0,
         )
         minutes_until_cutoff = max(0, int((cutoff_time - now).total_seconds() / 60))
+        session = market_calendar.get_market_session(dt=now, market=target)
+        selection_target_range = self._selection_target_range(
+            target,
+            session,
+            minutes_until_cutoff,
+        )
 
         prompt = get_market_scan_prompt(primary_market).format(
             market_label=get_market_label(primary_market),
             current_time=now.strftime("%H:%M"),
+            timezone_label=now.tzname() or "LOCAL",
+            market_session=session,
             minutes_until_cutoff=minutes_until_cutoff,
+            selection_target_range=selection_target_range,
             available_cash=available_cash,
             max_per_stock=max_per_stock,
             volume_rank_data=self._format_data(volume_rank),

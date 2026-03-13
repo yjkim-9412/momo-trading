@@ -20,7 +20,7 @@ KRX와 US 등을 동시에 자동 매매할 수 있다.
 타임라인 예시 — US (America/New_York, US_PREMARKET_ENABLED=true):
   03:50  프리마켓 준비
   04:05  프리마켓 시작 스캔
-  10:30~15:30  보유종목 점검 (1시간 간격)
+  04:30~15:30  보유종목 점검 (1시간 간격)
   11:00/13:00  장중 재스캔
   15:40  강제 청산
   16:10  장 마감 리뷰
@@ -197,6 +197,14 @@ class TradingScheduler:
         }
         return trigger_messages[trigger_reason]
 
+    @staticmethod
+    def _holdings_check_hours(market: str) -> str:
+        from trading.market_profile import is_us_market
+
+        if is_us_market(market):
+            return "4-15" if settings.US_PREMARKET_ENABLED else "10-15"
+        return "9-14"
+
     def _setup_jobs(self) -> None:
         from scheduler.jobs.portfolio_sync_job import portfolio_sync_job
         from scheduler.jobs.market_data_job import market_data_job
@@ -214,7 +222,7 @@ class TradingScheduler:
             # 시장별 시간 계산
             pre_h, pre_m = schedule.prep_time.hour, schedule.prep_time.minute
             open_h, open_m = schedule.open_scan_time.hour, schedule.open_scan_time.minute
-            holdings_hours = "10-15" if is_us else "9-14"
+            holdings_hours = self._holdings_check_hours(market)
             force_h = mkt_cfg["force_liquidation_hour"]
             force_m = mkt_cfg["force_liquidation_minute"]
             post_h, post_m = (16, 10) if is_us else (15, 40)
@@ -337,64 +345,32 @@ class TradingScheduler:
     # ─────────── 스케줄 작업 구현 ───────────
 
     async def _on_startup(self) -> None:
-        """서버 기동 시 현재 시간대에 맞는 초기 작업 실행"""
+        """서버 기동 시 즉시 매매사이클은 막고 장외 리뷰만 체크"""
         import asyncio
         from scheduler.market_calendar import market_calendar
-        from trading.mcp_client import mcp_client
         from trading.market_profile import normalize_market
 
-        # 기동 직후 약간의 딜레이 (MCP 연결 안정화)
+        # 기동 직후 약간의 딜레이 (하위 시스템 연결 안정화)
         await asyncio.sleep(3)
 
-        mcp_available = mcp_client.is_connected
-        scheduled_tasks = False
         for market_group in settings.enabled_market_groups:
             market = normalize_market(market_group)
-            if not market_calendar.is_trading_hours(market):
-                next_open = market_calendar.next_market_open(market=market)
+            if market_calendar.is_trading_hours(market):
+                session = market_calendar.get_market_session(market=market)
                 logger.info(
-                    "서버 기동: {} 장외 → 다음 장 시작: {}",
-                    market, next_open.strftime("%m/%d %H:%M"),
+                    "서버 기동: {} {} 세션 — startup 매매사이클 비활성, 다음 정시 스캔 대기",
+                    market,
+                    session,
                 )
                 continue
 
-            action = self._startup_trading_action(market)
-            session = market_calendar.get_market_session(market=market)
-            market_now = self._market_now(market)
-            schedule = self._market_schedule_profile(market)
+            next_open = market_calendar.next_market_open(market=market)
+            logger.info(
+                "서버 기동: {} 장외 → 다음 장 시작: {}",
+                market, next_open.strftime("%m/%d %H:%M"),
+            )
 
-            if action is None:
-                open_scan_at = datetime.combine(
-                    market_now.date(),
-                    schedule.open_scan_time,
-                    tzinfo=market_now.tzinfo,
-                )
-                if market_now < open_scan_at:
-                    logger.info(
-                        "서버 기동: {} {} 세션 — {} 장 시작 스캔 대기 ({})",
-                        market,
-                        session,
-                        schedule.session_label,
-                        open_scan_at.strftime("%H:%M"),
-                    )
-                else:
-                    logger.info(
-                        "서버 기동: {} {} 세션 — startup 트레이딩 catch-up 대상 아님",
-                        market,
-                        session,
-                    )
-                continue
-
-            if not mcp_available:
-                logger.warning("[{}] 서버 기동: MCP 미연결 → {} 스킵", market, action)
-                continue
-
-            logger.info("서버 기동: {} {} 실행", market, action)
-            asyncio.create_task(self._market_open_scan(market, trigger_reason=action))
-            scheduled_tasks = True
-
-        if not scheduled_tasks:
-            asyncio.create_task(self._post_market_if_needed())
+        asyncio.create_task(self._post_market_if_needed())
 
     async def _pre_market(self, market: str) -> None:
         """장 시작 전 준비 — 어제 리뷰 피드백 확인"""

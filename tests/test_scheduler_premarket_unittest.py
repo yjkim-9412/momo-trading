@@ -1,14 +1,12 @@
 import unittest
 from datetime import date, datetime, time
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from core.config import settings
 from scheduler.market_calendar import market_calendar
 from scheduler.scheduler import TradingScheduler
 from trading.enums import ActivityPhase
-from trading.mcp_client import mcp_client
-
 
 class SchedulerPremarketProfileTest(unittest.TestCase):
     def setUp(self):
@@ -36,6 +34,16 @@ class SchedulerPremarketProfileTest(unittest.TestCase):
         self.assertEqual(profile.open_scan_time, time(9, 35))
         self.assertEqual(profile.resume_sessions, frozenset({"US_REGULAR"}))
         self.assertEqual(profile.session_label, "정규장")
+
+    def test_holdings_check_hours_expand_into_premarket_when_enabled(self):
+        settings.US_PREMARKET_ENABLED = True
+
+        self.assertEqual(TradingScheduler._holdings_check_hours("NASDAQ"), "4-15")
+
+    def test_holdings_check_hours_keep_regular_window_when_premarket_disabled(self):
+        settings.US_PREMARKET_ENABLED = False
+
+        self.assertEqual(TradingScheduler._holdings_check_hours("NASDAQ"), "10-15")
 
 
 class SchedulerStartupActionTest(unittest.TestCase):
@@ -86,18 +94,19 @@ class SchedulerStartupExecutionTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         settings.ENABLED_MARKETS = self._original_markets
 
-    async def test_on_startup_schedules_us_premarket_catchup(self):
+    async def test_on_startup_does_not_schedule_us_trading_cycle(self):
         settings.ENABLED_MARKETS = "US"
         self.scheduler._market_open_scan = AsyncMock()
+        self.scheduler._post_market_if_needed = AsyncMock()
 
         with patch("asyncio.sleep", AsyncMock()), \
                 patch("asyncio.create_task", MagicMock()) as create_task, \
-                patch.object(type(mcp_client), "is_connected", new_callable=PropertyMock, return_value=True), \
-                patch.object(self.scheduler, "_startup_trading_action", return_value="startup_catchup"), \
-                patch.object(market_calendar, "is_trading_hours", return_value=True):
+                patch.object(market_calendar, "is_trading_hours", return_value=True), \
+                patch.object(market_calendar, "get_market_session", return_value="US_PRE"):
             await self.scheduler._on_startup()
 
-        self.scheduler._market_open_scan.assert_called_once_with("NASDAQ", trigger_reason="startup_catchup")
+        self.scheduler._market_open_scan.assert_not_called()
+        self.scheduler._post_market_if_needed.assert_called_once()
         self.assertEqual(create_task.call_count, 1)
         create_task.call_args.args[0].close()
 

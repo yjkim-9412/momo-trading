@@ -29,6 +29,20 @@ class RiskManager:
 
     RR_FLOOR = {"THEME": 1.0, "BULL": 1.0}
 
+    @classmethod
+    def resolve_rr_floor(
+        cls,
+        market_regime: str,
+        rr_floor_overrides: dict[str, float] | None = None,
+    ) -> float:
+        regime = str(market_regime or "").upper()
+        overrides = rr_floor_overrides or {}
+        if regime in overrides:
+            return overrides[regime]
+        if "ALL" in overrides:
+            return overrides["ALL"]
+        return cls.RR_FLOOR.get(regime, 1.2)
+
     @staticmethod
     def _unit_price_krw(signal: TradeSignal) -> float:
         """시그널 단가를 KRW 기준으로 환산"""
@@ -149,10 +163,7 @@ class RiskManager:
             risk = abs(entry - stop)
             if risk > 0:
                 rr_ratio = reward / risk
-                min_rr = (rr_floor_overrides or {}).get(
-                    market_regime,
-                    self.RR_FLOOR.get(market_regime, 1.2),
-                )
+                min_rr = self.resolve_rr_floor(market_regime, rr_floor_overrides)
                 if rr_ratio < min_rr:
                     result = {
                         "approved": False,

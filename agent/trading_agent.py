@@ -1124,12 +1124,13 @@ class TradingAgent:
                 if code_risk > 0:
                     code_rr = code_reward / code_risk
                     rr_overrides = active_rules.get("rr_floor_overrides", {})
-                    min_rr = rr_overrides.get(
+                    merged_rr_overrides = {
+                        **(mkt_state.rr_floor_overrides or {}),
+                        **rr_overrides,
+                    }
+                    min_rr = risk_manager.resolve_rr_floor(
                         mkt_state.market_regime,
-                        mkt_state.rr_floor_overrides.get(
-                            mkt_state.market_regime,
-                            risk_manager.RR_FLOOR.get(mkt_state.market_regime, 1.2),
-                        ),
+                        merged_rr_overrides,
                     )
                     if code_rr < min_rr:
                         await activity_logger.log(
@@ -1945,7 +1946,7 @@ class TradingAgent:
         return "\n".join(parts)
 
     async def _build_trading_context(self, market: str | None = None) -> str:
-        """데이트레이딩 컨텍스트 (프롬프트 주입용)"""
+        """트레이딩 컨텍스트 (프롬프트 주입용)"""
         from util.time_util import now_kst
         from trading.account_manager import account_manager
         from zoneinfo import ZoneInfo
@@ -1964,6 +1965,15 @@ class TradingAgent:
             second=0, microsecond=0,
         )
         minutes_left = max(0, int((close_time - now).total_seconds() / 60))
+        buy_cutoff_time = now.replace(
+            hour=mkt_cfg["buy_cutoff_hour"],
+            minute=mkt_cfg["buy_cutoff_minute"],
+            second=0,
+            microsecond=0,
+        )
+        minutes_until_buy_cutoff = max(0, int((buy_cutoff_time - now).total_seconds() / 60))
+        session = market_calendar.get_market_session(dt=now, market=target)
+        timezone_label = now.tzname() or "LOCAL"
 
         # 일일 손익
         daily_pnl_pct = 0.0
@@ -1981,7 +1991,8 @@ class TradingAgent:
         stats = await self._get_today_trade_stats(scope)
 
         context = (
-            f"현재 시각: {now.strftime('%H:%M')} | "
+            f"현재 세션: {session} | 현지 시각({timezone_label}): {now.strftime('%H:%M')}\n"
+            f"신규 매수 마감까지: {minutes_until_buy_cutoff}분 | "
             f"강제 청산까지: {minutes_left}분\n"
             f"오늘 누적 손익: {daily_pnl_pct:+.2f}% | "
             f"매매 성적: {stats['wins']}승 {stats['losses']}패 "
@@ -2069,8 +2080,12 @@ class TradingAgent:
         if stop_loss and float(stop_loss) > 0:
             kwargs["stop_loss"] = float(stop_loss)
 
-        # take_profit: Tier2 target_price > Tier1 target_price
-        take_profit = tier2.get("target_price") or tier1.get("target_price")
+        # take_profit: Tier2 take_profit_price > Tier2 target_price > Tier1 target_price
+        take_profit = (
+            tier2.get("take_profit_price")
+            or tier2.get("target_price")
+            or tier1.get("target_price")
+        )
         if take_profit and float(take_profit) > 0:
             kwargs["take_profit"] = float(take_profit)
 
@@ -2149,7 +2164,7 @@ class TradingAgent:
             market_cap=price_data.get("market_cap", "N/A"),
             feedback_context=feedback_context or "매매 이력 없음",
             market_context=market_context or "시장 컨텍스트 없음",
-            trading_context=trading_context or "데이트레이딩 컨텍스트 없음",
+            trading_context=trading_context or "트레이딩 컨텍스트 없음",
         )
 
         try:
@@ -2200,6 +2215,7 @@ class TradingAgent:
             for key, value in tier1_analysis.items()
             if key != "price_krw"
         }
+        chart_snapshot = chart_result.prompt_text if chart_result and chart_result.prompt_text else "차트 요약 없음"
 
         # 추세 분석 기반 전략 파라미터 조정 제안
         tuning_suggestions = "조정 제안 없음"
@@ -2224,6 +2240,11 @@ class TradingAgent:
         total_asset = snap.get("total_asset", 0)
         max_amount = max_order if max_order > 0 else int(total_asset * max_pos_pct / 100) if total_asset > 0 else 0
         position_pct = (max_amount / total_asset * 100) if total_asset > 0 else 0
+        max_hold_days = (
+            settings.MAX_HOLD_DAYS_AGGRESSIVE
+            if strategy_type == "AGGRESSIVE_SHORT"
+            else settings.MAX_HOLD_DAYS_STABLE
+        )
 
         prompt = FINAL_REVIEW_PROMPT.format(
             tier1_analysis=json.dumps(tier1_prompt_payload, ensure_ascii=False, indent=2),
@@ -2231,6 +2252,7 @@ class TradingAgent:
             symbol=symbol,
             market=market_code,
             currency=currency,
+            chart_snapshot=chart_snapshot,
             product_context=self._format_product_context_for_prompt(product_context),
             current_price_text=current_price_text,
             exchange_rate_to_krw=exchange_rate_to_krw,
@@ -2240,12 +2262,12 @@ class TradingAgent:
             position_pct=position_pct or 0,
             stop_loss_pct=getattr(strategy, "stop_loss_pct", None) or -3,
             take_profit_pct=getattr(strategy, "take_profit_pct", None) or 5,
-            max_hold_days=5,
-            max_position_pct=20,
+            max_hold_days=max_hold_days,
+            max_position_pct=max_pos_pct,
             feedback_context=feedback_context or "매매 이력 없음",
             tuning_suggestions=tuning_suggestions,
             market_context=market_context or "시장 컨텍스트 없음",
-            trading_context=trading_context or "데이트레이딩 컨텍스트 없음",
+            trading_context=trading_context or "트레이딩 컨텍스트 없음",
         )
 
         try:

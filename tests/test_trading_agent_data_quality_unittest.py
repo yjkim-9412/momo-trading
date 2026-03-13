@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from agent.trading_agent import TradingAgent
+from analysis.llm.prompts.market_scan import MARKET_SCAN_PROMPT, US_MARKET_SCAN_PROMPT
 from analysis.llm.prompts.stock_analysis import STOCK_ANALYSIS_PROMPT
 
 
@@ -63,15 +64,27 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertNotIn("### 최근 일봉 데이터", STOCK_ANALYSIS_PROMPT)
         self.assertIn("### 상품 특성", STOCK_ANALYSIS_PROMPT)
         self.assertIn("{product_context}", STOCK_ANALYSIS_PROMPT)
+        self.assertIn("### 트레이딩 상황", STOCK_ANALYSIS_PROMPT)
 
     def test_final_review_prompt_requires_market_currency_for_price_fields(self):
         from analysis.llm.prompts.final_review import FINAL_REVIEW_PROMPT
 
+        self.assertIn("### 원본 차트 요약", FINAL_REVIEW_PROMPT)
         self.assertIn("### 상품 특성", FINAL_REVIEW_PROMPT)
         self.assertIn("배수(1x/2x/3x)", FINAL_REVIEW_PROMPT)
         self.assertIn("환산 참고: 1{currency}", FINAL_REVIEW_PROMPT)
         self.assertIn("stop_loss_price: 손절 기준가 ({currency})", FINAL_REVIEW_PROMPT)
         self.assertIn("가격 필드에 넣지 마세요", FINAL_REVIEW_PROMPT)
+        self.assertNotIn("checklist_pass", FINAL_REVIEW_PROMPT)
+        self.assertNotIn("partial_exit_plan", FINAL_REVIEW_PROMPT)
+
+    def test_market_scan_prompts_use_local_timezone_and_variable_selection_range(self):
+        self.assertIn("현재 시각({timezone_label})", MARKET_SCAN_PROMPT)
+        self.assertIn("이번 스캔 선정 목표: {selection_target_range}개", MARKET_SCAN_PROMPT)
+        self.assertNotIn('"direction": "BUY/SELL"', MARKET_SCAN_PROMPT)
+        self.assertIn("현재 시각({timezone_label})", US_MARKET_SCAN_PROMPT)
+        self.assertNotIn("현재 시각(KST)", US_MARKET_SCAN_PROMPT)
+        self.assertNotIn('"direction": "BUY/SELL"', US_MARKET_SCAN_PROMPT)
 
     def test_should_skip_tier2_blocks_restricted_products(self):
         self.assertFalse(
@@ -82,6 +95,35 @@ class TradingAgentDataQualityTest(unittest.TestCase):
                 recommendation="BUY",
             )
         )
+
+    def test_apply_trade_thresholds_prefers_explicit_take_profit_price(self):
+        captured = {}
+
+        class _EventDetectorStub:
+            @staticmethod
+            def set_thresholds(symbol, market=None, **kwargs):
+                captured["symbol"] = symbol
+                captured["market"] = market
+                captured["kwargs"] = kwargs
+
+        original_detector = __import__("agent.trading_agent", fromlist=["event_detector"]).event_detector
+        module = __import__("agent.trading_agent", fromlist=["event_detector"])
+        module.event_detector = _EventDetectorStub()
+        try:
+            TradingAgent()._apply_trade_thresholds(
+                "AAPL",
+                {"target_price": 205.0, "stop_loss_price": 190.0},
+                {"take_profit_price": 210.0, "trailing_stop_pct": 2.0},
+                market="NASDAQ",
+            )
+        finally:
+            module.event_detector = original_detector
+
+        self.assertEqual(captured["symbol"], "AAPL")
+        self.assertEqual(captured["market"], "NASDAQ")
+        self.assertEqual(captured["kwargs"]["take_profit"], 210.0)
+        self.assertEqual(captured["kwargs"]["stop_loss"], 190.0)
+        self.assertEqual(captured["kwargs"]["trailing_stop_pct"], 2.0)
         self.assertTrue(
             TradingAgent._should_skip_tier2(
                 is_restricted_product=False,
