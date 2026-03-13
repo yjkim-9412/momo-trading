@@ -507,7 +507,7 @@ async def get_overseas_daily_price(symbol: str, market: str = "NASDAQ") -> dict:
                 "SYMB": symbol,
                 "GUBN": "0",
                 "BYMD": "",
-                "MODP": "1",
+                "MODP": "0",
             },
         )
         result["success"] = result.get("rt_cd") == "0"

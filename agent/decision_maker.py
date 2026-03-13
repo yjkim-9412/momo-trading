@@ -14,8 +14,12 @@ from repositories.trade_result_repository import TradeResultRepository
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, AutonomyMode, OrderSource, RecommendationStatus
+from trading.market_profile import is_us_market, normalize_market
 from trading.mcp_client import mcp_client
+from scheduler.market_calendar import market_calendar
 from util.time_util import now_kst
+
+_US_ORDER_SANITY_MAX_GAP_PCT = 0.15
 
 
 class DecisionMaker:
@@ -29,6 +33,73 @@ class DecisionMaker:
     def __init__(self):
         self._pending_tasks: set[asyncio.Task] = set()
 
+    @staticmethod
+    def _price_display(price: float, currency: str, price_krw: float) -> str:
+        if currency == "KRW":
+            return f"@{price:,.0f}원"
+        return f"@{price:,.2f}{currency} ({price_krw:,.0f}원)"
+
+    @staticmethod
+    def _detect_order_price_sanity_issue(signal: TradeSignal) -> dict | None:
+        market_code = normalize_market(signal.metadata.get("market", "KRX"))
+        if not is_us_market(market_code):
+            return None
+
+        requested_price = float(signal.suggested_price or 0)
+        live_price = float(signal.metadata.get("live_price") or 0)
+        if requested_price <= 0 or live_price <= 0:
+            return None
+
+        gap_pct = abs(requested_price - live_price) / live_price
+        if gap_pct <= _US_ORDER_SANITY_MAX_GAP_PCT:
+            return None
+
+        currency = signal.metadata.get("currency", "USD")
+        exchange_rate = float(signal.metadata.get("exchange_rate_to_krw") or 1.0)
+        requested_price_krw = float(
+            signal.metadata.get("entry_price_krw")
+            or signal.metadata.get("price_krw")
+            or (requested_price * exchange_rate if currency != "KRW" else requested_price)
+        )
+        live_price_krw = float(
+            signal.metadata.get("live_price_krw")
+            or (live_price * exchange_rate if currency != "KRW" else live_price)
+        )
+        return {
+            "reason": "미국장 주문 가격이 실시간 현재가 대비 과도하게 벗어남",
+            "market": market_code,
+            "currency": currency,
+            "requested_price": round(requested_price, 4),
+            "requested_price_krw": round(requested_price_krw, 4),
+            "live_price": round(live_price, 4),
+            "live_price_krw": round(live_price_krw, 4),
+            "gap_pct": round(gap_pct, 4),
+        }
+
+    @staticmethod
+    def _detect_paper_us_session_block(signal: TradeSignal) -> dict | None:
+        market_code = normalize_market(signal.metadata.get("market", "KRX"))
+        if not settings.is_paper_trading or not is_us_market(market_code):
+            return None
+
+        session = market_calendar.get_market_session(market=market_code)
+        if session == "US_REGULAR":
+            return None
+
+        session_label = {
+            "US_PRE": "프리마켓",
+            "US_AFTER": "애프터마켓",
+            "CLOSED": "장외",
+        }.get(session, session)
+        return {
+            "reason": "모의투자 미국주식 주문은 정규장만 지원",
+            "market": market_code,
+            "session": session,
+            "session_label": session_label,
+            "account_type": settings.KIS_ACCOUNT_TYPE,
+            "currency": signal.metadata.get("currency", "USD"),
+        }
+
     async def execute(
         self, signal: TradeSignal, analysis_id: str = "", cycle_id: str | None = None,
         analysis_context: dict | None = None,
@@ -37,12 +108,12 @@ class DecisionMaker:
         mode = AutonomyMode(settings.AUTONOMY_MODE)
 
         if mode == AutonomyMode.AUTONOMOUS:
-            return await self._execute_autonomous(signal, cycle_id, analysis_context)
+            return await self._execute_autonomous(signal, analysis_id, cycle_id, analysis_context)
         else:
             return await self._create_recommendation(signal, analysis_id, cycle_id)
 
     async def _execute_autonomous(
-        self, signal: TradeSignal, cycle_id: str | None = None,
+        self, signal: TradeSignal, analysis_id: str = "", cycle_id: str | None = None,
         analysis_context: dict | None = None,
     ) -> dict:
         """완전자율: MCP로 즉시 주문 실행"""
@@ -53,17 +124,76 @@ class DecisionMaker:
         )
 
         market = signal.metadata.get("market", "KRX")
+        market_code = normalize_market(market)
+        currency = signal.metadata.get("currency", "KRW")
+        exchange_rate = float(signal.metadata.get("exchange_rate_to_krw") or 1.0)
         qty = signal.suggested_quantity or 0
         price = signal.suggested_price or 0
-        amount = (signal.metadata.get("price_krw") or price) * qty
+        price_krw = float(
+            signal.metadata.get("entry_price_krw")
+            or signal.metadata.get("price_krw")
+            or (price * exchange_rate if currency != "KRW" else price)
+        )
+        amount = price_krw * qty
         await activity_logger.log(
             ActivityType.DECISION, ActivityPhase.START,
             f"\U0001f4b0 [{signal.symbol}] 자동 주문 실행: "
             f"{signal.action.value} {qty}주 "
-            f"@{price:,.2f}{signal.metadata.get('currency', 'KRW')} ({amount:,.0f}원)",
+            f"{self._price_display(price, currency, price_krw)}",
             cycle_id=cycle_id,
             symbol=signal.symbol,
+            detail={
+                "market": market_code,
+                "currency": currency,
+                "requested_quantity": qty,
+                "requested_price": price,
+                "requested_price_krw": round(price_krw, 4),
+                "live_price": signal.metadata.get("live_price"),
+                "live_price_krw": signal.metadata.get("live_price_krw"),
+            },
         )
+
+        sanity_issue = self._detect_order_price_sanity_issue(signal)
+        if sanity_issue:
+            result = {
+                "mode": "AUTONOMOUS",
+                "symbol": signal.symbol,
+                "action": signal.action.value,
+                "success": False,
+                "order_id": "",
+                "message": sanity_issue["reason"],
+                "data": sanity_issue,
+            }
+            await activity_logger.log(
+                ActivityType.DECISION, ActivityPhase.ERROR,
+                f"\u274c [{signal.symbol}] 주문 차단: 실시간가 대비 지정가 괴리 {sanity_issue['gap_pct']:.1%}",
+                cycle_id=cycle_id,
+                symbol=signal.symbol,
+                error_message=sanity_issue["reason"],
+                detail=sanity_issue,
+            )
+            await event_bus.publish(Event(
+                type=EventType.ORDER_EXECUTED,
+                data=result,
+                source="decision_maker",
+            ))
+            return result
+
+        paper_session_block = self._detect_paper_us_session_block(signal)
+        if paper_session_block:
+            await activity_logger.log(
+                ActivityType.DECISION, ActivityPhase.ERROR,
+                f"⚠️ [{signal.symbol}] {paper_session_block['session_label']} 모의주문 불가 — 추천으로 전환",
+                cycle_id=cycle_id,
+                symbol=signal.symbol,
+                error_message=paper_session_block["reason"],
+                detail=paper_session_block,
+            )
+            recommendation = await self._create_recommendation(signal, analysis_id, cycle_id)
+            recommendation["mode"] = "AUTONOMOUS_FALLBACK"
+            recommendation["fallback_reason"] = paper_session_block["reason"]
+            recommendation["fallback_session"] = paper_session_block["session"]
+            return recommendation
 
         response = await mcp_client.place_order(
             symbol=signal.symbol,
@@ -86,6 +216,9 @@ class DecisionMaker:
             "success": is_submitted,
             "order_id": order_id,
             "message": "주문 접수" if is_submitted else (response.error or "주문 응답 없음"),
+            "requested_price": price,
+            "requested_price_krw": round(price_krw, 4),
+            "currency": currency,
             "data": response.data,
         }
 
@@ -112,7 +245,7 @@ class DecisionMaker:
             self._pending_tasks.add(task)
             task.add_done_callback(self._pending_tasks.discard)
         else:
-            error_msg = response.error or "주문번호 없음"
+            error_msg = response.error or order_data.get("msg1") or "주문번호 없음"
             # 매매불가 종목 → 런타임 블록리스트 등록 (이후 스캔에서 제외)
             if "매매불가" in error_msg:
                 from agent.market_scanner import market_scanner
@@ -123,6 +256,11 @@ class DecisionMaker:
                 f"\u274c [{signal.symbol}] 주문 실패: {error_msg}",
                 cycle_id=cycle_id, symbol=signal.symbol,
                 error_message=error_msg,
+                detail={
+                    **result,
+                    "market": market_code,
+                    "response_success": response.success,
+                },
             )
 
         await event_bus.publish(Event(

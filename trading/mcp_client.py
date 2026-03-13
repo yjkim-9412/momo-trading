@@ -578,6 +578,32 @@ class MCPClient:
                 return [records]
         return []
 
+    @staticmethod
+    def _first_record(value: Any) -> dict[str, Any]:
+        """dict 또는 dict 배열에서 첫 레코드 반환"""
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    return item
+        return {}
+
+    @staticmethod
+    def _sort_series_records(records: list[dict[str, Any]], *keys: str) -> list[dict[str, Any]]:
+        """시계열 레코드를 과거→현재 순으로 정렬"""
+        if not records:
+            return []
+
+        def sort_key(item: dict[str, Any]) -> tuple[int, str]:
+            for key in keys:
+                value = item.get(key)
+                if value not in (None, ""):
+                    return (0, str(value))
+            return (1, "")
+
+        return sorted(records, key=sort_key)
+
     async def call_any_tool(
         self, tool_calls: list[tuple[str, dict[str, Any]]]
     ) -> MCPResponse:
@@ -906,7 +932,7 @@ class MCPClient:
                         "change": self._to_float(self._pick_first(item, "prdy_vrss", "diff")),
                         "change_rate": self._to_float(self._pick_first(item, "prdy_ctrt", "rate")),
                     })
-                resp.data["prices"] = prices
+                resp.data["prices"] = self._sort_series_records(prices, "date")
             else:
                 logger.warning("[{}] 일봉 데이터 키 누락 — keys: {}", symbol,
                                list(resp.data.keys())[:10])
@@ -949,7 +975,7 @@ class MCPClient:
                 resp.success = False
                 resp.error = error_msg
                 return resp
-            output = d.get("output", {}) if isinstance(d.get("output"), dict) else {}
+            output = self._first_record(d.get("output")) or self._first_record(d.get("output1"))
             order_id = (
                 d.get("ODNO") or d.get("odno")
                 or d.get("ORDNO") or d.get("ordno")
@@ -1038,19 +1064,20 @@ class MCPClient:
                     self._extract_records(response.data, "output2", "dataframe2")
                     or self._extract_records(response.data, "output1", "dataframe1")
                 )
+                prices = [
+                    {
+                        "time": self._pick_first(item, "xymd", "time", default=""),
+                        "open": self._to_float(self._pick_first(item, "open", "stck_oprc")),
+                        "high": self._to_float(self._pick_first(item, "high", "stck_hgpr")),
+                        "low": self._to_float(self._pick_first(item, "low", "stck_lwpr")),
+                        "close": self._to_float(self._pick_first(item, "clos", "close", "stck_prpr")),
+                        "volume": self._to_int(self._pick_first(item, "tvol", "volume", "cntg_vol")),
+                    }
+                    for item in items
+                ]
                 response.data = {
                     **response.data,
-                    "prices": [
-                        {
-                            "time": self._pick_first(item, "xymd", "time", default=""),
-                            "open": self._to_float(self._pick_first(item, "open", "stck_oprc")),
-                            "high": self._to_float(self._pick_first(item, "high", "stck_hgpr")),
-                            "low": self._to_float(self._pick_first(item, "low", "stck_lwpr")),
-                            "close": self._to_float(self._pick_first(item, "clos", "close", "stck_prpr")),
-                            "volume": self._to_int(self._pick_first(item, "tvol", "volume", "cntg_vol")),
-                        }
-                        for item in items
-                    ],
+                    "prices": self._sort_series_records(prices, "time"),
                 }
             return response
 

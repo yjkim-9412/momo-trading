@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from core.config import settings
-from trading.kis_api import _get_account_parts, get_overseas_order_list
+from trading.kis_api import _get_account_parts, get_overseas_daily_price, get_overseas_order_list
 
 
 class AccountPartsTest(unittest.TestCase):
@@ -64,6 +64,15 @@ class OverseasOrderListTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["ORD_DT"], "")
         self.assertEqual(params["ORD_GNO_BRNO"], "")
         self.assertEqual(params["ODNO"], "")
+
+    async def test_get_overseas_daily_price_uses_unadjusted_basis_for_intraday_alignment(self):
+        mock_request = AsyncMock(return_value={"rt_cd": "0", "output2": []})
+
+        with patch("trading.kis_api._request_json", mock_request):
+            await get_overseas_daily_price("NVDA", "NASDAQ")
+
+        params = mock_request.await_args.kwargs["params"]
+        self.assertEqual(params["MODP"], "0")
 
 
 if __name__ == "__main__":

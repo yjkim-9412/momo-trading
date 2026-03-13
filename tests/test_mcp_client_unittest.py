@@ -1,5 +1,6 @@
-import asyncio
 import json
+import unittest
+from unittest.mock import AsyncMock, patch
 
 from trading.mcp_client import MCPClient
 
@@ -16,8 +17,8 @@ class _DummyPostClient:
         return await self._handler(session_id, json)
 
 
-def test_call_tool_marks_kis_business_error_as_failure():
-    async def scenario():
+class MCPClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_call_tool_marks_kis_business_error_as_failure(self):
         client = MCPClient()
         client._session_id = "/messages/?session_id=test"
 
@@ -39,10 +40,31 @@ def test_call_tool_marks_kis_business_error_as_failure():
             return _DummyResponse()
 
         client._post_client = _DummyPostClient(fake_post)
-        return await client._call_tool_inner("inquery-balance", None, 0)
+        response = await client._call_tool_inner("inquery-balance", None, 0)
 
-    response = asyncio.run(scenario())
+        self.assertFalse(response.success)
+        self.assertEqual(response.error, "ERROR INVALID INPUT_FILED_SIZE")
+        self.assertEqual(response.data["rt_cd"], "2")
 
-    assert response.success is False
-    assert response.error == "ERROR INVALID INPUT_FILED_SIZE"
-    assert response.data["rt_cd"] == "2"
+    async def test_place_order_extracts_order_id_from_output_list(self):
+        client = MCPClient()
+        client._get_exchange_rate_to_krw = AsyncMock(return_value=1300.0)
+
+        with patch(
+            "trading.kis_api.place_overseas_order",
+            new=AsyncMock(return_value={
+                "success": True,
+                "rt_cd": "0",
+                "output": [
+                    {"ODNO": "90123456", "ORD_TMD": "181530"},
+                ],
+            }),
+        ):
+            response = await client.place_order("COIN", "BUY", 1, price=196.6, market="NASDAQ")
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.data["order_id"], "90123456")
+
+
+if __name__ == "__main__":
+    unittest.main()

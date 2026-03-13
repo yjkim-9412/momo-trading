@@ -26,7 +26,14 @@ from strategy.aggressive_short import AggressiveShortStrategy
 from strategy.risk_manager import risk_manager
 from strategy.signal import TradeSignal
 from strategy.stable_short import StableShortStrategy
-from trading.enums import ActivityPhase, ActivityType, LLMTier, SignalAction, SignalUrgency
+from trading.enums import (
+    ActivityPhase,
+    ActivityType,
+    LLMTier,
+    SignalAction,
+    SignalUrgency,
+    Tier1Profile,
+)
 from trading.market_profile import (
     market_currency,
     market_scope,
@@ -40,6 +47,10 @@ from trading.product_policy import (
     coerce_strategy_for_product,
     is_product_trade_allowed,
 )
+
+_DATA_CONSISTENCY_MAX_GAP_PCT = 0.25
+_TIER2_PRICE_KRW_HINT_RATIO = 10.0
+_TIER2_PRICE_CONVERSION_MAX_GAP_PCT = 0.25
 
 
 def _default_strategies() -> dict[str, object]:
@@ -117,6 +128,111 @@ class TradingAgent:
                 merged[field_name] = value
         if merged:
             self._product_metadata[key] = merged
+
+    @staticmethod
+    def _sort_market_data_frame(df: pd.DataFrame, time_column: str) -> pd.DataFrame:
+        """시계열 DataFrame을 과거→현재 순으로 정렬"""
+        if df.empty:
+            return df
+        if time_column not in df.columns:
+            return df.reset_index(drop=True)
+
+        ordered = (
+            df.assign(_sort_key=df[time_column].fillna("").astype(str).str.strip())
+            .sort_values("_sort_key")
+            .drop(columns="_sort_key")
+            .reset_index(drop=True)
+        )
+        return ordered
+
+    @staticmethod
+    def _detect_price_consistency_issue(
+        current_price: float,
+        daily_df: pd.DataFrame,
+        minute_df: pd.DataFrame | None = None,
+    ) -> dict | None:
+        """실시간 현재가와 최신 일봉/분봉 종가 괴리 검증"""
+        if current_price <= 0:
+            return None
+
+        anchors: list[tuple[str, float]] = []
+        if not daily_df.empty and "close" in daily_df.columns:
+            latest_daily_close = float(daily_df["close"].iloc[-1] or 0)
+            if latest_daily_close > 0:
+                anchors.append(("latest_daily_close", latest_daily_close))
+
+        if minute_df is not None and not minute_df.empty and "close" in minute_df.columns:
+            latest_minute_close = float(minute_df["close"].iloc[-1] or 0)
+            if latest_minute_close > 0:
+                anchors.append(("latest_minute_close", latest_minute_close))
+
+        if not anchors:
+            return None
+
+        worst_anchor = ""
+        worst_anchor_price = 0.0
+        worst_gap_pct = 0.0
+        for anchor_name, anchor_price in anchors:
+            gap_pct = abs(current_price - anchor_price) / anchor_price
+            if gap_pct > worst_gap_pct:
+                worst_anchor = anchor_name
+                worst_anchor_price = anchor_price
+                worst_gap_pct = gap_pct
+
+        if worst_gap_pct < _DATA_CONSISTENCY_MAX_GAP_PCT:
+            return None
+
+        detail = {
+            "live_quote": round(current_price, 4),
+            "anchor": worst_anchor,
+            "anchor_price": round(worst_anchor_price, 4),
+            "gap_pct": round(worst_gap_pct, 4),
+        }
+        for anchor_name, anchor_price in anchors:
+            detail[anchor_name] = round(anchor_price, 4)
+        return detail
+
+    @staticmethod
+    def _normalize_tier2_price_fields(
+        parsed: dict | None,
+        *,
+        current_price: float,
+        currency: str,
+        exchange_rate_to_krw: float,
+    ) -> dict | None:
+        """미국장 Tier2 가격 필드가 원화로 반환된 경우 시장 통화로 보정"""
+        if not parsed:
+            return parsed
+        if currency == "KRW" or current_price <= 0 or exchange_rate_to_krw <= 0:
+            return parsed
+
+        normalized: dict[str, dict[str, float | str]] = {}
+        for key in ("entry_price", "target_price", "stop_loss_price", "take_profit_price"):
+            value = parsed.get(key)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if numeric <= 0:
+                continue
+
+            converted = numeric / exchange_rate_to_krw
+            raw_ratio = numeric / current_price
+            converted_gap_pct = abs(converted - current_price) / current_price
+
+            if raw_ratio >= _TIER2_PRICE_KRW_HINT_RATIO and converted_gap_pct <= _TIER2_PRICE_CONVERSION_MAX_GAP_PCT:
+                parsed[key] = round(converted, 4)
+                normalized[key] = {
+                    "raw_value": round(numeric, 4),
+                    "normalized_value": round(converted, 4),
+                    "currency": currency,
+                }
+            else:
+                parsed[key] = round(numeric, 4)
+
+        if normalized:
+            parsed["normalized_price_fields"] = normalized
+        return parsed
 
     def _get_state(self, market: str) -> MarketState:
         """시장별 격리 상태 조회 (없으면 자동 생성)"""
@@ -687,6 +803,7 @@ class TradingAgent:
                         daily_df[col] = pd.to_numeric(daily_df[col], errors="coerce")
                 if "volume" in daily_df.columns:
                     daily_df["volume"] = pd.to_numeric(daily_df["volume"], errors="coerce")
+                daily_df = self._sort_market_data_frame(daily_df, "date")
             else:
                 logger.warning("[{}] 일봉 응답은 성공이나 prices 비어있음", symbol)
         else:
@@ -701,19 +818,54 @@ class TradingAgent:
                         minute_df[col] = pd.to_numeric(minute_df[col], errors="coerce")
                 if "volume" in minute_df.columns:
                     minute_df["volume"] = pd.to_numeric(minute_df["volume"], errors="coerce")
+                minute_df = self._sort_market_data_frame(minute_df, "time")
 
-        if not daily_df.empty:
-            chart_result = chart_analyzer.analyze(daily_df, minute_df)
-
-        # 핵심 데이터 없으면 AI 분석 스킵 (LLM 비용 + 무의미한 HOLD 방지)
-        if current_price == 0 and daily_df.empty:
-            logger.warning("[{}] 현재가·일봉 모두 없음 → 분석 스킵", symbol)
+        # 핵심 데이터 없으면 AI 분석 스킵 (단기 전략에서는 현재가와 일봉이 모두 필수)
+        missing_fields = []
+        if current_price <= 0:
+            missing_fields.append("현재가")
+        if daily_df.empty:
+            missing_fields.append("일봉")
+        if missing_fields:
+            logger.warning("[{}] 핵심 데이터 누락({}) → 분석 스킵", symbol, ", ".join(missing_fields))
             await activity_logger.log(
                 ActivityType.TIER1_ANALYSIS, ActivityPhase.SKIP,
-                f"⚠️ [{name}] 데이터 부족으로 분석 스킵 (현재가·일봉 조회 실패)",
+                f"⚠️ [{name}] 데이터 부족으로 분석 스킵 ({'·'.join(missing_fields)} 조회 실패)",
                 cycle_id=cycle_id, symbol=symbol,
+                detail={
+                    "missing_fields": missing_fields,
+                    "live_quote": round(current_price, 4),
+                    "latest_daily_close": float(daily_df['close'].iloc[-1]) if not daily_df.empty and "close" in daily_df.columns else None,
+                    "latest_minute_close": float(minute_df['close'].iloc[-1]) if minute_df is not None and not minute_df.empty and "close" in minute_df.columns else None,
+                },
             )
             return result
+
+        consistency_issue = self._detect_price_consistency_issue(current_price, daily_df, minute_df)
+        if consistency_issue:
+            anchor_labels = {
+                "latest_daily_close": "최신 일봉 종가",
+                "latest_minute_close": "최신 분봉 종가",
+            }
+            anchor_label = anchor_labels.get(consistency_issue["anchor"], consistency_issue["anchor"])
+            logger.warning(
+                "[{}] 데이터 정합성 차단: 현재가 {:.2f}, {} {:.2f}, 괴리 {:.1%}",
+                symbol,
+                consistency_issue["live_quote"],
+                anchor_label,
+                consistency_issue["anchor_price"],
+                consistency_issue["gap_pct"],
+            )
+            await activity_logger.log(
+                ActivityType.TIER1_ANALYSIS, ActivityPhase.SKIP,
+                f"⚠️ [{name}] 데이터 정합성 차단 ({anchor_label} 대비 괴리 {consistency_issue['gap_pct']:.1%})",
+                cycle_id=cycle_id,
+                symbol=symbol,
+                detail=consistency_issue,
+            )
+            return result
+
+        chart_result = chart_analyzer.analyze(daily_df, minute_df)
 
         indicators = chart_result.indicators
 
@@ -959,7 +1111,12 @@ class TradingAgent:
                     "reason": final.get("reason", ""),
                     "suggested_quantity": final.get("suggested_quantity"),
                     "entry_price": final.get("entry_price"),
+                    "entry_price_currency": currency,
+                    "entry_price_krw": final.get("entry_price_krw"),
                     "target_price": final.get("target_price"),
+                    "target_price_currency": currency,
+                    "target_price_krw": final.get("target_price_krw"),
+                    "normalized_price_fields": final.get("normalized_price_fields"),
                 },
                 llm_provider=final.get("provider"),
                 llm_tier="TIER2",
@@ -1001,7 +1158,12 @@ class TradingAgent:
                     "market": market_code,
                     "currency": currency,
                     "exchange_rate_to_krw": exchange_rate_to_krw,
-                    "price_krw": price_krw or (final["entry_price"] * exchange_rate_to_krw),
+                    "price_krw": final.get("entry_price_krw") or price_krw or (final["entry_price"] * exchange_rate_to_krw),
+                    "live_price": current_price,
+                    "live_price_krw": price_krw or (current_price * exchange_rate_to_krw),
+                    "entry_price_krw": final.get("entry_price_krw") or (final["entry_price"] * exchange_rate_to_krw),
+                    "target_price_krw": final.get("target_price_krw"),
+                    "stop_loss_price_krw": final.get("stop_loss_price_krw"),
                     **classification.to_metadata(),
                 },
             )
@@ -1010,8 +1172,15 @@ class TradingAgent:
             await activity_logger.log(
                 ActivityType.STRATEGY_EVAL, ActivityPhase.COMPLETE,
                 f"\U0001f4c8 [{name}] Tier2 승인 기반 시그널: {action.value} "
-                f"{signal.suggested_quantity}주 @{signal.suggested_price:,.0f}원",
+                f"{signal.suggested_quantity}주 @{signal.suggested_price:,.2f}{currency}",
                 cycle_id=cycle_id, symbol=symbol,
+                detail={
+                    "action": action.value,
+                    "suggested_quantity": signal.suggested_quantity,
+                    "entry_price": signal.suggested_price,
+                    "currency": currency,
+                    "entry_price_krw": signal.metadata.get("entry_price_krw"),
+                },
             )
         else:
             # Tier2가 구체적 수량/가격을 제시하지 않은 경우 → 전략 평가로 폴백
@@ -1061,6 +1230,11 @@ class TradingAgent:
 
             signal.metadata = {
                 **(signal.metadata or {}),
+                "market": market_code,
+                "currency": currency,
+                "exchange_rate_to_krw": exchange_rate_to_krw,
+                "live_price": current_price,
+                "live_price_krw": price_krw or (current_price * exchange_rate_to_krw),
                 **classification.to_metadata(),
             }
 
@@ -1822,6 +1996,7 @@ class TradingAgent:
             result_text, provider = await llm_factory.generate_tier1(
                 prompt,
                 system_prompt=STOCK_ANALYSIS_SYSTEM,
+                profile=Tier1Profile.ANALYSIS,
                 scope=scope,
                 phase="cycle",
                 symbol=symbol,
@@ -1856,7 +2031,13 @@ class TradingAgent:
         scope = market_scope(market_code)
         strategy = self._get_state(scope).strategies.get(strategy_type)
         currency = tier1_analysis.get("currency", market_currency(market_code))
+        exchange_rate_to_krw = float(tier1_analysis.get("exchange_rate_to_krw", 1.0) or 1.0)
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
+        tier1_prompt_payload = {
+            key: value
+            for key, value in tier1_analysis.items()
+            if key != "price_krw"
+        }
 
         # 추세 분석 기반 전략 파라미터 조정 제안
         tuning_suggestions = "조정 제안 없음"
@@ -1883,12 +2064,13 @@ class TradingAgent:
         position_pct = (max_amount / total_asset * 100) if total_asset > 0 else 0
 
         prompt = FINAL_REVIEW_PROMPT.format(
-            tier1_analysis=json.dumps(tier1_analysis, ensure_ascii=False, indent=2),
+            tier1_analysis=json.dumps(tier1_prompt_payload, ensure_ascii=False, indent=2),
             stock_name=name,
             symbol=symbol,
             market=market_code,
             currency=currency,
             current_price_text=current_price_text,
+            exchange_rate_to_krw=exchange_rate_to_krw,
             strategy_type=strategy_type,
             max_amount=max_amount or 0,
             holding_count=snap.get("holding_count") or 0,
@@ -1917,6 +2099,19 @@ class TradingAgent:
                 parsed["provider"] = provider
                 parsed["market"] = market_code
                 parsed["currency"] = currency
+                parsed = self._normalize_tier2_price_fields(
+                    parsed,
+                    current_price=current_price,
+                    currency=currency,
+                    exchange_rate_to_krw=exchange_rate_to_krw,
+                )
+                for price_key in ("entry_price", "target_price", "stop_loss_price", "take_profit_price"):
+                    price_value = parsed.get(price_key)
+                    if price_value:
+                        parsed[f"{price_key}_krw"] = round(
+                            float(price_value) * exchange_rate_to_krw if currency != "KRW" else float(price_value),
+                            4,
+                        )
             return parsed
         except Exception as e:
             logger.error("Tier 2 검토 실패 ({}): {}", symbol, str(e))

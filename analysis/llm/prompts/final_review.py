@@ -50,6 +50,7 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 - 종목: {stock_name} ({symbol})
 - 시장/통화: {market} / {currency}
 - 현재가: {current_price_text}
+- 환산 참고: 1{currency} ≈ {exchange_rate_to_krw:,.2f}원
 - 전략 유형: {strategy_type}
 
 ### 투자 가능 금액
@@ -95,11 +96,11 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 
 ## 추가 결정사항
 실시간 모니터링 파라미터 최종 확정:
-- stop_loss_price: 손절 기준가 (원)
-- take_profit_price: 익절 기준가 (원) = target_price와 동일하거나 별도 설정
+- stop_loss_price: 손절 기준가 ({currency})
+- take_profit_price: 익절 기준가 ({currency}) = target_price와 동일하거나 별도 설정
 - trailing_stop_pct: 고점 대비 자동 손절 % (0이면 미사용)
 
-**주의**: 아래 JSON은 필드 구조 설명입니다. 모든 가격/수량은 위 종목 정보와 Tier 1 분석을 기반으로 도출하세요.
+**주의**: 아래 JSON은 필드 구조 설명입니다. entry_price/target_price/stop_loss_price/take_profit_price는 반드시 `{currency}` 기준으로 작성하세요. 원화는 투자금 한도와 환산 참고용이며 가격 필드에 넣지 마세요.
 
 JSON 형식으로 답변:
 ```json

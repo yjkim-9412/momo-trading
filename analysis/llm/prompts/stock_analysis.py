@@ -44,7 +44,7 @@ STOCK_ANALYSIS_PROMPT = """## 종목 분석 요청: {stock_name} ({symbol})
 ### 차트 패턴
 {chart_patterns}
 
-### 최근 일봉 데이터 (최근 20일)
+### 추세 분석 요약
 {daily_data}
 
 ### 재무 정보 (있는 경우)
