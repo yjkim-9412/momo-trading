@@ -340,6 +340,7 @@ async def get_system_status(market: str | None = Query(None)):
     from scheduler.market_calendar import market_calendar
 
     market_code = market or settings.primary_market_code
+    session_schedule = market_calendar.get_session_schedule(market=market_code)
 
     return SuccessResponse(data={
         "trading_enabled": settings.TRADING_ENABLED,
@@ -353,6 +354,10 @@ async def get_system_status(market: str | None = Query(None)):
         "primary_market": settings.primary_market_code,
         "market": market_code,
         "market_open": market_calendar.is_trading_hours(market_code),
+        "market_session": session_schedule["current_session"],
+        "market_sessions": session_schedule["sessions"],
+        "market_tz": session_schedule["tz_label"],
+        "dst_active": session_schedule["dst_active"],
         "market_holiday": market_calendar.get_holiday_name(market=market_code),
         "next_market_open": market_calendar.next_market_open(market=market_code).strftime("%m/%d %H:%M"),
     })

@@ -340,7 +340,9 @@ function updateBackgroundBadge(scope, count) {
 function updateMarketContextBar(statusData) {
   if (!statusData) return;
   const isHoliday = !!statusData.market_holiday;
-  const statusText = statusData.market_open ? '장중' : (isHoliday ? `휴장` : '장외');
+  const session = statusData.market_session || 'CLOSED';
+  const sessionLabel = getSessionLabel(session);
+  const statusText = isHoliday ? '휴장' : (session === 'CLOSED' ? '장외' : sessionLabel);
   const statusEl = document.getElementById('ctx-market-status');
   if (statusEl) statusEl.textContent = statusText;
 
@@ -356,6 +358,47 @@ function updateMarketContextBar(statusData) {
       ? `마지막 사이클: ${formatTime(statusData.last_cycle_time)}`
       : '';
   }
+
+  // Session schedule pills
+  const scheduleEl = document.getElementById('ctx-session-schedule');
+  if (scheduleEl && statusData.market_sessions) {
+    const isUS = currentScope() !== 'KRX';
+    scheduleEl.innerHTML = statusData.market_sessions.map(s => {
+      const active = s.key === session;
+      const timeStr = isUS
+        ? `${s.open}-${s.close} ${s.tz} <span class="session-pill-time">(${s.open_kst}-${s.close_kst} KST)</span>`
+        : `${s.open}-${s.close}`;
+      return `<span class="session-pill${active ? ' session-active' : ''}">${s.label} ${timeStr}</span>`;
+    }).join('');
+  }
+
+  // DST badge
+  const dstEl = document.getElementById('ctx-dst-badge');
+  if (dstEl) {
+    if (statusData.dst_active) {
+      dstEl.innerHTML = '<span class="dst-badge"><i data-lucide="sun" class="w-3 h-3"></i> 써머타임</span>';
+      refreshIcons();
+    } else if (statusData.market_tz === 'EST') {
+      dstEl.innerHTML = '<span class="dst-badge" style="background:rgba(96,165,250,0.1);border-color:rgba(96,165,250,0.2);color:#93c5fd"><i data-lucide="moon" class="w-3 h-3"></i> 표준시</span>';
+      refreshIcons();
+    } else {
+      dstEl.innerHTML = '';
+    }
+  }
+}
+
+function getSessionLabel(session) {
+  const labels = {
+    NXT_PRE: 'NXT 프리',
+    KRX_NXT: '정규장',
+    KRX_CLOSE: '동시호가',
+    NXT_AFTER: 'NXT 애프터',
+    US_PRE: '프리마켓',
+    US_REGULAR: '정규장',
+    US_AFTER: '애프터마켓',
+    CLOSED: '장외',
+  };
+  return labels[session] || session;
 }
 
 // ── Account Info ──
@@ -1748,13 +1791,16 @@ async function loadSystemStatus() {
     updateBadge('badge-mcp', s.mcp_connected ? 'MCP:ON' : 'MCP:OFF', s.mcp_connected ? 'green' : 'red');
     const statusEl = document.getElementById('sys-status');
     const isHoliday = !!s.market_holiday;
-    const marketLabel = s.market_open ? '장중' : (isHoliday ? `휴장 (${s.market_holiday})` : '장외');
+    const session = s.market_session || 'CLOSED';
+    const sessionLabel = getSessionLabel(session);
+    const marketLabel = isHoliday ? `휴장 (${s.market_holiday})` : (session === 'CLOSED' ? '장외' : sessionLabel);
     const marketColor = s.market_open ? 'bg-green-400' : (isHoliday ? 'bg-yellow-400' : 'bg-gray-500');
     const marketExtra = s.market_open ? '' : ` (다음: ${s.next_market_open || ''})`;
+    const tzInfo = s.market_tz && s.market_tz !== 'KST' ? ` (${s.market_tz}${s.dst_active ? ' 써머타임' : ''})` : '';
     statusEl.innerHTML = `
       <div class="flex items-center gap-1.5">
         <span class="status-dot w-1.5 h-1.5 rounded-full ${marketColor}"></span>
-        <strong>${marketLabel}</strong>${marketExtra}
+        <strong>${marketLabel}</strong>${tzInfo}${marketExtra}
       </div>
       <div class="flex items-center gap-1.5">
         <span class="status-dot w-1.5 h-1.5 rounded-full ${s.mcp_connected ? 'bg-green-400' : 'bg-red-400'}"></span>

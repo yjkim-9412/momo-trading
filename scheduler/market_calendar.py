@@ -295,6 +295,63 @@ class MarketCalendar:
         return MarketCalendar.next_krx_open(dt)
 
     @staticmethod
+    def get_session_schedule(market: str | None = None, dt: datetime | None = None) -> dict:
+        """시장별 세션 스케줄 정보 반환 (현지 시간 + KST 변환)"""
+        market_code = normalize_market(market or settings.primary_market_code)
+        current_session = MarketCalendar.get_market_session(dt=dt, market=market_code)
+
+        if is_domestic_market(market_code):
+            sessions = [
+                {"key": "NXT_PRE", "label": "NXT 프리", "open": "08:00", "close": "08:50", "tz": "KST"},
+                {"key": "KRX_NXT", "label": "정규장", "open": "09:00", "close": "15:20", "tz": "KST"},
+                {"key": "KRX_CLOSE", "label": "동시호가", "open": "15:20", "close": "15:30", "tz": "KST"},
+                {"key": "NXT_AFTER", "label": "NXT 애프터", "open": "15:30", "close": "20:00", "tz": "KST"},
+            ]
+            return {
+                "current_session": current_session,
+                "sessions": sessions,
+                "tz_label": "KST",
+                "dst_active": False,
+            }
+
+        # US market — ET 기준, DST 반영
+        ny_now = MarketCalendar._to_new_york(dt)
+        dst_active = bool(ny_now.dst())
+        tz_label = "EDT" if dst_active else "EST"
+        kst_offset = 13 if dst_active else 14  # ET → KST 시차
+
+        def _to_kst_str(hh: int, mm: int) -> str:
+            total = (hh + kst_offset) * 60 + mm
+            kh, km = divmod(total % 1440, 60)
+            return f"{kh:02d}:{km:02d}"
+
+        include_pre, include_after = MarketCalendar._us_session_flags()
+        sessions = []
+        if include_pre:
+            sessions.append({
+                "key": "US_PRE", "label": "프리마켓",
+                "open": "04:00", "close": "09:30", "tz": tz_label,
+                "open_kst": _to_kst_str(4, 0), "close_kst": _to_kst_str(9, 30),
+            })
+        sessions.append({
+            "key": "US_REGULAR", "label": "정규장",
+            "open": "09:30", "close": "16:00", "tz": tz_label,
+            "open_kst": _to_kst_str(9, 30), "close_kst": _to_kst_str(16, 0),
+        })
+        if include_after:
+            sessions.append({
+                "key": "US_AFTER", "label": "애프터마켓",
+                "open": "16:00", "close": "20:00", "tz": tz_label,
+                "open_kst": _to_kst_str(16, 0), "close_kst": _to_kst_str(20, 0),
+            })
+        return {
+            "current_session": current_session,
+            "sessions": sessions,
+            "tz_label": tz_label,
+            "dst_active": dst_active,
+        }
+
+    @staticmethod
     def get_holiday_name(dt: datetime | None = None, market: str | None = None) -> str | None:
         """공휴일이면 휴일명 반환"""
         market_code = normalize_market(market or settings.primary_market_code)
