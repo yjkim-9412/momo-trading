@@ -15,9 +15,12 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$APP_DIR/venv"
 PID_FILE="$APP_DIR/.momo.pid"
+LOG_DIR="$APP_DIR/logs"
 LOG_FILE="$APP_DIR/logs/momo-trading.log"
+DATA_DIR="$APP_DIR/data"
 HOST="${MOMO_HOST:-0.0.0.0}"
 PORT="${MOMO_PORT:-9000}"
+DOCKER_STATUS_MSG=""
 
 # ── 공통 함수 ──
 
@@ -37,9 +40,45 @@ check_env() {
     fi
 }
 
-ensure_docker() {
+ensure_runtime_dirs() {
+    mkdir -p "$LOG_DIR" "$DATA_DIR"
+}
+
+migrate_db() {
+    echo "🗃️  DB 마이그레이션 확인..."
+    if ! python -m alembic upgrade head; then
+        echo "❌ Alembic migration 실패"
+        echo "   python -m alembic upgrade head 를 먼저 확인하세요."
+        exit 1
+    fi
+}
+
+docker_daemon_ready() {
+    local err
+    local code
+
     if ! command -v docker >/dev/null 2>&1; then
-        echo "⚠️  Docker가 설치되어 있지 않습니다. KIS MCP 서버 없이 실행합니다."
+        DOCKER_STATUS_MSG="Docker CLI가 설치되어 있지 않습니다."
+        return 1
+    fi
+
+    set +e
+    err=$(docker info 2>&1 >/dev/null)
+    code=$?
+    set -e
+    if [ "$code" -ne 0 ]; then
+        DOCKER_STATUS_MSG="${err%%$'\n'*}"
+        return 1
+    fi
+
+    DOCKER_STATUS_MSG=""
+    return 0
+}
+
+ensure_docker() {
+    if ! docker_daemon_ready; then
+        echo "⚠️  Docker daemon 접근 불가: $DOCKER_STATUS_MSG"
+        echo "   KIS MCP 서버 없이 실행합니다."
         return 1
     fi
 
@@ -64,6 +103,20 @@ ensure_docker() {
     return 0
 }
 
+print_docker_status() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "ℹ️  Docker 미설치"
+        return
+    fi
+
+    if ! docker_daemon_ready; then
+        echo "⚠️  Docker daemon 접근 불가: $DOCKER_STATUS_MSG"
+        return
+    fi
+
+    docker compose ps 2>/dev/null || echo "❌ Docker 컨테이너 없음"
+}
+
 check_port() {
     if lsof -ti:"$PORT" >/dev/null 2>&1; then
         echo "❌ 포트 $PORT 이미 사용 중"
@@ -80,10 +133,39 @@ print_banner() {
     echo "   Admin: http://localhost:$PORT/admin"
 }
 
+launch_daemon() {
+    : > "$LOG_FILE"
+
+    if command -v setsid >/dev/null 2>&1; then
+        setsid env PYTHONUNBUFFERED=1 \
+            python -u -m uvicorn main:app \
+            --host "$HOST" --port "$PORT" \
+            --log-level info \
+            >> "$LOG_FILE" 2>&1 < /dev/null &
+    else
+        nohup env PYTHONUNBUFFERED=1 \
+            python -u -m uvicorn main:app \
+            --host "$HOST" --port "$PORT" \
+            --log-level info \
+            >> "$LOG_FILE" 2>&1 < /dev/null &
+    fi
+
+    echo $! > "$PID_FILE"
+    sleep 2
+
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "❌ 서버 기동 실패"
+        echo "   최근 로그:"
+        sed -n '1,200p' "$LOG_FILE"
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+}
+
 # ── 명령 분기 ──
 
 cd "$APP_DIR"
-mkdir -p "$(dirname "$LOG_FILE")"
+ensure_runtime_dirs
 
 case "${1:-}" in
     stop)
@@ -110,11 +192,7 @@ case "${1:-}" in
 
         echo ""
         echo "=== Docker ==="
-        if command -v docker >/dev/null 2>&1; then
-            docker compose ps 2>/dev/null || echo "❌ Docker 컨테이너 없음"
-        else
-            echo "ℹ️  Docker 미설치"
-        fi
+        print_docker_status
         ;;
 
     logs)
@@ -135,17 +213,13 @@ case "${1:-}" in
         activate_venv
         check_env
         check_port
+        migrate_db
         ensure_docker || true
 
         print_banner "백그라운드"
         echo "   Log:   $LOG_FILE"
 
-        nohup python -m uvicorn main:app \
-            --host "$HOST" --port "$PORT" \
-            --log-level info \
-            >> "$LOG_FILE" 2>&1 &
-
-        echo $! > "$PID_FILE"
+        launch_daemon
         echo "   PID:   $(cat "$PID_FILE")"
         echo ""
         echo "종료: ./start.sh stop  또는  ./stop.sh"
@@ -155,12 +229,13 @@ case "${1:-}" in
         activate_venv
         check_env
         check_port
+        migrate_db
 
         print_banner "포그라운드 — 서버만"
         echo "   종료: Ctrl+C"
         echo ""
 
-        python -m uvicorn main:app \
+        PYTHONUNBUFFERED=1 python -u -m uvicorn main:app \
             --host "$HOST" --port "$PORT" \
             --log-level info \
             --reload
@@ -170,13 +245,14 @@ case "${1:-}" in
         activate_venv
         check_env
         check_port
+        migrate_db
         ensure_docker || true
 
         print_banner "포그라운드"
         echo "   종료: Ctrl+C"
         echo ""
 
-        python -m uvicorn main:app \
+        PYTHONUNBUFFERED=1 python -u -m uvicorn main:app \
             --host "$HOST" --port "$PORT" \
             --log-level info \
             --reload
