@@ -1,8 +1,10 @@
+import asyncio
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from core.config import settings
 from trading.account_manager import AccountManager
-from trading.models import HoldingInfo
+from trading.models import HoldingInfo, MCPResponse
 
 
 class AccountManagerBalanceTest(unittest.TestCase):
@@ -120,6 +122,39 @@ class AccountManagerBalanceTest(unittest.TestCase):
         self.assertEqual(balance.raw_total_pnl, 0.0)
         self.assertEqual(balance.raw_total_pnl_rate, 0.0)
         self.assertEqual(balance.pnl_source, "BROKER_SUMMARY")
+
+    def test_parse_balance_marks_error_payload_invalid(self):
+        balance = self.manager._parse_balance(
+            {"rt_cd": "2", "msg1": "ERROR INVALID INPUT_FILED_SIZE"},
+            holdings=[],
+            market="KRX",
+        )
+
+        self.assertFalse(balance.is_valid)
+        self.assertEqual(balance.total_asset, 0.0)
+        self.assertIn("INVALID INPUT_FILED_SIZE", balance.status_message)
+
+def test_get_account_snapshot_returns_invalid_balance_on_mcp_failure():
+    async def scenario():
+        manager = AccountManager()
+        response = MCPResponse(
+            success=False,
+            error="ERROR INVALID INPUT_FILED_SIZE",
+            data={"rt_cd": "2", "msg1": "ERROR INVALID INPUT_FILED_SIZE"},
+        )
+
+        with patch(
+            "trading.account_manager.mcp_client.get_account_balance",
+            AsyncMock(return_value=response),
+        ):
+            return await manager.get_account_snapshot("KRX")
+
+    balance, holdings = asyncio.run(scenario())
+
+    assert balance.is_valid is False
+    assert balance.total_asset == 0.0
+    assert holdings == []
+    assert "INVALID INPUT_FILED_SIZE" in balance.status_message
 
 
 if __name__ == "__main__":

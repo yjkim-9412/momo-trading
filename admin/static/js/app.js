@@ -123,6 +123,14 @@ async function loadMarketAccountInfo() {
   }
 }
 
+function renderBalanceFailure(el, badgeEl, message) {
+  if (badgeEl) badgeEl.classList.add('hidden');
+  const row = document.createElement('div');
+  row.className = 'text-sm text-red-400';
+  row.textContent = message || '계좌 조회 실패';
+  el.replaceChildren(row);
+}
+
 function hasMeaningfulDiff(left, right, threshold = 1) {
   return Math.abs(Number(left || 0) - Number(right || 0)) >= threshold;
 }
@@ -139,6 +147,10 @@ function renderBalance(data, market) {
   if (!el || !data) {
     if (el) el.textContent = '계좌 미연결';
     if (badgeEl) badgeEl.classList.add('hidden');
+    return;
+  }
+  if (data.is_valid === false) {
+    renderBalanceFailure(el, badgeEl, data.status_message);
     return;
   }
   const isUS = market !== 'KRX';
@@ -201,6 +213,7 @@ function _renderBalanceKRX(el, data, effectiveCash, rawCash, totalPnl, totalPnlR
     rows.push(_singleRow('브로커 요약 손익', `${formatSignedAmount(rawTotalPnl, 'KRW')} (${formatSignedAmount(rawTotalPnlRate, 'PCT')})`, 'text-gray-500'));
   if (data.cash_source === 'TOTAL_ASSET_PROXY') rows.push(_noteRow('총자산 - 주식평가액으로 주문가능 현금을 추정합니다.'));
   if (data.pnl_source === 'HOLDINGS_SUM') rows.push(_noteRow('손익은 보유종목 기준으로 재계산합니다.'));
+  if (data.status_message) rows.push(_noteRow(data.status_message, 'text-gray-500'));
   rows.forEach(r => el.appendChild(r));
 }
 function _singleRow(label, value, valueClass) {

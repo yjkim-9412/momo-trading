@@ -169,8 +169,9 @@ KIS_APP_KEY=your_app_key              # 실전 투자 앱 키
 KIS_APP_SECRET=your_app_secret        # 실전 투자 앱 시크릿
 KIS_PAPER_APP_KEY=your_paper_key      # 모의 투자 앱 키
 KIS_PAPER_APP_SECRET=your_paper_secret # 모의 투자 앱 시크릿
-KIS_ACCT_STOCK=your_account_number    # 실전 계좌번호
-KIS_PAPER_STOCK=your_paper_account    # 모의 계좌번호
+KIS_ACCT_STOCK=your_account_number    # 실전 계좌번호(10자리 전체)
+KIS_PAPER_STOCK=your_paper_account    # 모의 계좌번호(10자리 전체)
+KIS_PROD_TYPE=01                      # 계좌상품코드 override (비우면 계좌번호 뒤 2자리 사용)
 KIS_ACCOUNT_TYPE=VIRTUAL              # VIRTUAL(모의) 또는 REAL(실전)
 
 # === LLM Provider 선택 ===
@@ -188,6 +189,10 @@ CODEX_MODEL=gpt-5.4
 CODEX_REASONING_EFFORT=
 # CODEX_REASONING_EFFORT_TIER1=medium
 CODEX_REASONING_EFFORT_TIER2=xhigh
+
+# 참고:
+# - 앱과 kis-mcp 컨테이너는 10자리 계좌번호를 받아 내부에서 CANO(앞 8자리) + 상품코드(뒤 2자리)로 자동 분리합니다.
+# - KIS_PROD_TYPE 를 명시하면 자동 분리된 뒤 2자리 대신 해당 값을 우선 사용합니다.
 
 # === 거래 안전 설정 ===
 TRADING_ENABLED=false                 # true로 변경 시 실제 매매 실행

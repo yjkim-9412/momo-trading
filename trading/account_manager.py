@@ -50,7 +50,7 @@ class AccountManager:
                 return value
         return None
 
-    def _empty_balance(self, market: str) -> AccountBalance:
+    def _empty_balance(self, market: str, *, status_message: str = "") -> AccountBalance:
         normalized_market = normalize_market(market)
         return AccountBalance(
             total_asset=0,
@@ -67,6 +67,7 @@ class AccountManager:
             raw_cash=0,
             effective_cash=0,
             cash_source="BROKER",
+            status_message=status_message,
             is_valid=False,
         )
 
@@ -162,6 +163,7 @@ class AccountManager:
 
         if output2 and isinstance(output2, list):
             summary = output2[0]
+            is_error_payload = str(data.get("rt_cd") or "") not in ("", "0")
             cash = self._to_float(
                 self._first_value(
                     summary,
@@ -257,6 +259,7 @@ class AccountManager:
                 effective_cash=effective_cash,
                 cash_source=cash_source,
                 status_message=str(data.get("msg1") or ""),
+                is_valid=not is_error_payload,
             )
 
         cash = self._to_float(data.get("cash", 0))
@@ -282,6 +285,7 @@ class AccountManager:
             total_pnl_rate,
             holdings,
         )
+        is_error_payload = str(data.get("rt_cd") or "") not in ("", "0")
         return AccountBalance(
             total_asset=total_asset,
             cash=cash,
@@ -298,6 +302,7 @@ class AccountManager:
             effective_cash=effective_cash,
             cash_source=cash_source,
             status_message=str(data.get("msg1") or ""),
+            is_valid=bool(data) and not is_error_payload,
         )
 
     def _parse_holdings(self, data: dict, market: str = "KRX") -> list[HoldingInfo]:
@@ -421,8 +426,9 @@ class AccountManager:
         response = await mcp_client.get_account_balance(market=market_code)
         if not response.success:
             logger.warning("계좌 조회 실패: {}", response.error)
-            balance = self._balance_cache.get(market_code, self._empty_balance(market_code))
-            holdings = self._holdings_cache.get(market_code, [])
+            error_message = str((response.data or {}).get("msg1") or response.error or "")
+            balance = self._empty_balance(market_code, status_message=error_message)
+            holdings: list[HoldingInfo] = []
             return balance, holdings
 
         data = response.data or {}
