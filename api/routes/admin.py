@@ -233,6 +233,7 @@ async def get_settings():
     data = {}
     for key in MUTABLE_SETTINGS:
         data[key] = getattr(settings, key, None)
+    data["ENABLED_MARKET_GROUPS"] = settings.enabled_market_groups
     return SuccessResponse(data=data)
 
 
@@ -288,12 +289,14 @@ async def get_llm_status():
 
 # ── 시스템 상태 ──
 @router.get("/system/status")
-async def get_system_status():
+async def get_system_status(market: str | None = Query(None)):
     """시스템 전체 상태"""
     from agent.trading_agent import trading_agent
     from scheduler.scheduler import trading_scheduler
 
     from scheduler.market_calendar import market_calendar
+
+    market_code = market or settings.primary_market_code
 
     return SuccessResponse(data={
         "trading_enabled": settings.TRADING_ENABLED,
@@ -305,26 +308,30 @@ async def get_system_status():
         "sse_clients": sse_manager.client_count,
         "environment": settings.ENVIRONMENT,
         "primary_market": settings.primary_market_code,
-        "market_open": market_calendar.is_primary_market_trading_hours(),
-        "market_holiday": market_calendar.get_holiday_name(market=settings.primary_market_code),
-        "next_market_open": market_calendar.next_market_open(market=settings.primary_market_code).strftime("%m/%d %H:%M"),
+        "market": market_code,
+        "market_open": market_calendar.is_trading_hours(market_code),
+        "market_holiday": market_calendar.get_holiday_name(market=market_code),
+        "next_market_open": market_calendar.next_market_open(market=market_code).strftime("%m/%d %H:%M"),
     })
 
 
 # ── 수동 사이클 트리거 ──
 @router.post("/agent/trigger")
-async def trigger_agent_cycle():
+async def trigger_agent_cycle(market: str | None = Query(None)):
     """수동으로 에이전트 사이클 실행"""
     from agent.trading_agent import trading_agent
 
+    market_code = market or settings.primary_market_code
+    market_label = "US" if market_code in ("NASDAQ", "NYSE", "AMEX") else "KRX"
+
     await activity_logger.log(
         ActivityType.EVENT, ActivityPhase.PROGRESS,
-        "\U0001f3ae 수동 사이클 트리거 (관리자)",
+        f"\U0001f3ae 수동 사이클 트리거 (관리자, {market_label})",
     )
 
     # 비동기로 실행 (즉시 응답)
-    asyncio.create_task(trading_agent.run_cycle())
-    return SuccessResponse(message="에이전트 사이클이 트리거되었습니다")
+    asyncio.create_task(trading_agent.run_cycle(market=market_code))
+    return SuccessResponse(message=f"에이전트 사이클이 트리거되었습니다 ({market_label})")
 
 
 # ── 수동 일일 리포트 생성 ──

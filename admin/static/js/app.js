@@ -6,22 +6,24 @@ let currentView = 'live';
 let activityCount = 0;
 let autoScroll = true;
 let accountPollTimer = null;
+let currentMarket = 'KRX';
+let enabledMarkets = ['KRX'];
 
 // Stock card tracking: key = "cycleId:symbol" → { element, headerEl, bodyEl, stepsEl, activities[], outcome }
 let stockCards = {};
 
 // ── Init ──
-document.addEventListener('DOMContentLoaded', () => {
-  loadSettings();
+document.addEventListener('DOMContentLoaded', async () => {
+  await loadSettings();
   loadSystemStatus();
   loadReportList();
-  loadAllAccountInfo();
+  loadMarketAccountInfo();
   loadLLMStatus();
   loadLLMUsage();
   connectSSE();
   loadTodayActivities();
   setInterval(loadSystemStatus, 15000);
-  accountPollTimer = setInterval(loadAllAccountInfo, 30000);
+  accountPollTimer = setInterval(loadMarketAccountInfo, 30000);
   setInterval(loadLLMUsage, 60000);
 });
 
@@ -42,11 +44,11 @@ function connectSSE() {
         appendActivity(msg.data);
         if (msg.data && msg.data.phase === 'COMPLETE' &&
             ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
-          setTimeout(loadAllAccountInfo, 2000);
+          setTimeout(loadMarketAccountInfo, 2000);
         }
       }
       if (msg.type === 'account_changed') {
-        loadAllAccountInfo();
+        loadMarketAccountInfo();
       }
     } catch (err) {
       console.error('SSE parse error', err);
@@ -62,53 +64,62 @@ function connectSSE() {
   };
 }
 
-// ── Account Info ──
-function loadAllAccountInfo() {
-  loadAccountInfo();
-  loadUsAccountInfo();
+// ── Market Switching ──
+function switchMarket(market) {
+  if (market === currentMarket) return;
+  currentMarket = market;
+
+  // Update segmented control
+  const indicator = document.getElementById('market-seg-indicator');
+  const btns = document.querySelectorAll('.market-seg-btn');
+  btns.forEach(btn => btn.classList.toggle('active', btn.dataset.market === market));
+  if (indicator) indicator.classList.toggle('right', market !== 'KRX');
+
+  // Fade out data, reload, fade in
+  document.querySelectorAll('.account-data-transition').forEach(el => el.classList.add('switching'));
+  loadMarketAccountInfo().then(() => {
+    setTimeout(() => {
+      document.querySelectorAll('.account-data-transition').forEach(el => el.classList.remove('switching'));
+    }, 60);
+  });
+  loadSystemStatus();
 }
 
-async function loadAccountInfo() {
-  try {
-    const [balResp, holdResp, pendResp] = await Promise.all([
-      fetch(`${API}/account/balance`),
-      fetch(`${API}/account/holdings`),
-      fetch(`${API}/account/pending-orders`),
-    ]);
-    const balJson = await balResp.json();
-    const holdJson = await holdResp.json();
-    const pendJson = await pendResp.json();
-    renderAccountBalance(balJson.data);
-    renderAccountHoldings(holdJson.data);
-    renderPendingOrders(pendJson.data);
-  } catch (err) {
-    console.error('Account info error:', err);
-    const el = document.getElementById('account-info');
-    if (el) el.innerHTML = '<div class="text-gray-600">조회 실패</div>';
+function setupMarketTabs() {
+  const tabsEl = document.getElementById('market-tabs');
+  if (!tabsEl) return;
+  if (enabledMarkets.length > 1) {
+    tabsEl.classList.remove('hidden');
+    // Ensure correct initial state
+    const btns = document.querySelectorAll('.market-seg-btn');
+    btns.forEach(btn => btn.classList.toggle('active', btn.dataset.market === currentMarket));
+    const indicator = document.getElementById('market-seg-indicator');
+    if (indicator) indicator.classList.toggle('right', currentMarket !== 'KRX');
+  } else {
+    tabsEl.classList.add('hidden');
   }
 }
 
-async function loadUsAccountInfo() {
+// ── Account Info ──
+async function loadMarketAccountInfo() {
+  const market = currentMarket;
+  const marketParam = market === 'KRX' ? '' : `?market=${market}`;
   try {
     const [balResp, holdResp, pendResp] = await Promise.all([
-      fetch(`${API}/account/balance?market=NASDAQ`),
-      fetch(`${API}/account/holdings?market=NASDAQ`),
-      fetch(`${API}/account/pending-orders?market=NASDAQ`),
+      fetch(`${API}/account/balance${marketParam}`),
+      fetch(`${API}/account/holdings${marketParam}`),
+      fetch(`${API}/account/pending-orders${marketParam}`),
     ]);
     const balJson = await balResp.json();
     const holdJson = await holdResp.json();
     const pendJson = await pendResp.json();
-    renderUsAccountBalance(balJson.data);
-    renderUsAccountHoldings(holdJson.data);
-    renderUsPendingOrders(pendJson.data);
+    renderBalance(balJson.data, market);
+    renderHoldings(holdJson.data, market);
+    renderPendingOrders(pendJson.data, market);
   } catch (err) {
-    console.error('US account info error:', err);
-    const balanceEl = document.getElementById('us-account-info');
-    const holdingsEl = document.getElementById('us-holdings-info');
-    const pendingEl = document.getElementById('us-pending-orders-info');
-    if (balanceEl) balanceEl.innerHTML = '<div class="text-gray-600">조회 실패</div>';
-    if (holdingsEl) holdingsEl.innerHTML = '<div class="text-gray-600">조회 실패</div>';
-    if (pendingEl) pendingEl.innerHTML = '<div class="text-gray-600">조회 실패</div>';
+    console.error('Account info error:', err);
+    const el = document.getElementById('account-info');
+    if (el) el.textContent = '조회 실패';
   }
 }
 
@@ -122,12 +133,16 @@ function shouldShowRawPnl(data) {
     || hasMeaningfulDiff(data.raw_total_pnl_rate, data.total_pnl_rate, 0.01);
 }
 
-function renderAccountBalance(data) {
+function renderBalance(data, market) {
   const el = document.getElementById('account-info');
+  const badgeEl = document.getElementById('cash-source-badge');
   if (!el || !data) {
-    if (el) el.innerHTML = '<div class="text-gray-600">계좌 미연결</div>';
+    if (el) el.textContent = '계좌 미연결';
+    if (badgeEl) badgeEl.classList.add('hidden');
     return;
   }
+  const isUS = market !== 'KRX';
+  const exchangeRate = Number(data.exchange_rate_to_krw || 0);
   const effectiveCash = Number(data.effective_cash ?? data.cash ?? 0);
   const rawCash = Number(data.raw_cash ?? data.cash ?? 0);
   const totalPnl = Number(data.total_pnl ?? 0);
@@ -135,51 +150,100 @@ function renderAccountBalance(data) {
   const rawTotalPnl = Number(data.raw_total_pnl ?? totalPnl);
   const rawTotalPnlRate = Number(data.raw_total_pnl_rate ?? totalPnlRate);
   const pnlColor = totalPnl >= 0 ? 'text-green-400' : 'text-red-400';
-  const cashRatio = data.total_asset > 0
-    ? ((effectiveCash / data.total_asset) * 100).toFixed(1)
-    : '0.0';
-  const rawCashRow = Math.abs(effectiveCash - rawCash) >= 1
-    ? `<div class="flex justify-between">
-        <span class="text-gray-500">브로커 현금</span>
-        <span>${formatAmount(rawCash, 'KRW')}</span>
-      </div>`
-    : '';
-  const rawPnlRow = shouldShowRawPnl(data)
-    ? `<div class="flex justify-between">
-        <span class="text-gray-500">브로커 요약 손익</span>
-        <span class="text-gray-500">${formatSignedAmount(rawTotalPnl, 'KRW')} (${formatSignedAmount(rawTotalPnlRate, 'PCT')})</span>
-      </div>`
-    : '';
-  const proxyNote = data.cash_source === 'TOTAL_ASSET_PROXY'
-    ? `<div class="text-[11px] text-sky-300 leading-4">미국 모의투자 기준: 총자산 - 주식평가액으로 주문가능 현금을 추정합니다.</div>`
-    : '';
-  const pnlNote = data.pnl_source === 'HOLDINGS_SUM'
-    ? `<div class="text-[11px] text-sky-300 leading-4">해외 모의투자 손익은 보유종목 기준으로 재계산합니다.</div>`
-    : '';
-  el.innerHTML = `
-    <div class="flex justify-between">
-      <span class="text-gray-400">총자산</span>
-      <span class="text-white font-medium">${formatKRW(data.total_asset)}</span>
-    </div>
-    <div class="flex justify-between">
-      <span class="text-gray-400">실주문 기준 현금</span>
-      <span>${formatAmount(effectiveCash, 'KRW')} <span class="text-gray-600">(${cashRatio}%)</span></span>
-    </div>
-    ${rawCashRow}
-    <div class="flex justify-between">
-      <span class="text-gray-400">주식</span>
-      <span>${formatKRW(data.stock_value)}</span>
-    </div>
-    <div class="flex justify-between">
-      <span class="text-gray-400">손익</span>
-      <span class="${pnlColor}">${totalPnl >= 0 ? '+' : ''}${formatKRW(totalPnl)} (${totalPnlRate >= 0 ? '+' : ''}${totalPnlRate.toFixed(2)}%)</span>
-    </div>
-    ${rawPnlRow}
-    ${proxyNote}
-    ${pnlNote}`;
+  // Cash source badge (US only)
+  if (badgeEl) {
+    if (isUS) {
+      badgeEl.classList.remove('hidden');
+      badgeEl.textContent = data.cash_source === 'TOTAL_ASSET_PROXY' ? '총자산 프록시' : '브로커 현금';
+      badgeEl.className = data.cash_source === 'TOTAL_ASSET_PROXY'
+        ? 'px-2 py-0.5 rounded-full text-[10px] bg-sky-500/15 text-sky-300'
+        : 'px-2 py-0.5 rounded-full text-[10px] bg-slate-800 text-gray-300';
+    } else {
+      badgeEl.classList.add('hidden');
+    }
+  }
+  el.replaceChildren();
+  if (isUS) {
+    _renderBalanceUS(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor, exchangeRate);
+  } else {
+    _renderBalanceKRX(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor);
+  }
+}
+function _renderBalanceUS(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor, exchangeRate) {
+  const totalAssetUsd = convertKrwToUsd(data.total_asset, exchangeRate);
+  const effectiveCashUsd = convertKrwToUsd(effectiveCash, exchangeRate);
+  const rawCashUsd = convertKrwToUsd(rawCash, exchangeRate);
+  const stockValueUsd = convertKrwToUsd(data.stock_value, exchangeRate);
+  const rows = [];
+  rows.push(_dualRow('총자산', formatAmount(totalAssetUsd, 'USD'), formatAmount(data.total_asset, 'KRW'), 'text-white font-medium'));
+  rows.push(_dualRow('실주문 기준 현금', formatAmount(effectiveCashUsd, 'USD'), formatAmount(effectiveCash, 'KRW'), 'text-sky-300 font-medium'));
+  if (Math.abs(effectiveCash - rawCash) >= 1)
+    rows.push(_dualRow('브로커 현금', formatAmount(rawCashUsd, 'USD'), formatAmount(rawCash, 'KRW'), 'text-gray-300'));
+  rows.push(_dualRow('주식 평가', formatAmount(stockValueUsd, 'USD'), formatAmount(data.stock_value, 'KRW'), 'text-gray-200'));
+  rows.push(_dualRow('손익', formatSignedAmount(totalPnlRate, 'PCT'), formatSignedAmount(totalPnl, 'KRW'), pnlColor));
+  if (shouldShowRawPnl(data))
+    rows.push(_dualRow('브로커 요약 손익', formatSignedAmount(rawTotalPnlRate, 'PCT'), formatSignedAmount(rawTotalPnl, 'KRW'), 'text-gray-400'));
+  rows.push(_noteRow(`환율 ${exchangeRate ? exchangeRate.toFixed(2) : '-'} KRW/USD`));
+  if (data.pnl_source === 'HOLDINGS_SUM') rows.push(_noteRow('모의투자 손익은 보유종목 기준으로 재계산합니다.'));
+  if (data.status_message) rows.push(_noteRow(data.status_message, 'text-gray-500'));
+  rows.forEach(r => el.appendChild(r));
+}
+function _renderBalanceKRX(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor) {
+  const cashRatio = data.total_asset > 0 ? ((effectiveCash / data.total_asset) * 100).toFixed(1) : '0.0';
+  const rows = [];
+  rows.push(_singleRow('총자산', formatKRW(data.total_asset), 'text-white font-medium'));
+  rows.push(_singleRow('실주문 기준 현금', `${formatAmount(effectiveCash, 'KRW')} (${cashRatio}%)`));
+  if (Math.abs(effectiveCash - rawCash) >= 1) rows.push(_singleRow('브로커 현금', formatAmount(rawCash, 'KRW')));
+  rows.push(_singleRow('주식', formatKRW(data.stock_value)));
+  const pnlText = `${totalPnl >= 0 ? '+' : ''}${formatKRW(totalPnl)} (${totalPnlRate >= 0 ? '+' : ''}${totalPnlRate.toFixed(2)}%)`;
+  rows.push(_singleRow('손익', pnlText, pnlColor));
+  if (shouldShowRawPnl(data))
+    rows.push(_singleRow('브로커 요약 손익', `${formatSignedAmount(rawTotalPnl, 'KRW')} (${formatSignedAmount(rawTotalPnlRate, 'PCT')})`, 'text-gray-500'));
+  if (data.cash_source === 'TOTAL_ASSET_PROXY') rows.push(_noteRow('총자산 - 주식평가액으로 주문가능 현금을 추정합니다.'));
+  if (data.pnl_source === 'HOLDINGS_SUM') rows.push(_noteRow('손익은 보유종목 기준으로 재계산합니다.'));
+  rows.forEach(r => el.appendChild(r));
+}
+function _singleRow(label, value, valueClass) {
+  const row = document.createElement('div');
+  row.className = 'flex justify-between';
+  const lbl = document.createElement('span');
+  lbl.className = 'text-gray-400';
+  lbl.textContent = label;
+  const val = document.createElement('span');
+  val.className = valueClass || '';
+  val.textContent = value;
+  row.appendChild(lbl);
+  row.appendChild(val);
+  return row;
+}
+function _dualRow(label, primary, secondary, primaryClass) {
+  const row = document.createElement('div');
+  row.className = 'flex justify-between gap-3';
+  const lbl = document.createElement('span');
+  lbl.className = 'text-gray-500';
+  lbl.textContent = label;
+  const right = document.createElement('div');
+  right.className = 'text-right';
+  const p = document.createElement('div');
+  p.className = primaryClass || '';
+  p.textContent = primary;
+  const s = document.createElement('div');
+  s.className = 'text-gray-600';
+  s.textContent = secondary;
+  right.appendChild(p);
+  right.appendChild(s);
+  row.appendChild(lbl);
+  row.appendChild(right);
+  return row;
+}
+function _noteRow(text, cls) {
+  const row = document.createElement('div');
+  row.className = cls || 'text-[11px] leading-4 text-sky-300';
+  row.textContent = text;
+  return row;
 }
 
-function renderAccountHoldings(data) {
+function renderHoldings(data, market) {
   const el = document.getElementById('holdings-info');
   const countEl = document.getElementById('holdings-count');
   const sectionEl = document.getElementById('holdings-section');
@@ -190,34 +254,117 @@ function renderAccountHoldings(data) {
   }
   if (sectionEl) sectionEl.style.display = '';
   if (countEl) countEl.textContent = `${data.length}종목`;
-  el.innerHTML = data.map(h => {
+  const isUS = market !== 'KRX';
+  el.replaceChildren();
+  data.forEach(h => {
     const pnlColor = h.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
-    const currency = h.currency || 'KRW';
+    const currency = h.currency || (isUS ? 'USD' : 'KRW');
     const evalAmt = h.current_price * h.quantity;
-    const evalSecondary = currency === 'KRW'
-      ? ''
-      : `<span class="text-gray-600">${formatAmount(evalAmt * (h.exchange_rate_to_krw || 0), 'KRW')}</span>`;
-    const pnlSecondary = currency === 'KRW'
-      ? ''
-      : `<span class="text-gray-600">${formatAmount(h.pnl * (h.exchange_rate_to_krw || 0), 'KRW')}</span>`;
-    return `<div class="border border-gray-700 rounded p-1.5 space-y-0.5">
-      <div class="flex justify-between items-center">
-        <span class="text-gray-200 font-medium truncate" title="${h.symbol}">${h.name}</span>
-        <span class="${pnlColor} font-medium">${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%</span>
-      </div>
-      <div class="flex justify-between text-gray-500">
-        <span>${h.quantity}주 | 평단 ${formatAmount(h.avg_buy_price, currency)}</span>
-        <span>현재 ${formatAmount(h.current_price, currency)}</span>
-      </div>
-      <div class="flex justify-between text-gray-500">
-        <span>평가 ${formatAmount(evalAmt, currency)} ${evalSecondary}</span>
-        <span class="${pnlColor}">${formatSignedAmount(h.pnl, currency)} ${pnlSecondary}</span>
-      </div>
-    </div>`;
-  }).join('');
+    const card = document.createElement('div');
+    if (isUS) {
+      card.className = 'rounded-lg border border-sky-950/70 bg-slate-950/60 p-2 space-y-1';
+      _buildUSHoldingCard(card, h, pnlColor, currency, evalAmt);
+    } else {
+      card.className = 'border border-gray-700 rounded p-1.5 space-y-0.5';
+      _buildKRXHoldingCard(card, h, pnlColor, currency, evalAmt);
+    }
+    el.appendChild(card);
+  });
+}
+function _buildUSHoldingCard(card, h, pnlColor, currency, evalAmt) {
+  const evalAmtKrw = evalAmt * (h.exchange_rate_to_krw || 0);
+  const pnlKrw = h.pnl * (h.exchange_rate_to_krw || 0);
+  // Row 1: name + pnl rate
+  const r1 = document.createElement('div');
+  r1.className = 'flex justify-between items-center gap-2';
+  const nameBlock = document.createElement('div');
+  nameBlock.className = 'min-w-0';
+  const nameEl = document.createElement('div');
+  nameEl.className = 'text-gray-100 font-medium truncate';
+  nameEl.title = h.symbol;
+  nameEl.textContent = h.name;
+  const subEl = document.createElement('div');
+  subEl.className = 'text-[11px] text-gray-500';
+  subEl.textContent = `${h.symbol} \u00b7 ${h.quantity}주`;
+  nameBlock.appendChild(nameEl);
+  nameBlock.appendChild(subEl);
+  const rateEl = document.createElement('span');
+  rateEl.className = `${pnlColor} font-medium`;
+  rateEl.textContent = formatSignedAmount(h.pnl_rate, 'PCT');
+  r1.appendChild(nameBlock);
+  r1.appendChild(rateEl);
+  card.appendChild(r1);
+  // Row 2: avg + current
+  const r2 = _flexRow(`평단 ${formatAmount(h.avg_buy_price, currency)}`, `현재 ${formatAmount(h.current_price, currency)}`, 'text-gray-400');
+  card.appendChild(r2);
+  // Row 3: eval
+  card.appendChild(_flexRow(`평가 ${formatAmount(evalAmt, currency)}`, formatAmount(evalAmtKrw, 'KRW'), 'text-gray-500'));
+  // Row 4: pnl
+  const r4 = document.createElement('div');
+  r4.className = 'flex justify-between text-gray-500';
+  const p1 = document.createElement('span');
+  p1.className = pnlColor;
+  p1.textContent = formatSignedAmount(h.pnl, currency);
+  const p2 = document.createElement('span');
+  p2.className = pnlColor;
+  p2.textContent = formatSignedAmount(pnlKrw, 'KRW');
+  r4.appendChild(p1);
+  r4.appendChild(p2);
+  card.appendChild(r4);
+}
+function _buildKRXHoldingCard(card, h, pnlColor, currency, evalAmt) {
+  // Row 1: name + pnl rate
+  const r1 = document.createElement('div');
+  r1.className = 'flex justify-between items-center';
+  const nameEl = document.createElement('span');
+  nameEl.className = 'text-gray-200 font-medium truncate';
+  nameEl.title = h.symbol;
+  nameEl.textContent = h.name;
+  const rateEl = document.createElement('span');
+  rateEl.className = `${pnlColor} font-medium`;
+  rateEl.textContent = `${h.pnl_rate >= 0 ? '+' : ''}${h.pnl_rate.toFixed(2)}%`;
+  r1.appendChild(nameEl);
+  r1.appendChild(rateEl);
+  card.appendChild(r1);
+  // Row 2
+  card.appendChild(_flexRow(`${h.quantity}주 | 평단 ${formatAmount(h.avg_buy_price, currency)}`, `현재 ${formatAmount(h.current_price, currency)}`, 'text-gray-500'));
+  // Row 3
+  const r3 = document.createElement('div');
+  r3.className = 'flex justify-between text-gray-500';
+  const evalEl = document.createElement('span');
+  evalEl.textContent = `평가 ${formatAmount(evalAmt, currency)}`;
+  if (currency !== 'KRW') {
+    const sec = document.createElement('span');
+    sec.className = 'text-gray-600 ml-1';
+    sec.textContent = formatAmount(evalAmt * (h.exchange_rate_to_krw || 0), 'KRW');
+    evalEl.appendChild(sec);
+  }
+  const pnlEl = document.createElement('span');
+  pnlEl.className = pnlColor;
+  pnlEl.textContent = formatSignedAmount(h.pnl, currency);
+  if (currency !== 'KRW') {
+    const sec2 = document.createElement('span');
+    sec2.className = 'text-gray-600 ml-1';
+    sec2.textContent = formatSignedAmount(h.pnl * (h.exchange_rate_to_krw || 0), 'KRW');
+    pnlEl.appendChild(sec2);
+  }
+  r3.appendChild(evalEl);
+  r3.appendChild(pnlEl);
+  card.appendChild(r3);
+}
+function _flexRow(left, right, cls) {
+  const row = document.createElement('div');
+  row.className = `flex justify-between ${cls || ''}`;
+  const l = document.createElement('span');
+  l.textContent = left;
+  const r = document.createElement('span');
+  r.textContent = right;
+  row.appendChild(l);
+  row.appendChild(r);
+  return row;
 }
 
-function renderPendingOrders(data) {
+function renderPendingOrders(data, market) {
   const el = document.getElementById('pending-orders-info');
   const countEl = document.getElementById('pending-count');
   const sectionEl = document.getElementById('pending-section');
@@ -227,203 +374,72 @@ function renderPendingOrders(data) {
     return;
   }
   if (sectionEl) sectionEl.style.display = '';
-  if (countEl) {
-    const totalAmt = data.reduce((s, o) => s + o.order_price * o.remaining_qty, 0);
-    const currency = data[0]?.currency || 'KRW';
-    countEl.textContent = `${data.length}건 (${formatAmount(totalAmt, currency)})`;
-  }
-  el.innerHTML = data.map(o => {
+  const isUS = market !== 'KRX';
+  const defaultCurrency = isUS ? 'USD' : 'KRW';
+  const totalAmt = data.reduce((s, o) => s + o.order_price * o.remaining_qty, 0);
+  if (countEl) countEl.textContent = `${data.length}건 (${formatAmount(totalAmt, data[0]?.currency || defaultCurrency)})`;
+  el.replaceChildren();
+  data.forEach(o => {
     const sideColor = o.side === '매수' ? 'text-red-400' : 'text-blue-400';
-    const borderColor = o.side === '매수' ? 'border-yellow-700/60' : 'border-yellow-700/60';
-    const currency = o.currency || 'KRW';
+    const currency = o.currency || defaultCurrency;
     const orderAmt = o.order_price * o.remaining_qty;
-    const timeStr = o.order_time ? o.order_time.slice(0,2) + ':' + o.order_time.slice(2,4) + ':' + o.order_time.slice(4,6) : '';
-    const converted = currency === 'KRW'
-      ? ''
-      : `<span class="text-gray-600">${formatAmount(orderAmt * (o.exchange_rate_to_krw || 0), 'KRW')}</span>`;
-    return `<div class="border ${borderColor} bg-yellow-900/10 rounded p-1.5 space-y-0.5">
-      <div class="flex justify-between items-center">
-        <span class="text-gray-200 font-medium truncate" title="${o.symbol}">${o.name}</span>
-        <span class="${sideColor} font-medium text-xs px-1.5 py-0.5 rounded ${o.side === '매수' ? 'bg-red-900/30' : 'bg-blue-900/30'}">${o.side}</span>
-      </div>
-      <div class="flex justify-between text-gray-500">
-        <span>미체결 ${o.remaining_qty}주 / ${o.order_qty}주</span>
-        <span>${formatAmount(o.order_price, currency)}</span>
-      </div>
-      <div class="flex justify-between text-gray-500">
-        <span>${formatAmount(orderAmt, currency)} ${converted}</span>
-        <span>${timeStr}</span>
-      </div>
-    </div>`;
-  }).join('');
+    const timeStr = o.order_time
+      ? `${o.order_time.slice(0, 2)}:${o.order_time.slice(2, 4)}:${o.order_time.slice(4, 6)}` : '';
+    const card = document.createElement('div');
+    if (isUS) {
+      card.className = 'rounded-lg border border-amber-900/50 bg-amber-950/10 p-2 space-y-1';
+      _buildUSPendingCard(card, o, sideColor, currency, orderAmt, timeStr);
+    } else {
+      card.className = 'border border-yellow-700/60 bg-yellow-900/10 rounded p-1.5 space-y-0.5';
+      _buildKRXPendingCard(card, o, sideColor, currency, orderAmt, timeStr);
+    }
+    el.appendChild(card);
+  });
 }
-
-function renderUsAccountBalance(data) {
-  const el = document.getElementById('us-account-info');
-  const badgeEl = document.getElementById('us-cash-source-badge');
-  if (!el || !badgeEl || !data) {
-    if (el) el.innerHTML = '<div class="text-gray-600">미국 계좌 미연결</div>';
-    return;
-  }
-
-  const exchangeRate = Number(data.exchange_rate_to_krw || 0);
-  const effectiveCash = Number(data.effective_cash ?? data.cash ?? 0);
-  const rawCash = Number(data.raw_cash ?? data.cash ?? 0);
-  const totalPnl = Number(data.total_pnl ?? 0);
-  const totalPnlRate = Number(data.total_pnl_rate ?? 0);
-  const rawTotalPnl = Number(data.raw_total_pnl ?? totalPnl);
-  const rawTotalPnlRate = Number(data.raw_total_pnl_rate ?? totalPnlRate);
-  const totalAssetUsd = convertKrwToUsd(data.total_asset, exchangeRate);
-  const effectiveCashUsd = convertKrwToUsd(effectiveCash, exchangeRate);
-  const rawCashUsd = convertKrwToUsd(rawCash, exchangeRate);
-  const stockValueUsd = convertKrwToUsd(data.stock_value, exchangeRate);
-  const pnlColor = totalPnl >= 0 ? 'text-green-400' : 'text-red-400';
-
-  badgeEl.textContent = data.cash_source === 'TOTAL_ASSET_PROXY' ? '총자산 프록시' : '브로커 현금';
-  badgeEl.className = data.cash_source === 'TOTAL_ASSET_PROXY'
-    ? 'px-2 py-0.5 rounded-full text-[10px] bg-sky-500/15 text-sky-300'
-    : 'px-2 py-0.5 rounded-full text-[10px] bg-slate-800 text-gray-300';
-
-  const rawCashRow = Math.abs(effectiveCash - rawCash) >= 1
-    ? `<div class="flex justify-between gap-3">
-        <span class="text-gray-500">브로커 현금</span>
-        <div class="text-right">
-          <div class="text-gray-300">${formatAmount(rawCashUsd, 'USD')}</div>
-        <div class="text-gray-600">${formatAmount(rawCash, 'KRW')}</div>
-      </div>
-      </div>`
-    : '';
-  const rawPnlRow = shouldShowRawPnl(data)
-    ? `<div class="flex justify-between gap-3">
-        <span class="text-gray-500">브로커 요약 손익</span>
-        <div class="text-right">
-          <div class="text-gray-400">${formatSignedAmount(rawTotalPnlRate, 'PCT')}</div>
-          <div class="text-gray-500">${formatSignedAmount(rawTotalPnl, 'KRW')}</div>
-        </div>
-      </div>`
-    : '';
-  const pnlNote = data.pnl_source === 'HOLDINGS_SUM'
-    ? `<div class="text-[11px] leading-4 text-sky-300">모의투자 손익은 보유종목 기준으로 재계산합니다.</div>`
-    : '';
-  const statusRow = data.status_message
-    ? `<div class="text-[11px] leading-4 text-gray-500">${escapeHtml(data.status_message)}</div>`
-    : '';
-
-  el.innerHTML = `
-    <div class="flex justify-between gap-3">
-      <span class="text-gray-500">총자산</span>
-      <div class="text-right">
-        <div class="text-white font-medium">${formatAmount(totalAssetUsd, 'USD')}</div>
-        <div class="text-gray-600">${formatAmount(data.total_asset, 'KRW')}</div>
-      </div>
-    </div>
-    <div class="flex justify-between gap-3">
-      <span class="text-gray-500">실주문 기준 현금</span>
-      <div class="text-right">
-        <div class="text-sky-300 font-medium">${formatAmount(effectiveCashUsd, 'USD')}</div>
-        <div class="text-gray-600">${formatAmount(effectiveCash, 'KRW')}</div>
-      </div>
-    </div>
-    ${rawCashRow}
-    <div class="flex justify-between gap-3">
-      <span class="text-gray-500">주식 평가</span>
-      <div class="text-right">
-        <div class="text-gray-200">${formatAmount(stockValueUsd, 'USD')}</div>
-        <div class="text-gray-600">${formatAmount(data.stock_value, 'KRW')}</div>
-      </div>
-    </div>
-    <div class="flex justify-between gap-3">
-      <span class="text-gray-500">손익</span>
-      <div class="text-right">
-        <div class="${pnlColor}">${formatSignedAmount(totalPnlRate, 'PCT')}</div>
-        <div class="${pnlColor}">${formatSignedAmount(totalPnl, 'KRW')}</div>
-      </div>
-    </div>
-    ${rawPnlRow}
-    <div class="text-[11px] leading-4 text-sky-300">환율 ${exchangeRate ? exchangeRate.toFixed(2) : '-'} KRW/USD</div>
-    ${pnlNote}
-    ${statusRow}`;
+function _buildUSPendingCard(card, o, sideColor, currency, orderAmt, timeStr) {
+  const orderAmtKrw = orderAmt * (o.exchange_rate_to_krw || 0);
+  // Row 1: name + side
+  const r1 = document.createElement('div');
+  r1.className = 'flex justify-between items-center gap-2';
+  const nameBlock = document.createElement('div');
+  nameBlock.className = 'min-w-0';
+  const nameEl = document.createElement('div');
+  nameEl.className = 'text-gray-100 font-medium truncate';
+  nameEl.title = o.symbol;
+  nameEl.textContent = o.name || o.symbol;
+  const subEl = document.createElement('div');
+  subEl.className = 'text-[11px] text-gray-500';
+  subEl.textContent = o.symbol;
+  nameBlock.appendChild(nameEl);
+  nameBlock.appendChild(subEl);
+  const sideEl = document.createElement('span');
+  sideEl.className = `${sideColor} text-xs font-medium`;
+  sideEl.textContent = o.side;
+  r1.appendChild(nameBlock);
+  r1.appendChild(sideEl);
+  card.appendChild(r1);
+  card.appendChild(_flexRow(`미체결 ${o.remaining_qty}주 / ${o.order_qty}주`, formatAmount(o.order_price, currency), 'text-gray-400'));
+  card.appendChild(_flexRow(`${formatAmount(orderAmt, currency)} \u00b7 ${formatAmount(orderAmtKrw, 'KRW')}`, timeStr, 'text-gray-500'));
 }
-
-function renderUsAccountHoldings(data) {
-  const el = document.getElementById('us-holdings-info');
-  const countEl = document.getElementById('us-holdings-count');
-  if (!el || !countEl) return;
-
-  if (!data || !data.length) {
-    countEl.textContent = '0종목';
-    el.innerHTML = '<div class="text-gray-600">보유 없음</div>';
-    return;
-  }
-
-  countEl.textContent = `${data.length}종목`;
-  el.innerHTML = data.map((holding) => {
-    const pnlColor = holding.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
-    const evalAmt = holding.current_price * holding.quantity;
-    const evalAmtKrw = evalAmt * (holding.exchange_rate_to_krw || 0);
-    const pnlKrw = holding.pnl * (holding.exchange_rate_to_krw || 0);
-    return `<div class="rounded-lg border border-sky-950/70 bg-slate-950/60 p-2 space-y-1">
-      <div class="flex justify-between items-center gap-2">
-        <div class="min-w-0">
-          <div class="text-gray-100 font-medium truncate" title="${holding.symbol}">${holding.name}</div>
-          <div class="text-[11px] text-gray-500">${holding.symbol} · ${holding.quantity}주</div>
-        </div>
-        <span class="${pnlColor} font-medium">${formatSignedAmount(holding.pnl_rate, 'PCT')}</span>
-      </div>
-      <div class="flex justify-between text-gray-400">
-        <span>평단 ${formatAmount(holding.avg_buy_price, holding.currency)}</span>
-        <span>현재 ${formatAmount(holding.current_price, holding.currency)}</span>
-      </div>
-      <div class="flex justify-between text-gray-500">
-        <span>평가 ${formatAmount(evalAmt, holding.currency)}</span>
-        <span>${formatAmount(evalAmtKrw, 'KRW')}</span>
-      </div>
-      <div class="flex justify-between text-gray-500">
-        <span class="${pnlColor}">${formatSignedAmount(holding.pnl, holding.currency)}</span>
-        <span class="${pnlColor}">${formatSignedAmount(pnlKrw, 'KRW')}</span>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-function renderUsPendingOrders(data) {
-  const el = document.getElementById('us-pending-orders-info');
-  const countEl = document.getElementById('us-pending-count');
-  if (!el || !countEl) return;
-
-  if (!data || !data.length) {
-    countEl.textContent = '0건';
-    el.innerHTML = '<div class="text-gray-600">미체결 없음</div>';
-    return;
-  }
-
-  const totalAmt = data.reduce((sum, order) => sum + (order.order_price * order.remaining_qty), 0);
-  countEl.textContent = `${data.length}건 (${formatAmount(totalAmt, data[0]?.currency || 'USD')})`;
-  el.innerHTML = data.map((order) => {
-    const sideColor = order.side === '매수' ? 'text-red-400' : 'text-blue-400';
-    const orderAmt = order.order_price * order.remaining_qty;
-    const orderAmtKrw = orderAmt * (order.exchange_rate_to_krw || 0);
-    const timeStr = order.order_time
-      ? `${order.order_time.slice(0, 2)}:${order.order_time.slice(2, 4)}:${order.order_time.slice(4, 6)}`
-      : '-';
-    return `<div class="rounded-lg border border-amber-900/50 bg-amber-950/10 p-2 space-y-1">
-      <div class="flex justify-between items-center gap-2">
-        <div class="min-w-0">
-          <div class="text-gray-100 font-medium truncate" title="${order.symbol}">${order.name || order.symbol}</div>
-          <div class="text-[11px] text-gray-500">${order.symbol}</div>
-        </div>
-        <span class="${sideColor} text-xs font-medium">${order.side}</span>
-      </div>
-      <div class="flex justify-between text-gray-400">
-        <span>미체결 ${order.remaining_qty}주 / ${order.order_qty}주</span>
-        <span>${formatAmount(order.order_price, order.currency || 'USD')}</span>
-      </div>
-      <div class="flex justify-between text-gray-500">
-        <span>${formatAmount(orderAmt, order.currency || 'USD')} · ${formatAmount(orderAmtKrw, 'KRW')}</span>
-        <span>${timeStr}</span>
-      </div>
-    </div>`;
-  }).join('');
+function _buildKRXPendingCard(card, o, sideColor, currency, orderAmt, timeStr) {
+  // Row 1: name + side badge
+  const r1 = document.createElement('div');
+  r1.className = 'flex justify-between items-center';
+  const nameEl = document.createElement('span');
+  nameEl.className = 'text-gray-200 font-medium truncate';
+  nameEl.title = o.symbol;
+  nameEl.textContent = o.name;
+  const sideEl = document.createElement('span');
+  sideEl.className = `${sideColor} font-medium text-xs px-1.5 py-0.5 rounded ${o.side === '매수' ? 'bg-red-900/30' : 'bg-blue-900/30'}`;
+  sideEl.textContent = o.side;
+  r1.appendChild(nameEl);
+  r1.appendChild(sideEl);
+  card.appendChild(r1);
+  card.appendChild(_flexRow(`미체결 ${o.remaining_qty}주 / ${o.order_qty}주`, formatAmount(o.order_price, currency), 'text-gray-500'));
+  // Row 3: amount + time
+  const r3Left = formatAmount(orderAmt, currency);
+  const converted = currency !== 'KRW' ? ` ${formatAmount(orderAmt * (o.exchange_rate_to_krw || 0), 'KRW')}` : '';
+  card.appendChild(_flexRow(r3Left + converted, timeStr, 'text-gray-500'));
 }
 
 function toggleSettings() {
@@ -1139,6 +1155,12 @@ async function loadSettings() {
     if (riskEl && s.RISK_APPETITE) riskEl.value = s.RISK_APPETITE;
     updateBadge('badge-trading', s.TRADING_ENABLED ? '매매:ON' : '매매:OFF', s.TRADING_ENABLED ? 'green' : 'red');
     updateBadge('badge-mode', s.AUTONOMY_MODE, 'purple');
+    // Market tabs setup
+    if (s.ENABLED_MARKET_GROUPS && s.ENABLED_MARKET_GROUPS.length) {
+      enabledMarkets = s.ENABLED_MARKET_GROUPS;
+      if (!enabledMarkets.includes(currentMarket)) currentMarket = enabledMarkets[0];
+    }
+    setupMarketTabs();
   } catch (err) {
     console.error('Settings load error:', err);
   }
@@ -1327,7 +1349,7 @@ function formatReasoningEffortLabel(effort, provider) {
 // ── System Status ──
 async function loadSystemStatus() {
   try {
-    const resp = await fetch(`${API}/system/status`);
+    const resp = await fetch(`${API}/system/status?market=${currentMarket}`);
     const json = await resp.json();
     const s = json.data;
     if (!s) return;
@@ -1395,7 +1417,7 @@ async function triggerCycle() {
   if (triggerPending) return;
   triggerPending = true;
   try {
-    await fetch(`${API}/agent/trigger`, { method: 'POST' });
+    await fetch(`${API}/agent/trigger?market=${currentMarket}`, { method: 'POST' });
   } catch (err) {
     console.error('Trigger error:', err);
   } finally {
