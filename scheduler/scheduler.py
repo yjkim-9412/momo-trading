@@ -241,33 +241,39 @@ class TradingScheduler:
         """장 시작 전 준비 — 어제 리뷰 피드백 확인"""
         from scheduler.market_calendar import market_calendar
         from services.activity_logger import activity_logger
-        from trading.market_profile import market_timezone
+        from trading.market_profile import market_scope, market_timezone
 
-        if market_calendar.is_holiday(market):
-            holiday_name = market_calendar.get_holiday_name(market=market) or "공휴일"
-            logger.info("[{}] 오늘은 휴장일 ({}) — 장 시작 전 준비 스킵", market, holiday_name)
+        scope = market_scope(market)
+        trading_date = market_calendar.market_date(market=scope)
+
+        with activity_logger.context(market_scope=scope, trading_date=trading_date):
+            if market_calendar.is_holiday(market):
+                holiday_name = market_calendar.get_holiday_name(market=market) or "공휴일"
+                logger.info("[{}] 오늘은 휴장일 ({}) — 장 시작 전 준비 스킵", market, holiday_name)
+                await activity_logger.log(
+                    ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
+                    f"\U0001f3d6\ufe0f [{market}] 오늘은 휴장일 ({holiday_name}) — 매매 스킵",
+                )
+                return
+
+            logger.info("=== [{}] 장 시작 전 준비 ===", market)
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-                f"\U0001f3d6\ufe0f [{market}] 오늘은 휴장일 ({holiday_name}) — 매매 스킵",
+                f"\u2615 [{market}] 장 시작 전 준비 — 곧 개장",
             )
-            return
 
-        logger.info("=== [{}] 장 시작 전 준비 ===", market)
-        await activity_logger.log(
-            ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
-            f"\u2615 [{market}] 장 시작 전 준비 — 곧 개장",
-        )
+            # 1. 일일 기준 자산 설정 (데이트레이딩 손익 계산용)
+            try:
+                from agent.trading_agent import trading_agent
+                from trading.account_manager import account_manager
 
-        # 1. 일일 기준 자산 설정 (데이트레이딩 손익 계산용)
-        try:
-            from agent.trading_agent import trading_agent
-            from trading.account_manager import account_manager
-
-            balance = await account_manager.get_balance(market)
-            trading_agent._get_state(market).daily_start_balance = balance.total_asset
-            logger.info("[{}] 일일 기준 자산 설정: {:,.0f}원", market, balance.total_asset)
-        except Exception as e:
-            logger.warning("[{}] 기준 자산 설정 실패: {}", market, str(e))
+                balance = await account_manager.get_balance(market)
+                runtime = trading_agent.get_runtime(scope)
+                runtime.daily_start_balance = balance.total_asset
+                runtime.trading_date = trading_date
+                logger.info("[{}] 일일 기준 자산 설정: {:,.0f}원", market, balance.total_asset)
+            except Exception as e:
+                logger.warning("[{}] 기준 자산 설정 실패: {}", market, str(e))
 
         # 2. 어제 리뷰 피드백 확인 (AI 학습용)
         try:
@@ -281,7 +287,7 @@ class TradingScheduler:
             yesterday = (now_kst().astimezone(tz) - timedelta(days=1)).date()
             async with AsyncSessionLocal() as session:
                 repo = DailyReportRepository(session)
-                report = await repo.get_by_date(yesterday)
+                report = await repo.get_by_date(yesterday, market_scope=scope)
                 if report and report.lessons_learned:
                     await activity_logger.log(
                         ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
@@ -300,17 +306,16 @@ class TradingScheduler:
             from agent.trading_agent import trading_agent
             from strategy.risk_manager import risk_manager
 
-            active_rules = await trading_rule_engine.load_active_rules()
+            active_rules = await trading_rule_engine.load_active_rules(scope)
             rules = active_rules.get("rules", [])
 
             if rules:
+                runtime = trading_agent.get_runtime(scope)
                 trading_rule_engine.apply_to_strategies(
-                    trading_agent.strategies, active_rules,
+                    runtime.strategies, active_rules,
                 )
-                trading_rule_engine.apply_to_risk_manager(
-                    risk_manager, active_rules,
-                )
-                trading_agent._active_trading_rules = active_rules
+                runtime.active_trading_rules = active_rules
+                runtime.rr_floor_overrides = active_rules.get("rr_floor_overrides", {})
 
                 rule_summary = ", ".join(
                     f"{r.param_name}={r.param_value}" for r in rules[:5]
@@ -320,10 +325,11 @@ class TradingScheduler:
                     f"📋 [{market}] 트레이딩 규칙 {len(rules)}건 적용: {rule_summary}",
                 )
                 await trading_rule_engine.record_application(
-                    [r.id for r in rules]
+                    [r.id for r in rules],
+                    market_scope=scope,
                 )
 
-            expired = await trading_rule_engine.expire_old_rules()
+            expired = await trading_rule_engine.expire_old_rules(scope)
             if expired:
                 logger.info("[{}] 만료된 트레이딩 규칙 {}건 비활성화", market, expired)
         except Exception as e:
@@ -388,7 +394,7 @@ class TradingScheduler:
 
             if all_symbols:
                 from realtime.stream_manager import stream_manager
-                await stream_manager.update_subscriptions(all_symbols)
+                await stream_manager.replace_market_subscriptions(market, all_symbols)
 
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
@@ -446,7 +452,7 @@ class TradingScheduler:
                 holding_symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
                 all_symbols = list({(m, symbol): (symbol, m) for symbol, m in selected + holding_symbols}.values())[:41]
                 if all_symbols:
-                    await stream_manager.update_subscriptions(all_symbols)
+                    await stream_manager.replace_market_subscriptions(market, all_symbols)
 
             await activity_logger.log(
                 ActivityType.SCHEDULE, ActivityPhase.PROGRESS,
@@ -465,7 +471,7 @@ class TradingScheduler:
             holdings = await account_manager.get_holdings(market)
             if holdings:
                 symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
-                await stream_manager.update_subscriptions(symbols)
+                await stream_manager.replace_market_subscriptions(market, symbols)
                 logger.info("[{}] WebSocket 구독 갱신: {}종목", market, len(symbols))
         except Exception as e:
             logger.warning("[{}] WebSocket 구독 갱신 실패: {}", market, str(e))
@@ -623,16 +629,17 @@ class TradingScheduler:
         from core.database import AsyncSessionLocal
         from repositories.daily_report_repository import DailyReportRepository
         from scheduler.market_calendar import market_calendar
-        from trading.market_profile import market_timezone
+        from trading.market_profile import market_scope, market_timezone
         from zoneinfo import ZoneInfo
 
+        scope = market_scope(market)
         tz = ZoneInfo(market_timezone(market))
         market_now = now_kst().astimezone(tz)
-        today = market_now.date()
+        today = market_calendar.market_date(market=scope)
 
         async with AsyncSessionLocal() as session:
             repo = DailyReportRepository(session)
-            existing = await repo.get_by_date(today)
+            existing = await repo.get_by_date(today, market_scope=scope)
             if existing:
                 logger.info("[{}] 오늘 리포트 이미 존재 — 장외 리뷰 스킵", market)
                 return

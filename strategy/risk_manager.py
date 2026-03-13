@@ -50,6 +50,7 @@ class RiskManager:
         cycle_id: str | None = None,
         dynamic_limits: dict | None = None,
         market_regime: str = "",
+        rr_floor_overrides: dict[str, float] | None = None,
     ) -> dict:
         """
         리스크 검사
@@ -137,7 +138,10 @@ class RiskManager:
             risk = abs(entry - stop)
             if risk > 0:
                 rr_ratio = reward / risk
-                min_rr = self.RR_FLOOR.get(market_regime, 1.2)
+                min_rr = (rr_floor_overrides or {}).get(
+                    market_regime,
+                    self.RR_FLOOR.get(market_regime, 1.2),
+                )
                 if rr_ratio < min_rr:
                     result = {
                         "approved": False,

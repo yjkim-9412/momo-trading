@@ -27,7 +27,7 @@ class AIRiskTuner:
         cycle_id: str | None = None,
     ) -> dict:
         """적정 한도 계산"""
-        from trading.market_profile import normalize_market
+        from trading.market_profile import market_scope, normalize_market
 
         target = normalize_market(market or settings.primary_market_code)
         timer = activity_logger.timer()
@@ -41,7 +41,7 @@ class AIRiskTuner:
             try:
                 async with AsyncSessionLocal() as session:
                     tracker = PerformanceTracker(session)
-                    stats = await tracker.get_overall_stats()
+                    stats = await tracker.get_overall_stats(market_scope=market_scope(target))
                     overall = stats.get("overall")
                     if overall and overall.total_trades > 0:
                         performance_summary = (
@@ -79,7 +79,10 @@ class AIRiskTuner:
             )
 
             result_text, provider = await llm_factory.generate_tier1(
-                prompt, system_prompt=RISK_TUNING_SYSTEM
+                prompt,
+                system_prompt=RISK_TUNING_SYSTEM,
+                scope=market_scope(target),
+                phase="cycle",
             )
 
             # 6. 파싱 + clamp (settings 상한선으로 제한)

@@ -2,7 +2,8 @@
 import asyncio
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 
 import pandas as pd
 from loguru import logger
@@ -26,7 +27,13 @@ from strategy.risk_manager import risk_manager
 from strategy.signal import TradeSignal
 from strategy.stable_short import StableShortStrategy
 from trading.enums import ActivityPhase, ActivityType, LLMTier, SignalAction, SignalUrgency
-from trading.market_profile import market_currency, market_timezone, normalize_market
+from trading.market_profile import (
+    market_currency,
+    market_scope,
+    market_timezone,
+    normalize_market,
+    normalize_market_scope,
+)
 from trading.mcp_client import mcp_client
 from trading.product_policy import (
     classification_from_metadata,
@@ -35,15 +42,29 @@ from trading.product_policy import (
 )
 
 
+def _default_strategies() -> dict[str, object]:
+    return {
+        "STABLE_SHORT": StableShortStrategy(),
+        "AGGRESSIVE_SHORT": AggressiveShortStrategy(),
+    }
+
+
 @dataclass
 class MarketState:
     """시장별 격리 상태 (KRX/US 동시 운영 지원)"""
+    scope: str = "KRX"
     market_context: str = ""
     market_regime: str = ""
     trading_context: str = ""
     daily_start_balance: float = 0.0
     available_cash: float = 0.0
-    last_session_id: str | None = None
+    trading_date: date | None = None
+    session_ids: dict[str, str | None] = field(default_factory=dict)
+    active_trading_rules: dict = field(default_factory=dict)
+    rr_floor_overrides: dict[str, float] = field(default_factory=dict)
+    cycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    cash_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    strategies: dict[str, object] = field(default_factory=_default_strategies)
 
 
 class TradingAgent:
@@ -55,13 +76,8 @@ class TradingAgent:
     """
 
     def __init__(self):
-        self.strategies = {
-            "STABLE_SHORT": StableShortStrategy(),
-            "AGGRESSIVE_SHORT": AggressiveShortStrategy(),
-        }
+        self.strategies = _default_strategies()
         self._running = False
-        self._active_trading_rules: dict = {}  # 활성 트레이딩 규칙 (프리마켓에서 로드)
-        self._cycle_lock = asyncio.Lock()  # 사이클 동시 실행 방지
         self._last_cycle_time = None
         # 실시간 이벤트 중복 분석 방지 (종목별 쿨다운)
         self._analyzing: set[str] = set()
@@ -69,8 +85,6 @@ class TradingAgent:
         self.EVENT_COOLDOWN_SEC = 120  # 동일 종목 재분석 최소 간격 (초)
         # 시장별 격리 상태 (KRX/US 동시 운영 지원)
         self._market_states: dict[str, MarketState] = {}
-        # 병렬/다중경로 매수 시 잔고 이중사용 방지 (시간대 겹침 없으므로 글로벌)
-        self._cash_lock = asyncio.Lock()
         # 종목별 상품 메타데이터 캐시 (실시간 이벤트 경로 재사용)
         self._product_metadata: dict[str, dict] = {}
 
@@ -104,10 +118,27 @@ class TradingAgent:
 
     def _get_state(self, market: str) -> MarketState:
         """시장별 격리 상태 조회 (없으면 자동 생성)"""
-        m = normalize_market(market)
-        if m not in self._market_states:
-            self._market_states[m] = MarketState()
-        return self._market_states[m]
+        scope = normalize_market_scope(market)
+        if scope not in self._market_states:
+            self._market_states[scope] = MarketState(scope=scope)
+        return self._market_states[scope]
+
+    def get_runtime(self, market: str) -> MarketState:
+        """외부 호출용 runtime 조회"""
+        return self._get_state(market)
+
+    def _refresh_runtime_date(self, runtime: MarketState, market: str) -> date:
+        """시장 거래일 변경 시 runtime의 일일 상태를 리셋"""
+        trading_date = market_calendar.market_date(market=market)
+        if runtime.trading_date != trading_date:
+            runtime.trading_date = trading_date
+            runtime.daily_start_balance = 0.0
+            runtime.available_cash = 0.0
+            runtime.market_context = ""
+            runtime.trading_context = ""
+            runtime.market_regime = ""
+            runtime.session_ids = {}
+        return trading_date
 
     async def start(self) -> None:
         """에이전트 시작 - 실시간 이벤트 구독"""
@@ -127,58 +158,63 @@ class TradingAgent:
 
     async def run_cycle(self, market: str | None = None) -> dict:
         """에이전트 1회 실행 사이클 — 장중이면 매매, 장외면 리뷰"""
-        if self._cycle_lock.locked():
-            logger.warning("사이클 이미 실행 중 — 중복 트리거 무시")
-            return {"skipped": True, "reason": "cycle_already_running"}
-
         target = normalize_market(market or settings.primary_market_code)
+        scope = market_scope(target)
+        runtime = self._get_state(scope)
+        trading_date = self._refresh_runtime_date(runtime, scope)
 
-        async with self._cycle_lock:
-            if market_calendar.is_trading_hours(target):
-                if not mcp_client.is_connected:
-                    logger.warning("[{}] MCP 미연결 → 장중 매매 사이클 스킵", target)
-                    await activity_logger.log(
-                        ActivityType.CYCLE,
-                        ActivityPhase.ERROR,
-                        f"⚠️ [{target}] MCP 미연결 — 장중 매매 사이클 스킵",
-                    )
-                    return {
-                        "skipped": True,
-                        "reason": "mcp_unavailable",
-                        "scanned": 0,
-                        "analyzed": 0,
-                        "signals": 0,
-                        "executed": 0,
-                        "selected_symbols": [],
-                    }
-                # 데이트레이딩 모드: 매수 마감 시간 이후 신규 매수 차단
-                # 스윙 모드: 오버나이트 보유 가능 → 장 마감(15:20)까지 매수 허용
-                if settings.DAY_TRADING_ONLY:
-                    from datetime import time as _time
-                    from util.time_util import now_kst
-                    from zoneinfo import ZoneInfo
+        if runtime.cycle_lock.locked():
+            logger.warning("[{}] 사이클 이미 실행 중 — 중복 트리거 무시", scope)
+            return {"skipped": True, "reason": "cycle_already_running", "market_scope": scope}
 
-                    mkt_cfg = settings.get_market_config(target)
-                    cutoff = _time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
-                    market_now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
-                    if market_now.time() >= cutoff:
-                        logger.info("매수 마감 시간({}) 경과 → 신규 매매 사이클 스킵", cutoff)
+        with activity_logger.context(market_scope=scope, trading_date=trading_date):
+            async with runtime.cycle_lock:
+                if market_calendar.is_trading_hours(target):
+                    if not mcp_client.is_connected:
+                        logger.warning("[{}] MCP 미연결 → 장중 매매 사이클 스킵", target)
                         await activity_logger.log(
-                            ActivityType.CYCLE, ActivityPhase.COMPLETE,
-                            f"\u23f0 매수 마감({cutoff.strftime('%H:%M')}) — "
-                            "신규 매수 차단, 보유종목 모니터링만 유지",
+                            ActivityType.CYCLE,
+                            ActivityPhase.ERROR,
+                            f"⚠️ [{target}] MCP 미연결 — 장중 매매 사이클 스킵",
                         )
-                        return {"skipped": True, "reason": "buy_cutoff"}
-                return await self._run_trading_cycle(target)
-            else:
+                        return {
+                            "skipped": True,
+                            "reason": "mcp_unavailable",
+                            "market_scope": scope,
+                            "scanned": 0,
+                            "analyzed": 0,
+                            "signals": 0,
+                            "executed": 0,
+                            "selected_symbols": [],
+                        }
+                    # 데이트레이딩 모드: 매수 마감 시간 이후 신규 매수 차단
+                    if settings.DAY_TRADING_ONLY:
+                        from datetime import time as _time
+                        from util.time_util import now_kst
+                        from zoneinfo import ZoneInfo
+
+                        mkt_cfg = settings.get_market_config(target)
+                        cutoff = _time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
+                        market_now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
+                        if market_now.time() >= cutoff:
+                            logger.info("매수 마감 시간({}) 경과 → 신규 매매 사이클 스킵", cutoff)
+                            await activity_logger.log(
+                                ActivityType.CYCLE,
+                                ActivityPhase.COMPLETE,
+                                f"\u23f0 매수 마감({cutoff.strftime('%H:%M')}) — 신규 매수 차단, 보유종목 모니터링만 유지",
+                            )
+                            return {"skipped": True, "reason": "buy_cutoff", "market_scope": scope}
+                    return await self._run_trading_cycle(target)
                 return await self._run_after_hours_cycle(target)
 
     async def _run_trading_cycle(self, market: str | None = None) -> dict:
         """장중 사이클: 스캔 → 분석 → 매매"""
         target = normalize_market(market or settings.primary_market_code)
-        state = self._get_state(target)
+        scope = market_scope(target)
+        state = self._get_state(scope)
+        trading_date = self._refresh_runtime_date(state, scope)
 
-        llm_factory.start_session()
+        llm_factory.start_session(scope=scope, phase="cycle")
 
         cycle_id = activity_logger.start_cycle()
         cycle_timer = activity_logger.timer()
@@ -193,7 +229,15 @@ class TradingAgent:
             cycle_id=cycle_id,
         )
 
-        results = {"scanned": 0, "analyzed": 0, "signals": 0, "executed": 0, "selected_symbols": []}
+        results = {
+            "market_scope": scope,
+            "trading_date": trading_date.isoformat(),
+            "scanned": 0,
+            "analyzed": 0,
+            "signals": 0,
+            "executed": 0,
+            "selected_symbols": [],
+        }
 
         # AI 자율 한도 결정
         dynamic_limits = None
@@ -260,7 +304,7 @@ class TradingAgent:
                 snapshot["total_asset"] = balance.total_asset
                 snapshot["holding_count"] = len(holdings)
                 snapshot["holding_symbols"] = [(h.market, h.symbol) for h in holdings]
-                snapshot["today_trade_count"] = await self._get_today_trade_count()
+                snapshot["today_trade_count"] = await self._get_today_trade_count(scope)
                 for holding in holdings:
                     self._remember_product_metadata(
                         holding.symbol,
@@ -268,7 +312,7 @@ class TradingAgent:
                         {"name": holding.name},
                     )
                 # 인스턴스 레벨 현금 트래커 갱신
-                async with self._cash_lock:
+                async with state.cash_lock:
                     state.available_cash = balance.effective_cash
             except Exception as e:
                 logger.warning("포트폴리오 스냅샷 조회 실패, 기본값 사용: {}", str(e))
@@ -280,7 +324,7 @@ class TradingAgent:
             # 4. 후보 종목별 심층 분석 + 전략 평가 + 매매 (병렬)
             # 세션 일시 중지 → 각 종목 분석은 독립 호출 (병렬 가능)
             # 스크리닝 맥락은 state.market_context로 프롬프트에 전달됨
-            paused_sid = llm_factory.pause_session()
+            paused_sid = llm_factory.pause_session(scope=scope, phase="cycle")
 
             semaphore = asyncio.Semaphore(3)
             executed_count = 0
@@ -295,7 +339,7 @@ class TradingAgent:
                 nonlocal executed_count
                 async with semaphore:
                     # 잔고 사전 확인 — 최소 주문금액 미달 시 스킵
-                    async with self._cash_lock:
+                    async with state.cash_lock:
                         if state.available_cash < eff_min_order_amount:
                             logger.info(
                                 "[{}] 현금 부족으로 스킵: {:,.0f} < {:,.0f}",
@@ -316,7 +360,7 @@ class TradingAgent:
                         # 체결된 주문 금액만큼 잔고 차감
                         order_amount = r.get("order_amount", 0)
                         if order_amount > 0:
-                            async with self._cash_lock:
+                            async with state.cash_lock:
                                 state.available_cash -= order_amount
                                 logger.debug(
                                     "[{}] 주문 {:,.0f}원 차감 → 잔여 현금 {:,.0f}원",
@@ -332,7 +376,7 @@ class TradingAgent:
 
             # 병렬 분석 완료 → 세션 재개 (리포트/후속 처리용)
             if paused_sid:
-                llm_factory.resume_session(paused_sid)
+                llm_factory.resume_session(paused_sid, scope=scope, phase="cycle")
 
             for i, r in enumerate(all_results):
                 if isinstance(r, Exception):
@@ -378,7 +422,7 @@ class TradingAgent:
             execution_time_ms=elapsed,
         )
         # 세션 종료 (세션 ID 보존 — 장외 사이클에서 재개 가능)
-        state.last_session_id = llm_factory.end_session()
+        state.session_ids["cycle"] = llm_factory.end_session(scope=scope, phase="cycle")
 
         logger.info("=== Agent 장중 사이클 종료: {} ===", results)
         return results
@@ -394,8 +438,9 @@ class TradingAgent:
         name = stock_info.get("name", symbol)
         strategy_type = stock_info.get("strategy_type", "STABLE_SHORT")
         market_code = normalize_market(stock_info.get("market", settings.primary_market_code))
+        scope = market_scope(market_code)
         cached_product = self._get_product_metadata(symbol, market_code)
-        mkt_state = self._get_state(market_code)
+        mkt_state = self._get_state(scope)
 
         result = {"symbol": symbol, "signal": False, "executed": False}
 
@@ -404,7 +449,7 @@ class TradingAgent:
             async with AsyncSessionLocal() as session:
                 from analysis.feedback.performance_tracker import PerformanceTracker
                 tracker = PerformanceTracker(session)
-                consecutive = await tracker.get_consecutive_losses()
+                consecutive = await tracker.get_consecutive_losses(market_scope=scope)
                 if consecutive >= 5:
                     logger.warning("[하드 룰] 연속 {}회 손실 → 전체 매수 일시 중단", consecutive)
                     await activity_logger.log(
@@ -544,6 +589,7 @@ class TradingAgent:
                     strategy_type=strategy_type,
                     symbol=symbol,
                     current_rsi=rsi_val,
+                    market_scope=scope,
                 )
         except Exception as e:
             logger.warning("피드백 컨텍스트 빌드 실패: {}", str(e))
@@ -635,7 +681,7 @@ class TradingAgent:
 
         # ── [하드 게이트] 트레이딩 규칙 기반 검증 (Tier2 진행 전) ──
         tier1_confidence = analysis.get("confidence") or 0
-        active_rules = self._active_trading_rules
+        active_rules = mkt_state.active_trading_rules or {}
         _param_overrides = active_rules.get("param_overrides", {})
         _validation_flags = active_rules.get("validation_flags", {})
 
@@ -669,7 +715,10 @@ class TradingAgent:
                     rr_overrides = active_rules.get("rr_floor_overrides", {})
                     min_rr = rr_overrides.get(
                         mkt_state.market_regime,
-                        risk_manager.RR_FLOOR.get(mkt_state.market_regime, 1.2),
+                        mkt_state.rr_floor_overrides.get(
+                            mkt_state.market_regime,
+                            risk_manager.RR_FLOOR.get(mkt_state.market_regime, 1.2),
+                        ),
                     )
                     if code_rr < min_rr:
                         await activity_logger.log(
@@ -780,7 +829,7 @@ class TradingAgent:
             )
 
         # 4. 전략 적용 — Tier2 승인 시 AI 결정을 우선, 전략은 보조
-        strategy = self.strategies.get(strategy_type)
+        strategy = mkt_state.strategies.get(strategy_type)
 
         # Tier2가 수량/가격까지 제시한 경우 → AI 결정으로 직접 시그널 생성
         if final.get("suggested_quantity") and final.get("entry_price"):
@@ -904,6 +953,7 @@ class TradingAgent:
             cycle_id=cycle_id,
             dynamic_limits=dynamic_limits,
             market_regime=mkt_state.market_regime,
+            rr_floor_overrides=mkt_state.rr_floor_overrides,
         )
 
         if not risk_result.get("approved"):
@@ -945,11 +995,13 @@ class TradingAgent:
     async def _run_after_hours_cycle(self, market: str | None = None) -> dict:
         """장외 사이클: 오늘 데이트레이딩 성과 리뷰 (피드백 학습용)"""
         target = normalize_market(market or settings.primary_market_code)
+        scope = market_scope(target)
+        state = self._get_state(scope)
 
         from trading.account_manager import account_manager
-        from util.time_util import now_kst
 
-        llm_factory.start_session()
+        trading_date = self._refresh_runtime_date(state, scope)
+        llm_factory.start_session(scope=scope, phase="after_hours")
 
         cycle_id = activity_logger.start_cycle()
         cycle_timer = activity_logger.timer()
@@ -964,7 +1016,12 @@ class TradingAgent:
             cycle_id=cycle_id,
         )
 
-        results = {"mode": "AFTER_HOURS", "review_generated": False}
+        results = {
+            "mode": "AFTER_HOURS",
+            "market_scope": scope,
+            "trading_date": trading_date.isoformat(),
+            "review_generated": False,
+        }
 
         try:
             # 1. 오늘 시장 마감 데이터 수집 (MCP)
@@ -979,7 +1036,7 @@ class TradingAgent:
                 cash_ratio = (effective_cash / balance.total_asset) * 100
 
             # 3. 오늘 활동 집계
-            today_date = now_kst().date()
+            today_date = trading_date
             activity_summary = "활동 없음"
             today_cycles = 0
             today_analyses = 0
@@ -990,8 +1047,8 @@ class TradingAgent:
                 async with AsyncSessionLocal() as session:
                     from repositories.agent_activity_repository import AgentActivityRepository
                     activity_repo = AgentActivityRepository(session)
-                    activity_counts = await activity_repo.count_by_date(today_date)
-                    activities = await activity_repo.get_by_date(today_date, limit=50)
+                    activity_counts = await activity_repo.count_by_date(today_date, market_scope=scope)
+                    activities = await activity_repo.get_by_date(today_date, limit=50, market_scope=scope)
 
                     today_cycles = activity_counts.get("CYCLE", 0) // 2
                     today_analyses = activity_counts.get("TIER1_ANALYSIS", 0)
@@ -1012,7 +1069,7 @@ class TradingAgent:
                 from analysis.feedback.performance_tracker import PerformanceTracker
                 async with AsyncSessionLocal() as session:
                     tracker = PerformanceTracker(session)
-                    stats = await tracker.get_overall_stats()
+                    stats = await tracker.get_overall_stats(market_scope=scope)
                     overall = stats.get("overall")
                     if overall and overall.total_trades > 0:
                         performance_summary = (
@@ -1031,7 +1088,7 @@ class TradingAgent:
                         from repositories.trade_result_repository import TradeResultRepository
                         from strategy.holding_policy import _calc_hold_days, _get_max_hold_days
                         repo = TradeResultRepository(session)
-                        open_positions = await repo.get_all_open()
+                        open_positions = await repo.get_all_open(market_scope=scope)
                         if open_positions:
                             lines = []
                             for tr in open_positions:
@@ -1082,7 +1139,10 @@ class TradingAgent:
             )
 
             result_text, provider = await llm_factory.generate_tier1(
-                prompt, system_prompt=DAILY_PLAN_SYSTEM
+                prompt,
+                system_prompt=DAILY_PLAN_SYSTEM,
+                scope=scope,
+                phase="after_hours",
             )
             t1_elapsed = activity_logger.elapsed_ms(t1_timer)
 
@@ -1129,6 +1189,7 @@ class TradingAgent:
                 try:
                     await self._save_daily_report(
                         today_date, parsed,
+                        market_scope=scope,
                         today_cycles=today_cycles,
                         today_analyses=today_analyses,
                         today_recommendations=today_recommendations,
@@ -1141,7 +1202,9 @@ class TradingAgent:
                 try:
                     from analysis.feedback.trading_rules import trading_rule_engine
                     rules = await trading_rule_engine.generate_rules_from_review(
-                        parsed, today_date,
+                        parsed,
+                        today_date,
+                        market_scope=scope,
                     )
                     if rules:
                         rule_summary = ", ".join(
@@ -1189,14 +1252,17 @@ class TradingAgent:
             detail=results,
             execution_time_ms=elapsed,
         )
-        llm_factory.end_session()
-        self._get_state(target).last_session_id = None
+        llm_factory.end_session(scope=scope, phase="after_hours")
+        state.session_ids["after_hours"] = None
 
         logger.info("=== Agent 장 마감 리뷰 종료 ===")
         return results
 
     async def _save_daily_report(
-        self, report_date, parsed: dict,
+        self,
+        report_date,
+        parsed: dict,
+        market_scope: str = "KRX",
         today_cycles: int = 0, today_analyses: int = 0,
         today_recommendations: int = 0, today_orders: int = 0,
     ) -> None:
@@ -1219,9 +1285,10 @@ class TradingAgent:
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 repo = DailyReportRepository(session)
-                report = await repo.get_by_date(report_date)
+                report = await repo.get_by_date(report_date, market_scope=market_scope)
 
                 report_data = {
+                    "market_scope": normalize_market_scope(market_scope),
                     "total_cycles": today_cycles,
                     "total_analyses": today_analyses,
                     "total_recommendations": today_recommendations,
@@ -1402,7 +1469,8 @@ class TradingAgent:
         from zoneinfo import ZoneInfo
 
         target = normalize_market(market or settings.primary_market_code)
-        state = self._get_state(target)
+        scope = market_scope(target)
+        state = self._get_state(scope)
         mkt_cfg = settings.get_market_config(target)
 
         now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
@@ -1428,7 +1496,7 @@ class TradingAgent:
                 pass
 
         # 오늘 매매 성적
-        stats = await self._get_today_trade_stats()
+        stats = await self._get_today_trade_stats(scope)
 
         context = (
             f"현재 시각: {now.strftime('%H:%M')} | "
@@ -1446,19 +1514,24 @@ class TradingAgent:
 
         return context
 
-    async def _get_today_trade_stats(self) -> dict:
+    async def _get_today_trade_stats(self, market: str | None = None) -> dict:
         """오늘 매매 승/패 집계 (trade_results 테이블)"""
         from models.trade_result import TradeResult
-        from sqlalchemy import select, func
-        from util.time_util import now_kst
+        from sqlalchemy import select
+        from trading.market_profile import markets_for_scope
 
-        today = now_kst().date()
+        scope = normalize_market_scope(market or settings.primary_market_code)
+        trading_date = market_calendar.market_date(market=scope)
+        start, end = market_calendar.market_day_bounds(scope, trading_date)
         stats = {"wins": 0, "losses": 0, "total": 0}
         try:
             async with AsyncSessionLocal() as session:
                 result = await session.execute(
                     select(TradeResult.pnl).where(
-                        func.date(TradeResult.created_at) == today
+                        TradeResult.market.in_(markets_for_scope(scope)),
+                        TradeResult.exit_at.isnot(None),
+                        TradeResult.exit_at >= start,
+                        TradeResult.exit_at <= end,
                     )
                 )
                 for (pnl,) in result:
@@ -1532,19 +1605,27 @@ class TradingAgent:
                 ", ".join(f"{k}={v}" for k, v in kwargs.items()),
             )
 
-    async def _get_today_trade_count(self) -> int:
+    async def _get_today_trade_count(self, market: str | None = None) -> int:
         """당일 체결 건수 조회"""
         try:
             from models.order import Order
+            from models.stock import Stock
             from sqlalchemy import select, func
-            from util.time_util import now_kst
+            from trading.market_profile import markets_for_scope
 
-            today = now_kst().date()
+            scope = normalize_market_scope(market or settings.primary_market_code)
+            trading_date = market_calendar.market_date(market=scope)
+            start, end = market_calendar.market_day_bounds(scope, trading_date)
             async with AsyncSessionLocal() as session:
                 result = await session.execute(
-                    select(func.count(Order.id)).where(
-                        func.date(Order.created_at) == today,
+                    select(func.count(Order.id))
+                    .select_from(Order)
+                    .join(Stock, Stock.id == Order.stock_id)
+                    .where(
+                        Stock.market.in_(markets_for_scope(scope)),
                         Order.status == "FILLED",
+                        Order.created_at >= start,
+                        Order.created_at <= end,
                     )
                 )
                 return result.scalar() or 0
@@ -1562,6 +1643,7 @@ class TradingAgent:
     ) -> dict | None:
         """Tier 1 AI 심층 분석"""
         market_code = normalize_market(price_data.get("market", settings.primary_market_code))
+        scope = market_scope(market_code)
         currency = price_data.get("currency", market_currency(market_code))
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
         change_value = float(price_data.get("change") or 0)
@@ -1588,8 +1670,12 @@ class TradingAgent:
 
         try:
             result_text, provider = await llm_factory.generate_tier1(
-                prompt, system_prompt=STOCK_ANALYSIS_SYSTEM,
-                symbol=symbol, cycle_id=cycle_id,
+                prompt,
+                system_prompt=STOCK_ANALYSIS_SYSTEM,
+                scope=scope,
+                phase="cycle",
+                symbol=symbol,
+                cycle_id=cycle_id,
             )
             parsed = self._parse_json(result_text)
             if parsed:
@@ -1615,9 +1701,10 @@ class TradingAgent:
         cycle_id: str | None = None,
     ) -> dict | None:
         """Tier 2 최종 검토"""
-        strategy = self.strategies.get(strategy_type)
         snap = portfolio_snapshot or {}
         market_code = normalize_market(tier1_analysis.get("market", settings.primary_market_code))
+        scope = market_scope(market_code)
+        strategy = self._get_state(scope).strategies.get(strategy_type)
         currency = tier1_analysis.get("currency", market_currency(market_code))
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
 
@@ -1668,8 +1755,12 @@ class TradingAgent:
 
         try:
             result_text, provider = await llm_factory.generate_tier2(
-                prompt, system_prompt=FINAL_REVIEW_SYSTEM,
-                symbol=symbol, cycle_id=cycle_id,
+                prompt,
+                system_prompt=FINAL_REVIEW_SYSTEM,
+                scope=scope,
+                phase="cycle",
+                symbol=symbol,
+                cycle_id=cycle_id,
             )
             parsed = self._parse_json(result_text)
             if parsed:
@@ -1688,6 +1779,9 @@ class TradingAgent:
 
         symbol = event.data.get("symbol", "")
         market_code = normalize_market(event.data.get("market", settings.primary_market_code))
+        scope = market_scope(market_code)
+        event_state = self._get_state(scope)
+        trading_date = self._refresh_runtime_date(event_state, scope)
 
         # 데이트레이딩: 매수 마감 시간 이후 신규 매수 이벤트 무시
         if settings.DAY_TRADING_ONLY:
@@ -1719,89 +1813,92 @@ class TradingAgent:
         change_rate = event.data.get("change_rate", 0)
         event_type = event.type.value
 
-        await activity_logger.log(
-            ActivityType.EVENT, ActivityPhase.PROGRESS,
-            f"\u26a1 실시간 감지: {event_type} - {symbol} "
-            f"({price:,.0f}원, {change_rate:+.2f}%)",
-            symbol=symbol,
-            detail=event.data,
-        )
-
-        # 즉시 분석 + 매매 (비동기)
-        try:
-            # 실시간 이벤트에서도 트레이딩 컨텍스트 갱신
-            event_state = self._get_state(market_code)
-            event_state.trading_context = await self._build_trading_context(market_code)
-
-            product_metadata = self._get_product_metadata(symbol, market_code)
-            stock_info = {
-                "symbol": symbol,
-                "name": product_metadata.get("name") or event.data.get("name", symbol),
-                "market": market_code,
-                "strategy_type": "AGGRESSIVE_SHORT" if abs(change_rate) >= 5 else "STABLE_SHORT",
-                "trigger": event_type,
-                **product_metadata,
-            }
-            cycle_id = activity_logger.start_cycle()
-
-            # 포트폴리오 스냅샷 조회 (리스크 체크용, MCP 1회)
-            snapshot = {"cash": 0, "total_asset": 0, "holding_count": 0, "today_trade_count": 0}
-            try:
-                from trading.account_manager import account_manager
-                balance, holdings = await account_manager.get_account_snapshot(market_code)
-                if not balance.is_valid:
-                    logger.error("실시간 이벤트: 계좌 조회 실패 → 분석 중단")
-                    return
-                # 인스턴스 트래커의 현금을 사용 (병렬 매수 추적)
-                async with self._cash_lock:
-                    snapshot["cash"] = event_state.available_cash
-                snapshot["total_asset"] = balance.total_asset
-                snapshot["holding_count"] = len(holdings)
-                snapshot["holding_symbols"] = [(h.market, h.symbol) for h in holdings]
-                snapshot["today_trade_count"] = await self._get_today_trade_count()
-                for holding in holdings:
-                    self._remember_product_metadata(
-                        holding.symbol,
-                        holding.market,
-                        {"name": holding.name},
-                    )
-            except Exception as e:
-                logger.warning("실시간 이벤트 포트폴리오 스냅샷 조회 실패: {}", str(e))
-
-            # AI 한도
-            dynamic_limits = None
-            if settings.AI_RISK_TUNING_ENABLED:
-                try:
-                    from strategy.ai_risk_tuner import ai_risk_tuner
-                    dynamic_limits = await ai_risk_tuner.compute_limits(
-                        market=market_code,
-                        risk_appetite=settings.RISK_APPETITE, cycle_id=cycle_id,
-                    )
-                except Exception:
-                    pass
-
-            result = await self._analyze_and_trade(
-                stock_info, cycle_id,
-                dynamic_limits=dynamic_limits,
-                portfolio_snapshot=snapshot,
+        with activity_logger.context(market_scope=scope, trading_date=trading_date):
+            await activity_logger.log(
+                ActivityType.EVENT, ActivityPhase.PROGRESS,
+                f"\u26a1 실시간 감지: {event_type} - {symbol} "
+                f"({price:,.0f}원, {change_rate:+.2f}%)",
+                symbol=symbol,
+                detail=event.data,
             )
-            if result.get("executed"):
-                logger.info("실시간 매매 실행: {} ({})", symbol, event_type)
-                # 체결 금액 인스턴스 트래커에서 차감
-                order_amount = result.get("order_amount", 0)
-                if order_amount > 0:
-                    async with self._cash_lock:
-                        event_state.available_cash -= order_amount
-                        logger.debug(
-                            "[{}] 실시간 주문 {:,.0f}원 차감 → 잔여 현금 {:,.0f}원",
-                            symbol, order_amount, event_state.available_cash,
+
+            # 즉시 분석 + 매매 (비동기)
+            try:
+                # 실시간 이벤트에서도 트레이딩 컨텍스트 갱신
+                event_state.trading_context = await self._build_trading_context(market_code)
+
+                product_metadata = self._get_product_metadata(symbol, market_code)
+                stock_info = {
+                    "symbol": symbol,
+                    "name": product_metadata.get("name") or event.data.get("name", symbol),
+                    "market": market_code,
+                    "strategy_type": "AGGRESSIVE_SHORT" if abs(change_rate) >= 5 else "STABLE_SHORT",
+                    "trigger": event_type,
+                    **product_metadata,
+                }
+                cycle_id = activity_logger.start_cycle()
+
+                # 포트폴리오 스냅샷 조회 (리스크 체크용, MCP 1회)
+                snapshot = {"cash": 0, "total_asset": 0, "holding_count": 0, "today_trade_count": 0}
+                try:
+                    from trading.account_manager import account_manager
+
+                    balance, holdings = await account_manager.get_account_snapshot(market_code)
+                    if not balance.is_valid:
+                        logger.error("실시간 이벤트: 계좌 조회 실패 → 분석 중단")
+                        return
+                    async with event_state.cash_lock:
+                        snapshot["cash"] = event_state.available_cash
+                    snapshot["total_asset"] = balance.total_asset
+                    snapshot["holding_count"] = len(holdings)
+                    snapshot["holding_symbols"] = [(h.market, h.symbol) for h in holdings]
+                    snapshot["today_trade_count"] = await self._get_today_trade_count(scope)
+                    for holding in holdings:
+                        self._remember_product_metadata(
+                            holding.symbol,
+                            holding.market,
+                            {"name": holding.name},
                         )
+                except Exception as e:
+                    logger.warning("실시간 이벤트 포트폴리오 스냅샷 조회 실패: {}", str(e))
+
+                dynamic_limits = None
+                if settings.AI_RISK_TUNING_ENABLED:
+                    try:
+                        from strategy.ai_risk_tuner import ai_risk_tuner
+
+                        dynamic_limits = await ai_risk_tuner.compute_limits(
+                            market=market_code,
+                            risk_appetite=settings.RISK_APPETITE,
+                            cycle_id=cycle_id,
+                        )
+                    except Exception:
+                        pass
+
+                result = await self._analyze_and_trade(
+                    stock_info,
+                    cycle_id,
+                    dynamic_limits=dynamic_limits,
+                    portfolio_snapshot=snapshot,
+                )
+                if result.get("executed"):
+                    logger.info("실시간 매매 실행: {} ({})", symbol, event_type)
+                    order_amount = result.get("order_amount", 0)
+                    if order_amount > 0:
+                        async with event_state.cash_lock:
+                            event_state.available_cash -= order_amount
+                            logger.debug(
+                                "[{}] 실시간 주문 {:,.0f}원 차감 → 잔여 현금 {:,.0f}원",
+                                symbol,
+                                order_amount,
+                                event_state.available_cash,
+                            )
                 # 신규 매수 종목 WebSocket 구독 추가
                 await self._ensure_realtime_subscription(symbol, market=market_code)
-        except Exception as e:
-            logger.error("실시간 분석 오류 ({}): {}", symbol, str(e))
-        finally:
-            self._analyzing.discard(cooldown_key)
+            except Exception as e:
+                logger.error("실시간 분석 오류 ({}): {}", symbol, str(e))
+            finally:
+                self._analyzing.discard(cooldown_key)
 
     async def _on_stop_loss(self, event: Event) -> None:
         """손절선 도달 → 즉시 매도"""
@@ -1809,51 +1906,51 @@ class TradingAgent:
             return
         symbol = event.data.get("symbol", "")
         market_code = normalize_market(event.data.get("market", settings.primary_market_code))
+        scope = market_scope(market_code)
+        trading_date = market_calendar.market_date(market=scope)
         price = event.data.get("price", 0)
         stop_loss = event.data.get("stop_loss_price", 0)
 
-        logger.warning("손절선 도달: {} (현재가: {:,.0f}, 손절: {:,.0f})", symbol, price, stop_loss)
-        await activity_logger.log(
-            ActivityType.EVENT, ActivityPhase.PROGRESS,
-            f"\U0001f6a8 손절선 도달: {symbol} — 즉시 매도 실행 "
-            f"(현재가: {price:,.0f}원, 손절: {stop_loss:,.0f}원)",
-            symbol=symbol,
-            detail=event.data,
-        )
-
-        # 즉시 시장가 매도
-        if settings.TRADING_ENABLED:
-            try:
-                from trading.account_manager import account_manager
-                holdings = await account_manager.get_holdings(market_code)
-                holding = next((h for h in holdings if h.symbol == symbol and h.market == market_code), None)
-                if holding and holding.quantity > 0:
-                    resp = await mcp_client.place_order(
-                        symbol=symbol, side="SELL",
-                        quantity=holding.quantity, price=None, market=market_code,
-                    )
-                    await activity_logger.log(
-                        ActivityType.ORDER, ActivityPhase.COMPLETE,
-                        f"\U0001f6a8 손절 매도: {symbol} {holding.quantity}주 "
-                        f"({'성공' if resp.success else '실패: ' + (resp.error or '')})",
-                        symbol=symbol,
-                    )
-                    if resp.success:
-                        event_detector.remove_levels(symbol, market=market_code)
-                        # 체결 확인 + TradeResult 기록
-                        order_data = resp.data or {}
-                        order_id = order_data.get("order_id", "")
-                        await decision_maker.confirm_and_record(
-                            symbol=symbol,
-                            market=market_code,
-                            side="SELL",
-                            order_id=order_id,
-                            quantity=holding.quantity,
-                            expected_price=price,
-                            exit_reason="STOP_LOSS",
+        with activity_logger.context(market_scope=scope, trading_date=trading_date):
+            logger.warning("손절선 도달: {} (현재가: {:,.0f}, 손절: {:,.0f})", symbol, price, stop_loss)
+            await activity_logger.log(
+                ActivityType.EVENT, ActivityPhase.PROGRESS,
+                f"\U0001f6a8 손절선 도달: {symbol} — 즉시 매도 실행 "
+                f"(현재가: {price:,.0f}원, 손절: {stop_loss:,.0f}원)",
+                symbol=symbol,
+                detail=event.data,
+            )
+            if settings.TRADING_ENABLED:
+                try:
+                    from trading.account_manager import account_manager
+                    holdings = await account_manager.get_holdings(market_code)
+                    holding = next((h for h in holdings if h.symbol == symbol and h.market == market_code), None)
+                    if holding and holding.quantity > 0:
+                        resp = await mcp_client.place_order(
+                            symbol=symbol, side="SELL",
+                            quantity=holding.quantity, price=None, market=market_code,
                         )
-            except Exception as e:
-                logger.error("손절 매도 실패 ({}): {}", symbol, str(e))
+                        await activity_logger.log(
+                            ActivityType.ORDER, ActivityPhase.COMPLETE,
+                            f"\U0001f6a8 손절 매도: {symbol} {holding.quantity}주 "
+                            f"({'성공' if resp.success else '실패: ' + (resp.error or '')})",
+                            symbol=symbol,
+                        )
+                        if resp.success:
+                            event_detector.remove_levels(symbol, market=market_code)
+                            order_data = resp.data or {}
+                            order_id = order_data.get("order_id", "")
+                            await decision_maker.confirm_and_record(
+                                symbol=symbol,
+                                market=market_code,
+                                side="SELL",
+                                order_id=order_id,
+                                quantity=holding.quantity,
+                                expected_price=price,
+                                exit_reason="STOP_LOSS",
+                            )
+                except Exception as e:
+                    logger.error("손절 매도 실패 ({}): {}", symbol, str(e))
 
     async def _on_take_profit(self, event: Event) -> None:
         """익절선 도달 → 즉시 매도"""
@@ -1861,58 +1958,58 @@ class TradingAgent:
             return
         symbol = event.data.get("symbol", "")
         market_code = normalize_market(event.data.get("market", settings.primary_market_code))
+        scope = market_scope(market_code)
+        trading_date = market_calendar.market_date(market=scope)
         price = event.data.get("price", 0)
         take_profit = event.data.get("take_profit_price", 0)
 
-        logger.info("익절선 도달: {} (현재가: {:,.0f}, 익절: {:,.0f})", symbol, price, take_profit)
-        await activity_logger.log(
-            ActivityType.EVENT, ActivityPhase.PROGRESS,
-            f"\U0001f3af 익절선 도달: {symbol} — 매도 실행 "
-            f"(현재가: {price:,.0f}원, 익절: {take_profit:,.0f}원)",
-            symbol=symbol,
-            detail=event.data,
-        )
-
-        # 즉시 시장가 매도
-        if settings.TRADING_ENABLED:
-            try:
-                from trading.account_manager import account_manager
-                holdings = await account_manager.get_holdings(market_code)
-                holding = next((h for h in holdings if h.symbol == symbol and h.market == market_code), None)
-                if holding and holding.quantity > 0:
-                    resp = await mcp_client.place_order(
-                        symbol=symbol, side="SELL",
-                        quantity=holding.quantity, price=None, market=market_code,
-                    )
-                    await activity_logger.log(
-                        ActivityType.ORDER, ActivityPhase.COMPLETE,
-                        f"\U0001f3af 익절 매도: {symbol} {holding.quantity}주 "
-                        f"({'성공' if resp.success else '실패: ' + (resp.error or '')})",
-                        symbol=symbol,
-                    )
-                    if resp.success:
-                        event_detector.remove_levels(symbol, market=market_code)
-                        # 체결 확인 + TradeResult 기록
-                        order_data = resp.data or {}
-                        order_id = order_data.get("order_id", "")
-                        await decision_maker.confirm_and_record(
-                            symbol=symbol,
-                            market=market_code,
-                            side="SELL",
-                            order_id=order_id,
-                            quantity=holding.quantity,
-                            expected_price=price,
-                            exit_reason="TAKE_PROFIT",
+        with activity_logger.context(market_scope=scope, trading_date=trading_date):
+            logger.info("익절선 도달: {} (현재가: {:,.0f}, 익절: {:,.0f})", symbol, price, take_profit)
+            await activity_logger.log(
+                ActivityType.EVENT, ActivityPhase.PROGRESS,
+                f"\U0001f3af 익절선 도달: {symbol} — 매도 실행 "
+                f"(현재가: {price:,.0f}원, 익절: {take_profit:,.0f}원)",
+                symbol=symbol,
+                detail=event.data,
+            )
+            if settings.TRADING_ENABLED:
+                try:
+                    from trading.account_manager import account_manager
+                    holdings = await account_manager.get_holdings(market_code)
+                    holding = next((h for h in holdings if h.symbol == symbol and h.market == market_code), None)
+                    if holding and holding.quantity > 0:
+                        resp = await mcp_client.place_order(
+                            symbol=symbol, side="SELL",
+                            quantity=holding.quantity, price=None, market=market_code,
                         )
-            except Exception as e:
-                logger.error("익절 매도 실패 ({}): {}", symbol, str(e))
+                        await activity_logger.log(
+                            ActivityType.ORDER, ActivityPhase.COMPLETE,
+                            f"\U0001f3af 익절 매도: {symbol} {holding.quantity}주 "
+                            f"({'성공' if resp.success else '실패: ' + (resp.error or '')})",
+                            symbol=symbol,
+                        )
+                        if resp.success:
+                            event_detector.remove_levels(symbol, market=market_code)
+                            order_data = resp.data or {}
+                            order_id = order_data.get("order_id", "")
+                            await decision_maker.confirm_and_record(
+                                symbol=symbol,
+                                market=market_code,
+                                side="SELL",
+                                order_id=order_id,
+                                quantity=holding.quantity,
+                                expected_price=price,
+                                exit_reason="TAKE_PROFIT",
+                            )
+                except Exception as e:
+                    logger.error("익절 매도 실패 ({}): {}", symbol, str(e))
 
     async def _ensure_realtime_subscription(self, symbol: str, market: str | None = None) -> None:
         """매수 후 WebSocket 실시간 구독 확인/추가"""
         try:
             from realtime.stream_manager import stream_manager
             market_code = normalize_market(market or settings.primary_market_code)
-            await stream_manager.subscribe_symbols([(symbol, market_code)])
+            await stream_manager.ensure_symbol(market_scope(market_code), symbol, market_code)
             logger.debug("매수 종목 WebSocket 구독 추가: {} ({})", symbol, market_code)
         except Exception as e:
             logger.warning("WebSocket 구독 추가 실패 ({}): {}", symbol, str(e))

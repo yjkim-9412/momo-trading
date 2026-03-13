@@ -16,7 +16,7 @@ from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
-from trading.market_profile import is_us_market, normalize_market
+from trading.market_profile import is_us_market, market_scope, normalize_market
 from trading.mcp_client import mcp_client
 from trading.product_policy import (
     classify_product,
@@ -146,7 +146,7 @@ class MarketScanner:
             self._get_volume_rank(scan_markets),
             self._get_fluctuation_rank(scan_markets, "top"),
             self._get_fluctuation_rank(scan_markets, "bottom"),
-            self._get_performance_summary(),
+                self._get_performance_summary(target),
         )
         balance, holdings = account_snapshot
         available_cash = balance.effective_cash
@@ -189,7 +189,10 @@ class MarketScanner:
 
         try:
             result_text, provider = await llm_factory.generate_tier1(
-                prompt, system_prompt=get_market_scan_system(primary_market)
+                prompt,
+                system_prompt=get_market_scan_system(primary_market),
+                scope=market_scope(target),
+                phase="cycle",
             )
             parsed = self._parse_json_response(result_text)
             selected = parsed.get("selected", [])
@@ -262,12 +265,13 @@ class MarketScanner:
             )
             return {"selected": [], "market_summary": "스캔 실패", "available_cash": available_cash}
 
-    async def _get_performance_summary(self) -> str:
+    async def _get_performance_summary(self, market: str | None = None) -> str:
         """과거 매매 성과 요약 텍스트 생성"""
         try:
+            scope = market_scope(market or settings.primary_market_code)
             async with AsyncSessionLocal() as session:
                 tracker = PerformanceTracker(session)
-                stats = await tracker.get_overall_stats()
+                stats = await tracker.get_overall_stats(market_scope=scope)
 
             overall = stats.get("overall")
             if not overall or overall.total_trades == 0:

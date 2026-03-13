@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 try:
@@ -9,7 +9,12 @@ except ImportError:  # pragma: no cover - 의존성 미설치 로컬 폴백
     holidays = None
 
 from core.config import settings
-from trading.market_profile import is_domestic_market, is_us_market, normalize_market
+from trading.market_profile import (
+    is_domestic_market,
+    is_us_market,
+    normalize_market,
+    normalize_market_scope,
+)
 from util.time_util import KST, now_kst
 
 _KR_HOLIDAYS = holidays.KR(years=range(2024, 2031)) if holidays else set()
@@ -203,10 +208,25 @@ class MarketCalendar:
     @staticmethod
     def market_date(dt: datetime | None = None, market: str | None = None):
         """시장 현지 기준 날짜"""
-        market_code = normalize_market(market or settings.primary_market_code)
+        market_code = normalize_market_scope(market or settings.primary_market_code)
         if is_us_market(market_code):
             return MarketCalendar._to_new_york(dt).date()
         return MarketCalendar._to_kst(dt).date()
+
+    @staticmethod
+    def market_day_bounds(
+        market: str | None = None,
+        trading_date: date | None = None,
+    ) -> tuple[datetime, datetime]:
+        """시장 거래일의 KST 기준 시작/종료 시각 반환"""
+        scope = normalize_market_scope(market or settings.primary_market_code)
+        local_date = trading_date or MarketCalendar.market_date(market=scope)
+        tz = _NY_TZ if is_us_market(scope) else KST
+        start_local = datetime.combine(local_date, time.min, tzinfo=tz)
+        end_local = datetime.combine(local_date, time.max, tzinfo=tz)
+        start_kst = start_local.astimezone(KST).replace(tzinfo=None)
+        end_kst = end_local.astimezone(KST).replace(tzinfo=None)
+        return start_kst, end_kst
 
     @staticmethod
     def is_any_market_open(dt: datetime | None = None) -> bool:
