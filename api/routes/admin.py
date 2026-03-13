@@ -363,6 +363,37 @@ async def get_system_status(market: str | None = Query(None)):
     })
 
 
+# ── 에이전트 파이프라인 상태 ──
+@router.get("/agent/state")
+async def get_agent_state():
+    """현재 에이전트 파이프라인 상태 (인메모리 조회, DB 없음)"""
+    from agent.trading_agent import trading_agent
+
+    result = {}
+    for scope in ("KRX", "US"):
+        state = trading_agent._market_states.get(scope)
+        if not state:
+            result[scope] = {
+                "cycle_active": False,
+                "cycle_id": None,
+                "started_at": None,
+                "scanned_count": 0,
+                "analyzed_count": 0,
+                "selected_symbols": [],
+            }
+        else:
+            pipeline = getattr(state, "_pipeline_snapshot", None) or {}
+            result[scope] = {
+                "cycle_active": state.cycle_lock.locked(),
+                "cycle_id": pipeline.get("cycle_id"),
+                "started_at": pipeline.get("started_at"),
+                "scanned_count": pipeline.get("scanned_count", 0),
+                "analyzed_count": pipeline.get("analyzed_count", 0),
+                "selected_symbols": pipeline.get("selected_symbols", []),
+            }
+    return SuccessResponse(data=result)
+
+
 # ── 수동 사이클 트리거 ──
 @router.post("/agent/trigger")
 async def trigger_agent_cycle(market: str | None = Query(None)):

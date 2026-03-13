@@ -51,11 +51,11 @@ body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, 
 .stock-step:first-child { border-top: none; }
 
 /* ── Cycle Divider ── */
-.cycle-divider { display: flex; align-items: center; gap: 8px; padding: 6px 12px; margin: 8px 0 4px 0; color: #9ca3af; font-size: 12px; }
-.cycle-divider::before, .cycle-divider::after { content: ''; flex: 1; height: 1px; background: #374151; }
-.cycle-divider.cycle-start::before, .cycle-divider.cycle-start::after { border-top: 1px dashed #4b5563; background: none; height: 0; }
-.cycle-divider.cycle-start { opacity: 0.8; }
-.cycle-divider.cycle-end { font-weight: 500; color: #9ca3af; }
+.cycle-divider { display: flex; align-items: center; gap: 8px; padding: 8px 12px; margin: 10px 0 4px 0; color: #9ca3af; font-size: 12px; }
+.cycle-divider::before, .cycle-divider::after { content: ''; flex: 1; height: 1px; background: #4b5563; }
+.cycle-divider.cycle-start::before, .cycle-divider.cycle-start::after { border-top: 1px dashed #6b7280; background: none; height: 0; }
+.cycle-divider.cycle-start { opacity: 0.85; }
+.cycle-divider.cycle-end { font-weight: 500; color: #d1d5db; }
 
 /* ── Market Segmented Control (legacy) ── */
 .market-seg-track {
@@ -275,6 +275,42 @@ body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, 
 }
 .back-to-live-btn:hover { background: rgba(96,165,250,0.1); }
 
+/* ── Product Badge (card header) ── */
+.product-badge {
+  display: inline-flex; align-items: center;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
+  padding: 1px 6px; border-radius: 4px; white-space: nowrap;
+}
+.product-leveraged {
+  background: rgba(251,191,36,0.15); color: #fbbf24;
+  border: 1px solid rgba(251,191,36,0.3);
+}
+.product-inverse {
+  background: rgba(34,211,238,0.12); color: #22d3ee;
+  border: 1px solid rgba(34,211,238,0.25);
+}
+.product-restricted {
+  box-shadow: 0 0 6px rgba(239,68,68,0.3);
+  border-color: rgba(239,68,68,0.4) !important;
+}
+
+/* ── Product Strip (detail panel) ── */
+.product-strip, .product-strip-restricted {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-radius: 6px; font-size: 11px;
+}
+.product-strip {
+  background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.2); color: #fde68a;
+}
+.product-strip-restricted {
+  background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.25); color: #fca5a5;
+}
+.product-restricted-label {
+  font-weight: 600; color: #f87171;
+  padding: 0 4px; border-radius: 3px;
+  background: rgba(239,68,68,0.15);
+}
+
 /* ── Keyboard Focus ── */
 button:focus-visible, select:focus-visible, input:focus-visible {
   outline: 2px solid #60a5fa; outline-offset: 2px;
@@ -286,6 +322,20 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .tech-table th { background: #1f2937; color: #9ca3af; text-align: center; }
 .tech-table tr:nth-child(even) { background: #1a1b2e; }
 .tech-table .label { text-align: left; color: #d1d5db; font-weight: 500; }
+
+/* ── Scroll to Bottom FAB ── */
+.scroll-fab {
+  position: absolute; bottom: 48px; right: 16px; z-index: 10;
+  width: 36px; height: 36px; border-radius: 50%;
+  background: #252744; border: 1px solid #374151;
+  color: #9ca3af; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity 0.2s, background 0.15s, color 0.15s;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  opacity: 1;
+}
+.scroll-fab:hover { background: #374151; color: #e5e7eb; }
+.scroll-fab.hidden { opacity: 0; pointer-events: none; }
 
 /* ── Toast Notifications ── */
 #toast-container { pointer-events: none; }
@@ -321,3 +371,127 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   100% { box-shadow: 0 0 0 0 rgba(251,191,36,0); }
 }
 .stock-card.highlighted { animation: cardHighlight 1.5s ease-out 2; }
+
+/* ── Agent Pipeline Monitor ── */
+.agent-monitor {
+  background: #12132a;
+  border-bottom: 1px solid #2a2d45;
+}
+.agent-monitor-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 16px; cursor: pointer; user-select: none;
+  transition: background 0.15s;
+}
+.agent-monitor-bar:hover { background: rgba(255,255,255,0.02); }
+.agent-monitor-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 5px;
+  background: #1e2040; border: 1px solid #30344f; color: #6b7280;
+  transition: all 0.25s;
+}
+.agent-monitor-icon.active { background: rgba(52,211,153,0.12); border-color: rgba(52,211,153,0.35); color: #34d399; }
+.agent-monitor-progress {
+  width: 80px; height: 4px; border-radius: 2px; background: #1e2040;
+  overflow: hidden;
+}
+.agent-monitor-progress-bar {
+  height: 100%; border-radius: 2px;
+  background: linear-gradient(90deg, #34d399 0%, #60a5fa 100%);
+  transition: width 0.4s ease-out;
+}
+.agent-monitor-body {
+  padding: 0 16px 10px 16px;
+  animation: fadeIn 0.25s ease-out;
+}
+
+/* Slot Cards */
+.agent-monitor-slots {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+  margin-bottom: 8px;
+}
+.monitor-slot {
+  background: #181a35; border: 1px solid #2a2d45; border-radius: 8px;
+  padding: 10px; animation: fadeIn 0.3s ease-out;
+  position: relative; overflow: hidden;
+}
+.monitor-slot::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, transparent 0%, #a78bfa 50%, transparent 100%);
+  opacity: 0; transition: opacity 0.3s;
+}
+.monitor-slot.slot-active::before { opacity: 1; animation: slotPulse 2s ease-in-out infinite; }
+@keyframes slotPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+.monitor-slot-symbol {
+  font-size: 13px; font-weight: 700; color: #e5e7eb;
+  letter-spacing: -0.01em;
+}
+.monitor-slot-name {
+  font-size: 10px; color: #6b7280; margin-top: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.monitor-slot-timer {
+  font-size: 11px; color: #4b5563; font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  margin-top: 6px;
+}
+
+/* Pipeline Steps */
+.pipeline-steps {
+  display: flex; align-items: center; gap: 0; margin-top: 8px;
+}
+.pipeline-step {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #2a2d45; border: 1.5px solid #3a3d5f;
+  transition: all 0.25s;
+  flex-shrink: 0;
+}
+.pipeline-step.step-done {
+  background: #34d399; border-color: #34d399;
+  box-shadow: 0 0 6px rgba(52,211,153,0.3);
+}
+.pipeline-step.step-active {
+  background: #a78bfa; border-color: #a78bfa;
+  box-shadow: 0 0 8px rgba(167,139,250,0.4);
+  animation: stepPulse 1.5s ease-in-out infinite;
+}
+@keyframes stepPulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(167,139,250,0.4); }
+  50% { box-shadow: 0 0 14px rgba(167,139,250,0.7); }
+}
+.pipeline-step.step-error {
+  background: #f87171; border-color: #f87171;
+  box-shadow: 0 0 6px rgba(248,113,113,0.3);
+}
+.pipeline-connector {
+  width: 12px; height: 1.5px; background: #2a2d45; flex-shrink: 0;
+  transition: background 0.25s;
+}
+.pipeline-connector.conn-done { background: #34d399; }
+.pipeline-step-label {
+  font-size: 10px; color: #6b7280; margin-top: 4px;
+  white-space: nowrap;
+}
+
+/* Completed badges */
+.monitor-completed-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
+  background: #1e2040; border: 1px solid #2a2d45; color: #9ca3af;
+  cursor: pointer; transition: all 0.15s;
+}
+.monitor-completed-badge:hover { background: #252744; }
+.monitor-completed-badge.badge-buy { border-color: rgba(248,113,113,0.3); color: #fca5a5; }
+.monitor-completed-badge.badge-sell { border-color: rgba(96,165,250,0.3); color: #93c5fd; }
+.monitor-completed-badge.badge-hold { color: #6b7280; }
+.monitor-completed-badge.badge-error { border-color: rgba(251,191,36,0.3); color: #fde68a; }
+.monitor-completed-badge.badge-skip { color: #4b5563; }
+
+/* Responsive: stack slots on narrow screens */
+@media (max-width: 900px) {
+  .agent-monitor-slots { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 600px) {
+  .agent-monitor-slots { grid-template-columns: 1fr; }
+}

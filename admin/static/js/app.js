@@ -78,6 +78,340 @@ function incActivityCount() { marketState[currentScope()].activityCount++; }
 // Legacy alias — many functions reference this directly
 let stockCards = marketState.KRX.stockCards;
 
+// ── Agent Pipeline Monitor State ──
+const PIPELINE_STEPS = ['data', 'tier1', 'tier2', 'strategy', 'decision'];
+const PIPELINE_LABELS = { data: '조회', tier1: 'Tier1', tier2: 'Tier2', strategy: '전략', decision: '결정' };
+let monitorState = {
+  KRX: { cycleActive: false, cycleId: null, startedAt: null, scannedCount: 0, analyzedCount: 0, slots: {}, completed: [], lastCycleSummary: null },
+  US:  { cycleActive: false, cycleId: null, startedAt: null, scannedCount: 0, analyzedCount: 0, slots: {}, completed: [], lastCycleSummary: null },
+};
+let monitorUpdateTimer = null;
+let monitorElapsedTimer = null;
+let monitorExpanded = true;
+
+function getMonitorState() { return monitorState[currentScope()]; }
+
+function scheduleMonitorRender() {
+  if (monitorUpdateTimer) return;
+  monitorUpdateTimer = setTimeout(() => {
+    monitorUpdateTimer = null;
+    renderAgentMonitor();
+  }, 80);
+}
+
+function updateMonitorFromActivity(data) {
+  const eventScope = (data.market_scope || 'KRX') === 'KRX' ? 'KRX' : 'US';
+  const ms = monitorState[eventScope];
+  if (!ms) return;
+  const { activity_type, phase, symbol, summary, confidence } = data;
+
+  switch (activity_type) {
+    case 'CYCLE':
+      if (phase === 'START') {
+        ms.cycleActive = true;
+        ms.cycleId = data.cycle_id;
+        ms.startedAt = Date.now();
+        ms.scannedCount = 0;
+        ms.analyzedCount = 0;
+        ms.slots = {};
+        ms.completed = [];
+      } else if (phase === 'COMPLETE' || phase === 'ERROR') {
+        ms.lastCycleSummary = {
+          analyzedCount: ms.analyzedCount,
+          scannedCount: ms.scannedCount,
+          elapsed: ms.startedAt ? Math.round((Date.now() - ms.startedAt) / 1000) : 0,
+          time: new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          error: phase === 'ERROR',
+        };
+        ms.cycleActive = false;
+        ms.slots = {};
+      }
+      break;
+    case 'SCAN':
+      if (phase === 'COMPLETE' && data.detail) {
+        try {
+          const d = typeof data.detail === 'string' ? JSON.parse(data.detail) : data.detail;
+          ms.scannedCount = (d.selected || []).length || ms.scannedCount;
+        } catch {}
+      }
+      break;
+    case 'TIER1_ANALYSIS':
+      if (phase === 'START' && symbol) {
+        ms.slots[symbol] = { symbol, name: _extractName(summary, symbol), step: 'tier1', startedAt: Date.now() };
+      } else if (phase === 'COMPLETE' && symbol) {
+        if (ms.slots[symbol]) ms.slots[symbol].step = 'tier1_done';
+        _tryResolveSlot(ms, symbol, data);
+      } else if (phase === 'ERROR' && symbol) {
+        _finishSlot(ms, symbol, 'error', summary);
+      } else if (phase === 'SKIP' && symbol) {
+        _finishSlot(ms, symbol, 'skip', summary);
+      }
+      break;
+    case 'TIER2_REVIEW':
+      if (symbol && ms.slots[symbol]) {
+        ms.slots[symbol].step = phase === 'COMPLETE' ? 'tier2_done' : 'tier2';
+      }
+      break;
+    case 'STRATEGY_EVAL':
+      if (symbol && ms.slots[symbol]) {
+        ms.slots[symbol].step = 'strategy';
+      }
+      break;
+    case 'RISK_GATE':
+      if (phase === 'SKIP' && symbol) {
+        _finishSlot(ms, symbol, 'skip', summary);
+      }
+      break;
+    case 'DECISION':
+      if ((phase === 'COMPLETE' || phase === 'ERROR') && symbol) {
+        const outcome = _detectOutcome(summary, data);
+        _finishSlot(ms, symbol, outcome, summary);
+      } else if (symbol && ms.slots[symbol]) {
+        ms.slots[symbol].step = 'decision';
+      }
+      break;
+    case 'TRADE_RESULT':
+      if (symbol) {
+        // Update completed badge if already finished
+        const existing = ms.completed.find(c => c.symbol === symbol);
+        if (existing) {
+          const outcome = _detectOutcome(summary, data);
+          if (outcome !== 'hold') existing.outcome = outcome;
+        }
+      }
+      break;
+  }
+
+  if (eventScope === currentScope()) scheduleMonitorRender();
+}
+
+function _extractName(summary, symbol) {
+  // Try to extract name from summary like "[삼성전자] ..."
+  const m = summary && summary.match(/\[([^\]]+)\]/);
+  return m ? m[1] : symbol;
+}
+
+function _detectOutcome(summary, data) {
+  if (!summary) return 'hold';
+  const s = summary.toLowerCase();
+  if (s.includes('매수') || s.includes('buy')) return 'buy';
+  if (s.includes('매도') || s.includes('sell')) return 'sell';
+  if (s.includes('오류') || s.includes('error') || s.includes('실패')) return 'error';
+  if (s.includes('스킵') || s.includes('skip') || s.includes('차단')) return 'skip';
+  return 'hold';
+}
+
+function _tryResolveSlot(ms, symbol, data) {
+  // For TIER1 COMPLETE without TIER2 or subsequent steps, check if it's a terminal hold/skip
+  const summary = data.summary || '';
+  if (summary.includes('HOLD') || summary.includes('관망') || summary.includes('보류')) {
+    _finishSlot(ms, symbol, 'hold', summary);
+  }
+}
+
+function _finishSlot(ms, symbol, outcome, summary) {
+  const slot = ms.slots[symbol];
+  const elapsed = slot ? Math.round((Date.now() - slot.startedAt) / 1000) : 0;
+  ms.completed.push({ symbol, name: slot ? slot.name : symbol, outcome, elapsed });
+  delete ms.slots[symbol];
+  ms.analyzedCount = ms.completed.length;
+}
+
+function handleAgentStateEvent(data) {
+  const scope = (data.market_scope || 'KRX') === 'KRX' ? 'KRX' : 'US';
+  const ms = monitorState[scope];
+  if (data.cycle_active) {
+    ms.cycleActive = true;
+    ms.cycleId = data.cycle_id;
+    ms.startedAt = data.started_at ? new Date(data.started_at).getTime() : Date.now();
+    ms.scannedCount = data.scanned_count || 0;
+    ms.analyzedCount = data.analyzed_count || 0;
+    ms.slots = ms.slots || {};
+  } else {
+    if (ms.cycleActive) {
+      ms.lastCycleSummary = {
+        analyzedCount: data.analyzed_count || ms.analyzedCount,
+        scannedCount: data.scanned_count || ms.scannedCount,
+        elapsed: ms.startedAt ? Math.round((Date.now() - ms.startedAt) / 1000) : 0,
+        time: new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      };
+    }
+    ms.cycleActive = false;
+    ms.slots = {};
+  }
+  if (scope === currentScope()) scheduleMonitorRender();
+}
+
+function renderAgentMonitor() {
+  const ms = getMonitorState();
+  const iconEl = document.getElementById('monitor-status-icon');
+  const statusEl = document.getElementById('monitor-status');
+  const elapsedEl = document.getElementById('monitor-elapsed');
+  const progressWrap = document.getElementById('monitor-progress-wrap');
+  const progressBar = document.getElementById('monitor-progress-bar');
+  const body = document.getElementById('monitor-body');
+  const slotsEl = document.getElementById('monitor-slots');
+  const completedWrap = document.getElementById('monitor-completed');
+  const completedList = document.getElementById('monitor-completed-list');
+
+  if (!iconEl) return;
+
+  if (ms.cycleActive) {
+    iconEl.classList.add('active');
+    const scopeLabel = currentScope() === 'KRX' ? '국내' : '해외';
+    const total = ms.scannedCount || 1;
+    const done = ms.analyzedCount;
+    statusEl.textContent = `${scopeLabel} 사이클 진행 중`;
+    statusEl.style.color = '#34d399';
+
+    // Progress bar
+    progressWrap.style.display = '';
+    const pct = Math.min(100, Math.round((done / total) * 100));
+    progressBar.style.width = `${pct}%`;
+
+    // Elapsed timer
+    if (ms.startedAt) {
+      const sec = Math.round((Date.now() - ms.startedAt) / 1000);
+      elapsedEl.textContent = `${sec}s`;
+      _startElapsedTimer();
+    }
+
+    // Body
+    if (monitorExpanded) {
+      body.style.display = '';
+      // Render slots
+      const slotSymbols = Object.keys(ms.slots);
+      let slotsHTML = '';
+      for (const sym of slotSymbols) {
+        const slot = ms.slots[sym];
+        const stepIdx = PIPELINE_STEPS.indexOf(slot.step.replace('_done', ''));
+        const isDone = slot.step.endsWith('_done');
+        const slotSec = Math.round((Date.now() - slot.startedAt) / 1000);
+
+        slotsHTML += `<div class="monitor-slot slot-active">
+          <div class="monitor-slot-symbol">${_escHtml(slot.symbol)}</div>
+          <div class="monitor-slot-name">${_escHtml(slot.name)}</div>
+          <div class="pipeline-steps">${_renderPipeline(stepIdx, isDone)}</div>
+          <div class="monitor-slot-timer">${slotSec}s · ${PIPELINE_LABELS[slot.step.replace('_done', '')] || slot.step}</div>
+        </div>`;
+      }
+      // Empty slot placeholders
+      const emptySlots = Math.max(0, 3 - slotSymbols.length);
+      if (slotSymbols.length === 0 && ms.completed.length === 0) {
+        slotsHTML += `<div class="monitor-slot" style="opacity:0.3; grid-column: 1/-1; text-align: center;">
+          <div class="text-xs text-gray-600">스캔 완료 · 분석 대기 중...</div>
+        </div>`;
+      }
+      slotsEl.innerHTML = slotsHTML;
+
+      // Render completed
+      if (ms.completed.length > 0) {
+        completedWrap.style.display = '';
+        let cHTML = '';
+        for (const c of ms.completed) {
+          const cls = `badge-${c.outcome}`;
+          const outcomeLabel = { buy: '매수', sell: '매도', hold: '관망', error: '오류', skip: '스킵' }[c.outcome] || c.outcome;
+          cHTML += `<span class="monitor-completed-badge ${cls}" title="${_escHtml(c.name)} (${c.elapsed}s)">
+            ${_escHtml(c.symbol)} <span style="opacity:0.7">${outcomeLabel}</span>
+          </span>`;
+        }
+        completedList.innerHTML = cHTML;
+      } else {
+        completedWrap.style.display = 'none';
+      }
+    } else {
+      body.style.display = 'none';
+    }
+  } else {
+    // Idle state
+    iconEl.classList.remove('active');
+    statusEl.style.color = '#6b7280';
+    progressWrap.style.display = 'none';
+    body.style.display = 'none';
+    _stopElapsedTimer();
+
+    if (ms.lastCycleSummary) {
+      const s = ms.lastCycleSummary;
+      statusEl.textContent = `대기 중`;
+      elapsedEl.textContent = `마지막: ${s.time} (${s.scannedCount}종목, ${s.elapsed}s)`;
+    } else {
+      statusEl.textContent = '대기 중';
+      elapsedEl.textContent = '';
+    }
+  }
+
+  refreshIcons();
+}
+
+function _renderPipeline(activeIdx, isDone) {
+  let html = '';
+  for (let i = 0; i < PIPELINE_STEPS.length; i++) {
+    if (i > 0) {
+      const connClass = i <= activeIdx ? 'conn-done' : '';
+      html += `<div class="pipeline-connector ${connClass}"></div>`;
+    }
+    let cls = 'pipeline-step';
+    if (i < activeIdx || (i === activeIdx && isDone)) cls += ' step-done';
+    else if (i === activeIdx) cls += ' step-active';
+    html += `<div class="${cls}" title="${PIPELINE_LABELS[PIPELINE_STEPS[i]]}"></div>`;
+  }
+  return html;
+}
+
+function _escHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function toggleMonitorExpand() {
+  monitorExpanded = !monitorExpanded;
+  renderAgentMonitor();
+}
+
+function _startElapsedTimer() {
+  if (monitorElapsedTimer) return;
+  monitorElapsedTimer = setInterval(() => {
+    const ms = getMonitorState();
+    if (!ms.cycleActive || !ms.startedAt) { _stopElapsedTimer(); return; }
+    const sec = Math.round((Date.now() - ms.startedAt) / 1000);
+    const el = document.getElementById('monitor-elapsed');
+    if (el) el.textContent = `${sec}s`;
+    // Also update slot timers
+    for (const sym of Object.keys(ms.slots)) {
+      const slot = ms.slots[sym];
+      const slotSec = Math.round((Date.now() - slot.startedAt) / 1000);
+      const timerEl = document.querySelector(`.monitor-slot .monitor-slot-timer`);
+      // Batch re-render is cheaper than individual updates for 3 slots
+    }
+  }, 1000);
+}
+
+function _stopElapsedTimer() {
+  if (monitorElapsedTimer) { clearInterval(monitorElapsedTimer); monitorElapsedTimer = null; }
+}
+
+async function initAgentMonitor() {
+  try {
+    const res = await fetch(`${API}/agent/state`);
+    const json = await res.json();
+    if (json.data) {
+      for (const scope of ['KRX', 'US']) {
+        const d = json.data[scope];
+        if (d && d.cycle_active) {
+          monitorState[scope].cycleActive = true;
+          monitorState[scope].cycleId = d.cycle_id;
+          monitorState[scope].startedAt = d.started_at ? new Date(d.started_at).getTime() : Date.now();
+          monitorState[scope].scannedCount = d.scanned_count || 0;
+          monitorState[scope].analyzedCount = d.analyzed_count || 0;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Agent monitor bootstrap failed:', e);
+  }
+  renderAgentMonitor();
+}
+
 // ── Init ──
 document.addEventListener('DOMContentLoaded', async () => {
   await loadSettings();
@@ -89,10 +423,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   loadLLMUsage();
   connectSSE();
   loadTodayActivities();
+  initAgentMonitor();
   setInterval(loadSystemStatus, 15000);
   accountPollTimer = setInterval(loadMarketAccountInfo, 30000);
   setInterval(loadLLMUsage, 60000);
 });
+
+// ── Scroll to Bottom ──
+function scrollToBottom() {
+  const container = document.getElementById('chat-container');
+  container.scrollTop = container.scrollHeight;
+  autoScroll = true;
+}
 
 // ── Toast Notifications ──
 function showToast(message, optsOrType = 'info', legacyDuration) {
@@ -248,10 +590,20 @@ function connectSSE() {
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'connected') return;
+
+      // Agent pipeline monitor events
+      if (msg.type === 'agent_state') {
+        handleAgentStateEvent(msg.data);
+        return;
+      }
+
       if (msg.type === 'activity') {
         const eventScope = (msg.data && msg.data.market_scope) || 'KRX';
         const scopeKey = eventScope === 'KRX' ? 'KRX' : 'US';
         const myScope = currentScope();
+
+        // ⓪ Agent Monitor routing (all markets)
+        updateMonitorFromActivity(msg.data);
 
         // ① Importance classification (all markets)
         const importance = classifyImportance(msg.data);
@@ -309,6 +661,8 @@ function connectSSE() {
     setTimeout(() => {
       if (es.readyState === EventSource.CLOSED) connectSSE();
     }, 3000);
+    // Re-bootstrap monitor on reconnect
+    setTimeout(initAgentMonitor, 4000);
   };
 }
 
@@ -363,6 +717,9 @@ function switchMarket(market) {
   });
   loadSystemStatus();
   loadReportList();
+
+  // 11. Re-render agent monitor for new market
+  renderAgentMonitor();
 }
 
 function setupMarketTabs() {
@@ -1032,9 +1389,42 @@ function createCycleDivider(data, isStart) {
   } else {
     const time = formatTime(data.created_at);
     const elapsed = data.execution_time_ms ? ` (${(data.execution_time_ms / 1000).toFixed(1)}초)` : '';
-    div.innerHTML = `<span>${escapeHtml(summary)}${elapsed}</span><span class="text-gray-600">${time}</span>`;
+    div.innerHTML = `<span>${escapeHtml(summary)}${elapsed}</span><span class="text-gray-500">${time}</span>`;
   }
   return div;
+}
+
+// ── Product Context Helpers ──
+function extractProductContext(data) {
+  if (!data.detail) return null;
+  try {
+    const obj = typeof data.detail === 'string' ? JSON.parse(data.detail) : data.detail;
+    return obj.product_context || null;
+  } catch { return null; }
+}
+function renderProductBadge(pc) {
+  if (!pc) return '';
+  const mult = pc.leverage_multiplier || 1;
+  const signed = pc.signed_exposure || mult;
+  const label = (pc.is_inverse ? '' : '+') + signed + 'x';
+  const restricted = pc.restricted_product;
+  if (pc.is_inverse) {
+    return `<span class="product-badge product-inverse${restricted ? ' product-restricted' : ''}">${label}</span>`;
+  } else if (pc.is_leveraged || mult > 1) {
+    return `<span class="product-badge product-leveraged${restricted ? ' product-restricted' : ''}">${label}</span>`;
+  }
+  return '';
+}
+function renderProductStrip(pc) {
+  if (!pc) return '';
+  const mult = pc.leverage_multiplier || 1;
+  const signed = pc.signed_exposure || mult;
+  const label = (pc.is_inverse ? '' : '+') + signed + 'x';
+  const typeLabel = pc.product_type ? pc.product_type.replace(/_/g, ' ') : '';
+  const source = pc.classification_source || '';
+  const restricted = pc.restricted_product;
+  const cls = restricted ? 'product-strip-restricted' : 'product-strip';
+  return `<div class="${cls} mb-2"><span class="font-medium">${label}</span><span class="opacity-75">${typeLabel}</span>${restricted ? '<span class="product-restricted-label">제한 상품</span>' : ''}<span class="opacity-50">${source}</span></div>`;
 }
 
 /**
@@ -1055,6 +1445,7 @@ function createStockCard(symbol, firstActivity) {
     <span class="text-sm font-medium text-white flex-1 truncate">
       ${escapeHtml(stockName)} <span class="text-gray-500 text-xs">${escapeHtml(symbol)}</span>
     </span>
+    <span class="stock-product-badge"></span>
     <span class="stock-outcome flex items-center gap-1 text-xs px-2 py-0.5 rounded bg-purple-900/40 text-purple-300">
       <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:2px"></span>분석 중
     </span>
@@ -1083,6 +1474,7 @@ function createStockCard(symbol, firstActivity) {
     symbol: symbol,
     stockName: stockName,
     outcome: null,       // BUY, SELL, HOLD, ERROR
+    productContext: null,
     confidence: null,
     totalElapsed: 0,
     isOpen: false,
@@ -1110,6 +1502,16 @@ function createStockCard(symbol, firstActivity) {
  */
 function addStepToCard(card, data) {
   card.activities.push(data);
+
+  // Extract product_context from detail (first occurrence wins)
+  if (!card.productContext) {
+    const pc = extractProductContext(data);
+    if (pc) {
+      card.productContext = pc;
+      const badgeEl = card.headerEl.querySelector('.stock-product-badge');
+      if (badgeEl) badgeEl.innerHTML = renderProductBadge(pc);
+    }
+  }
 
   const progressKey = getProgressKey(data);
 
@@ -1169,7 +1571,7 @@ function addStepToCard(card, data) {
         ${isLLMCall ? '<i data-lucide="message-square" class="w-3 h-3"></i> LLM 대화' : '<i data-lucide="chevron-down" class="w-3 h-3"></i> 상세'}
       </button>
       <div id="${detailId}" class="detail-content mt-1 text-xs bg-dark-900/50 rounded p-2 text-gray-400">
-        ${isLLMCall ? formatLLMConversation(data.detail) : `<div class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${formatDetail(data.detail, data.activity_type)}</div>`}
+        ${renderProductStrip(extractProductContext(data))}${isLLMCall ? formatLLMConversation(data.detail) : `<div class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${formatDetail(data.detail, data.activity_type)}</div>`}
       </div>`;
   }
 
@@ -2271,4 +2673,6 @@ function renderPlaceholder(container, type, message) {
 document.getElementById('chat-container').addEventListener('scroll', function() {
   const el = this;
   autoScroll = (el.scrollHeight - el.scrollTop - el.clientHeight) < 50;
+  const fab = document.getElementById('scroll-to-bottom');
+  if (fab) fab.classList.toggle('hidden', autoScroll);
 });
