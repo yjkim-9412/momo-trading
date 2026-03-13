@@ -150,6 +150,34 @@ class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_execute_trading_scan_reconciles_watchlist_after_successful_cycle(self):
+        with patch.object(market_calendar, "is_holiday", return_value=False), patch.object(
+            type(mcp_client),
+            "is_connected",
+            new_callable=PropertyMock,
+            return_value=True,
+        ), patch(
+            "agent.trading_agent.trading_agent.run_cycle",
+            AsyncMock(return_value={"analyzed": 2, "executed": 1, "selected_symbols": [("NVDA", "NASDAQ")]}),
+        ), patch(
+            "services.watchlist_sync.reconcile_market_watchlist",
+            AsyncMock(return_value=[("NVDA", "NASDAQ"), ("PLTR", "NASDAQ")]),
+        ) as reconcile_watchlist, patch.object(
+            self.scheduler,
+            "_log_schedule",
+            AsyncMock(),
+        ) as log_schedule:
+            await self.scheduler._execute_trading_scan(
+                "NASDAQ",
+                trigger_reason="adaptive_rescan",
+                include_gap_check=False,
+            )
+
+        reconcile_watchlist.assert_awaited_once_with("NASDAQ")
+        self.assertTrue(
+            any("실시간 감시 2종목" in call.args[2] for call in log_schedule.await_args_list)
+        )
+
     async def test_adaptive_rescan_clears_stale_next_run_at_before_execution(self):
         state = self.scheduler._adaptive_state("KRX")
         state.next_adaptive_run_at = datetime(2026, 3, 14, 9, 35)

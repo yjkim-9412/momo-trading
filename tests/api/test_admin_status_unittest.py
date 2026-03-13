@@ -1,15 +1,26 @@
+import asyncio
 import unittest
 from datetime import date, datetime, timezone
-from unittest.mock import PropertyMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from admin.sse_manager import sse_manager
 from agent.trading_agent import trading_agent
-from api.routes.admin import get_schedule_timeline, get_system_status
+from agent.trading_agent._types import MarketState
+from api.routes.admin import (
+    get_schedule_timeline,
+    get_system_status,
+    get_watchlist,
+    trigger_agent_cycle,
+)
+from realtime.event_detector import StockThresholds, event_detector
 from realtime.monitor import realtime_monitor
 from realtime.stream_manager import stream_manager
 from scheduler.market_calendar import market_calendar
 from scheduler.scheduler import AdaptiveRescanState, trading_scheduler
+from services.activity_logger import activity_logger
+from trading.account_manager import account_manager
 from trading.mcp_client import mcp_client
+from trading.models import HoldingInfo
 
 
 class AdminStatusRouteTest(unittest.IsolatedAsyncioTestCase):
@@ -77,6 +88,96 @@ class AdminStatusRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adaptive["next_run_in_minutes"], 30)
         self.assertEqual(adaptive["last_run_at"], last_run_at.isoformat())
         self.assertEqual(adaptive["last_error"], "cycle exploded")
+
+    async def test_get_watchlist_exposes_selected_desired_and_threshold_flags(self):
+        runtime = MarketState(
+            scope="US",
+            last_selected_watchlist=[
+                {"symbol": "NVDA", "market": "NASDAQ", "name": "NVIDIA"},
+            ],
+        )
+
+        with patch.object(trading_agent, "_market_states", {"US": runtime}), \
+                patch.object(
+                    account_manager,
+                    "get_holdings",
+                    AsyncMock(return_value=[
+                        HoldingInfo(
+                            symbol="PLTR",
+                            name="Palantir",
+                            market="NASDAQ",
+                            quantity=1,
+                            avg_buy_price=10,
+                            current_price=11,
+                            pnl=1,
+                            pnl_rate=10,
+                        )
+                    ]),
+                ), \
+                patch.object(stream_manager, "desired_keys", return_value={
+                    ("NASDAQ", "NVDA"),
+                    ("NASDAQ", "PLTR"),
+                }), \
+                patch.object(stream_manager, "active_keys", return_value={("NASDAQ", "PLTR")}), \
+                patch.object(stream_manager, "stream_status", return_value={"running": True}), \
+                patch.object(
+                    event_detector,
+                    "_thresholds",
+                    {
+                        "NASDAQ:NVDA": StockThresholds(surge_pct=1.5),
+                        "NASDAQ:SOFI": StockThresholds(volume_spike_ratio=4.0),
+                    },
+                ):
+            response = await get_watchlist("NASDAQ")
+
+        symbols = {
+            (item["market"], item["symbol"]): item
+            for item in response.data["symbols"]
+        }
+        self.assertTrue(symbols[("NASDAQ", "NVDA")]["selected_in_last_cycle"])
+        self.assertTrue(symbols[("NASDAQ", "NVDA")]["in_desired_set"])
+        self.assertTrue(symbols[("NASDAQ", "NVDA")]["has_thresholds"])
+        self.assertFalse(symbols[("NASDAQ", "NVDA")]["is_subscribed"])
+        self.assertTrue(symbols[("NASDAQ", "PLTR")]["is_holding"])
+        self.assertTrue(symbols[("NASDAQ", "PLTR")]["in_desired_set"])
+        self.assertFalse(symbols[("NASDAQ", "SOFI")]["in_desired_set"])
+        self.assertFalse(symbols[("NASDAQ", "SOFI")]["selected_in_last_cycle"])
+        self.assertTrue(symbols[("NASDAQ", "SOFI")]["has_thresholds"])
+
+    async def test_trigger_agent_cycle_reconciles_watchlist_after_successful_run(self):
+        created_tasks = []
+        real_create_task = asyncio.create_task
+
+        def _capture_task(coro):
+            task = real_create_task(coro)
+            created_tasks.append(task)
+            return task
+
+        with patch.object(
+            trading_agent,
+            "preview_cycle",
+            AsyncMock(return_value={"market_scope": "US", "trading_date": "2026-03-14"}),
+        ), patch.object(
+            trading_agent,
+            "run_cycle",
+            AsyncMock(return_value={"analyzed": 2, "executed": 0}),
+        ), patch.object(
+            activity_logger,
+            "log",
+            AsyncMock(),
+        ), patch(
+            "services.watchlist_sync.reconcile_market_watchlist",
+            AsyncMock(return_value=[("NVDA", "NASDAQ")]),
+        ) as reconcile_watchlist, patch(
+            "api.routes.admin.asyncio.create_task",
+            side_effect=_capture_task,
+        ):
+            response = await trigger_agent_cycle("NASDAQ")
+            self.assertEqual(len(created_tasks), 1)
+            await created_tasks[0]
+
+        self.assertEqual(response.data["market"], "NASDAQ")
+        reconcile_watchlist.assert_awaited_once_with("NASDAQ")
 
 
 if __name__ == "__main__":

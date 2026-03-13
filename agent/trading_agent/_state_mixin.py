@@ -57,6 +57,7 @@ class StateMixin:
             runtime.session_ids = {}
             runtime.last_completed_review_date = None
             runtime.last_schedule_hint = {}
+            runtime.last_selected_watchlist = []
             runtime.last_cycle_attempt_at = None
             runtime.last_cycle_status = None
             runtime.last_cycle_error = None

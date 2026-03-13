@@ -210,6 +210,7 @@ class CycleMixin:
             "executed": 0,
             "selected_symbols": [],
         }
+        selected_watchlist: list[dict[str, str]] = []
         snapshot: dict = {
             "cash": 0,
             "total_asset": 0,
@@ -323,17 +324,29 @@ class CycleMixin:
                 )
             else:
                 # 선정 종목을 결과에 저장 (WebSocket 구독용)
-                results["selected_symbols"] = [
-                    (c.get("symbol", ""), c.get("market", "KRX"))
+                selected_watchlist = [
+                    {
+                        "symbol": str(c.get("symbol", "")).upper(),
+                        "market": normalize_market(c.get("market", target)),
+                        "name": str(c.get("name", "") or ""),
+                    }
                     for c in candidates if c.get("symbol")
+                ]
+                results["selected_symbols"] = [
+                    (item["symbol"], item["market"])
+                    for item in selected_watchlist
                 ]
 
                 # 파이프라인 모니터 상태 업데이트 + SSE 브로드캐스트
                 from util.time_util import now_kst as _now_kst
 
                 selected_syms = [
-                    {"symbol": c.get("symbol", ""), "name": c.get("name", "")}
-                    for c in candidates if c.get("symbol")
+                    {
+                        "symbol": item["symbol"],
+                        "market": item["market"],
+                        "name": item["name"],
+                    }
+                    for item in selected_watchlist
                 ]
                 state._pipeline_snapshot = {
                     "cycle_id": cycle_id,
@@ -495,6 +508,7 @@ class CycleMixin:
                 results["schedule_hint"] = schedule_hint
                 state.last_schedule_hint = dict(schedule_hint)
 
+            state.last_selected_watchlist = list(selected_watchlist)
             self._last_cycle_time = now_kst()
             elapsed = activity_logger.elapsed_ms(cycle_timer)
             self._set_cycle_runtime_state(state, status="COMPLETE")

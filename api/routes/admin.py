@@ -134,25 +134,40 @@ async def get_watchlist(market: str | None = Query(None)):
     scope = normalize_market_scope(market_code)
 
     # 1) 보유종목 이름 맵
-    holding_map: dict[str, str] = {}
+    holding_names: dict[tuple[str, str], str] = {}
+    holding_keys: set[tuple[str, str]] = set()
     try:
         holdings = await account_manager.get_holdings(market_code)
         for h in holdings:
             if h.symbol:
-                holding_map[h.symbol.upper()] = h.name or ""
+                key = (str(h.market or market_code).upper(), h.symbol.upper())
+                holding_names[key] = h.name or ""
+                holding_keys.add(key)
     except Exception:
         pass
 
-    # 2) 파이프라인 스냅샷에서 종목명 보충
-    name_map: dict[str, str] = dict(holding_map)
+    # 2) 최근 선정 종목/파이프라인 스냅샷에서 종목명 보충
+    name_map: dict[tuple[str, str], str] = dict(holding_names)
+    selected_keys: set[tuple[str, str]] = set()
     state = trading_agent._market_states.get(scope)
     if state:
+        for sym_info in getattr(state, "last_selected_watchlist", []):
+            sym = str(sym_info.get("symbol", "")).upper()
+            mk = str(sym_info.get("market", market_code)).upper()
+            if not sym:
+                continue
+            key = (mk, sym)
+            selected_keys.add(key)
+            if key not in name_map:
+                name_map[key] = str(sym_info.get("name", "") or "")
         pipeline = getattr(state, "_pipeline_snapshot", None) or {}
         for sym_info in pipeline.get("selected_symbols", []):
             if isinstance(sym_info, dict):
                 sym = str(sym_info.get("symbol", "")).upper()
-                if sym and sym not in name_map:
-                    name_map[sym] = sym_info.get("name", "")
+                mk = str(sym_info.get("market", market_code)).upper()
+                key = (mk, sym)
+                if sym and key not in name_map:
+                    name_map[key] = str(sym_info.get("name", "") or "")
 
     # 3) scope에 해당하는 desired 종목 수집
     desired_set = stream_manager.desired_keys(scope)
@@ -166,20 +181,37 @@ async def get_watchlist(market: str | None = Query(None)):
     ]
 
     # 5) 합집합 구성
-    all_symbols: dict[tuple[str, str], bool] = {}  # (market, symbol) -> is_subscribed
+    all_symbols: dict[tuple[str, str], dict[str, bool]] = {}
     for market_sym, symbol_upper in desired_set:
-        all_symbols[(market_sym, symbol_upper)] = (market_sym, symbol_upper) in active_set
+        key = (market_sym, symbol_upper)
+        all_symbols[key] = {
+            "in_desired_set": True,
+            "selected_in_last_cycle": key in selected_keys,
+        }
     for key in threshold_keys:
         parts = key.split(":", 1)
         if len(parts) == 2:
             mk, sym = parts
-            if (mk, sym) not in all_symbols:
-                all_symbols[(mk, sym)] = (mk, sym) in active_set
+            all_symbols.setdefault(
+                (mk, sym),
+                {
+                    "in_desired_set": (mk, sym) in desired_set,
+                    "selected_in_last_cycle": (mk, sym) in selected_keys,
+                },
+            )
+    for key in selected_keys:
+        all_symbols.setdefault(
+            key,
+            {
+                "in_desired_set": key in desired_set,
+                "selected_in_last_cycle": True,
+            },
+        )
 
     # 6) 직렬화
     default_dict = asdict(DEFAULT_THRESHOLDS)
     symbols_list = []
-    for (mk, sym), is_sub in all_symbols.items():
+    for (mk, sym), flags in all_symbols.items():
         th = event_detector._thresholds.get(f"{mk}:{sym}")
         th_data = None
         if th:
@@ -189,14 +221,25 @@ async def get_watchlist(market: str | None = Query(None)):
         symbols_list.append({
             "symbol": sym,
             "market": mk,
-            "name": name_map.get(sym, ""),
-            "is_holding": sym in holding_map,
-            "is_subscribed": is_sub,
+            "name": name_map.get((mk, sym), ""),
+            "is_holding": (mk, sym) in holding_keys,
+            "is_subscribed": (mk, sym) in active_set,
+            "in_desired_set": flags["in_desired_set"],
+            "selected_in_last_cycle": flags["selected_in_last_cycle"],
+            "has_thresholds": th_data is not None,
             "thresholds": th_data,
         })
 
-    # 보유종목 우선, 그 다음 임계값 있는 것, 나머지
-    symbols_list.sort(key=lambda s: (not s["is_holding"], s["thresholds"] is None, s["symbol"]))
+    # 보유종목 우선, 그 다음 최근 선정, 실제 desired, threshold-only 순
+    symbols_list.sort(
+        key=lambda s: (
+            not s["is_holding"],
+            not s["selected_in_last_cycle"],
+            not s["in_desired_set"],
+            not s["has_thresholds"],
+            s["symbol"],
+        )
+    )
 
     return SuccessResponse(data={
         "symbols": symbols_list,
@@ -722,8 +765,17 @@ async def trigger_agent_cycle(market: str | None = Query(None)):
         f"\U0001f3ae 수동 사이클 트리거 (관리자, {market_label})",
     )
 
+    async def _run_manual_cycle() -> None:
+        from services.watchlist_sync import reconcile_market_watchlist
+
+        result = await trading_agent.run_cycle(market=market_code)
+        if result.get("skipped"):
+            logger.info("수동 사이클 스킵 ({}): {}", market_code, result.get("reason", "skipped"))
+            return
+        await reconcile_market_watchlist(market_code)
+
     # 비동기로 실행 (즉시 응답)
-    task = asyncio.create_task(trading_agent.run_cycle(market=market_code))
+    task = asyncio.create_task(_run_manual_cycle())
 
     def _log_cycle_task_result(done_task: asyncio.Task) -> None:
         if done_task.cancelled():

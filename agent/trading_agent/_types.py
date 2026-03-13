@@ -48,6 +48,7 @@ class MarketState:
     strategies: dict[str, object] = field(default_factory=_default_strategies)
     last_completed_review_date: date | None = None
     last_schedule_hint: dict = field(default_factory=dict)
+    last_selected_watchlist: list[dict[str, str]] = field(default_factory=list)
     _pipeline_snapshot: dict = field(default_factory=dict)
     last_cycle_attempt_at: datetime | None = None
     last_cycle_status: str | None = None

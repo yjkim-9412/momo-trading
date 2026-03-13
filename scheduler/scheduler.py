@@ -792,24 +792,16 @@ class TradingScheduler:
             if settings.AI_DYNAMIC_RESCAN_ENABLED and self._adaptive_trigger_uses_budget(trigger_reason):
                 self._record_completed_adaptive_cycle(market, trigger_reason)
 
-            selected = result.get("selected_symbols", [])
-            holdings = await account_manager.get_holdings(market)
-            holding_symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
-            all_symbols = list(
-                {(m, symbol): (symbol, m) for symbol, m in selected + holding_symbols}.values()
-            )[:41]
+            from services.watchlist_sync import reconcile_market_watchlist
 
-            if all_symbols:
-                from realtime.stream_manager import stream_manager
-
-                await stream_manager.replace_market_subscriptions(market, all_symbols)
+            desired_symbols = await reconcile_market_watchlist(market)
 
             await self._log_schedule(
                 market,
                 ActivityPhase.PROGRESS,
                 f"{complete_prefix} — 분석 {result.get('analyzed', 0)}건, "
                 f"매매 {result.get('executed', 0)}건, "
-                f"실시간 감시 {len(all_symbols)}종목 → 모니터링 돌입",
+                f"실시간 감시 {len(desired_symbols)}종목 → 모니터링 돌입",
             )
             if settings.AI_DYNAMIC_RESCAN_ENABLED and self._adaptive_trigger_can_reschedule(trigger_reason):
                 await self._schedule_next_adaptive_rescan(market, result)
@@ -920,16 +912,12 @@ class TradingScheduler:
         )
 
     async def _update_realtime_subscriptions(self, market: str) -> None:
-        """보유종목 WebSocket 구독 갱신 (임계값은 AI가 설정)"""
+        """최근 선정 종목 + 보유 종목 기준으로 WebSocket 구독 갱신."""
         try:
-            from trading.account_manager import account_manager
-            from realtime.stream_manager import stream_manager
+            from services.watchlist_sync import reconcile_market_watchlist
 
-            holdings = await account_manager.get_holdings(market)
-            if holdings:
-                symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
-                await stream_manager.replace_market_subscriptions(market, symbols)
-                logger.info("[{}] WebSocket 구독 갱신: {}종목", market, len(symbols))
+            desired_symbols = await reconcile_market_watchlist(market)
+            logger.info("[{}] WebSocket 구독 갱신: {}종목", market, len(desired_symbols))
         except Exception as e:
             logger.warning("[{}] WebSocket 구독 갱신 실패: {}", market, str(e))
 
