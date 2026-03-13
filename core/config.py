@@ -6,7 +6,7 @@ import shutil
 from loguru import logger
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from trading.enums import LLMProvider, LLMTier
+from trading.enums import LLMProvider, LLMTier, Tier1Profile
 
 VALID_CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
@@ -80,6 +80,8 @@ class Settings(BaseSettings):
     CODEX_MODEL_TIER2: str = ""
     CODEX_REASONING_EFFORT: str = ""
     CODEX_REASONING_EFFORT_TIER1: str = ""
+    CODEX_REASONING_EFFORT_TIER1_SCAN: str = ""
+    CODEX_REASONING_EFFORT_TIER1_ANALYSIS: str = ""
     CODEX_REASONING_EFFORT_TIER2: str = "xhigh"
     CODEX_CLI_PATH: str = ""
 
@@ -265,16 +267,20 @@ class Settings(BaseSettings):
         self,
         provider: LLMProvider,
         tier: LLMTier,
+        profile: Tier1Profile | None = None,
     ) -> str | None:
         """provider/tier 조합의 reasoning effort 반환"""
         if provider == LLMProvider.CLAUDE_CODE:
             return "medium" if tier == LLMTier.TIER1 else "high"
 
-        for field_name, raw_value in self._get_codex_reasoning_effort_candidates(tier):
+        for field_name, raw_value in self._get_codex_reasoning_effort_candidates(
+            tier,
+            profile,
+        ):
             normalized, is_valid = self._parse_codex_reasoning_effort(raw_value)
             if normalized and is_valid:
                 return normalized
-        return None
+        return self._get_default_codex_reasoning_effort(tier, profile)
 
     def get_llm_cli_path(self, provider: LLMProvider) -> str | None:
         """provider별 CLI 경로 탐색"""
@@ -320,16 +326,36 @@ class Settings(BaseSettings):
     def _get_codex_reasoning_effort_candidates(
         self,
         tier: LLMTier,
+        profile: Tier1Profile | None = None,
     ) -> list[tuple[str, str]]:
         """Codex reasoning effort 우선순위 후보 반환"""
         if tier == LLMTier.TIER1:
-            tier_field = "CODEX_REASONING_EFFORT_TIER1"
-        else:
-            tier_field = "CODEX_REASONING_EFFORT_TIER2"
+            profile_field = (
+                "CODEX_REASONING_EFFORT_TIER1_SCAN"
+                if profile == Tier1Profile.SCAN
+                else "CODEX_REASONING_EFFORT_TIER1_ANALYSIS"
+            )
+            return [
+                (profile_field, getattr(self, profile_field)),
+                ("CODEX_REASONING_EFFORT_TIER1", self.CODEX_REASONING_EFFORT_TIER1),
+                ("CODEX_REASONING_EFFORT", self.CODEX_REASONING_EFFORT),
+            ]
         return [
-            (tier_field, getattr(self, tier_field)),
+            ("CODEX_REASONING_EFFORT_TIER2", self.CODEX_REASONING_EFFORT_TIER2),
             ("CODEX_REASONING_EFFORT", self.CODEX_REASONING_EFFORT),
         ]
+
+    @staticmethod
+    def _get_default_codex_reasoning_effort(
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str:
+        """Codex reasoning effort 기본값"""
+        if tier == LLMTier.TIER2:
+            return "xhigh"
+        if profile == Tier1Profile.SCAN:
+            return "low"
+        return "medium"
 
     @staticmethod
     def _parse_codex_reasoning_effort(raw_value: str) -> tuple[str | None, bool]:
@@ -344,6 +370,8 @@ class Settings(BaseSettings):
         for field_name in (
             "CODEX_REASONING_EFFORT",
             "CODEX_REASONING_EFFORT_TIER1",
+            "CODEX_REASONING_EFFORT_TIER1_SCAN",
+            "CODEX_REASONING_EFFORT_TIER1_ANALYSIS",
             "CODEX_REASONING_EFFORT_TIER2",
         ):
             raw_value = getattr(self, field_name)

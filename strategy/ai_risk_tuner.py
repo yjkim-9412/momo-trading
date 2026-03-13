@@ -14,7 +14,7 @@ from core.config import settings
 from core.database import AsyncSessionLocal
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
-from trading.enums import ActivityPhase, ActivityType
+from trading.enums import ActivityPhase, ActivityType, Tier1Profile
 
 
 class AIRiskTuner:
@@ -81,6 +81,7 @@ class AIRiskTuner:
             result_text, provider = await llm_factory.generate_tier1(
                 prompt,
                 system_prompt=RISK_TUNING_SYSTEM,
+                profile=Tier1Profile.ANALYSIS,
                 scope=market_scope(target),
                 phase="cycle",
             )

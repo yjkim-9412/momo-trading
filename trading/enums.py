@@ -94,6 +94,12 @@ class LLMTier(str, Enum):
     TIER2 = "TIER2"      # 프리미엄 (최종 검토)
 
 
+class Tier1Profile(str, Enum):
+    """Tier1 호출 프로필"""
+    SCAN = "scan"
+    ANALYSIS = "analysis"
+
+
 class LLMProvider(str, Enum):
     """LLM 제공자"""
     CLAUDE_CODE = "CLAUDE_CODE"  # 로컬 Claude Code CLI (구독 크레딧)

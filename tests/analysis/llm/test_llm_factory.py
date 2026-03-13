@@ -2,7 +2,7 @@ import pytest
 
 from analysis.llm.llm_factory import llm_factory
 from core.config import settings
-from trading.enums import LLMProvider, LLMTier
+from trading.enums import LLMProvider, LLMTier, Tier1Profile
 
 
 class DummyCodexProvider:
@@ -42,9 +42,11 @@ class DummyCodexProvider:
         *,
         scope: str | None = None,
         phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
     ) -> str:
         session = self.get_session_id(scope, phase) or "no-session"
-        return f"{scope or 'NONE'}:{phase}:{session}|{system_prompt}|{prompt}"
+        effort = reasoning_effort_override or self.configured_reasoning_effort or "none"
+        return f"{scope or 'NONE'}:{phase}:{session}:{effort}|{system_prompt}|{prompt}"
 
     async def is_available(self) -> bool:
         return True
@@ -128,11 +130,12 @@ async def test_generate_routes_to_selected_provider(monkeypatch):
     result, provider = await llm_factory.generate_tier1(
         "PROMPT",
         system_prompt="SYSTEM",
+        profile=Tier1Profile.SCAN,
         scope="KRX",
         phase="cycle",
     )
 
-    assert result == "KRX:cycle:dummy-session|SYSTEM|PROMPT"
+    assert result == "KRX:cycle:dummy-session:low|SYSTEM|PROMPT"
     assert provider == LLMProvider.CODEX_CLI.value
 
 
@@ -158,11 +161,15 @@ async def test_get_llm_status_uses_selected_provider(monkeypatch):
         "short_label": "후보 분석",
         "description": "차트·시장 컨텍스트를 바탕으로 매수 후보와 목표/손절을 1차 판단",
     }
+    assert status["tier1_profiles"]["scan"]["reasoning_effort"] == "low"
+    assert status["tier1_profiles"]["analysis"]["reasoning_effort"] == "medium"
     assert status["tier2"]["reasoning_effort"] == "high"
     assert status["tier2"]["display_name"] == "최종 검토 에이전트"
     assert status["session_id"] == "dummy-session"
     assert any(
-        item["id"] == LLMProvider.CODEX_CLI.value and item["selected"]
+        item["id"] == LLMProvider.CODEX_CLI.value
+        and item["selected"]
+        and item["reasoning_efforts"]["tier1_profiles"]["scan"] == "low"
         for item in status["available_providers"]
     )
 

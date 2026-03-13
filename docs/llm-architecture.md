@@ -266,7 +266,7 @@ flowchart LR
 
     BASE["codex exec --json --skip-git-repo-check -o result.txt"]
     MODEL["--model gpt-5.4"]
-    EFFORT["-c model_reasoning_effort=xhigh"]
+    EFFORT["-c model_reasoning_effort=<profile/default>"]
     SESSION{"Session state?"}
     NEW["--sandbox read-only"]
     RESUME["resume thread_id"]

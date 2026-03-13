@@ -180,6 +180,7 @@ class ClaudeCodeProvider:
         *,
         scope: str | None = None,
         phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
     ) -> str:
         """claude -p 로 텍스트 생성
 
@@ -196,7 +197,7 @@ class ClaudeCodeProvider:
             raise RuntimeError("claude CLI를 찾을 수 없습니다 (PATH 확인)")
 
         # Tier별 effort: TIER1(스캔/분석)=medium, TIER2(최종검토)=high
-        effort = self._reasoning_effort or "medium"
+        effort = reasoning_effort_override or self._reasoning_effort or "medium"
 
         cmd = [
             claude, "-p",

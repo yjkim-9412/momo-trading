@@ -35,6 +35,7 @@ class LLMProviderProtocol(Protocol):
         *,
         scope: str | None = None,
         phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
     ) -> str:
         """텍스트 생성"""
         ...

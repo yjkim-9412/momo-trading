@@ -158,6 +158,7 @@ class CodexCLIProvider:
         *,
         scope: str | None = None,
         phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
     ) -> str:
         """codex exec로 텍스트 생성"""
         codex = self._find_codex()
@@ -170,7 +171,8 @@ class CodexCLIProvider:
             "active_session_id": None,
             "session_initialized": False,
         }
-        cmd, output_path = self._build_command(codex, state)
+        reasoning_effort = reasoning_effort_override or self._reasoning_effort
+        cmd, output_path = self._build_command(codex, state, reasoning_effort)
 
         if state["session_enabled"] and scope is not None:
             async with self._get_lock(scope, phase):
@@ -184,12 +186,18 @@ class CodexCLIProvider:
             return prompt
         return f"[역할]\n{system_prompt}\n\n[요청]\n{prompt}"
 
-    def _append_reasoning_effort(self, cmd: list[str]) -> None:
+    @staticmethod
+    def _append_reasoning_effort(cmd: list[str], reasoning_effort: str | None) -> None:
         """Codex reasoning effort override 추가"""
-        if self._reasoning_effort:
-            cmd.extend(["-c", f"model_reasoning_effort={self._reasoning_effort}"])
+        if reasoning_effort:
+            cmd.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
 
-    def _build_command(self, codex_path: str, state: dict[str, Any]) -> tuple[list[str], str]:
+    def _build_command(
+        self,
+        codex_path: str,
+        state: dict[str, Any],
+        reasoning_effort: str | None = None,
+    ) -> tuple[list[str], str]:
         """세션 상태에 맞는 Codex CLI 명령 구성"""
         fd, output_path = tempfile.mkstemp(prefix="codex-llm-", suffix=".txt")
         os.close(fd)
@@ -207,7 +215,7 @@ class CodexCLIProvider:
                 ]
                 if self._model:
                     cmd.extend(["--model", self._model])
-                self._append_reasoning_effort(cmd)
+                self._append_reasoning_effort(cmd, reasoning_effort)
                 cmd.extend([state["active_session_id"], "-"])
                 return cmd, output_path
 
@@ -223,7 +231,7 @@ class CodexCLIProvider:
             ]
             if self._model:
                 cmd.extend(["--model", self._model])
-            self._append_reasoning_effort(cmd)
+            self._append_reasoning_effort(cmd, reasoning_effort)
             cmd.append("-")
             return cmd, output_path
 
@@ -240,7 +248,7 @@ class CodexCLIProvider:
         ]
         if self._model:
             cmd.extend(["--model", self._model])
-        self._append_reasoning_effort(cmd)
+        self._append_reasoning_effort(cmd, reasoning_effort)
         cmd.append("-")
         return cmd, output_path
 

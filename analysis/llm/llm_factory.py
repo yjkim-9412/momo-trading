@@ -11,7 +11,7 @@ from analysis.llm.base import LLMProviderProtocol, LLMSessionProtocol
 from analysis.llm.claude_code_provider import ClaudeCodeProvider
 from analysis.llm.codex_cli_provider import CodexCLIProvider
 from core.config import settings
-from trading.enums import ActivityPhase, ActivityType, LLMProvider, LLMTier
+from trading.enums import ActivityPhase, ActivityType, LLMProvider, LLMTier, Tier1Profile
 
 
 class LLMFactory:
@@ -35,6 +35,18 @@ class LLMFactory:
             "display_name": "최종 검토 에이전트",
             "short_label": "최종 검토",
             "description": "1차 분석 결과를 리스크·포트폴리오 관점에서 재검증해 주문 승인 여부를 결정",
+        },
+    }
+    TIER1_PROFILE_METADATA = {
+        Tier1Profile.SCAN: {
+            "display_name": "시장 스캔 프로필",
+            "short_label": "스캔",
+            "description": "시장 스캔·스크리닝·뉴스 요약에 사용하는 저비용 추론 프로필",
+        },
+        Tier1Profile.ANALYSIS: {
+            "display_name": "종목 판단 프로필",
+            "short_label": "판단",
+            "description": "종목 1차 분석·AI 한도 결정에 사용하는 기본 추론 프로필",
         },
     }
 
@@ -81,6 +93,25 @@ class LLMFactory:
         tier_status.update(LLMFactory.get_tier_metadata(provider.tier))
         return tier_status
 
+    @classmethod
+    def _serialize_tier1_profiles(cls, provider: LLMProvider) -> dict[str, Any]:
+        """Tier1 프로필 상태 직렬화"""
+        model = settings.get_llm_model(provider, LLMTier.TIER1)
+        profiles: dict[str, Any] = {}
+        for profile in Tier1Profile:
+            payload = {
+                "provider": provider.value,
+                "model": model,
+                "reasoning_effort": settings.get_llm_reasoning_effort(
+                    provider,
+                    LLMTier.TIER1,
+                    profile,
+                ),
+            }
+            payload.update(cls.TIER1_PROFILE_METADATA[profile])
+            profiles[profile.value] = payload
+        return profiles
+
     async def generate(
         self,
         prompt: str,
@@ -91,6 +122,7 @@ class LLMFactory:
         phase: str = "cycle",
         symbol: str | None = None,
         cycle_id: str | None = None,
+        reasoning_effort_override: str | None = None,
     ) -> tuple[str, str]:
         """텍스트 생성 (최대 2회 시도)
 
@@ -111,6 +143,7 @@ class LLMFactory:
                     system_prompt,
                     scope=scope,
                     phase=phase,
+                    reasoning_effort_override=reasoning_effort_override,
                 )
                 elapsed_ms = int((time.time() - start) * 1000)
                 provider_name = provider.provider.value
@@ -181,12 +214,14 @@ class LLMFactory:
         prompt: str,
         system_prompt: str = "",
         *,
+        profile: Tier1Profile = Tier1Profile.ANALYSIS,
         scope: str | None = None,
         phase: str = "cycle",
         symbol: str | None = None,
         cycle_id: str | None = None,
     ) -> tuple[str, str]:
         """Tier 1 (빠른 분석용)"""
+        provider = self._get_provider(LLMTier.TIER1)
         return await self.generate(
             prompt,
             LLMTier.TIER1,
@@ -195,6 +230,11 @@ class LLMFactory:
             phase=phase,
             symbol=symbol,
             cycle_id=cycle_id,
+            reasoning_effort_override=settings.get_llm_reasoning_effort(
+                provider.provider,
+                LLMTier.TIER1,
+                profile,
+            ),
         )
 
     async def generate_tier2(
@@ -275,6 +315,14 @@ class LLMFactory:
                 },
                 "reasoning_efforts": {
                     "tier1": provider_tier1.configured_reasoning_effort,
+                    "tier1_profiles": {
+                        profile.value: settings.get_llm_reasoning_effort(
+                            provider_enum,
+                            LLMTier.TIER1,
+                            profile,
+                        )
+                        for profile in Tier1Profile
+                    },
                     "tier2": provider_tier2.configured_reasoning_effort,
                 },
                 "has_key": True,
@@ -287,6 +335,7 @@ class LLMFactory:
             "provider_name": self.PROVIDER_LABELS[selected_provider],
             "session_id": self.get_session_id(),
             "tier1": self._serialize_tier_status(selected_tier1),
+            "tier1_profiles": self._serialize_tier1_profiles(selected_provider),
             "tier2": self._serialize_tier_status(selected_tier2),
             "available_providers": available_providers,
         }

@@ -15,7 +15,7 @@ from core.database import AsyncSessionLocal
 from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
-from trading.enums import ActivityPhase, ActivityType
+from trading.enums import ActivityPhase, ActivityType, Tier1Profile
 from trading.market_profile import is_us_market, market_scope, normalize_market
 from trading.mcp_client import mcp_client
 from trading.product_policy import (
@@ -191,6 +191,7 @@ class MarketScanner:
             result_text, provider = await llm_factory.generate_tier1(
                 prompt,
                 system_prompt=get_market_scan_system(primary_market),
+                profile=Tier1Profile.SCAN,
                 scope=market_scope(target),
                 phase="cycle",
             )
