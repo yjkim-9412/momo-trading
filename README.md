@@ -185,6 +185,9 @@ CLAUDE_CODE_MODEL_TIER2=sonnet
 CODEX_MODEL=gpt-5.4
 # CODEX_MODEL_TIER1=gpt-5.4
 # CODEX_MODEL_TIER2=gpt-5.4
+CODEX_REASONING_EFFORT=
+# CODEX_REASONING_EFFORT_TIER1=medium
+CODEX_REASONING_EFFORT_TIER2=xhigh
 
 # === 거래 안전 설정 ===
 TRADING_ENABLED=false                 # true로 변경 시 실제 매매 실행
@@ -201,6 +204,8 @@ MAX_DAILY_TRADES=30                   # 일일 최대 거래 횟수
 > 전체 설정 항목은 `.env.example`을 참조하세요.
 
 > Codex를 사용할 경우 `codex login`이 선행되어 있어야 하며, Claude를 사용할 경우 `claude` CLI가 PATH에 있어야 합니다.
+
+> `Tier2` 최종 검토는 기본적으로 `xhigh`를 사용합니다. `CODEX_REASONING_EFFORT`와 `CODEX_REASONING_EFFORT_TIER1`를 비워두면 `Tier1`은 `~/.codex/config.toml`의 전역 설정을 상속합니다. 지원값은 `minimal`, `low`, `medium`, `high`, `xhigh`입니다.
 
 ### 3. 실행
 

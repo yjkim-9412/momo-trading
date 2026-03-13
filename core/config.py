@@ -8,6 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from trading.enums import LLMProvider, LLMTier
 
+VALID_CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True)
@@ -49,6 +51,19 @@ class Settings(BaseSettings):
     US_SCAN_LIMIT: int = 12
     BASE_CURRENCY: str = "KRW"
     FX_RATE_SOURCE: str = "KIS"
+    US_LEVERAGED_PRODUCTS_ENABLED: bool = True
+    US_INVERSE_PRODUCTS_ENABLED: bool = True
+    US_LEVERAGE_ALLOWED_SESSIONS: str = "US_REGULAR"
+    US_LEVERAGE_ALLOWED_STRATEGIES: str = "STABLE_SHORT"
+    US_LEVERAGE_MAX_SINGLE_ORDER_RATIO: float = 0.3
+    US_LEVERAGE_ALLOWLIST: str = ""
+    US_LEVERAGE_DENYLIST: str = ""
+    US_BUY_CUTOFF_HOUR: int = 15  # 미국장 신규 매수 마감 시각 (ET)
+    US_BUY_CUTOFF_MINUTE: int = 30
+    US_FORCE_LIQUIDATION_HOUR: int = 15  # 미국장 강제 청산 시각 (ET)
+    US_FORCE_LIQUIDATION_MINUTE: int = 40
+    US_LEVERAGE_KEYWORDS: str = "2X,3X,ULTRA,ULTRAPRO,LEVERAGED"
+    US_INVERSE_KEYWORDS: str = "INVERSE,SHORT,BEAR"
 
     # === AI / LLM ===
     LLM_PROVIDER: str = LLMProvider.CLAUDE_CODE.value
@@ -63,6 +78,9 @@ class Settings(BaseSettings):
     CODEX_MODEL: str = "gpt-5.4"
     CODEX_MODEL_TIER1: str = ""
     CODEX_MODEL_TIER2: str = ""
+    CODEX_REASONING_EFFORT: str = ""
+    CODEX_REASONING_EFFORT_TIER1: str = ""
+    CODEX_REASONING_EFFORT_TIER2: str = "xhigh"
     CODEX_CLI_PATH: str = ""
 
     # === AI Agent ===
@@ -110,14 +128,39 @@ class Settings(BaseSettings):
     def is_paper_trading(self) -> bool:
         return self.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
 
+    @staticmethod
+    def _parse_csv(raw_value: str, *, upper: bool = False) -> list[str]:
+        """콤마 구분 문자열을 리스트로 변환"""
+        items = [item.strip() for item in (raw_value or "").split(",")]
+        filtered = [item for item in items if item]
+        if upper:
+            return [item.upper() for item in filtered]
+        return filtered
+
     @property
     def enabled_markets_list(self) -> list[str]:
         """활성 시장 목록"""
         from trading.market_profile import expand_scan_markets
 
-        raw_items = [item.strip() for item in self.ENABLED_MARKETS.split(",")]
-        items = [item for item in raw_items if item]
+        items = self._parse_csv(self.ENABLED_MARKETS)
         return expand_scan_markets(items or [self.PRIMARY_MARKET])
+
+    @property
+    def enabled_market_groups(self) -> list[str]:
+        """스케줄링용 시장 그룹 목록 (US → NASDAQ 대표)"""
+        from trading.market_profile import is_us_market, normalize_market
+
+        raw = self._parse_csv(self.ENABLED_MARKETS) or [self.PRIMARY_MARKET]
+        seen: list[str] = []
+        for m in raw:
+            norm = normalize_market(m)
+            # US 계열은 대표 마켓(NASDAQ)으로 통합
+            if is_us_market(norm):
+                if not any(is_us_market(s) for s in seen):
+                    seen.append(norm)
+            elif norm not in seen:
+                seen.append(norm)
+        return seen
 
     @property
     def primary_market_code(self) -> str:
@@ -129,22 +172,70 @@ class Settings(BaseSettings):
     @property
     def scan_markets(self) -> list[str]:
         """시장 스캔 대상 목록"""
-        from trading.market_profile import expand_scan_markets
+        return self.scan_markets_for(self.primary_market_code)
 
-        if self.primary_market_code in ("NASDAQ", "NYSE", "AMEX"):
-            raw_items = [item.strip() for item in self.US_SCAN_MARKETS.split(",")]
-            items = [item for item in raw_items if item]
+    def scan_markets_for(self, market: str) -> list[str]:
+        """지정 시장의 스캔 대상 목록"""
+        from trading.market_profile import expand_scan_markets, is_us_market, normalize_market
+
+        m = normalize_market(market)
+        if is_us_market(m):
+            items = self._parse_csv(self.US_SCAN_MARKETS)
             return expand_scan_markets(items)
-        return [self.primary_market_code]
+        return [m]
+
+    def get_market_config(self, market: str) -> dict:
+        """시장별 매수마감/강제청산 시간 설정 반환"""
+        from trading.market_profile import is_us_market, normalize_market
+
+        if is_us_market(normalize_market(market)):
+            return {
+                "buy_cutoff_hour": self.US_BUY_CUTOFF_HOUR,
+                "buy_cutoff_minute": self.US_BUY_CUTOFF_MINUTE,
+                "force_liquidation_hour": self.US_FORCE_LIQUIDATION_HOUR,
+                "force_liquidation_minute": self.US_FORCE_LIQUIDATION_MINUTE,
+            }
+        return {
+            "buy_cutoff_hour": self.BUY_CUTOFF_HOUR,
+            "buy_cutoff_minute": self.BUY_CUTOFF_MINUTE,
+            "force_liquidation_hour": self.FORCE_LIQUIDATION_HOUR,
+            "force_liquidation_minute": self.FORCE_LIQUIDATION_MINUTE,
+        }
 
     @property
     def us_watchlist_symbols(self) -> list[str]:
         """미국장 스캔용 우선 감시 종목"""
-        return [
-            item.strip().upper()
-            for item in self.US_WATCHLIST_SYMBOLS.split(",")
-            if item.strip()
-        ][: self.US_SCAN_LIMIT]
+        return self._parse_csv(self.US_WATCHLIST_SYMBOLS, upper=True)[: self.US_SCAN_LIMIT]
+
+    @property
+    def us_leverage_allowed_sessions_list(self) -> list[str]:
+        """미국 레버리지 상품 허용 세션 목록"""
+        return self._parse_csv(self.US_LEVERAGE_ALLOWED_SESSIONS, upper=True)
+
+    @property
+    def us_leverage_allowed_strategies_list(self) -> list[str]:
+        """미국 레버리지 상품 허용 전략 목록"""
+        return self._parse_csv(self.US_LEVERAGE_ALLOWED_STRATEGIES, upper=True)
+
+    @property
+    def us_leverage_allowlist_symbols(self) -> list[str]:
+        """미국 레버리지 상품 명시 허용 티커"""
+        return self._parse_csv(self.US_LEVERAGE_ALLOWLIST, upper=True)
+
+    @property
+    def us_leverage_denylist_symbols(self) -> list[str]:
+        """미국 레버리지 상품 명시 차단 티커"""
+        return self._parse_csv(self.US_LEVERAGE_DENYLIST, upper=True)
+
+    @property
+    def us_leverage_keywords_list(self) -> list[str]:
+        """미국 레버리지 상품명 판별 키워드"""
+        return self._parse_csv(self.US_LEVERAGE_KEYWORDS, upper=True)
+
+    @property
+    def us_inverse_keywords_list(self) -> list[str]:
+        """미국 인버스 상품명 판별 키워드"""
+        return self._parse_csv(self.US_INVERSE_KEYWORDS, upper=True)
 
     @property
     def llm_provider(self) -> LLMProvider:
@@ -170,6 +261,21 @@ class Settings(BaseSettings):
             return self.CODEX_MODEL_TIER1 or self.CODEX_MODEL or "gpt-5.4"
         return self.CODEX_MODEL_TIER2 or self.CODEX_MODEL or "gpt-5.4"
 
+    def get_llm_reasoning_effort(
+        self,
+        provider: LLMProvider,
+        tier: LLMTier,
+    ) -> str | None:
+        """provider/tier 조합의 reasoning effort 반환"""
+        if provider == LLMProvider.CLAUDE_CODE:
+            return "medium" if tier == LLMTier.TIER1 else "high"
+
+        for field_name, raw_value in self._get_codex_reasoning_effort_candidates(tier):
+            normalized, is_valid = self._parse_codex_reasoning_effort(raw_value)
+            if normalized and is_valid:
+                return normalized
+        return None
+
     def get_llm_cli_path(self, provider: LLMProvider) -> str | None:
         """provider별 CLI 경로 탐색"""
         if provider == LLMProvider.CLAUDE_CODE:
@@ -193,6 +299,8 @@ class Settings(BaseSettings):
                 "CODEX_CLI_PATH를 설정하거나 codex CLI를 설치하세요."
             )
 
+        self._validate_codex_reasoning_efforts()
+
         if not self.KIS_APP_KEY and not self.KIS_PAPER_APP_KEY:
             logger.warning(
                 "KIS API 키 미설정: KIS_APP_KEY, KIS_PAPER_APP_KEY 모두 비어있음. "
@@ -208,6 +316,45 @@ class Settings(BaseSettings):
                 "현재 리스크 관리는 KRW 기준에 맞춰져 있습니다.",
                 self.BASE_CURRENCY,
             )
+
+    def _get_codex_reasoning_effort_candidates(
+        self,
+        tier: LLMTier,
+    ) -> list[tuple[str, str]]:
+        """Codex reasoning effort 우선순위 후보 반환"""
+        if tier == LLMTier.TIER1:
+            tier_field = "CODEX_REASONING_EFFORT_TIER1"
+        else:
+            tier_field = "CODEX_REASONING_EFFORT_TIER2"
+        return [
+            (tier_field, getattr(self, tier_field)),
+            ("CODEX_REASONING_EFFORT", self.CODEX_REASONING_EFFORT),
+        ]
+
+    @staticmethod
+    def _parse_codex_reasoning_effort(raw_value: str) -> tuple[str | None, bool]:
+        """Codex reasoning effort 정규화 및 유효성 판정"""
+        normalized = (raw_value or "").strip().lower()
+        if not normalized:
+            return None, True
+        return normalized, normalized in VALID_CODEX_REASONING_EFFORTS
+
+    def _validate_codex_reasoning_efforts(self) -> None:
+        """Codex reasoning effort 설정 유효성 검증"""
+        for field_name in (
+            "CODEX_REASONING_EFFORT",
+            "CODEX_REASONING_EFFORT_TIER1",
+            "CODEX_REASONING_EFFORT_TIER2",
+        ):
+            raw_value = getattr(self, field_name)
+            normalized, is_valid = self._parse_codex_reasoning_effort(raw_value)
+            if normalized and not is_valid:
+                logger.warning(
+                    "잘못된 {}={} → 무시합니다. 지원값: {}",
+                    field_name,
+                    raw_value,
+                    ", ".join(VALID_CODEX_REASONING_EFFORTS),
+                )
 
     @staticmethod
     def _find_executable_path(
