@@ -857,6 +857,27 @@ class MCPClient:
             })
         return stocks
 
+    @staticmethod
+    def _merge_discovery_and_watchlist(
+        discovery_stocks: list[dict[str, Any]],
+        watchlist_stocks: list[dict[str, Any]],
+        limit: int = 30,
+    ) -> list[dict[str, Any]]:
+        """동적 발굴 + 워치리스트 결과 병합 (심볼 기준 중복 제거)"""
+        seen: set[str] = set()
+        merged: list[dict[str, Any]] = []
+        for stock in discovery_stocks:
+            sym = stock.get("symbol", "")
+            if sym and sym not in seen:
+                seen.add(sym)
+                merged.append(stock)
+        for stock in watchlist_stocks:
+            sym = stock.get("symbol", "")
+            if sym and sym not in seen:
+                seen.add(sym)
+                merged.append(stock)
+        return merged[:limit]
+
     def _normalize_stock_item(self, item: dict[str, Any], market: str) -> dict[str, Any]:
         """시장 스캔용 종목 데이터 정규화"""
         price_val = (
@@ -1231,32 +1252,33 @@ class MCPClient:
 
         market_code = normalize_market(market)
         if not is_domestic_market(market_code):
-            exchange = kis_exchange_code(market_code)
-            response = await self.call_any_tool([
-                ("volume_surge", {
-                    "excd": exchange,
-                    "mixn": "0",
-                    "vol_range": "0",
-                }),
-                ("trade_growth", {
-                    "excd": exchange,
-                    "nday": "0",
-                    "vol_range": "0",
-                }),
-            ])
-            if response.success and response.data:
-                items = (
-                    self._extract_records(response.data, "output1", "output", "dataframe1")
-                    or self._extract_records(response.data, "output2", "dataframe2")
-                )
-                response.data = {
-                    **response.data,
-                    "stocks": [self._normalize_stock_item(item, market_code) for item in items],
-                }
-                return response
-            stocks = await self._build_watchlist_scan(market_code)
-            stocks.sort(key=lambda item: item.get("volume", 0), reverse=True)
-            return MCPResponse(success=bool(stocks), data={"stocks": stocks[:30]})
+            discovery_stocks: list[dict[str, Any]] = []
+
+            if settings.US_DYNAMIC_DISCOVERY_ENABLED:
+                exchange = kis_exchange_code(market_code)
+                response = await self.call_any_tool([
+                    ("volume_surge", {
+                        "excd": exchange,
+                        "mixn": "0",
+                        "vol_range": "0",
+                    }),
+                    ("trade_growth", {
+                        "excd": exchange,
+                        "nday": "0",
+                        "vol_range": "0",
+                    }),
+                ])
+                if response.success and response.data:
+                    items = (
+                        self._extract_records(response.data, "output1", "output", "dataframe1")
+                        or self._extract_records(response.data, "output2", "dataframe2")
+                    )
+                    discovery_stocks = [self._normalize_stock_item(item, market_code) for item in items]
+
+            watchlist_stocks = await self._build_watchlist_scan(market_code)
+            merged = self._merge_discovery_and_watchlist(discovery_stocks, watchlist_stocks)
+            merged.sort(key=lambda item: item.get("volume", 0), reverse=True)
+            return MCPResponse(success=bool(merged), data={"stocks": merged[:30]})
 
         market_code = "J" if market_code in ("KOSPI", "KOSDAQ", "KRX") else market_code
         try:
@@ -1315,30 +1337,29 @@ class MCPClient:
 
         market_code = normalize_market(market)
         if not is_domestic_market(market_code):
-            exchange = kis_exchange_code(market_code)
-            response = await self.call_any_tool([
-                ("price_fluct", {
-                    "excd": exchange,
-                    "gubn": "0",
-                    "mixn": "0",
-                    "vol_range": "0",
-                }),
-            ])
-            if response.success and response.data:
-                items = (
-                    self._extract_records(response.data, "output1", "output", "dataframe1")
-                    or self._extract_records(response.data, "output2", "dataframe2")
-                )
-                normalized = [self._normalize_stock_item(item, market_code) for item in items]
-                normalized.sort(key=lambda item: item.get("change_rate", 0), reverse=(sort != "bottom"))
-                response.data = {
-                    **response.data,
-                    "stocks": normalized[:30],
-                }
-                return response
-            stocks = await self._build_watchlist_scan(market_code)
-            stocks.sort(key=lambda item: item.get("change_rate", 0), reverse=(sort != "bottom"))
-            return MCPResponse(success=bool(stocks), data={"stocks": stocks[:30]})
+            discovery_stocks: list[dict[str, Any]] = []
+
+            if settings.US_DYNAMIC_DISCOVERY_ENABLED:
+                exchange = kis_exchange_code(market_code)
+                response = await self.call_any_tool([
+                    ("price_fluct", {
+                        "excd": exchange,
+                        "gubn": "0",
+                        "mixn": "0",
+                        "vol_range": "0",
+                    }),
+                ])
+                if response.success and response.data:
+                    items = (
+                        self._extract_records(response.data, "output1", "output", "dataframe1")
+                        or self._extract_records(response.data, "output2", "dataframe2")
+                    )
+                    discovery_stocks = [self._normalize_stock_item(item, market_code) for item in items]
+
+            watchlist_stocks = await self._build_watchlist_scan(market_code)
+            merged = self._merge_discovery_and_watchlist(discovery_stocks, watchlist_stocks)
+            merged.sort(key=lambda item: item.get("change_rate", 0), reverse=(sort != "bottom"))
+            return MCPResponse(success=bool(merged), data={"stocks": merged[:30]})
 
         market_code = "J" if market_code in ("KOSPI", "KOSDAQ", "KRX") else market_code
         try:

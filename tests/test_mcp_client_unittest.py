@@ -230,5 +230,123 @@ class MCPClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["side"], "BUY")
 
 
+class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
+    """US 동적 발굴 + 워치리스트 하이브리드 병합 테스트"""
+
+    def _make_stock(self, symbol, volume=100, change_rate=1.0):
+        return {
+            "symbol": symbol,
+            "name": symbol,
+            "market": "NASDAQ",
+            "currency": "USD",
+            "price": 10.0,
+            "current_price": 10.0,
+            "change": 0.5,
+            "change_rate": change_rate,
+            "volume": volume,
+        }
+
+    async def test_hybrid_volume_rank_merges_discovery_and_watchlist(self):
+        """US_DYNAMIC_DISCOVERY_ENABLED=True: MCP 성공 시 동적 결과 + 워치리스트 병합"""
+        client = MCPClient()
+
+        discovery_items = [{"symb": "TSLA", "last": "250", "tvol": "9999", "rate": "3.0"}]
+        watchlist_stocks = [self._make_stock("SOFI", volume=500)]
+
+        with (
+            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
+                success=True,
+                data={"output1": discovery_items},
+            ))),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch("trading.mcp_client.settings") as mock_settings,
+        ):
+            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
+            response = await client.get_volume_rank(market="NASDAQ")
+
+        self.assertTrue(response.success)
+        symbols = [s["symbol"] for s in response.data["stocks"]]
+        self.assertIn("TSLA", symbols)
+        self.assertIn("SOFI", symbols)
+
+    async def test_hybrid_volume_rank_watchlist_only_when_mcp_fails(self):
+        """US_DYNAMIC_DISCOVERY_ENABLED=True: MCP 실패 시 워치리스트만 반환"""
+        client = MCPClient()
+
+        watchlist_stocks = [self._make_stock("PLTR", volume=300)]
+
+        with (
+            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
+                success=False,
+                error="MCP 도구 실패",
+            ))),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch("trading.mcp_client.settings") as mock_settings,
+        ):
+            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
+            response = await client.get_volume_rank(market="NASDAQ")
+
+        self.assertTrue(response.success)
+        symbols = [s["symbol"] for s in response.data["stocks"]]
+        self.assertEqual(symbols, ["PLTR"])
+
+    async def test_volume_rank_watchlist_only_when_discovery_disabled(self):
+        """US_DYNAMIC_DISCOVERY_ENABLED=False: 워치리스트만 사용"""
+        client = MCPClient()
+
+        watchlist_stocks = [self._make_stock("NIO", volume=200)]
+
+        with (
+            patch.object(client, "call_any_tool", new=AsyncMock()) as mcp_mock,
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch("trading.mcp_client.settings") as mock_settings,
+        ):
+            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = False
+            response = await client.get_volume_rank(market="NASDAQ")
+
+        mcp_mock.assert_not_awaited()
+        self.assertTrue(response.success)
+        self.assertEqual(response.data["stocks"][0]["symbol"], "NIO")
+
+    async def test_merge_deduplicates_symbols(self):
+        """동적 발굴과 워치리스트에 같은 심볼이 있으면 중복 없이 병합"""
+        discovery = [
+            {"symbol": "AAPL", "volume": 1000},
+            {"symbol": "TSLA", "volume": 900},
+        ]
+        watchlist = [
+            {"symbol": "AAPL", "volume": 500},  # 중복
+            {"symbol": "SOFI", "volume": 400},
+        ]
+        merged = MCPClient._merge_discovery_and_watchlist(discovery, watchlist)
+        symbols = [s["symbol"] for s in merged]
+        self.assertEqual(symbols, ["AAPL", "TSLA", "SOFI"])
+        # AAPL은 discovery 버전 유지 (volume=1000)
+        self.assertEqual(merged[0]["volume"], 1000)
+
+    async def test_hybrid_fluctuation_rank_merges_and_sorts(self):
+        """등락률 하이브리드 스캔: 병합 후 change_rate 기준 정렬"""
+        client = MCPClient()
+
+        discovery_items = [{"symb": "MARA", "last": "20", "tvol": "800", "rate": "5.0"}]
+        watchlist_stocks = [self._make_stock("RIOT", volume=300, change_rate=8.0)]
+
+        with (
+            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
+                success=True,
+                data={"output1": discovery_items},
+            ))),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch("trading.mcp_client.settings") as mock_settings,
+        ):
+            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
+            response = await client.get_fluctuation_rank(market="NASDAQ", sort="top")
+
+        self.assertTrue(response.success)
+        stocks = response.data["stocks"]
+        # change_rate 내림차순: RIOT(8.0) > MARA(5.0)
+        self.assertEqual(stocks[0]["symbol"], "RIOT")
+
+
 if __name__ == "__main__":
     unittest.main()

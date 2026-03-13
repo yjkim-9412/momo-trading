@@ -14,7 +14,13 @@ from core.database import get_async_db
 from models.broker_order import BrokerOrder
 from repositories.agent_activity_repository import AgentActivityRepository
 from repositories.daily_report_repository import DailyReportRepository
-from schemas.activity_schema import ActivityResponse, CycleResponse
+from scheduler.market_calendar import market_calendar
+from schemas.activity_schema import (
+    ActivityFeedCursor,
+    ActivityFeedResponse,
+    ActivityResponse,
+    CycleResponse,
+)
 from schemas.common import SuccessResponse
 from schemas.daily_report_schema import DailyReportResponse
 from services.activity_logger import activity_logger
@@ -252,9 +258,60 @@ async def get_activities(
         activities = await repo.get_by_type(activity_type, limit=limit, market_scope=market_scope)
     else:
         from util.time_util import now_kst
-        activities = await repo.get_by_date(now_kst().date(), limit=limit, offset=offset, market_scope=market_scope)
+        resolved_date = (
+            market_calendar.market_date(market=market_scope)
+            if market_scope
+            else now_kst().date()
+        )
+        activities = await repo.get_by_date(
+            resolved_date,
+            limit=limit,
+            offset=offset,
+            market_scope=market_scope,
+        )
 
     return SuccessResponse(data=activities)
+
+
+@router.get("/activities/feed", response_model=SuccessResponse[ActivityFeedResponse])
+async def get_activity_feed(
+    market_scope: str = Query(...),
+    limit: int = Query(100, ge=1, le=200),
+    target_date: str | None = Query(None, description="YYYY-MM-DD"),
+    before_created_at: datetime | None = Query(None),
+    before_id: str | None = Query(None),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """실시간 피드 bootstrap / pagination 전용 활동 조회"""
+    repo = AgentActivityRepository(db)
+    resolved_scope = normalize_market_scope(market_scope)
+    resolved_date = (
+        date.fromisoformat(target_date)
+        if target_date
+        else market_calendar.market_date(market=resolved_scope)
+    )
+    items, has_more = await repo.get_feed_page(
+        target_date=resolved_date,
+        market_scope=resolved_scope,
+        limit=limit,
+        before_created_at=before_created_at,
+        before_id=before_id,
+    )
+    next_cursor = None
+    if has_more and items:
+        last_item = items[-1]
+        next_cursor = ActivityFeedCursor(
+            before_created_at=last_item.created_at,
+            before_id=last_item.id,
+        )
+    return SuccessResponse(
+        data=ActivityFeedResponse(
+            items=items,
+            resolved_trading_date=resolved_date,
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+    )
 
 
 # ── 사이클 목록 ──
@@ -473,6 +530,7 @@ async def get_system_status(market: str | None = Query(None)):
 
     market_code = market or settings.primary_market_code
     session_schedule = market_calendar.get_session_schedule(market=market_code)
+    cycle_runtime = trading_agent.get_cycle_runtime_snapshot(market_code)
 
     return SuccessResponse(data={
         "trading_enabled": settings.TRADING_ENABLED,
@@ -481,6 +539,9 @@ async def get_system_status(market: str | None = Query(None)):
         "scheduler_running": trading_scheduler.is_running,
         "agent_running": trading_agent._running,
         "last_cycle_time": trading_agent.last_cycle_time.isoformat() if trading_agent.last_cycle_time else None,
+        "last_cycle_attempt_at": cycle_runtime["last_cycle_attempt_at"],
+        "last_cycle_status": cycle_runtime["last_cycle_status"],
+        "last_cycle_error": cycle_runtime["last_cycle_error"],
         "realtime_monitor_running": realtime_monitor.is_running,
         "sse_clients": sse_manager.client_count,
         "environment": settings.ENVIRONMENT,
@@ -527,6 +588,8 @@ async def get_schedule_timeline(market: str | None = Query(None)):
         "next_run_at": next_run_at.isoformat() if next_run_at else None,
         "next_run_in_minutes": next_run_in_minutes,
         "last_hint": state.last_schedule_hint or None,
+        "last_run_at": state.last_run_at.isoformat() if state.last_run_at else None,
+        "last_error": state.last_error,
     }
 
     # ── Fixed jobs ──
@@ -660,7 +723,21 @@ async def trigger_agent_cycle(market: str | None = Query(None)):
     )
 
     # 비동기로 실행 (즉시 응답)
-    asyncio.create_task(trading_agent.run_cycle(market=market_code))
+    task = asyncio.create_task(trading_agent.run_cycle(market=market_code))
+
+    def _log_cycle_task_result(done_task: asyncio.Task) -> None:
+        if done_task.cancelled():
+            logger.warning("수동 사이클 태스크 취소: {}", market_code)
+            return
+        try:
+            exc = done_task.exception()
+        except Exception as e:
+            logger.error("수동 사이클 태스크 확인 실패: {}", str(e))
+            return
+        if exc is not None:
+            logger.error("수동 사이클 비동기 실행 실패 ({}): {}", market_code, str(exc))
+
+    task.add_done_callback(_log_cycle_task_result)
     return SuccessResponse(
         data={
             "market": market_code,

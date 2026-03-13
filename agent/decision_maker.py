@@ -116,6 +116,18 @@ class DecisionMaker:
     def _enrich_detail(cls, signal: TradeSignal, detail: dict | None = None) -> dict:
         enriched = dict(detail or {})
         enriched["product_context"] = cls._signal_product_context(signal)
+        metadata = signal.metadata or {}
+        for key in (
+            "entry_mode",
+            "combined_position_pct",
+            "post_trade_cash_ratio",
+            "current_position",
+            "analysis_source",
+            "event_type",
+        ):
+            value = metadata.get(key)
+            if value not in (None, "", {}):
+                enriched[key] = value
         return enriched
 
     @staticmethod
@@ -789,57 +801,110 @@ class DecisionMaker:
             async with AsyncSessionLocal() as session:
                 async with session.begin():
                     repo = TradeResultRepository(session)
+                    trade_notes = {
+                        "entry_mode": ctx.get("entry_mode", ""),
+                        "combined_position_pct": ctx.get("combined_position_pct"),
+                        "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
+                        "analysis_source": ctx.get("analysis_source"),
+                        "event_type": ctx.get("event_type"),
+                        "market": market,
+                    }
 
                     if side == "BUY":
-                        # 매수 체결 → 새 TradeResult 생성 (미청산 상태)
-                        tr = TradeResult(
-                            order_id=order_id,
-                            stock_symbol=symbol,
-                            stock_name=ctx.get("stock_name", symbol),
-                            currency=currency,
-                            exchange_rate_to_krw=exchange_rate_to_krw,
-                            market=market,
-                            side="BUY",
-                            strategy_type=ctx.get("strategy_type", ""),
-                            entry_price=filled_price,
-                            entry_price_krw=filled_price_krw,
-                            exit_price=0.0,
-                            exit_price_krw=0.0,
-                            quantity=filled_qty,
-                            raw_pnl=0.0,
-                            pnl=0.0,
-                            return_pct=0.0,
-                            is_win=False,
-                            hold_days=0,
-                            ai_recommendation=ctx.get("ai_recommendation", ""),
-                            ai_confidence=ctx.get("ai_confidence", 0.0),
-                            ai_target_price=ctx.get("ai_target_price"),
-                            ai_stop_loss_price=ctx.get("ai_stop_loss_price"),
-                            entry_rsi=ctx.get("entry_rsi"),
-                            entry_macd_hist=ctx.get("entry_macd_hist"),
-                            market_regime=ctx.get("market_regime", ""),
-                            entry_at=now,
-                        )
-                        session.add(tr)
+                        open_buy = await repo.get_open_buy(symbol, market=market)
+                        is_add_on = open_buy is not None
+                        if open_buy:
+                            previous_qty = int(open_buy.quantity or 0)
+                            combined_qty = previous_qty + filled_qty
+                            combined_price = (
+                                ((open_buy.entry_price or 0.0) * previous_qty) + (filled_price * filled_qty)
+                            ) / combined_qty
+                            combined_price_krw = (
+                                ((open_buy.entry_price_krw or 0.0) * previous_qty) + (filled_price_krw * filled_qty)
+                            ) / combined_qty
 
-                        logger.info(
-                            "[TradeResult] 매수 기록 생성: {} {} {}주 @{}",
-                            market,
-                            symbol,
-                            filled_qty,
-                            self._format_trade_price(filled_price, currency, exchange_rate_to_krw),
-                        )
+                            open_buy.order_id = order_id
+                            open_buy.stock_name = ctx.get("stock_name", symbol)
+                            open_buy.currency = currency
+                            open_buy.exchange_rate_to_krw = exchange_rate_to_krw
+                            open_buy.strategy_type = ctx.get("strategy_type", "")
+                            open_buy.entry_price = combined_price
+                            open_buy.entry_price_krw = combined_price_krw
+                            open_buy.quantity = combined_qty
+                            open_buy.ai_recommendation = ctx.get("ai_recommendation", "")
+                            open_buy.ai_confidence = ctx.get("ai_confidence", 0.0)
+                            open_buy.ai_target_price = ctx.get("ai_target_price")
+                            open_buy.ai_stop_loss_price = ctx.get("ai_stop_loss_price")
+                            open_buy.entry_rsi = ctx.get("entry_rsi")
+                            open_buy.entry_macd_hist = ctx.get("entry_macd_hist")
+                            open_buy.market_regime = ctx.get("market_regime", "")
+                            open_buy.notes = json.dumps(trade_notes, ensure_ascii=False, default=str)
+
+                            logger.info(
+                                "[TradeResult] 추가매수 병합 기록: {} {} {}주 추가 → 총 {}주 @{}",
+                                market,
+                                symbol,
+                                filled_qty,
+                                combined_qty,
+                                self._format_trade_price(combined_price, currency, exchange_rate_to_krw),
+                            )
+                        else:
+                            tr = TradeResult(
+                                order_id=order_id,
+                                stock_symbol=symbol,
+                                stock_name=ctx.get("stock_name", symbol),
+                                currency=currency,
+                                exchange_rate_to_krw=exchange_rate_to_krw,
+                                market=market,
+                                side="BUY",
+                                strategy_type=ctx.get("strategy_type", ""),
+                                entry_price=filled_price,
+                                entry_price_krw=filled_price_krw,
+                                exit_price=0.0,
+                                exit_price_krw=0.0,
+                                quantity=filled_qty,
+                                raw_pnl=0.0,
+                                pnl=0.0,
+                                return_pct=0.0,
+                                is_win=False,
+                                hold_days=0,
+                                ai_recommendation=ctx.get("ai_recommendation", ""),
+                                ai_confidence=ctx.get("ai_confidence", 0.0),
+                                ai_target_price=ctx.get("ai_target_price"),
+                                ai_stop_loss_price=ctx.get("ai_stop_loss_price"),
+                                entry_rsi=ctx.get("entry_rsi"),
+                                entry_macd_hist=ctx.get("entry_macd_hist"),
+                                market_regime=ctx.get("market_regime", ""),
+                                notes=json.dumps(trade_notes, ensure_ascii=False, default=str),
+                                entry_at=now,
+                            )
+                            session.add(tr)
+
+                            logger.info(
+                                "[TradeResult] 매수 기록 생성: {} {} {}주 @{}",
+                                market,
+                                symbol,
+                                filled_qty,
+                                self._format_trade_price(filled_price, currency, exchange_rate_to_krw),
+                            )
                         await activity_logger.log(
                             ActivityType.TRADE_RESULT, ActivityPhase.COMPLETE,
-                            f"\U0001f4dd [{symbol}] 매수 체결 기록: "
+                            f"\U0001f4dd [{symbol}] {'추가매수 체결 기록' if is_add_on else '매수 체결 기록'}: "
                             f"{filled_qty}주 @{self._format_trade_price(filled_price, currency, exchange_rate_to_krw)}",
                             cycle_id=cycle_id,
                             symbol=symbol,
                             detail={
+                                "market": market,
                                 "currency": currency,
                                 "exchange_rate_to_krw": exchange_rate_to_krw,
                                 "entry_price": filled_price,
                                 "entry_price_krw": filled_price_krw,
+                                "entry_mode": ctx.get("entry_mode", ""),
+                                "combined_position_pct": ctx.get("combined_position_pct"),
+                                "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
+                                "analysis_source": ctx.get("analysis_source"),
+                                "event_type": ctx.get("event_type"),
+                                "is_add_on": is_add_on,
                             },
                         )
 

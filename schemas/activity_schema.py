@@ -53,3 +53,20 @@ class ActivityFilter(BaseModel):
     activity_type: Optional[str] = None
     limit: int = 100
     offset: int = 0
+
+
+class ActivityFeedCursor(BaseModel):
+    before_created_at: datetime
+    before_id: str
+
+    @field_validator("before_created_at", mode="before")
+    @classmethod
+    def ensure_kst_cursor_time(cls, v):
+        return ensure_kst(v)
+
+
+class ActivityFeedResponse(BaseModel):
+    items: list[ActivityResponse]
+    resolved_trading_date: date
+    has_more: bool
+    next_cursor: Optional[ActivityFeedCursor] = None

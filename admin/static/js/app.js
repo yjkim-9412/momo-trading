@@ -4,6 +4,7 @@
 const API = '/api/v1/admin';
 let currentView = 'live';
 let autoScroll = true;
+let isNearTop = false;
 let missedCount = 0;
 let accountPollTimer = null;
 let currentMarket = 'KRX';
@@ -63,9 +64,25 @@ function transformAdminAgentValue(value) {
 function currentScope() {
   return currentMarket === 'KRX' ? 'KRX' : 'US';
 }
+
+function createMarketFeedState() {
+  return {
+    stockCards: {},
+    activityCount: 0,
+    loaded: false,
+    scrollPos: 0,
+    feedItems: [],
+    feedTradingDate: null,
+    feedHasMore: false,
+    feedCursor: null,
+    feedLoading: false,
+    loadedActivityIds: new Set(),
+  };
+}
+
 let marketState = {
-  KRX: { stockCards: {}, activityCount: 0, loaded: false, fragment: null, scrollPos: 0 },
-  US:  { stockCards: {}, activityCount: 0, loaded: false, fragment: null, scrollPos: 0 },
+  KRX: createMarketFeedState(),
+  US: createMarketFeedState(),
 };
 let activityBuffer = { KRX: [], US: [] };
 const BUFFER_MAX = 300;
@@ -75,6 +92,39 @@ function getStockCards() { return marketState[currentScope()].stockCards; }
 function getActivityCount() { return marketState[currentScope()].activityCount; }
 function setActivityCount(v) { marketState[currentScope()].activityCount = v; }
 function incActivityCount() { marketState[currentScope()].activityCount++; }
+function getMarketState(scope = currentScope()) { return marketState[scope]; }
+
+function getActivityIdentity(data) {
+  return data.id || `${data.created_at || ''}|${data.activity_type || ''}|${data.phase || ''}|${data.symbol || ''}|${data.summary || ''}`;
+}
+
+function rememberFeedActivities(scope, activities, { prepend = false } = {}) {
+  const state = getMarketState(scope);
+  const accepted = [];
+  activities.forEach((activity) => {
+    const identity = getActivityIdentity(activity);
+    if (state.loadedActivityIds.has(identity)) return;
+    state.loadedActivityIds.add(identity);
+    accepted.push(activity);
+  });
+  if (!accepted.length) return 0;
+  state.feedItems = prepend
+    ? [...accepted, ...state.feedItems]
+    : [...state.feedItems, ...accepted];
+  return accepted.length;
+}
+
+function resetFeedState(scope, { preserveLoaded = false } = {}) {
+  const state = getMarketState(scope);
+  state.feedItems = [];
+  state.feedTradingDate = null;
+  state.feedHasMore = false;
+  state.feedCursor = null;
+  state.feedLoading = false;
+  state.loadedActivityIds = new Set();
+  state.activityCount = 0;
+  if (!preserveLoaded) state.loaded = false;
+}
 
 // Legacy alias — many functions reference this directly
 let stockCards = marketState.KRX.stockCards;
@@ -747,6 +797,7 @@ function switchMarket(market) {
 
   // 11. Re-render agent monitor for new market
   renderAgentMonitor();
+  updateFeedLoadMore();
 }
 
 function setupMarketTabs() {
@@ -794,31 +845,15 @@ function saveMarketFeed(scope) {
   const state = marketState[scope];
   state.scrollPos = container.scrollTop;
   pauseMarketTimers(scope);
-  // Detach all children into a fragment
-  const frag = document.createDocumentFragment();
-  while (container.firstChild) {
-    frag.appendChild(container.firstChild);
-  }
-  state.fragment = frag;
 }
 
 function restoreMarketFeed(scope) {
-  const container = document.getElementById('chat-container');
   const state = marketState[scope];
-
-  if (state.fragment) {
-    // Restore saved DOM
-    container.innerHTML = '';
-    container.appendChild(state.fragment);
-    state.fragment = null;
-    requestAnimationFrame(() => { container.scrollTop = state.scrollPos; });
-  } else if (!state.loaded) {
-    // First visit — load from API
+  if (!state.loaded) {
     loadTodayActivities();
-  } else {
-    // Loaded but empty
-    container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">아직 활동 기록이 없습니다</div>';
+    return;
   }
+  renderLiveFeedFromState(scope, { restoreScroll: true });
 }
 
 function flushBuffer(scope) {
@@ -1296,6 +1331,8 @@ function renderWatchlist(data) {
 
   if (!symbols.length) {
     if (sectionEl) sectionEl.style.display = 'none';
+    const tabBadge = document.getElementById('watchlist-tab-count');
+    if (tabBadge) tabBadge.style.display = 'none';
     return;
   }
 
@@ -1391,6 +1428,13 @@ function renderWatchlist(data) {
     el.appendChild(card);
   });
 
+  // Update tab badge
+  const tabBadge = document.getElementById('watchlist-tab-count');
+  if (tabBadge) {
+    tabBadge.textContent = symbols.length;
+    tabBadge.style.display = '';
+  }
+
   refreshIcons();
 }
 
@@ -1456,7 +1500,11 @@ function convertKrwToUsd(amount, exchangeRate) {
 /**
  * 활동 1건 추가 — 종목별 카드로 라우팅
  */
-function appendActivity(data) {
+function appendActivity(data, options = {}) {
+  const { skipStore = false } = options;
+  const scope = currentScope();
+  if (!skipStore && rememberFeedActivities(scope, [data]) === 0) return;
+
   const container = document.getElementById('chat-container');
 
   // Remove placeholder
@@ -2001,6 +2049,7 @@ function switchView(view) {
   } else if (view === 'today') {
     loadReport('today');
   }
+  updateFeedLoadMore();
 }
 
 function switchToReport(dateStr) {
@@ -2009,52 +2058,149 @@ function switchToReport(dateStr) {
 }
 
 // ── Data Loading ──
+function buildActivityFeedUrl(scope, options = {}) {
+  const params = new URLSearchParams();
+  params.set('market_scope', scope);
+  params.set('limit', String(options.limit || 100));
+  if (options.targetDate) params.set('target_date', options.targetDate);
+  if (options.beforeCreatedAt) params.set('before_created_at', options.beforeCreatedAt);
+  if (options.beforeId) params.set('before_id', options.beforeId);
+  return `${API}/activities/feed?${params.toString()}`;
+}
+
+function updateFeedLoadMore(scope = currentScope()) {
+  const bar = document.getElementById('feed-load-more-bar');
+  const btn = document.getElementById('feed-load-more-btn');
+  const meta = document.getElementById('feed-load-more-meta');
+  if (!bar || !btn || !meta) return;
+  const btnLabel = btn.querySelector('span');
+
+  const state = getMarketState(scope);
+  const isActiveLiveFeed = currentView === 'live' && scope === currentScope();
+  if (!isActiveLiveFeed) {
+    bar.classList.add('hidden');
+    btn.disabled = false;
+    if (btnLabel) btnLabel.textContent = '이전 내역 더보기';
+    meta.textContent = '';
+    return;
+  }
+
+  const canShow = state.loaded && (state.feedHasMore || state.feedLoading) && isNearTop;
+  if (!canShow) {
+    bar.classList.add('hidden');
+    btn.disabled = false;
+    if (btnLabel) btnLabel.textContent = '이전 내역 더보기';
+  } else {
+    bar.classList.remove('hidden');
+    btn.disabled = state.feedLoading;
+    if (btnLabel) btnLabel.textContent = state.feedLoading ? '불러오는 중...' : '이전 내역 더보기';
+  }
+
+  meta.textContent = state.feedTradingDate
+    ? `${state.feedTradingDate} 거래일`
+    : '';
+}
+
+function renderLiveFeedFromState(scope, options = {}) {
+  const {
+    restoreScroll = false,
+    preserveViewport = false,
+    previousScrollHeight = 0,
+    previousScrollTop = 0,
+  } = options;
+  if (scope !== currentScope() || currentView !== 'live') return;
+
+  const container = document.getElementById('chat-container');
+  cleanupStockCards(scope);
+  container.innerHTML = '';
+  setActivityCount(0);
+
+  const visibleActivities = filterResolvedStarts(getMarketState(scope).feedItems);
+  if (!visibleActivities.length) {
+    renderPlaceholder(container, 'empty', '현재 거래일 활동이 없습니다');
+  } else {
+    visibleActivities.forEach((activity) => appendActivity(activity, { skipStore: true }));
+  }
+
+  getMarketState(scope).loaded = true;
+  getMarketState(scope).activityCount = visibleActivities.length;
+  document.getElementById('activity-count').textContent = `${getActivityCount()}건`;
+  updateFeedLoadMore(scope);
+  refreshIcons();
+
+  requestAnimationFrame(() => {
+    if (preserveViewport) {
+      const nextHeight = container.scrollHeight;
+      container.scrollTop = previousScrollTop + (nextHeight - previousScrollHeight);
+      return;
+    }
+    if (restoreScroll) {
+      container.scrollTop = getMarketState(scope).scrollPos || 0;
+      return;
+    }
+    container.scrollTop = container.scrollHeight;
+  });
+}
+
+async function loadMoreActivities() {
+  const scope = currentScope();
+  const state = getMarketState(scope);
+  if (state.feedLoading || !state.feedHasMore || !state.feedCursor) return;
+
+  const container = document.getElementById('chat-container');
+  const previousScrollHeight = container.scrollHeight;
+  const previousScrollTop = container.scrollTop;
+  state.feedLoading = true;
+  updateFeedLoadMore(scope);
+
+  try {
+    const json = await fetchJSON(buildActivityFeedUrl(scope, {
+      limit: 100,
+      targetDate: state.feedTradingDate,
+      beforeCreatedAt: state.feedCursor.before_created_at,
+      beforeId: state.feedCursor.before_id,
+    }));
+    const feed = json.data || {};
+    const page = Array.isArray(feed.items) ? [...feed.items].reverse() : [];
+    rememberFeedActivities(scope, page, { prepend: true });
+    state.feedTradingDate = feed.resolved_trading_date || state.feedTradingDate;
+    state.feedHasMore = !!feed.has_more;
+    state.feedCursor = feed.next_cursor || null;
+    renderLiveFeedFromState(scope, {
+      preserveViewport: true,
+      previousScrollHeight,
+      previousScrollTop,
+    });
+  } catch (err) {
+    showToast(`이전 내역 로드 실패: ${err.message}`, 'error');
+  } finally {
+    state.feedLoading = false;
+    updateFeedLoadMore(scope);
+  }
+}
+
 async function loadTodayActivities() {
   const scope = currentScope();
   const container = document.getElementById('chat-container');
+  const state = getMarketState(scope);
   renderPlaceholder(container, 'loading', '불러오는 중...');
-  // Clear card tracking for current market
-  cleanupStockCards();
+  cleanupStockCards(scope);
+  resetFeedState(scope);
+  updateFeedLoadMore(scope);
 
   try {
-    const json = await fetchJSON(`${API}/activities?limit=500&market_scope=${encodeURIComponent(scope)}`);
-    container.innerHTML = '';
-    setActivityCount(0);
-
-    if (json.data && json.data.length) {
-      // Pre-process: filter resolved STARTs
-      const activities = filterResolvedStarts(json.data);
-      activities.forEach(a => appendActivity(a));
-
-      // History load: stop all timers and finalize stuck cards
-      const cards = getStockCards();
-      for (const card of Object.values(cards)) {
-        if (card.liveTimer) {
-          clearInterval(card.liveTimer);
-          card.liveTimer = null;
-        }
-        // 히스토리 로드 후 여전히 progress면 → 종료된 분석으로 처리
-        if (card.outcome === 'progress') {
-          card.outcome = 'hold';
-          const outcomeEl = card.headerEl.querySelector('.stock-outcome');
-          if (outcomeEl) {
-            outcomeEl.className = 'stock-outcome flex items-center gap-1.5 text-xs px-2 py-0.5 rounded bg-gray-700/60 text-gray-400';
-            outcomeEl.innerHTML = '<i data-lucide="check-circle" class="w-3 h-3"></i> 완료';
-          }
-          card.element.className = 'stock-card outcome-hold';
-        }
-      }
-
-      requestAnimationFrame(() => {
-        container.scrollTop = container.scrollHeight;
-      });
-    } else {
-      renderPlaceholder(container, 'empty', '아직 활동 기록이 없습니다');
-    }
-    marketState[scope].loaded = true;
-    refreshIcons();
+    const json = await fetchJSON(buildActivityFeedUrl(scope, { limit: 100 }));
+    const feed = json.data || {};
+    const page = Array.isArray(feed.items) ? [...feed.items].reverse() : [];
+    rememberFeedActivities(scope, page);
+    state.feedTradingDate = feed.resolved_trading_date || null;
+    state.feedHasMore = !!feed.has_more;
+    state.feedCursor = feed.next_cursor || null;
+    state.loaded = true;
+    renderLiveFeedFromState(scope);
   } catch (err) {
     renderPlaceholder(container, 'error', `로드 실패: ${err.message}`);
+    updateFeedLoadMore(scope);
   }
 }
 
@@ -2083,21 +2229,23 @@ function clearChat() {
   const scope = currentScope();
   const container = document.getElementById('chat-container');
   container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">화면을 비웠습니다. 새 활동이 들어오면 여기에 표시됩니다.</div>';
+  resetFeedState(scope, { preserveLoaded: true });
+  marketState[scope].loaded = true;
   setActivityCount(0);
   document.getElementById('activity-count').textContent = '0건';
-  cleanupStockCards();
-  // Also clear any saved fragment
-  marketState[scope].fragment = null;
+  cleanupStockCards(scope);
+  updateFeedLoadMore(scope);
 }
 
-function cleanupStockCards() {
-  const scope = currentScope();
+function cleanupStockCards(scope = currentScope()) {
   const cards = marketState[scope].stockCards;
   for (const card of Object.values(cards)) {
     if (card.liveTimer) clearInterval(card.liveTimer);
   }
   marketState[scope].stockCards = {};
-  stockCards = marketState[scope].stockCards;
+  if (scope === currentScope()) {
+    stockCards = marketState[scope].stockCards;
+  }
 }
 
 // ── Reports ──
@@ -2845,8 +2993,8 @@ function toggleRightSidebar() {
 
 // ── Collapsible Account Sections (Holdings / Pending) ──
 function toggleAccountSection(section) {
-  const idMap = { holdings: 'holdings-info', pending: 'pending-orders-info', watchlist: 'watchlist-info' };
-  const arrowMap = { holdings: 'holdings-arrow', pending: 'pending-arrow', watchlist: 'watchlist-arrow' };
+  const idMap = { holdings: 'holdings-info', pending: 'pending-orders-info' };
+  const arrowMap = { holdings: 'holdings-arrow', pending: 'pending-arrow' };
   const bodyEl = document.getElementById(idMap[section] || `${section}-info`);
   const arrowEl = document.getElementById(arrowMap[section] || `${section}-arrow`);
   const toggleBtn = bodyEl && bodyEl.closest(`#${section}-section`)
@@ -2913,6 +3061,7 @@ function renderPlaceholder(container, type, message) {
     </div>`;
   }
   container.innerHTML = html;
+  updateFeedLoadMore();
   refreshIcons();
 }
 
@@ -2926,4 +3075,8 @@ document.getElementById('chat-container').addEventListener('scroll', function() 
     missedCount = 0;
     updateScrollBadge();
   }
+  // Show load-more bar only when scrolled near top
+  const wasNearTop = isNearTop;
+  isNearTop = el.scrollTop < 30;
+  if (isNearTop !== wasNearTop) updateFeedLoadMore();
 });

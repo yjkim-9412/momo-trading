@@ -34,6 +34,7 @@ KRX와 US 등을 동시에 자동 매매할 수 있다.
 ※ DAY_TRADING_ONLY=true: 당일 매수→당일 청산 필수 (오버나이트 없음)
 ※ DAY_TRADING_ONLY=false: 스윙 모드 — 유망 종목 오버나이트 보유 (스마트 청산)
 """
+import asyncio
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
@@ -58,6 +59,8 @@ class AdaptiveRescanState:
     scheduled_cycle_count_today: int = 0
     next_adaptive_run_at: datetime | None = None
     last_schedule_hint: dict = field(default_factory=dict)
+    last_run_at: datetime | None = None
+    last_error: str | None = None
 
 
 class TradingScheduler:
@@ -254,6 +257,8 @@ class TradingScheduler:
             state.scheduled_cycle_count_today = 0
             state.next_adaptive_run_at = None
             state.last_schedule_hint = {}
+            state.last_run_at = None
+            state.last_error = None
         return state
 
     def _reset_adaptive_state(self, market: str) -> None:
@@ -261,6 +266,8 @@ class TradingScheduler:
         state.scheduled_cycle_count_today = 0
         state.next_adaptive_run_at = None
         state.last_schedule_hint = {}
+        state.last_run_at = None
+        state.last_error = None
 
     def _remaining_scheduled_budget(
         self,
@@ -743,6 +750,9 @@ class TradingScheduler:
 
         logger.info("=== [{}] {} ===", market, header)
         await self._log_schedule(market, ActivityPhase.PROGRESS, start_summary)
+        state = self._adaptive_state(market)
+        state.last_run_at = market_now
+        state.last_error = None
 
         try:
             if include_gap_check and not settings.DAY_TRADING_ONLY:
@@ -803,8 +813,25 @@ class TradingScheduler:
             )
             if settings.AI_DYNAMIC_RESCAN_ENABLED and self._adaptive_trigger_can_reschedule(trigger_reason):
                 await self._schedule_next_adaptive_rescan(market, result)
+        except asyncio.CancelledError:
+            err_msg = f"{trigger_reason}: asyncio.CancelledError"
+            state.last_error = err_msg
+            await self._log_schedule(
+                market,
+                ActivityPhase.ERROR,
+                f"❌ [{market}] 트레이딩 스캔 취소 ({trigger_reason})",
+            )
+            logger.warning("[{}] 트레이딩 스캔 취소 ({})", market, trigger_reason)
+            raise
         except Exception as e:
-            logger.error("[{}] 트레이딩 스캔 오류: {}", market, str(e))
+            err_msg = " ".join((str(e) or repr(e)).split())[:500]
+            state.last_error = err_msg
+            await self._log_schedule(
+                market,
+                ActivityPhase.ERROR,
+                f"❌ [{market}] 트레이딩 스캔 오류 ({trigger_reason}): {err_msg[:120]}",
+            )
+            logger.error("[{}] 트레이딩 스캔 오류 ({}): {}", market, trigger_reason, err_msg)
 
     async def _market_open_scan(self, market: str, trigger_reason: str = "scheduled_open") -> None:
         """장 시작 직후 — 전체 시장 스캔 → 종목 선정 → 매매
@@ -848,6 +875,7 @@ class TradingScheduler:
                 self._clear_adaptive_rescan_job(market)
                 return
 
+        self._clear_adaptive_rescan_job(market)
         await self._execute_trading_scan(
             market,
             trigger_reason=trigger_reason,

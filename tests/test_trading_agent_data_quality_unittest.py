@@ -131,9 +131,9 @@ class TradingAgentDataQualityTest(unittest.TestCase):
                 captured["market"] = market
                 captured["kwargs"] = kwargs
 
-        original_detector = __import__("agent.trading_agent", fromlist=["event_detector"]).event_detector
-        module = __import__("agent.trading_agent", fromlist=["event_detector"])
-        module.event_detector = _EventDetectorStub()
+        import agent.trading_agent._analysis_mixin as _amixin
+        original_detector = _amixin.event_detector
+        _amixin.event_detector = _EventDetectorStub()
         try:
             TradingAgent()._apply_trade_thresholds(
                 "AAPL",
@@ -142,7 +142,7 @@ class TradingAgentDataQualityTest(unittest.TestCase):
                 market="NASDAQ",
             )
         finally:
-            module.event_detector = original_detector
+            _amixin.event_detector = original_detector
 
         self.assertEqual(captured["symbol"], "AAPL")
         self.assertEqual(captured["market"], "NASDAQ")

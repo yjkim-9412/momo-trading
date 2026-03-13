@@ -23,6 +23,13 @@ STOCK_ANALYSIS_SYSTEM = """당신은 한국/미국 주식 시장 단기 매매 �
 - 시그널 확인: **1개의 강한 시그널**(극단 RSI/거래량 폭증/급등 모멘텀 등) 또는 **2개 이상의 보통 시그널**이 같은 방향이면 매매 근거 충분
 - 거래량 확인: 거래량 급증이 가격 움직임을 뒷받침하면 강력한 확인 시그널
 - 추세 우선: 추세에 역행하는 진입은 신뢰도 하향, 단 과매도 반등은 예외
+- 현재 종목 포지션이 있으면 신규 진입 후보가 아니라 기존 포지션 맥락으로 해석하세요
+- 보유 종목에서 BUY 판단 시 반드시 `position_intent`를 명시하세요.
+  - 미보유 종목: `NEW`
+  - 보유 종목 수익 구간 추가매수: `ADD_ON_PYRAMID`
+  - 보유 종목 손실 구간 반등 확인형 추가매수: `ADD_ON_AVERAGE_DOWN`
+  - 매수 부적합: `HOLD`
+- `ADD_ON_AVERAGE_DOWN`은 RSI/모멘텀 반전과 거래량 확인이 동시에 있을 때만 선택하세요
 - 실행 계약: 이 경로는 신규 매수 기회 탐색 전용이므로 최종 recommendation은 BUY 또는 HOLD만 사용하고 SELL은 사용하지 마세요
 - 제한 상품 주의: 레버리지/인버스 상품은 배수만큼 변동성과 갭 리스크가 커질 수 있으므로 일반 종목보다 더 강한 추세·거래량 확인과 더 보수적인 손절/수량 판단이 필요합니다
 - **절대 규칙**: 목표가/손절가는 반드시 위 현재가/일봉 데이터에서 도출할 것. 임의의 가격을 만들지 마세요
@@ -40,6 +47,12 @@ STOCK_ANALYSIS_PROMPT = """## 종목 분석 요청: {stock_name} ({symbol})
 
 ### 트레이딩 상황
 {trading_context}
+
+### 현재 종목 포지션
+{current_position_context}
+
+### 계좌 상태
+{account_context}
 
 ### 상품 특성
 {product_context}
@@ -75,12 +88,14 @@ STOCK_ANALYSIS_PROMPT = """## 종목 분석 요청: {stock_name} ({symbol})
 **주의**: 아래 JSON은 필드 구조 설명입니다. target_price, stop_loss_price 등 모든 가격은 반드시 위 현재가/일봉 데이터를 분석하여 도출하세요.
 - recommendation: BUY 또는 HOLD만 사용하세요. SELL은 사용하지 마세요.
 - confidence: 이 매매가 손절 전에 목표가에 도달할 확률 (0.00~1.00)
+- position_intent: NEW / ADD_ON_PYRAMID / ADD_ON_AVERAGE_DOWN / HOLD
 
 JSON 형식으로 답변:
 ```json
 {{
   "analysis": "추세·시그널·거래량·리스크보상·피드백을 종합한 분석 (3~4줄)",
   "recommendation": "BUY/HOLD",
+  "position_intent": "NEW/ADD_ON_PYRAMID/ADD_ON_AVERAGE_DOWN/HOLD",
   "confidence": 0.00,
   "reason": "최종 판단 이유 (2~3줄)",
   "target_price": 0,

@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import AsyncMock, PropertyMock, patch
 
 from agent.trading_agent import TradingAgent
@@ -117,6 +118,55 @@ class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         state = self.scheduler._adaptive_state("KRX")
         self.assertEqual(state.scheduled_cycle_count_today, 0)
+
+    async def test_execute_trading_scan_records_last_error_on_cycle_failure(self):
+        with patch.object(market_calendar, "is_holiday", return_value=False), patch.object(
+            type(mcp_client),
+            "is_connected",
+            new_callable=PropertyMock,
+            return_value=True,
+        ), patch(
+            "agent.trading_agent.trading_agent.run_cycle",
+            AsyncMock(side_effect=RuntimeError("cycle exploded")),
+        ), patch.object(
+            self.scheduler,
+            "_log_schedule",
+            AsyncMock(),
+        ) as log_schedule:
+            await self.scheduler._execute_trading_scan(
+                "KRX",
+                trigger_reason="adaptive_rescan",
+                include_gap_check=False,
+            )
+
+        state = self.scheduler._adaptive_state("KRX")
+        self.assertIsNotNone(state.last_run_at)
+        self.assertEqual(state.scheduled_cycle_count_today, 0)
+        self.assertIn("cycle exploded", state.last_error)
+        self.assertTrue(
+            any(
+                call.args[1] == "ERROR" and "cycle exploded" in call.args[2]
+                for call in log_schedule.await_args_list
+            )
+        )
+
+    async def test_adaptive_rescan_clears_stale_next_run_at_before_execution(self):
+        state = self.scheduler._adaptive_state("KRX")
+        state.next_adaptive_run_at = datetime(2026, 3, 14, 9, 35)
+
+        with patch.object(market_calendar, "is_holiday", return_value=False), patch.object(
+            self.scheduler,
+            "_execute_trading_scan",
+            AsyncMock(),
+        ) as execute_scan:
+            await self.scheduler._adaptive_rescan("KRX")
+
+        self.assertIsNone(state.next_adaptive_run_at)
+        execute_scan.assert_awaited_once_with(
+            "KRX",
+            trigger_reason="adaptive_rescan",
+            include_gap_check=False,
+        )
 
 
 class TradingAgentScheduleHintTest(unittest.IsolatedAsyncioTestCase):

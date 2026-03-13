@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     US_AFTERMARKET_ENABLED: bool = False
     US_WATCHLIST_SYMBOLS: str = "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD"
     US_SCAN_LIMIT: int = 12
+    US_DYNAMIC_DISCOVERY_ENABLED: bool = True  # MCP 동적 발굴 + 워치리스트 병합
     BASE_CURRENCY: str = "KRW"
     FX_RATE_SOURCE: str = "KIS"
     US_LEVERAGED_PRODUCTS_ENABLED: bool = True

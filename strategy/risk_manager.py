@@ -75,6 +75,7 @@ class RiskManager:
         portfolio_budget: float,
         today_trade_count: int,
         current_holding_count: int,
+        current_position: dict | None = None,
         max_position_pct: float = 20.0,
         cycle_id: str | None = None,
         dynamic_limits: dict | None = None,
@@ -167,6 +168,7 @@ class RiskManager:
 
         unit_price_krw = self._unit_price_krw(signal)
         total_amount = unit_price_krw * quantity
+        current_position_value_krw = float((current_position or {}).get("current_value_krw") or 0.0)
 
         # 리스크:보상 비율 검사 (다른 조정 전에 먼저 확인)
         entry = signal.suggested_price or 0
@@ -190,24 +192,28 @@ class RiskManager:
                     )
                     return result
 
+        requested_quantity = quantity
+        adjustment_labels: list[str] = []
+
+        def _apply_quantity_cap(capped_qty: int, label: str) -> tuple[bool, dict | None]:
+            nonlocal quantity, total_amount
+            if capped_qty >= quantity:
+                return False, None
+            if capped_qty < eff_min_qty:
+                return True, {"approved": False, "reason": f"{label} 후 최소 수량 미달"}
+            quantity = capped_qty
+            total_amount = unit_price_krw * quantity
+            adjustment_labels.append(label)
+            return True, None
+
         # 단일 주문 금액 한도 (0이면 AI 자율 → 스킵)
         if eff_max_order > 0 and total_amount > eff_max_order:
-            adjusted_qty = int(eff_max_order / unit_price_krw)
-            if adjusted_qty < eff_min_qty:
-                result = {"approved": False, "reason": "단일 주문 한도 내에서 최소 수량 미달"}
+            _, reject_result = _apply_quantity_cap(int(eff_max_order / unit_price_krw), "단일 주문 한도")
+            if reject_result:
                 await self._log_result(
-                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                    symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
-                return result
-            result = {
-                "approved": True,
-                "reason": f"수량 조정 (한도 초과): {quantity} → {adjusted_qty}",
-                "adjusted_quantity": adjusted_qty,
-            }
-            await self._log_result(
-                symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
-            )
-            return result
+                return reject_result
 
         # 현금 부족 검사 (음수 현금 방어 포함)
         if portfolio_cash <= 0:
@@ -218,22 +224,12 @@ class RiskManager:
             return result
 
         if total_amount > portfolio_cash:
-            adjusted_qty = int(portfolio_cash / unit_price_krw)
-            if adjusted_qty < eff_min_qty:
-                result = {"approved": False, "reason": "현금 부족"}
+            _, reject_result = _apply_quantity_cap(int(portfolio_cash / unit_price_krw), "현금 부족")
+            if reject_result:
                 await self._log_result(
-                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                    symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
-                return result
-            result = {
-                "approved": True,
-                "reason": f"수량 조정 (현금 부족): {quantity} → {adjusted_qty}",
-                "adjusted_quantity": adjusted_qty,
-            }
-            await self._log_result(
-                symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
-            )
-            return result
+                return reject_result
 
         # 최소 현금 비중 검사
         cash_after = portfolio_cash - total_amount
@@ -245,45 +241,49 @@ class RiskManager:
                     symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
                 return result
-            adjusted_qty = int(max_spend / unit_price_krw)
-            if adjusted_qty < eff_min_qty:
-                result = {"approved": False, "reason": "현금 비중 유지 후 최소 수량 미달"}
+            _, reject_result = _apply_quantity_cap(int(max_spend / unit_price_krw), "현금 비중 유지")
+            if reject_result:
                 await self._log_result(
-                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                    symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
-                return result
-            result = {
-                "approved": True,
-                "reason": f"수량 조정 (현금 비중 유지): {quantity} → {adjusted_qty}",
-                "adjusted_quantity": adjusted_qty,
-            }
-            await self._log_result(
-                symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
-            )
-            return result
+                return reject_result
 
         # 종목 비중 검사
         if portfolio_budget > 0:
-            position_pct = (total_amount / portfolio_budget) * 100
-            if position_pct > eff_max_pos_pct:
-                adjusted_qty = int((portfolio_budget * eff_max_pos_pct / 100) / unit_price_krw)
-                if adjusted_qty < eff_min_qty:
-                    result = {"approved": False, "reason": "비중 한도 내에서 최소 수량 미달"}
-                    await self._log_result(
-                        symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
-                    )
-                    return result
-                result = {
-                    "approved": True,
-                    "reason": f"수량 조정 (비중 한도): {quantity} → {adjusted_qty}",
-                    "adjusted_quantity": adjusted_qty,
-                }
-                await self._log_result(
-                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+            combined_position_pct = ((current_position_value_krw + total_amount) / portfolio_budget) * 100
+            if combined_position_pct > eff_max_pos_pct:
+                remaining_amount = max((portfolio_budget * eff_max_pos_pct / 100) - current_position_value_krw, 0.0)
+                _, reject_result = _apply_quantity_cap(
+                    int(remaining_amount / unit_price_krw) if unit_price_krw > 0 else 0,
+                    "합산 비중 한도",
                 )
-                return result
+                if reject_result:
+                    reject_result["combined_position_pct"] = combined_position_pct
+                    reject_result["current_position_value_krw"] = current_position_value_krw
+                    await self._log_result(
+                        symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
+                    )
+                    return reject_result
 
-        result = {"approved": True, "reason": "리스크 검사 통과", "adjusted_quantity": None}
+        combined_position_pct = (
+            ((current_position_value_krw + total_amount) / portfolio_budget) * 100
+            if portfolio_budget > 0
+            else 0.0
+        )
+        adjustment_reason = "리스크 검사 통과"
+        adjusted_quantity = None
+        if quantity != requested_quantity:
+            adjusted_quantity = quantity
+            adjustment_reason = (
+                f"수량 조정 ({', '.join(adjustment_labels)}): {requested_quantity} → {quantity}"
+            )
+        result = {
+            "approved": True,
+            "reason": adjustment_reason,
+            "adjusted_quantity": adjusted_quantity,
+            "combined_position_pct": combined_position_pct,
+            "current_position_value_krw": current_position_value_krw,
+        }
         await self._log_result(
             symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
         )

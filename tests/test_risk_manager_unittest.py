@@ -127,6 +127,82 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["approved"])
         self.assertIn("3/무제한", log_mock.await_args.args[2])
 
+    async def test_combined_position_cap_uses_existing_position_value(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="PLTR",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=100.0,
+            suggested_quantity=100,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="AGGRESSIVE_SHORT",
+            metadata={
+                "market": "NASDAQ",
+                "price_krw": 100.0,
+                "session": "US_REGULAR",
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50000,
+                portfolio_budget=100000,
+                today_trade_count=0,
+                current_holding_count=1,
+                current_position={
+                    "symbol": "PLTR",
+                    "market": "NASDAQ",
+                    "quantity": 220,
+                    "current_value_krw": 22000,
+                },
+                dynamic_limits={"max_position_pct": 25.0},
+            )
+
+        self.assertTrue(result["approved"])
+        self.assertEqual(result["adjusted_quantity"], 30)
+        self.assertEqual(result["combined_position_pct"], 25.0)
+
+    async def test_combined_position_cap_still_applies_after_order_cap_adjustment(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="PLTR",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=100.0,
+            suggested_quantity=300,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="AGGRESSIVE_SHORT",
+            metadata={
+                "market": "NASDAQ",
+                "price_krw": 100.0,
+                "session": "US_REGULAR",
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50000,
+                portfolio_budget=100000,
+                today_trade_count=0,
+                current_holding_count=1,
+                current_position={
+                    "symbol": "PLTR",
+                    "market": "NASDAQ",
+                    "quantity": 220,
+                    "current_value_krw": 22000,
+                },
+                dynamic_limits={"max_position_pct": 25.0},
+            )
+
+        self.assertTrue(result["approved"])
+        self.assertEqual(result["adjusted_quantity"], 30)
+        self.assertIn("합산 비중 한도", result["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

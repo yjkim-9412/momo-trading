@@ -34,6 +34,9 @@ Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매
 - SIDEWAYS/BEAR 국면: RR비율 __DEFENSIVE_RR__:1 미만 → REJECT
 - 시장 전체 급락 중에 무리한 역추세 매수 (단, 과매도 반등은 허용)
 - 거래량 뒷받침 전혀 없는 돌파/반전 시그널
+- 현재 종목 포지션이 이미 크면 추가매수 정당성이 명확하지 않은 한 승인하지 마세요
+- 보유 종목 BUY는 반드시 `position_intent`를 `ADD_ON_PYRAMID` 또는 `ADD_ON_AVERAGE_DOWN`으로 명시하세요
+- `ADD_ON_AVERAGE_DOWN`은 손실 구간 반등 확인형 추가매수일 때만 허용하세요
 
 반드시 한국어로 답변"""
 FINAL_REVIEW_SYSTEM = (
@@ -49,6 +52,12 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 
 ### 트레이딩 상황
 {trading_context}
+
+### 현재 종목 포지션
+{current_position_context}
+
+### 계좌 상태
+{account_context}
 
 ### Tier 1 AI 분석 결과
 {tier1_analysis}
@@ -69,8 +78,10 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 
 ### 투자 가능 금액
 - 종목당 최대: {max_amount:,.0f}원
+- 현재가 기준 최대 수량: {max_quantity}주
 - 현재 보유 종목 수: {holding_count}개
-- 총 포트폴리오 대비 비중: {position_pct:.1f}%
+- 현재 이 종목 비중: {current_position_pct:.1f}%
+- 하드 가드 기준 최대 집행 시 예상 합산 비중: {position_pct:.1f}%
 
 ### 전략 파라미터
 - 손절: {stop_loss_pct}%
@@ -117,6 +128,7 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 
 **주의**: 아래 JSON은 필드 구조 설명입니다. entry_price/target_price/stop_loss_price/take_profit_price는 반드시 `{currency}` 기준으로 작성하세요. 원화는 투자금 한도와 환산 참고용이며 가격 필드에 넣지 마세요.
 - confidence: 이 매매가 손절 전에 목표가에 도달할 확률 (0.00~1.00)
+- position_intent: NEW / ADD_ON_PYRAMID / ADD_ON_AVERAGE_DOWN / HOLD
 
 JSON 형식으로 답변:
 ```json
@@ -128,6 +140,7 @@ JSON 형식으로 답변:
   }},
   "approved": true,
   "action": "BUY/SELL/HOLD",
+  "position_intent": "NEW/ADD_ON_PYRAMID/ADD_ON_AVERAGE_DOWN/HOLD",
   "confidence": 0.00,
   "entry_price": 0,
   "target_price": 0,

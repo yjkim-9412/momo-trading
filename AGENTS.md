@@ -59,7 +59,7 @@ Scheduler (고정 오픈 스캔 + adaptive 장중 재스캔)
 
 | 컴포넌트 | 파일 | 핵심 메서드 |
 |----------|------|------------|
-| TradingAgent | `agent/trading_agent.py` | `run_cycle()`, `_run_trading_cycle()`, `_analyze_and_trade()` |
+| TradingAgent | `agent/trading_agent/` | `run_cycle()`, `_run_trading_cycle()`, `_analyze_and_trade()` |
 | MarketScanner | `agent/market_scanner.py` | `scan()` |
 | DecisionMaker | `agent/decision_maker.py` | `execute()`, `_execute_autonomous()` |
 | TradingScheduler | `scheduler/scheduler.py` | `start()`, `_market_open_scan()`, `_adaptive_rescan()`, `_schedule_next_adaptive_rescan()` |
@@ -113,7 +113,7 @@ WebSocket → EventDetector → EventBus:
 
 - 미국 프리마켓은 `US_PREMARKET_ENABLED=true`일 때 정식 장중 세션으로 취급한다. 스케줄 기준은 `03:50 ET` 준비, `04:05 ET` 오픈 스캔이며, 그 이후 장중 재스캔은 고정 `11:00/13:00 ET`가 아니라 adaptive one-shot으로 이어진다. 미국장 스케줄은 `scheduler/scheduler.py`의 프로필 계산과 `schedule_hint` 흐름을 기준으로 유지하고, `09:35 ET` 같은 정규장 하드코딩을 다시 넣지 말 것.
 - 미국장 API 장애의 1차 원인은 `프리마켓 미지원`이 아니라 `해외 시세 burst 호출`이었다. 종목 병렬 분석과 종목 내부 `현재가 + 일봉 + 분봉` 동시 호출이 겹치면 KIS가 `초당 거래건수를 초과하였습니다.`를 반환할 수 있다. 해외 현재가/일봉/분봉은 반드시 공통 limiter 또는 직렬화 경로를 타게 유지할 것.
-- 미국장 API 장애의 2차 원인은 `시계열 역순 응답`이었다. KIS 해외 `dailyprice`, `inquire-time-itemchartprice` 응답은 최신순일 수 있고, 지표 계산기는 `oldest -> newest`를 가정한다. 해외 시세는 `trading/mcp_client.py`에서 먼저 `date/time` 오름차순 정렬하고, `agent/trading_agent.py`의 DataFrame 단계에서도 다시 정렬하는 이중 방어를 유지할 것.
+- 미국장 API 장애의 2차 원인은 `시계열 역순 응답`이었다. KIS 해외 `dailyprice`, `inquire-time-itemchartprice` 응답은 최신순일 수 있고, 지표 계산기는 `oldest -> newest`를 가정한다. 해외 시세는 `trading/mcp_client.py`에서 먼저 `date/time` 오름차순 정렬하고, `agent/trading_agent/`의 DataFrame 단계에서도 다시 정렬하는 이중 방어를 유지할 것.
 - 미국 단기매매에서는 `실시간 현재가`와 같은 가격 축을 쓰는 것이 우선이다. 해외 일봉은 `trading/kis_api.py`에서 `MODP="0"`을 사용해 비수정주가 기준으로 가져오고, 수정주가 기준 일봉과 실시간 현재가를 혼용하지 말 것. 장기 백테스트처럼 수정주가가 꼭 필요한 경우가 아니라면 단기 AI 분석 경로에서는 `MODP="1"`로 되돌리지 않는다.
 - 미국장 Tier2 가격 필드는 반드시 시장 통화 기준이다. 미국 종목에서 `entry_price`, `target_price`, `stop_loss_price`, `take_profit_price`에 원화 값을 넣지 말 것. Tier2가 원화처럼 보이는 값을 반환하면 시장 통화로 정규화하고, 주문 직전에는 실시간 현재가 대비 지정가 괴리 sanity guard를 통과한 값만 브로커로 보낼 것.
 - `KIS_ACCOUNT_TYPE=VIRTUAL` 기준으로 미국 `US_PRE`/`US_AFTER` 주문은 KIS가 `모의투자 장시작전 입니다.` 등으로 거절할 수 있다. 모의계좌에서 미국 프리마켓/애프터마켓은 분석 세션으로는 유지하되, 자동주문은 실패 반복 대신 추천 fallback으로 전환하는 현재 동작을 유지할 것.
@@ -133,11 +133,13 @@ WebSocket → EventDetector → EventBus:
 - Type hints 필수 (Pydantic v2 모델, Protocol 기반 인터페이스)
 - loguru 로깅 (logger.info/warning/error)
 - 테스트: `pytest` + `pytest-asyncio` + `unittest` 혼용, `tests/` 디렉토리
+- 테스트 실행 시 반드시 `.venv` 가상환경 사용: `.venv/bin/python -m pytest tests/ -v`
 
 ## 주요 디렉토리
 
 ```
 agent/          — AI 트레이딩 에이전트 (스캔, 분석, 의사결정)
+  trading_agent/ — Mixin 패키지 (StateMixin → PortfolioMixin → AnalysisMixin → CycleMixin → EventMixin)
 analysis/       — LLM 프로바이더, 차트 분석
 api/            — FastAPI 라우트
 core/           — 설정 (Settings), 공통 유틸

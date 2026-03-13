@@ -15,6 +15,21 @@ Codex CLI 관련 개발·디버깅 시 프로젝트 내 구현과 공식 레포�
 - 공식 레포: https://github.com/openai/codex
 - 프로젝트 내 구현: `analysis/llm/codex_cli_provider.py`, `core/config.py`
 
+## TradingAgent 구조
+
+`agent/trading_agent/`는 Mixin 기반 패키지로, `from agent.trading_agent import trading_agent` 경로는 그대로 유지된다.
+
+| Mixin | 역할 |
+|-------|------|
+| `_state_mixin.py` | `__init__`, 상태 관리, 런타임 (MRO 최우선) |
+| `_portfolio_mixin.py` | 포트폴리오 스냅샷, 상품분류, 데이터 검증 |
+| `_analysis_mixin.py` | 분석 파이프라인 (Tier1/Tier2), 컨텍스트 빌더 |
+| `_cycle_mixin.py` | 사이클 오케스트레이션, 스케줄, 장마감 리뷰 |
+| `_event_mixin.py` | 실시간 이벤트 핸들러 |
+| `_types.py` | `MarketState` dataclass, 공유 상수 |
+
+Mixin 파일은 서로를 임포트하지 않으며, 상호 호출은 `self.*`로 런타임 해결한다.
+
 ## 분리된 장 구조
 
 - 운영 장은 `KRX` 와 `US` 두 runtime scope로 분리한다.
@@ -38,7 +53,7 @@ Codex CLI 관련 개발·디버깅 시 프로젝트 내 구현과 공식 레포�
 
 - 미국 프리마켓은 `US_PREMARKET_ENABLED=true`일 때 정식 분석 세션이다. 스케줄 기준은 `03:50 ET` 준비, `04:05 ET` 오픈 스캔이며, 그 이후 장중 재스캔은 `schedule_hint` 기반 adaptive one-shot으로 이어진다. 미국장 스케줄은 `scheduler/scheduler.py` 프로필과 adaptive 흐름을 기준으로 사용하고, 정규장 시간 하드코딩을 다시 넣지 말 것.
 - 미국장 API 실패 원인은 `프리마켓 조회 불가`가 아니라 `해외 시세 burst 호출`이었다. 종목 병렬 분석과 종목 내부 `현재가 + 일봉 + 분봉` 동시 조회가 겹치면 KIS가 `초당 거래건수를 초과하였습니다.`를 반환할 수 있다. 해외 quote 경로는 공통 limiter/직렬화 경로를 유지할 것.
-- KIS 해외 `dailyprice`와 `inquire-time-itemchartprice`는 최신순 응답일 수 있다. 지표 계산기는 `oldest -> newest`를 가정하므로, 미국장 시세는 `trading/mcp_client.py`에서 정렬하고 `agent/trading_agent.py`에서 DataFrame 단계에서 다시 정렬하는 이중 방어를 유지할 것.
+- KIS 해외 `dailyprice`와 `inquire-time-itemchartprice`는 최신순 응답일 수 있다. 지표 계산기는 `oldest -> newest`를 가정하므로, 미국장 시세는 `trading/mcp_client.py`에서 정렬하고 `agent/trading_agent/`에서 DataFrame 단계에서 다시 정렬하는 이중 방어를 유지할 것.
 - 미국 단기매매는 실시간 현재가와 같은 가격 축이 우선이다. 해외 일봉은 `MODP="0"` 비수정주가 기준으로 맞추고, 수정주가 일봉과 실시간 현재가를 섞지 말 것. 단기 AI 분석 경로에서 `MODP="1"` 복귀는 금지한다.
 - 미국장 Tier2 가격 필드는 반드시 시장 통화 기준이다. 미국 종목의 `entry_price`, `target_price`, `stop_loss_price`, `take_profit_price`에 원화를 넣지 말 것. 원화처럼 보이는 응답은 시장 통화로 정규화하고, 주문 직전에는 실시간 현재가 대비 지정가 sanity guard를 통과한 값만 주문 경로로 보낼 것.
 - `KIS_ACCOUNT_TYPE=VIRTUAL`에서는 미국 `US_PRE`/`US_AFTER` 주문이 KIS 서버에서 거절될 수 있다. 모의계좌의 미국 프리마켓/애프터마켓은 분석 세션으로 유지하되, 자동주문은 추천 fallback으로 전환하는 현재 동작을 유지할 것.
@@ -52,3 +67,9 @@ Codex CLI 관련 개발·디버깅 시 프로젝트 내 구현과 공식 레포�
   - 해외 일봉/분봉 정렬
   - 해외 quote 직렬화 및 rate limit 재시도
   - 분석 전 데이터 정합성 차단
+
+## 테스트
+
+- 테스트 실행 시 반드시 `.venv` 가상환경의 Python을 사용할 것.
+- 실행: `.venv/bin/python -m pytest tests/ -v`
+- `.venv`가 없으면 `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`로 먼저 생성할 것.
