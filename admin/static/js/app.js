@@ -463,8 +463,8 @@ function renderBalance(data, market) {
       badgeEl.classList.remove('hidden');
       badgeEl.textContent = data.cash_source === 'TOTAL_ASSET_PROXY' ? '총자산 프록시' : '브로커 현금';
       badgeEl.className = data.cash_source === 'TOTAL_ASSET_PROXY'
-        ? 'px-2 py-0.5 rounded-full text-[10px] bg-sky-500/15 text-sky-300'
-        : 'px-2 py-0.5 rounded-full text-[10px] bg-slate-800 text-gray-300';
+        ? 'px-2 py-0.5 rounded-full text-[11px] bg-sky-500/15 text-sky-300'
+        : 'px-2 py-0.5 rounded-full text-[11px] bg-slate-800 text-gray-300';
     } else {
       badgeEl.classList.add('hidden');
     }
@@ -536,7 +536,7 @@ function _dualRow(label, primary, secondary, primaryClass) {
   p.className = primaryClass || '';
   p.textContent = primary;
   const s = document.createElement('div');
-  s.className = 'text-gray-600';
+  s.className = 'text-gray-500 text-[11px]';
   s.textContent = secondary;
   right.appendChild(p);
   right.appendChild(s);
@@ -920,7 +920,7 @@ function createStockCard(symbol, firstActivity) {
     <span class="stock-outcome flex items-center gap-1 text-xs px-2 py-0.5 rounded bg-purple-900/40 text-purple-300">
       <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:2px"></span>분석 중
     </span>
-    <span class="stock-elapsed text-xs text-gray-600"></span>
+    <span class="stock-elapsed text-xs text-gray-400"></span>
     <span class="stock-expand text-gray-500 text-xs transition-transform" style="transform:rotate(-90deg)"><i data-lucide="chevron-down" class="w-4 h-4"></i></span>
   `;
   header.onclick = () => toggleCardBody(card);
@@ -983,7 +983,7 @@ function addStepToCard(card, data) {
     const time = formatTime(data.created_at);
     const label = formatAdminAgentText((data.summary || '').replace(/시작$/, '').trim());
     step.innerHTML = `
-      <span class="text-xs text-gray-600 shrink-0 w-14">${time}</span>
+      <span class="text-xs text-gray-500 shrink-0 w-14">${time}</span>
       <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px"></span>
       <span class="text-xs text-gray-400">${escapeHtml(label)}...</span>
     `;
@@ -1005,7 +1005,7 @@ function addStepToCard(card, data) {
   const elapsed = data.execution_time_ms ? `${(data.execution_time_ms / 1000).toFixed(1)}초` : '';
 
   let html = `
-    <span class="text-xs text-gray-600 shrink-0 w-14">${time}</span>
+    <span class="text-xs text-gray-500 shrink-0 w-14">${time}</span>
     <div class="flex-1 min-w-0">
       <div class="text-xs">${escapeHtml(formatAdminAgentText(data.summary))}</div>`;
 
@@ -1015,10 +1015,11 @@ function addStepToCard(card, data) {
   if (elapsed) meta.push(elapsed);
   if (data.confidence != null) {
     const pct = Math.round(data.confidence * 100);
-    meta.push(`신뢰도 ${pct}%`);
+    const confColor = pct >= 70 ? 'text-green-400' : pct >= 40 ? 'text-yellow-400' : 'text-red-400';
+    meta.push(`<span class="${confColor} font-medium">신뢰도 ${pct}%</span>`);
   }
   if (meta.length) {
-    html += `<div class="text-xs text-gray-600 mt-0.5">${meta.join(' · ')}</div>`;
+    html += `<div class="text-xs text-gray-400 mt-0.5">${meta.join(' · ')}</div>`;
   }
 
   // Detail (expandable)
@@ -1598,7 +1599,7 @@ async function loadLLMUsage() {
     const json = await fetchJSON(`${API}/llm/usage`);
     const d = json.data;
     if (!d) {
-      document.getElementById('usage-summary').innerHTML = '<div class="text-gray-600 text-xs">데이터 없음</div>';
+      document.getElementById('usage-summary').innerHTML = '<div class="text-gray-500 text-xs">데이터 없음</div>';
       return;
     }
     const providerLabel = d.provider_name || formatProviderLabel(d.provider || (d.app_usage && d.app_usage.provider));
@@ -1638,15 +1639,15 @@ async function loadLLMUsage() {
             .replace(/-\d{8,}$/, '');
           const cachedTokens = mu.cached_input_tokens ?? mu.cache_read ?? 0;
           html += `<div class="bg-dark-900 rounded p-1.5 mt-1">
-            <div class="text-gray-300 text-xs">${short} <span class="text-gray-600">(${mu.calls}회)</span></div>
+            <div class="text-gray-300 text-xs">${short} <span class="text-gray-500">(${mu.calls}회)</span></div>
             <div class="text-gray-500">${formatTokens(mu.input_tokens)} in / ${formatTokens(mu.output_tokens)} out</div>
-            ${cachedTokens ? `<div class="text-gray-600">${formatTokens(cachedTokens)} cached</div>` : ''}
+            ${cachedTokens ? `<div class="text-gray-500">${formatTokens(cachedTokens)} cached</div>` : ''}
           </div>`;
         }
       }
       appEl.innerHTML = html;
     } else {
-      appEl.innerHTML = '<div class="text-gray-600">아직 호출 없음</div>';
+      appEl.innerHTML = '<div class="text-gray-500">아직 호출 없음</div>';
     }
     const modelsEl = document.getElementById('usage-models');
     const modelData = d.model_usage && Object.keys(d.model_usage).length
@@ -1674,11 +1675,11 @@ async function loadLLMUsage() {
         </div>`;
       }).join('');
     } else {
-      chartEl.innerHTML = '<div class="text-gray-600">데이터 없음</div>';
+      chartEl.innerHTML = '<div class="text-gray-500">데이터 없음</div>';
     }
   } catch (err) {
     console.error('LLM usage error:', err);
-    document.getElementById('usage-summary').innerHTML = '<div class="text-gray-600 text-xs">조회 실패</div>';
+    document.getElementById('usage-summary').innerHTML = '<div class="text-gray-500 text-xs">조회 실패</div>';
   }
 }
 
@@ -1692,7 +1693,7 @@ function formatTokens(n) {
 
 function renderModelCards(models, targetEl) {
   if (!models || !Object.keys(models).length) {
-    targetEl.innerHTML = '<div class="text-gray-600">데이터 없음</div>';
+    targetEl.innerHTML = '<div class="text-gray-500">데이터 없음</div>';
     return;
   }
   let html = '';
@@ -1704,7 +1705,7 @@ function renderModelCards(models, targetEl) {
     const creation = u.cacheCreationInputTokens ?? 0;
     html += `<div class="bg-dark-900 rounded p-2 mb-1">
       <div class="text-gray-300 font-medium mb-1" title="${model}">${short}</div>
-      <div class="grid grid-cols-2 gap-x-2 gap-y-0.5 text-gray-500">
+      <div class="grid grid-cols-2 gap-x-2 gap-y-1 text-gray-500">
         <span>입력</span><span class="text-right text-gray-400">${formatTokens(input)}</span>
         <span>출력</span><span class="text-right text-green-400">${formatTokens(output)}</span>
         <span>캐시읽기</span><span class="text-right text-blue-400">${formatTokens(cached)}</span>
@@ -1814,8 +1815,8 @@ async function loadSystemStatus() {
         <span class="status-dot w-1.5 h-1.5 rounded-full ${s.agent_running ? 'bg-green-400' : 'bg-yellow-400'}"></span>
         에이전트: ${s.agent_running ? '동작' : '중지'}
       </div>
-      ${s.last_cycle_time ? `<div class="text-gray-600">마지막: ${formatTime(s.last_cycle_time)}</div>` : ''}
-      <div class="text-gray-600">SSE: ${s.sse_clients}명</div>`;
+      ${s.last_cycle_time ? `<div class="text-gray-500">마지막: ${formatTime(s.last_cycle_time)}</div>` : ''}
+      <div class="text-gray-500">SSE: ${s.sse_clients}명</div>`;
     // Update market context bar
     updateMarketContextBar(s);
 
@@ -1852,7 +1853,7 @@ async function loadReportList() {
         listEl.appendChild(btn);
       });
     } else {
-      listEl.innerHTML = '<div class="px-3 text-xs text-gray-600">리포트 없음</div>';
+      listEl.innerHTML = '<div class="px-3 text-xs text-gray-500">리포트 없음</div>';
     }
   } catch (err) {
     console.error('Report list error:', err);

@@ -57,14 +57,14 @@
     <div class="market-context-accent flex items-center gap-2">
       <span class="market-ctx-dot"></span>
       <span id="ctx-market-label" class="text-white font-medium">KRX 국내주식</span>
-      <span class="text-gray-600">·</span>
+      <span class="text-gray-500">·</span>
       <span id="ctx-market-status">장외</span>
-      <span class="text-gray-600">·</span>
+      <span class="text-gray-500">·</span>
       <span id="ctx-trading-date"></span>
-      <span class="text-gray-600">·</span>
+      <span class="text-gray-500">·</span>
       <span id="ctx-session-schedule" class="flex items-center gap-1"></span>
     </div>
-    <div class="text-xs text-gray-600 flex items-center gap-3">
+    <div class="text-xs text-gray-500 flex items-center gap-3">
       <span id="ctx-last-cycle"></span>
       <span id="ctx-dst-badge"></span>
     </div>
@@ -100,10 +100,10 @@
         <div class="sticky top-0 bg-dark-800 z-[1] pb-1">
           <div class="flex items-center justify-between">
             <div class="text-xs text-gray-500 font-medium">계좌 잔고</div>
-            <span id="cash-source-badge" class="hidden px-2 py-0.5 rounded-full text-[10px] bg-sky-950/70 text-sky-300"></span>
+            <span id="cash-source-badge" class="hidden px-2 py-0.5 rounded-full text-[11px] bg-sky-950/70 text-sky-300"></span>
           </div>
           <div id="account-info" class="text-xs space-y-1 account-data-transition">
-            <div class="text-gray-600">로딩 중...</div>
+            <div class="text-gray-500">로딩 중...</div>
           </div>
         </div>
 
@@ -114,7 +114,7 @@
               <span class="section-toggle-icon" id="holdings-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
               <span class="text-xs text-green-400 font-medium">보유종목</span>
             </span>
-            <span id="holdings-count" class="text-xs text-gray-600">0종목</span>
+            <span id="holdings-count" class="text-xs text-gray-500">0종목</span>
           </button>
           <div id="holdings-info" class="account-section-body text-xs space-y-1 max-h-60 overflow-y-auto account-data-transition" style="max-height:240px"></div>
         </div>
@@ -126,7 +126,7 @@
               <span class="section-toggle-icon" id="pending-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
               <span class="text-xs text-yellow-400 font-medium">미체결 주문</span>
             </span>
-            <span id="pending-count" class="text-xs text-gray-600">0건</span>
+            <span id="pending-count" class="text-xs text-gray-500">0건</span>
           </button>
           <div id="pending-orders-info" class="account-section-body text-xs space-y-1 max-h-40 overflow-y-auto account-data-transition" style="max-height:160px"></div>
         </div>
@@ -172,7 +172,7 @@
             <div class="text-xs text-gray-500 font-medium mb-1">LLM</div>
             <div class="text-xs text-gray-400">선택된 로컬 CLI Provider</div>
             <div id="llm-agent-summary" class="mt-1 space-y-1.5">
-              <div class="text-xs text-gray-600">로딩 중...</div>
+              <div class="text-xs text-gray-500">로딩 중...</div>
             </div>
           </div>
         </div>
@@ -237,7 +237,7 @@
         <div>
           <div class="text-xs text-gray-500 font-medium mb-2">분석 에이전트</div>
           <div id="llm-agent-guide" class="space-y-2">
-            <div class="text-gray-600 text-xs">로딩 중...</div>
+            <div class="text-gray-500 text-xs">로딩 중...</div>
           </div>
         </div>
 
@@ -245,7 +245,7 @@
 
         <!-- Summary -->
         <div id="usage-summary" class="space-y-2">
-          <div class="text-gray-600 text-xs">로딩 중...</div>
+          <div class="text-gray-500 text-xs">로딩 중...</div>
         </div>
 
         <!-- App (trading) usage -->
