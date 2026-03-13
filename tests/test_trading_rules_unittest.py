@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from analysis.feedback.trading_rules import TradingRuleEngine
 from strategy.risk_manager import RiskManager
+from trading.risk_policy import resolve_rr_floor as resolve_shared_rr_floor
 
 
 class _FakeScalarResult:
@@ -104,6 +105,16 @@ class RiskManagerRRFloorTest(unittest.TestCase):
         self.assertEqual(
             RiskManager.resolve_rr_floor("SIDEWAYS", None),
             1.2,
+        )
+
+    def test_resolve_rr_floor_matches_shared_policy_defaults(self):
+        self.assertEqual(
+            RiskManager.resolve_rr_floor("BULL", None),
+            resolve_shared_rr_floor("BULL", None),
+        )
+        self.assertEqual(
+            RiskManager.resolve_rr_floor("SIDEWAYS", None),
+            resolve_shared_rr_floor("SIDEWAYS", None),
         )
 
 

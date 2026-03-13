@@ -3,8 +3,15 @@ import unittest
 import pandas as pd
 
 from agent.trading_agent import TradingAgent
-from analysis.llm.prompts.market_scan import MARKET_SCAN_PROMPT, US_MARKET_SCAN_PROMPT
-from analysis.llm.prompts.stock_analysis import STOCK_ANALYSIS_PROMPT
+from analysis.llm.prompts.daily_plan import DAILY_PLAN_PROMPT
+from analysis.llm.prompts.final_review import FINAL_REVIEW_PROMPT, FINAL_REVIEW_SYSTEM
+from analysis.llm.prompts.market_scan import (
+    MARKET_SCAN_PROMPT,
+    US_MARKET_SCAN_PROMPT,
+    US_MARKET_SCAN_SYSTEM,
+)
+from analysis.llm.prompts.stock_analysis import STOCK_ANALYSIS_PROMPT, STOCK_ANALYSIS_SYSTEM
+from trading.risk_policy import BULL_THEME_RR_FLOOR, DEFENSIVE_RR_FLOOR
 
 
 class TradingAgentDataQualityTest(unittest.TestCase):
@@ -65,16 +72,28 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("### 상품 특성", STOCK_ANALYSIS_PROMPT)
         self.assertIn("{product_context}", STOCK_ANALYSIS_PROMPT)
         self.assertIn("### 트레이딩 상황", STOCK_ANALYSIS_PROMPT)
+        self.assertIn(f"BULL/THEME 국면: {BULL_THEME_RR_FLOOR:.1f}:1 이상이면 적정", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn(f"SIDEWAYS/BEAR 국면: 최소 {DEFENSIVE_RR_FLOOR:.1f}:1", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("recommendation은 BUY 또는 HOLD만 사용", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("recommendation: BUY 또는 HOLD만 사용하세요", STOCK_ANALYSIS_PROMPT)
+        self.assertIn("confidence: 이 매매가 손절 전에 목표가에 도달할 확률", STOCK_ANALYSIS_PROMPT)
+        self.assertNotIn('"recommendation": "BUY/SELL/HOLD"', STOCK_ANALYSIS_PROMPT)
 
     def test_final_review_prompt_requires_market_currency_for_price_fields(self):
-        from analysis.llm.prompts.final_review import FINAL_REVIEW_PROMPT
-
         self.assertIn("### 원본 차트 요약", FINAL_REVIEW_PROMPT)
         self.assertIn("### 상품 특성", FINAL_REVIEW_PROMPT)
         self.assertIn("배수(1x/2x/3x)", FINAL_REVIEW_PROMPT)
         self.assertIn("환산 참고: 1{currency}", FINAL_REVIEW_PROMPT)
         self.assertIn("stop_loss_price: 손절 기준가 ({currency})", FINAL_REVIEW_PROMPT)
         self.assertIn("가격 필드에 넣지 마세요", FINAL_REVIEW_PROMPT)
+        self.assertIn(f"RR비율: {BULL_THEME_RR_FLOOR:.1f}:1 이상이면 허용", FINAL_REVIEW_SYSTEM)
+        self.assertIn(f"RR비율: 최소 {DEFENSIVE_RR_FLOOR:.1f}:1", FINAL_REVIEW_SYSTEM)
+        self.assertIn(
+            f"THEME/BULL: {BULL_THEME_RR_FLOOR:.1f}:1 이상, SIDEWAYS/BEAR: {DEFENSIVE_RR_FLOOR:.1f}:1 이상",
+            FINAL_REVIEW_PROMPT,
+        )
+        self.assertIn("confidence: 이 매매가 손절 전에 목표가에 도달할 확률", FINAL_REVIEW_PROMPT)
+        self.assertNotIn("기타: 1.5:1 이상", FINAL_REVIEW_PROMPT)
         self.assertNotIn("checklist_pass", FINAL_REVIEW_PROMPT)
         self.assertNotIn("partial_exit_plan", FINAL_REVIEW_PROMPT)
 
@@ -85,6 +104,12 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("현재 시각({timezone_label})", US_MARKET_SCAN_PROMPT)
         self.assertNotIn("현재 시각(KST)", US_MARKET_SCAN_PROMPT)
         self.assertNotIn('"direction": "BUY/SELL"', US_MARKET_SCAN_PROMPT)
+        self.assertIn("프리마켓(04:00~09:30 ET)", US_MARKET_SCAN_SYSTEM)
+        self.assertIn("정규장(09:30~15:00 ET)", US_MARKET_SCAN_SYSTEM)
+        self.assertIn("장후반(15:00 ET~매수 마감)", US_MARKET_SCAN_SYSTEM)
+
+    def test_daily_plan_prompt_limits_action_items_to_top_changes(self):
+        self.assertIn("action_items는 가장 중요한 3~5개만 제안하세요", DAILY_PLAN_PROMPT)
 
     def test_should_skip_tier2_blocks_restricted_products(self):
         self.assertFalse(

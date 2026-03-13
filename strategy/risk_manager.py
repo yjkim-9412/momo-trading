@@ -5,6 +5,7 @@ from core.config import settings
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, SignalAction
+from trading.risk_policy import DEFAULT_RR_FLOOR, resolve_rr_floor as resolve_shared_rr_floor
 from trading.product_policy import (
     build_product_context,
     classification_from_metadata,
@@ -27,7 +28,7 @@ class RiskManager:
         self.max_single_order_krw = settings.MAX_SINGLE_ORDER_KRW
         self.min_cash_ratio = settings.MIN_CASH_RATIO  # 기본 5%
 
-    RR_FLOOR = {"THEME": 1.0, "BULL": 1.0}
+    RR_FLOOR = dict(DEFAULT_RR_FLOOR)
 
     @classmethod
     def resolve_rr_floor(
@@ -35,13 +36,11 @@ class RiskManager:
         market_regime: str,
         rr_floor_overrides: dict[str, float] | None = None,
     ) -> float:
-        regime = str(market_regime or "").upper()
-        overrides = rr_floor_overrides or {}
-        if regime in overrides:
-            return overrides[regime]
-        if "ALL" in overrides:
-            return overrides["ALL"]
-        return cls.RR_FLOOR.get(regime, 1.2)
+        return resolve_shared_rr_floor(
+            market_regime,
+            rr_floor_overrides,
+            defaults=cls.RR_FLOOR,
+        )
 
     @staticmethod
     def _unit_price_krw(signal: TradeSignal) -> float:

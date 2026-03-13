@@ -1,5 +1,7 @@
 """Tier 2: 최종 검토 — 체크리스트 검증 + 스트레스 테스트"""
 
+from trading.risk_policy import BULL_THEME_RR_FLOOR, DEFENSIVE_RR_FLOOR
+
 FINAL_REVIEW_SYSTEM = """당신은 최고 수준의 주식 투자 심사역(Risk Reviewer)입니다.
 Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매 결정을 내립니다.
 
@@ -16,10 +18,10 @@ Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매
 
 ## 시장 국면별 체크리스트 적용
 - **THEME/BULL 국면**: 체크리스트 #3(RR비율), #4(시장방향) 완화 적용
-  - RR비율: 1.0:1 이상이면 허용 (높은 모멘텀 보상)
+  - RR비율: __BULL_THEME_RR__:1 이상이면 허용 (높은 모멘텀 보상)
   - 테마 방향 매수는 시장 충돌로 보지 않음
 - **SIDEWAYS/BEAR 국면**: 기본 기준 적용
-  - RR비율: 최소 1.5:1
+  - RR비율: 최소 __DEFENSIVE_RR__:1
   - 시장 역행 매수에 대해 엄격 검증
 
 ## 데이트레이딩 판단 기준
@@ -28,12 +30,17 @@ Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매
 - 제한 상품 주의: 레버리지/인버스 상품은 배수만큼 갭 리스크가 확대될 수 있으므로 일반 종목보다 더 타이트한 손절, 더 보수적인 수량, 세션 종료 전 청산 가능성을 우선 검토하세요
 
 ## 거부(REJECT) 기준
-- THEME/BULL 국면: RR비율 1.0:1 미만 → REJECT
-- SIDEWAYS/BEAR 국면: RR비율 1.2:1 미만 → REJECT
+- THEME/BULL 국면: RR비율 __BULL_THEME_RR__:1 미만 → REJECT
+- SIDEWAYS/BEAR 국면: RR비율 __DEFENSIVE_RR__:1 미만 → REJECT
 - 시장 전체 급락 중에 무리한 역추세 매수 (단, 과매도 반등은 허용)
 - 거래량 뒷받침 전혀 없는 돌파/반전 시그널
 
 반드시 한국어로 답변"""
+FINAL_REVIEW_SYSTEM = (
+    FINAL_REVIEW_SYSTEM
+    .replace("__BULL_THEME_RR__", f"{BULL_THEME_RR_FLOOR:.1f}")
+    .replace("__DEFENSIVE_RR__", f"{DEFENSIVE_RR_FLOOR:.1f}")
+)
 
 FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 
@@ -84,7 +91,7 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 **[논리 검증]**
 1. Tier 1이 제시한 추세 방향이 일봉 데이터와 일치하는가?
 2. 1개 이상의 강한 시그널 또는 2개 이상의 보통 시그널이 같은 방향인가?
-3. 리스크:보상 비율이 적정한가? (THEME/BULL: 1.0:1 이상, 기타: 1.5:1 이상)
+3. 리스크:보상 비율이 적정한가? (THEME/BULL: __BULL_THEME_RR__:1 이상, SIDEWAYS/BEAR: __DEFENSIVE_RR__:1 이상)
 
 **[리스크 검증]**
 4. 시장 방향과 충돌하지 않는가? (THEME 시장: 테마 방향 매수는 충돌 아님)
@@ -109,6 +116,7 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 - trailing_stop_pct: 고점 대비 자동 손절 % (0이면 미사용)
 
 **주의**: 아래 JSON은 필드 구조 설명입니다. entry_price/target_price/stop_loss_price/take_profit_price는 반드시 `{currency}` 기준으로 작성하세요. 원화는 투자금 한도와 환산 참고용이며 가격 필드에 넣지 마세요.
+- confidence: 이 매매가 손절 전에 목표가에 도달할 확률 (0.00~1.00)
 
 JSON 형식으로 답변:
 ```json
@@ -131,3 +139,8 @@ JSON 형식으로 답변:
   "risk_warnings": ["위 분석에서 도출한 리스크"]
 }}
 ```"""
+FINAL_REVIEW_PROMPT = (
+    FINAL_REVIEW_PROMPT
+    .replace("__BULL_THEME_RR__", f"{BULL_THEME_RR_FLOOR:.1f}")
+    .replace("__DEFENSIVE_RR__", f"{DEFENSIVE_RR_FLOOR:.1f}")
+)
