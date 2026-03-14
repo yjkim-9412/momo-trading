@@ -1,9 +1,49 @@
+import base64
+import json
 import httpx
 import pytest
 from unittest.mock import AsyncMock, patch
 
 from trading.bithumb_client import BithumbClient
 from trading.models import MCPResponse
+
+
+def _decode_segment(segment: str) -> dict:
+    padded = segment + "=" * (-len(segment) % 4)
+    raw = base64.urlsafe_b64decode(padded.encode("utf-8"))
+    return json.loads(raw.decode("utf-8"))
+
+
+def test_build_jwt_encodes_hs256_header_and_payload():
+    client = BithumbClient()
+    client._api_key = "test-access"
+    client._api_secret = "test-secret"
+
+    token = client._build_jwt()
+
+    header_segment, payload_segment, signature_segment = token.split(".")
+    header = _decode_segment(header_segment)
+    payload = _decode_segment(payload_segment)
+
+    assert header == {"alg": "HS256", "typ": "JWT"}
+    assert payload["access_key"] == "test-access"
+    assert payload["nonce"]
+    assert isinstance(payload["timestamp"], int)
+    assert signature_segment
+
+
+def test_build_jwt_includes_query_hash_when_query_string_exists():
+    client = BithumbClient()
+    client._api_key = "test-access"
+    client._api_secret = "test-secret"
+
+    token = client._build_jwt("market=KRW-BTC&limit=1")
+
+    _header_segment, payload_segment, _signature_segment = token.split(".")
+    payload = _decode_segment(payload_segment)
+
+    assert payload["query_hash_alg"] == "SHA512"
+    assert payload["query_hash"]
 
 
 def test_normalize_ticker_exposes_numeric_change_and_preserves_direction():

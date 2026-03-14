@@ -1,12 +1,15 @@
 """빗썸 거래소 REST API 클라이언트.
 
 BrokerClient + MarketDataProvider Protocol을 만족하는 빗썸 v2.1 구현체.
-인증: JWT Bearer (PyJWT + HMAC256), 해시: SHA-512.
+인증: JWT Bearer (HS256), 해시: SHA-512.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import hmac
+import json
 import time
 import uuid
 from decimal import Decimal, ROUND_DOWN
@@ -14,7 +17,6 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-import jwt
 from loguru import logger
 
 from core.config import settings
@@ -75,6 +77,29 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _encode_jwt_hs256(payload: dict[str, Any], secret: str) -> str:
+    """HS256 JWT 토큰을 표준 라이브러리만으로 생성."""
+    header = {"alg": "HS256", "typ": "JWT"}
+
+    def _b64url(data: bytes) -> bytes:
+        return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+    header_segment = _b64url(
+        json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    payload_segment = _b64url(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    signing_input = header_segment + b"." + payload_segment
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        signing_input,
+        hashlib.sha256,
+    ).digest()
+    signature_segment = _b64url(signature)
+    return b".".join((header_segment, payload_segment, signature_segment)).decode("utf-8")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -148,7 +173,7 @@ class BithumbClient:
             payload["query_hash"] = query_hash
             payload["query_hash_alg"] = "SHA512"
 
-        return jwt.encode(payload, self._api_secret, algorithm="HS256")
+        return _encode_jwt_hs256(payload, self._api_secret)
 
     # ------------------------------------------------------------------
     # Rate limiting (MCPClient _call_timestamps 패턴)

@@ -25,6 +25,7 @@ from trading.market_profile import (
 )
 from trading.mcp_client import mcp_client
 from trading.quantity_policy import normalize_quantity
+from trading.risk_policy import normalize_crypto_regime
 
 
 class CycleMixin:
@@ -320,7 +321,10 @@ class CycleMixin:
             results["scanned"] = len(candidates)
 
             # 1b. 시장 국면 + 컨텍스트 빌드 (Tier1/Tier2/전략/리스크에 전달)
-            state.market_regime = scan_result.get("market_regime", "")
+            if is_crypto_market(target):
+                state.market_regime = normalize_crypto_regime(scan_result.get("market_regime", ""))
+            else:
+                state.market_regime = scan_result.get("market_regime", "")
             state.market_context = self._build_market_context(scan_result)
 
             # 1c. 데이트레이딩 컨텍스트 빌드 (시간/손익/매매성적)
@@ -1097,7 +1101,11 @@ class CycleMixin:
         if results.get("executed", 0) > 0 or results.get("signals", 0) > 0:
             interval = 45
             reason = "유효 신호/체결 발생 → 후속 확인 우선"
-        elif state.market_regime in ("THEME", "BULL") and (
+        elif state.market_regime in (
+            ("THEME", "BULL_RUN", "ALTSEASON")
+            if is_crypto_market(target)
+            else ("THEME", "BULL")
+        ) and (
             minutes_until_buy_cutoff is None or minutes_until_buy_cutoff > 60
         ):
             interval = 30

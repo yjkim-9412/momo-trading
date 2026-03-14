@@ -2,8 +2,10 @@ import unittest
 from unittest.mock import patch
 
 from analysis.feedback.trading_rules import TradingRuleEngine
+from strategy.aggressive_short import AggressiveShortStrategy
 from strategy.risk_manager import RiskManager
-from trading.risk_policy import resolve_rr_floor as resolve_shared_rr_floor
+from strategy.stable_short import StableShortStrategy
+from trading.risk_policy import normalize_crypto_regime, resolve_rr_floor as resolve_shared_rr_floor
 
 
 class _FakeScalarResult:
@@ -93,6 +95,12 @@ class TradingRuleEngineScopeTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RiskManagerRRFloorTest(unittest.TestCase):
+    def test_normalize_crypto_regime_maps_legacy_aliases(self):
+        self.assertEqual(normalize_crypto_regime("BEAR"), "BEAR_MARKET")
+        self.assertEqual(normalize_crypto_regime("sideways"), "CONSOLIDATION")
+        self.assertEqual(normalize_crypto_regime("ALT_SEASON"), "ALTSEASON")
+        self.assertEqual(normalize_crypto_regime("THEME"), "THEME")
+
     def test_resolve_rr_floor_prefers_regime_then_all_then_default(self):
         self.assertEqual(
             RiskManager.resolve_rr_floor("BULL", {"ALL": 1.1, "BULL": 1.4}),
@@ -116,6 +124,55 @@ class RiskManagerRRFloorTest(unittest.TestCase):
             RiskManager.resolve_rr_floor("SIDEWAYS", None),
             resolve_shared_rr_floor("SIDEWAYS", None),
         )
+
+    def test_crypto_rr_floor_supports_canonical_regimes(self):
+        self.assertEqual(RiskManager.CRYPTO_RR_FLOOR["BULL_RUN"], 2.0)
+        self.assertEqual(RiskManager.CRYPTO_RR_FLOOR["ALTSEASON"], 2.0)
+        self.assertEqual(RiskManager.CRYPTO_RR_FLOOR["THEME"], 2.0)
+        self.assertEqual(RiskManager.CRYPTO_RR_FLOOR["BEAR_MARKET"], 1.5)
+        self.assertEqual(RiskManager.CRYPTO_RR_FLOOR["CONSOLIDATION"], 1.5)
+
+
+class CryptoStrategyRegimeMappingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_stable_strategy_uses_canonical_crypto_regime_params(self):
+        strategy = StableShortStrategy()
+
+        signal = await strategy.evaluate(
+            {
+                "recommendation": "BUY",
+                "confidence": 0.8,
+                "symbol": "BTC",
+                "stock_id": "BTC",
+                "current_price": 100.0,
+                "market": "BITHUMB",
+                "currency": "KRW",
+            },
+            market_regime="CONSOLIDATION",
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertAlmostEqual(signal.target_price, 103.0)
+        self.assertAlmostEqual(signal.stop_loss_price, 98.0)
+
+    async def test_aggressive_strategy_uses_canonical_crypto_regime_params(self):
+        strategy = AggressiveShortStrategy()
+
+        signal = await strategy.evaluate(
+            {
+                "recommendation": "BUY",
+                "confidence": 0.8,
+                "symbol": "DOGE",
+                "stock_id": "DOGE",
+                "current_price": 100.0,
+                "market": "BITHUMB",
+                "currency": "KRW",
+            },
+            market_regime="ALTSEASON",
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertAlmostEqual(signal.target_price, 112.0)
+        self.assertAlmostEqual(signal.stop_loss_price, 95.0)
 
 
 if __name__ == "__main__":

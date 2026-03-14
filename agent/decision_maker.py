@@ -370,7 +370,10 @@ class DecisionMaker:
         payload = order_data or {}
         order_id = str(payload.get("order_id") or "").strip()
         symbol = str(payload.get("symbol") or "").upper().strip()
-        market_code = normalize_market(payload.get("market") or "BITHUMB")
+        market_code = normalize_market(
+            payload.get("market") or settings.crypto_primary_market_code,
+            default=settings.crypto_primary_market_code,
+        )
         if not order_id or not symbol or not is_crypto_market(market_code):
             return
 
@@ -1545,7 +1548,9 @@ class DecisionMaker:
         """반자율: 코인 추천 생성 → CoinRecommendation 테이블 저장"""
         ts = now_kst()
         expires_at = ts + timedelta(
-            minutes=settings.recommendation_expire_minutes_for_market("BITHUMB")
+            minutes=settings.recommendation_expire_minutes_for_market(
+                settings.crypto_primary_market_code
+            )
         )
 
         # coin_asset_id 조회 (symbol → CoinAsset.id)
@@ -1617,7 +1622,7 @@ class DecisionMaker:
             "coin_asset_id": coin_asset_id,
             "analysis_id": resolved_analysis_id or "",
             "recommendation_id": coin_rec.id if coin_rec else None,
-            "market": signal.metadata.get("market", "BITHUMB"),
+            "market": signal.metadata.get("market", settings.crypto_primary_market_code),
             "currency": signal.metadata.get("currency", "KRW"),
             "action": signal.action.value,
             "suggested_price": price,

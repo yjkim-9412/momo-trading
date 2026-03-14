@@ -74,6 +74,7 @@ class Settings(BaseSettings):
 
     # === Crypto 운영 (주식 TRADING_ENABLED, AUTONOMY_MODE 등과 독립) ===
     CRYPTO_ENABLED: bool = False
+    CRYPTO_PRIMARY_MARKET: str = "BITHUMB"
     CRYPTO_TRADING_ENABLED: bool = False
     CRYPTO_AUTONOMY_MODE: str = "SEMI_AUTO"  # SEMI_AUTO / AUTONOMOUS
     CRYPTO_RECOMMENDATION_EXPIRE_MIN: int = 30
@@ -205,7 +206,7 @@ class Settings(BaseSettings):
         if self.CRYPTO_ENABLED and not any(
             s.upper() in {"CRYPTO", "BITHUMB", "BTH", "COIN"} for s in raw
         ):
-            raw.append("CRYPTO")
+            raw.append(self.crypto_primary_market_code)
         seen: list[str] = []
         for m in raw:
             norm = normalize_market(m)
@@ -241,6 +242,21 @@ class Settings(BaseSettings):
         return normalize_market(self.PRIMARY_MARKET)
 
     @property
+    def crypto_primary_market_code(self) -> str:
+        """코인 대표 시장 코드 (비어있거나 잘못되면 BITHUMB 고정)"""
+        from trading.market_profile import is_crypto_market, normalize_market
+
+        normalized = normalize_market(self.CRYPTO_PRIMARY_MARKET, default="BITHUMB")
+        if is_crypto_market(normalized):
+            return normalized
+
+        logger.warning(
+            "CRYPTO_PRIMARY_MARKET={}는 지원되지 않는 코인 시장 코드입니다. BITHUMB로 고정합니다.",
+            self.CRYPTO_PRIMARY_MARKET,
+        )
+        return "BITHUMB"
+
+    @property
     def scan_markets(self) -> list[str]:
         """시장 스캔 대상 목록"""
         return self.scan_markets_for(self.primary_market_code)
@@ -253,7 +269,7 @@ class Settings(BaseSettings):
 
         m = normalize_market(market)
         if is_crypto_market(m):
-            return [m]
+            return [self.crypto_primary_market_code]
         if is_us_market(m):
             items = self._parse_csv(self.US_SCAN_MARKETS)
             return expand_scan_markets(items)

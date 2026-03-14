@@ -40,9 +40,10 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 | `realtime/coin_stream_manager.py` | 코인 desired/active 구독 상태, admin stream status |
 | `realtime/coin_monitor.py` | WS 수신 → `event_detector` / broker ledger / cache 동기화 |
 | `agent/scanner_base.py` | MarketScannerProtocol |
-| `agent/crypto_scanner.py` | 코인 스캐너 (24h 거래대금/등락률 기반) |
+| `agent/crypto_scanner.py` | 코인 스캐너 (24h 거래대금/등락률 기반, shared prompt 사용, canonical regime 정규화) |
 | `analysis/llm/llm_factory.py` | 코인 scope LLM provider 선택 및 Codex 장애 시 Claude fallback |
 | `trading/market_profile.py` | `is_crypto_market()`, `MARKET_SCOPE_CRYPTO` |
+| `trading/risk_policy.py` | 코인 canonical regime alias 정규화, shared RR floor 상수 |
 | `core/config.py` | `CRYPTO_*`, `BITHUMB_*` 환경변수 |
 | `scheduler/market_calendar.py` | 24/7 세션 (`CRYPTO_ACTIVE`) |
 | `strategy/risk_manager.py` | `CRYPTO_RR_FLOOR` |
@@ -69,6 +70,7 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 BITHUMB_API_KEY / BITHUMB_API_SECRET    # API 인증
 BITHUMB_WS_URL_PUBLIC / BITHUMB_WS_URL_PRIVATE  # 빗썸 Public/Private WS 엔드포인트
 CRYPTO_ENABLED                          # 코인 기능 on/off
+CRYPTO_PRIMARY_MARKET                   # 코인 기본 시장 코드, 비어있거나 잘못되면 BITHUMB 고정
 CRYPTO_TRADING_ENABLED                  # 실제 주문 허용
 CRYPTO_AUTONOMY_MODE                    # SEMI_AUTO / AUTONOMOUS
 CRYPTO_SCAN_INTERVAL_HOURS              # 스캔 주기 (기본 4h)
@@ -98,8 +100,11 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 코인 소수점 수량은 `trading/quantity_policy.py`를 기준으로 end-to-end 8자리 floor 정책을 유지한다. 포지션 스냅샷, 계좌 컨텍스트, 리스크 캡, Tier2 제안 수량, 빗썸 주문 payload는 코인만 fractional 을 보존하고 주식 API/스키마는 그대로 둔다.
 - 캔들 정렬: newest-first → oldest-first 재정렬 (미국장과 동일 방어)
 - JWT 인증: PyJWT HS256. `Authorization: Bearer {jwt}`. Payload: access_key, nonce(UUID), timestamp(ms), query_hash(SHA512)
-- 시장 국면: BULL_RUN / BEAR_MARKET / CONSOLIDATION / ALTSEASON / ALT_SEASON (R:R floor에 양쪽 변형 매핑)
+- 시장 국면 canonical 값: `BULL_RUN` / `BEAR_MARKET` / `CONSOLIDATION` / `ALTSEASON` / `THEME`
+- legacy alias는 `normalize_crypto_regime()`에서 `BEAR -> BEAR_MARKET`, `SIDEWAYS -> CONSOLIDATION`, `ALT_SEASON -> ALTSEASON`으로 정규화한다
 - R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게)
+- 코인 기본 시장 fallback은 `PRIMARY_MARKET`를 공유하지 않는다. 코인 경로는 `CRYPTO_PRIMARY_MARKET`를 우선 사용하고, 값이 비어 있거나 잘못되면 `BITHUMB`로 고정한다.
+- 코인 프롬프트 스택(`market_scan.py`, `stock_analysis.py`, `final_review.py`)은 `빗썸 KRW 현물`, `수시간~2일`, `BUY/HOLD 전용`, `24h 거래대금 기반 유동성 확인`을 공통 계약으로 유지한다
 - Product Policy: 크립토는 항상 COMMON (Spot only)
 - 24/7 스케줄: buy cutoff / 강제 청산 없음
 - 코인 스캔은 `CRYPTO_DYNAMIC_DISCOVERY_ENABLED=true`일 때 `get_market_overview()` 전체 KRW 마켓에서 동적 discovery 후보를 만들고, `CRYPTO_WATCHLIST_SYMBOLS`는 discovery와 별도로 항상 병합되는 시드 목록으로 유지한다.

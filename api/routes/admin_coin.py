@@ -37,12 +37,16 @@ APP_STARTED_AT = now_kst()
 # 페이지 서빙은 main.py에서 /admin-coin 경로로 처리
 
 
+def _crypto_market_code() -> str:
+    return settings.crypto_primary_market_code
+
+
 # ── 계좌 정보 ──
 @router.get("/account/balance")
 async def get_coin_balance():
     """빗썸 계좌 잔고 조회"""
     try:
-        balance = await account_manager.get_balance("BITHUMB")
+        balance = await account_manager.get_balance(_crypto_market_code())
         return SuccessResponse(data=_serialize_balance(balance))
     except Exception as e:
         logger.error("코인 잔고 조회 실패: {}", str(e))
@@ -53,7 +57,7 @@ async def get_coin_balance():
 async def get_coin_holdings():
     """빗썸 보유 코인 조회"""
     try:
-        holdings = await account_manager.get_holdings("BITHUMB")
+        holdings = await account_manager.get_holdings(_crypto_market_code())
         return SuccessResponse(data=_serialize_holdings(holdings))
     except Exception as e:
         logger.error("보유 코인 조회 실패: {}", str(e))
@@ -64,7 +68,7 @@ async def get_coin_holdings():
 async def get_coin_overview():
     """코인 계좌 overview"""
     try:
-        overview = await account_manager.get_account_overview("BITHUMB")
+        overview = await account_manager.get_account_overview(_crypto_market_code())
         return SuccessResponse(data={
             "balance": _serialize_balance(overview.balance),
             "holdings": _serialize_holdings(overview.holdings),
@@ -163,14 +167,15 @@ async def get_coin_watchlist():
 
     state = trading_agent._market_states.get(MARKET_SCOPE_CRYPTO)
     default_thresholds = asdict(DEFAULT_THRESHOLDS)
-    holdings = await account_manager.get_holdings("BITHUMB")
+    crypto_market = _crypto_market_code()
+    holdings = await account_manager.get_holdings(crypto_market)
     holding_keys = {
-        (str(h.market or "BITHUMB").upper(), str(h.symbol or "").upper())
+        (str(h.market or crypto_market).upper(), str(h.symbol or "").upper())
         for h in holdings
         if getattr(h, "symbol", None)
     }
     name_map = {
-        (str(h.market or "BITHUMB").upper(), str(h.symbol or "").upper()): str(h.name or "")
+        (str(h.market or crypto_market).upper(), str(h.symbol or "").upper()): str(h.name or "")
         for h in holdings
         if getattr(h, "symbol", None)
     }
@@ -178,7 +183,7 @@ async def get_coin_watchlist():
     all_symbols: dict[tuple[str, str], dict[str, bool]] = {}
 
     for sym_info in getattr(state, "last_selected_watchlist", []) if state else []:
-        market_code = str(sym_info.get("market", "BITHUMB") or "BITHUMB").upper()
+        market_code = str(sym_info.get("market", crypto_market) or crypto_market).upper()
         symbol = str(sym_info.get("symbol", "")).upper()
         if not symbol:
             continue
@@ -215,10 +220,10 @@ async def get_coin_watchlist():
         })
 
     for instrument_key in event_detector.monitored_symbols:
-        if not instrument_key.startswith("BITHUMB:"):
+        if not instrument_key.startswith(f"{crypto_market}:"):
             continue
         _, symbol = instrument_key.split(":", 1)
-        key = ("BITHUMB", symbol)
+        key = (crypto_market, symbol)
         all_symbols.setdefault(key, {
             "selected_in_last_cycle": False,
             "in_desired_set": False,
@@ -329,8 +334,9 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
     from realtime.coin_stream_manager import coin_stream_manager
     from scheduler.scheduler import trading_scheduler
 
-    session_schedule = market_calendar.get_session_schedule(market="BITHUMB")
-    cycle_runtime = trading_agent.get_cycle_runtime_snapshot("BITHUMB")
+    crypto_market = _crypto_market_code()
+    session_schedule = market_calendar.get_session_schedule(market=crypto_market)
+    cycle_runtime = trading_agent.get_cycle_runtime_snapshot(crypto_market)
     runtime = trading_agent._market_states.get(MARKET_SCOPE_CRYPTO)
     watchlist = list(getattr(runtime, "last_selected_watchlist", []) or [])
     trading_date = market_calendar.market_date(market=MARKET_SCOPE_CRYPTO)
@@ -350,6 +356,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
 
     return SuccessResponse(data={
         "crypto_enabled": settings.CRYPTO_ENABLED,
+        "crypto_primary_market": crypto_market,
         "crypto_trading_enabled": settings.CRYPTO_TRADING_ENABLED,
         "crypto_autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
         "crypto_dynamic_discovery_enabled": settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED,
@@ -357,7 +364,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
         "scheduler_running": trading_scheduler.is_running,
         "agent_running": trading_agent._running,
-        "market": "BITHUMB",
+        "market": crypto_market,
         "market_scope": MARKET_SCOPE_CRYPTO,
         "market_open": True,  # 24/7
         "market_session": session_schedule["current_session"],
@@ -412,6 +419,7 @@ async def get_coin_agent_state():
 # ── 설정 조회/변경 ──
 COIN_MUTABLE_SETTINGS = [
     "CRYPTO_ENABLED",
+    "CRYPTO_PRIMARY_MARKET",
     "CRYPTO_TRADING_ENABLED",
     "CRYPTO_AUTONOMY_MODE",
     "CRYPTO_RECOMMENDATION_EXPIRE_MIN",
@@ -472,7 +480,8 @@ async def trigger_coin_cycle():
             message="코인 기능이 비활성화되어 있습니다",
         )
 
-    preview = await trading_agent.preview_cycle(market="BITHUMB")
+    crypto_market = _crypto_market_code()
+    preview = await trading_agent.preview_cycle(market=crypto_market)
     if preview.get("skipped"):
         return SuccessResponse(
             data={"skipped": True, "reason": preview.get("reason", "skipped")},
@@ -486,14 +495,14 @@ async def trigger_coin_cycle():
     )
 
     async def _run_crypto_cycle():
-        result = await trading_agent.run_cycle(market="BITHUMB")
+        result = await trading_agent.run_cycle(market=crypto_market)
         if result.get("skipped"):
             logger.info("수동 코인 스캔 스킵: {}", result.get("reason", "skipped"))
             return
         try:
             from services.watchlist_sync import reconcile_market_watchlist
 
-            synced_symbols = await reconcile_market_watchlist("BITHUMB")
+            synced_symbols = await reconcile_market_watchlist(crypto_market)
             logger.info("수동 코인 스캔 후 실시간 감시 갱신: {}종목", len(synced_symbols))
         except Exception as e:
             logger.warning("수동 코인 스캔 후 실시간 감시 갱신 실패: {}", str(e))
@@ -506,7 +515,7 @@ async def trigger_coin_cycle():
     ))
 
     return SuccessResponse(
-        data={"market": "BITHUMB", "market_scope": MARKET_SCOPE_CRYPTO, "skipped": False},
+        data={"market": crypto_market, "market_scope": MARKET_SCOPE_CRYPTO, "skipped": False},
         message="코인 스캔 사이클이 트리거되었습니다",
     )
 

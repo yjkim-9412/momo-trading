@@ -23,88 +23,9 @@ from core.database import AsyncSessionLocal
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType, Tier1Profile
-from trading.market_profile import market_scope, normalize_market
+from trading.market_profile import is_crypto_market, market_scope, normalize_market
+from trading.risk_policy import normalize_crypto_regime
 from trading.models import MCPResponse
-
-# 크립토 전용 스캔 시스템 프롬프트
-CRYPTO_SCAN_SYSTEM = """당신은 암호화폐(코인) 시장 전문 스크리너입니다.
-빗썸 거래소의 시장 데이터를 분석하여 단기 매매(수시간~수일) 후보 코인을 선별하고 전략을 배정합니다.
-
-## 분석 프레임워크
-반드시 아래 순서로 분석하세요:
-
-**Step 1. 시장 국면 판단** — 현재 코인 시장 전체 흐름
-  - BULL_RUN: BTC 및 대다수 알트코인 동반 상승, 거래대금 급증
-  - BEAR: BTC 하락 주도, 전반적 하락세, 공포 심리
-  - SIDEWAYS: 방향성 불명확, 거래량 감소, 좁은 범위 등락
-  - ALT_SEASON: BTC 횡보/약보합 중 알트코인에 자금 집중
-  - THEME: 특정 섹터(AI, L2, DeFi, 밈코인 등)에 거래량 집중
-
-**Step 2. 코인 선정 + 전략 배정** — 시장 국면에 맞는 코인 선별
-  - 안정형(STABLE_SHORT): BTC, ETH 등 대형 코인, 지지선 부근, 변동성 비교적 낮음
-  - 공격형(AGGRESSIVE_SHORT): 거래대금 급증, 강한 상승 모멘텀, 알트코인 급등
-  - BULL_RUN → 대형+알트 혼합 / BEAR → 대형 코인 위주 또는 0개 허용
-  - ALT_SEASON → 거래대금 상위 알트코인 AGGRESSIVE_SHORT
-
-**Step 3. 코인 고유 리스크**
-  - 24/7 시장이므로 오버나이트 갭 리스크는 없지만, 급변동 리스크가 큼
-  - BTC 도미넌스와 알트코인 상관관계 고려
-  - 거래대금이 매우 작은 코인은 유동성 리스크로 제외
-
-## 핵심 원칙
-- 제공된 데이터만 사용 (추측 금지)
-- 투자 가용 금액 고려
-- 과거 손실 패턴 회피
-- **절대 규칙**: 반드시 제공된 데이터에 있는 코인만 선정
-- 반드시 한국어로 답변
-- **간결하게**: JSON만 출력, 부연 설명 불필요"""
-
-CRYPTO_SCAN_PROMPT = """## 코인 시장 데이터
-
-현재 시각(KST): {current_time} | 시장: 24시간 운영 (매수 제한 없음)
-투자 가용 현금: {available_cash:,.0f}원 | 코인당 최대: {max_per_stock:,.0f}원
-보유 코인 수: {holding_count}개
-이번 스캔 선정 목표: {selection_target_range}개 (적합한 후보가 없으면 0개 허용)
-
-### 거래대금 상위
-{volume_rank_data}
-
-### 급등 코인
-{surge_data}
-
-### 급락 코인
-{drop_data}
-
-### 보유 코인
-{holdings_data}
-
-### 매매 성과
-{performance_summary}
-
----
-
-위 데이터를 분석하여 코인 시장 국면을 판단하고, **심층 분석할 코인을 {selection_target_range}개 범위에서** 직접 선정하세요.
-각 코인에 적합한 전략(STABLE_SHORT/AGGRESSIVE_SHORT)을 배정하세요.
-
-JSON:
-```json
-{{
-  "market_regime": "BULL_RUN/BEAR/SIDEWAYS/ALT_SEASON/THEME",
-  "market_analysis": "코인 시장 상황 1~2줄 요약",
-  "leading_sectors": ["주도 섹터 (예: L1, DeFi, 밈코인)"],
-  "selected": [
-    {{
-      "symbol": "코인심볼 (예: BTC)",
-      "name": "코인명 (예: 비트코인)",
-      "market": "BITHUMB",
-      "strategy_type": "STABLE_SHORT 또는 AGGRESSIVE_SHORT",
-      "reason": "선정 근거 1줄",
-      "category": "대형코인/알트코인/밈코인 등",
-      "monitoring": {{"surge_pct": 8.0, "drop_pct": -5.0, "volume_spike_ratio": 3.0}}
-    }}
-  ]
-}}
-```"""
 
 # 선정 목표 범위 (24/7 시장이므로 고정)
 _CRYPTO_SELECTION_TARGET_RANGE = "5~8"
@@ -116,7 +37,7 @@ class CryptoScanner:
     def __init__(self) -> None:
         self._untradeable_symbols: set[str] = set()
 
-    def add_untradeable(self, symbol: str, market: str = "BITHUMB") -> None:
+    def add_untradeable(self, symbol: str, market: str | None = None) -> None:
         """매매불가 코인을 런타임 블록리스트에 등록 (당일 스캔에서 제외)"""
         self._untradeable_symbols.add(symbol.upper())
         logger.info(
@@ -136,7 +57,7 @@ class CryptoScanner:
     async def scan(
         self,
         *,
-        market: str = "BITHUMB",
+        market: str | None = None,
         cycle_id: str | None = None,
         dynamic_limits: dict[str, Any] | None = None,
         account_snapshot: tuple | None = None,
@@ -151,7 +72,13 @@ class CryptoScanner:
         6. LLM 스캔 프롬프트로 후보 선별
         7. JSON 파싱 + source 메타데이터 재결합
         """
-        target = normalize_market(market, default="BITHUMB")
+        target = normalize_market(
+            market or settings.crypto_primary_market_code,
+            default=settings.crypto_primary_market_code,
+        )
+        if not is_crypto_market(target):
+            logger.warning("크립토 스캐너에 비코인 market={} 입력 → {}로 고정", market, settings.crypto_primary_market_code)
+            target = settings.crypto_primary_market_code
 
         if not settings.CRYPTO_ENABLED:
             logger.info("크립토 비활성화 -> 시장 스캔 스킵")
@@ -372,7 +299,7 @@ class CryptoScanner:
 
         now = now_kst()
 
-        prompt = CRYPTO_SCAN_PROMPT.format(
+        prompt = get_market_scan_prompt(target).format(
             current_time=now.strftime("%H:%M"),
             available_cash=available_cash,
             max_per_stock=max_per_coin,
@@ -389,12 +316,13 @@ class CryptoScanner:
         try:
             result_text, provider = await llm_factory.generate_tier1(
                 prompt,
-                system_prompt=CRYPTO_SCAN_SYSTEM,
+                system_prompt=get_market_scan_system(target),
                 profile=Tier1Profile.SCAN,
                 scope=market_scope(target),
                 phase="cycle",
             )
             parsed = self._parse_json_response(result_text)
+            market_regime = normalize_crypto_regime(parsed.get("market_regime", ""))
             selected = self._enrich_selected_candidates(
                 parsed.get("selected", []),
                 candidate_pool=candidate_pool,
@@ -438,7 +366,7 @@ class CryptoScanner:
                     "discovery_enabled": discovery_enabled,
                     "discovery_count": len([c for c in candidate_pool if c.get("scan_source") == "DISCOVERY"]),
                     "watchlist_count": len([c for c in candidate_pool if c.get("scan_source") != "DISCOVERY"]),
-                    "market_regime": parsed.get("market_regime", ""),
+                    "market_regime": market_regime,
                     "market_analysis": market_analysis,
                     "available_cash": available_cash,
                     "scan_source": "crypto_overview",
@@ -451,7 +379,7 @@ class CryptoScanner:
             return {
                 "selected": selected,
                 "market_summary": market_analysis,
-                "market_regime": parsed.get("market_regime", ""),
+                "market_regime": market_regime,
                 "market_analysis": market_analysis,
                 "leading_sectors": parsed.get("leading_sectors", []),
                 "available_cash": available_cash,
@@ -538,11 +466,17 @@ class CryptoScanner:
         change_rate = cls._to_float(item.get("change_rate", item.get("fluctate_rate_24H", 0)))
         volume = cls._to_float(item.get("volume", item.get("acc_trade_value_24h", item.get("acc_trade_value", 0))))
         trade_value = cls._to_float(item.get("trade_value", item.get("acc_trade_value_24h", item.get("volume", 0))))
+        market_code = normalize_market(
+            item.get("market"),
+            default=settings.crypto_primary_market_code,
+        )
+        if not is_crypto_market(market_code):
+            market_code = settings.crypto_primary_market_code
         normalized = dict(item)
         normalized.update({
             "symbol": symbol,
             "name": str(item.get("name") or item.get("korean_name") or symbol),
-            "market": "BITHUMB",
+            "market": market_code,
             "price": price,
             "change_rate": change_rate,
             "volume": volume,
@@ -729,8 +663,9 @@ class CryptoScanner:
         if not fallback_items:
             return []
 
+        market_code = settings.crypto_primary_market_code
         responses = await asyncio.gather(*[
-            _safe_call(bithumb_client.get_current_price, symbol, market="BITHUMB")
+            _safe_call(bithumb_client.get_current_price, symbol, market=market_code)
             for symbol, _ in fallback_items
         ])
         coins: list[dict] = []
@@ -741,7 +676,7 @@ class CryptoScanner:
             coins.append({
                 "symbol": symbol,
                 "name": data.get("name") or symbol,
-                "market": "BITHUMB",
+                "market": market_code,
                 "price": float(data.get("price", 0) or 0),
                 "change_rate": float(data.get("change_rate", 0) or 0),
                 "volume": float(data.get("trade_value", data.get("volume", 0)) or 0),
@@ -804,7 +739,10 @@ class CryptoScanner:
     def _parse_json_response(text: str) -> dict:
         """LLM 응답에서 JSON을 파싱"""
         from core.json_utils import parse_llm_json
-        return parse_llm_json(text)
+        parsed = parse_llm_json(text)
+        if isinstance(parsed, dict):
+            parsed["market_regime"] = normalize_crypto_regime(parsed.get("market_regime", ""))
+        return parsed
 
 
 # ------------------------------------------------------------------

@@ -23,6 +23,7 @@ PORT="${MOMO_PORT:-9000}"
 
 # 코인 전용: 주식 시장 비활성화, MCP/WebSocket 연결 건너뜀
 export ENABLED_MARKETS="CRYPTO"
+export CRYPTO_PRIMARY_MARKET="${CRYPTO_PRIMARY_MARKET:-BITHUMB}"
 
 # ── 공통 함수 ──
 

@@ -6,7 +6,11 @@ from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, SignalAction
 from trading.market_profile import is_crypto_market, is_us_market
-from trading.risk_policy import DEFAULT_RR_FLOOR, resolve_rr_floor as resolve_shared_rr_floor
+from trading.risk_policy import (
+    CRYPTO_DEFAULT_RR_FLOOR,
+    DEFAULT_RR_FLOOR,
+    resolve_rr_floor as resolve_shared_rr_floor,
+)
 from trading.product_policy import (
     build_product_context,
     classification_from_metadata,
@@ -26,18 +30,7 @@ class RiskManager:
     """
 
     # 크립토 전용 R:R floor (주식보다 넓은 스탑 반영)
-    CRYPTO_RR_FLOOR = {
-        "BULL_RUN": 2.0,
-        "BEAR_MARKET": 1.5,
-        "CONSOLIDATION": 1.5,
-        "ALTSEASON": 2.0,
-        "ALT_SEASON": 2.0,  # 프롬프트 변형 호환
-        # 주식 regime 호환
-        "BULL": 2.0,
-        "BEAR": 1.5,
-        "SIDEWAYS": 1.5,
-        "THEME": 2.0,
-    }
+    CRYPTO_RR_FLOOR = dict(CRYPTO_DEFAULT_RR_FLOOR)
 
     def __init__(self):
         self.max_daily_trades = settings.MAX_DAILY_TRADES

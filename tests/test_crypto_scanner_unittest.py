@@ -67,7 +67,7 @@ async def test_scan_reuses_single_overview_payload_for_ranked_views():
         "agent.crypto_scanner.llm_factory.generate_tier1",
         AsyncMock(
             return_value=(
-                '{"selected": [], "market_regime": "SIDEWAYS", "market_analysis": "관망"}',
+                '{"selected": [], "market_regime": "CONSOLIDATION", "market_analysis": "관망"}',
                 "TEST",
             )
         ),
@@ -180,7 +180,7 @@ async def test_scan_enriches_selected_candidates_with_discovery_source():
         "agent.crypto_scanner.llm_factory.generate_tier1",
         AsyncMock(
             return_value=(
-                '{"selected":[{"symbol":"P00","name":"상승코인00","strategy_type":"AGGRESSIVE_SHORT","reason":"거래량 우위"},{"symbol":"DOGE","name":"도지코인","strategy_type":"STABLE_SHORT","reason":"고정 감시"}],"market_regime":"SIDEWAYS","market_analysis":"혼조"}',
+                '{"selected":[{"symbol":"P00","name":"상승코인00","strategy_type":"AGGRESSIVE_SHORT","reason":"거래량 우위"},{"symbol":"DOGE","name":"도지코인","strategy_type":"STABLE_SHORT","reason":"고정 감시"}],"market_regime":"CONSOLIDATION","market_analysis":"혼조"}',
                 "TEST",
             )
         ),
@@ -264,6 +264,7 @@ async def test_scan_uses_watchlist_only_when_discovery_disabled():
     assert "솔라나(SOL)" not in prompt
     assert "보유 코인 없음" in prompt
     assert "P(P)" not in prompt
+    assert result["market_regime"] == "CONSOLIDATION"
     assert result["selected"][0]["scan_source"] == "WATCHLIST"
 
 

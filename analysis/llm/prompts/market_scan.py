@@ -156,43 +156,46 @@ JSON:
 
 
 CRYPTO_MARKET_SCAN_SYSTEM = """당신은 암호화폐(코인) 시장 전문 스크리너입니다.
-빗썸 거래소의 KRW 마켓 데이터를 분석하여 단기 매매 후보 코인을 선별하고 전략을 배정합니다.
+빗썸 거래소의 KRW 현물 데이터를 분석하여 **수시간~2일** 관점의 단기 매매 후보 코인을 선별하고 전략을 배정합니다.
 
 ## 분석 프레임워크
 반드시 아래 순서로 분석하세요:
 
 **Step 1. 시장 국면 판단** — 현재 코인 시장 전체 흐름
-  - BULL_RUN(강세장): 비트코인 상승 + 대부분의 코인 동반 상승, 거래대금 급증
-  - BEAR_MARKET(약세장): 전반적 하락, 거래대금 감소, 위험자산 회피
-  - CONSOLIDATION(횡보): 방향성 불분명, 거래대금 보합, 좁은 가격 범위
-  - ALTSEASON(알트시즌): 비트코인 도미넌스 하락 + 알트코인 대규모 상승
+  - BULL_RUN(강세장): BTC/ETH 주도로 시장 전반이 상승하고 거래대금이 넓게 확산
+  - BEAR_MARKET(약세장): BTC 약세가 시장 전체로 전염되고 반등 신뢰도가 낮음
+  - CONSOLIDATION(횡보): BTC와 알트 모두 방향성 약하고 거래대금이 식어 있음
+  - ALTSEASON(알트시즌): BTC는 견조하거나 횡보, 대신 알트 전반 또는 다수 알트 섹터가 강함
+  - THEME(섹터 장세): 시장 전체보다 특정 섹터(AI/L2/DeFi/밈 등)에 거래대금이 집중
 
 **Step 2. 종목 선정 + 전략 배정** — 시장 국면에 맞는 코인 선별
   - 안정형(STABLE_SHORT): 비트코인·이더리움 등 대형 코인, 상대적 저변동성, 지지선 부근
   - 공격형(AGGRESSIVE_SHORT): 알트코인, 거래대금 급증, 강한 모멘텀, 높은 변동성
-  - BULL_RUN → AGGRESSIVE_SHORT 비중 확대 / BEAR_MARKET → STABLE_SHORT 위주
-  - ALTSEASON → 알트코인 AGGRESSIVE_SHORT 적극 선정
+  - BULL_RUN → 대형 + 리더 알트 혼합 / BEAR_MARKET → 대형 코인 위주 또는 0개 허용
+  - ALTSEASON/THEME → 주도 알트·섹터 코인 AGGRESSIVE_SHORT 적극 선정
 
 **Step 3. 코인 시장 특성 반영**
-  - 24/7 시장이므로 시간대 제한 없이 후보 5~8개를 선정
-  - 코인 변동성 ±5%는 일상적 수준, ±10% 이상부터 주의
-  - 24h 거래대금과 24h 변동률이 핵심 선별 지표
-  - 비트코인 도미넌스 변화에 따른 알트코인 자금 흐름 고려
+  - 24/7 시장이므로 시간에 쫓겨 억지로 후보를 채우지 말고, 적합한 후보가 없으면 0개도 허용
+  - 코인 변동성 ±5%는 일상적 수준이므로, 절대 변동폭보다 **거래대금 유지와 추세 지속성**을 더 중요하게 본다
+  - 24h 거래대금과 24h 변동률이 핵심 선별 지표다
+  - 비트코인 주도 여부와 알트/섹터 로테이션을 함께 본다
+  - 이미 급등했지만 거래대금이 둔화된 코인, 유동성이 얕은 코인은 제외한다
 
 ## 핵심 원칙
 - 제공된 데이터만 사용 (추측 금지)
 - 투자 가용 금액 고려
 - 과거 손실 패턴 회피
+- canonical 국면명만 사용: `BULL_RUN`, `BEAR_MARKET`, `CONSOLIDATION`, `ALTSEASON`, `THEME`
 - **절대 규칙**: 반드시 위 데이터에 있는 코인만 선정
 - 반드시 한국어로 답변
 - **간결하게**: JSON만 출력, 부연 설명 불필요"""
 
 CRYPTO_MARKET_SCAN_PROMPT = """## 코인 시장 데이터
 
-현재 시각(KST): {current_time}
+현재 시각(KST): {current_time} | 시장: 24시간 운영 (세션 종료 없음)
 투자 가용 현금: {available_cash:,.0f} KRW | 코인당 최대: {max_per_stock:,.0f} KRW
 보유 코인 수: {holding_count}개
-이번 스캔 선정 목표: 5~8개
+이번 스캔 선정 목표: {selection_target_range}개 (적합한 후보가 없으면 0개 허용)
 
 === 24h 거래대금 상위 ===
 {volume_rank_data}
@@ -211,13 +214,13 @@ CRYPTO_MARKET_SCAN_PROMPT = """## 코인 시장 데이터
 
 ---
 
-위 데이터를 분석하여 시장 국면을 판단하고, **심층 분석할 코인을 5~8개** 직접 선정하세요.
+위 데이터를 분석하여 시장 국면을 판단하고, **심층 분석할 코인을 {selection_target_range}개 범위에서** 직접 선정하세요.
 각 코인에 적합한 전략(STABLE_SHORT/AGGRESSIVE_SHORT)을 배정하세요.
 
 JSON:
 ```json
 {{
-  "market_regime": "BULL_RUN/BEAR_MARKET/CONSOLIDATION/ALTSEASON",
+  "market_regime": "BULL_RUN/BEAR_MARKET/CONSOLIDATION/ALTSEASON/THEME",
   "market_analysis": "코인 시장 상황 1~2줄 요약",
   "leading_sectors": ["주도 섹터 (DeFi/Layer2/Meme 등)"],
   "selected": [

@@ -381,9 +381,14 @@ class AnalysisMixin:
             detail=self._enrich_activity_detail(None, product_context),
         )
 
+        price_payload = dict(price_resp.data or {})
+        if market_code and not price_payload.get("market"):
+            price_payload["market"] = market_code
+
         analysis = await self._tier1_analysis(
             symbol, name, current_price, chart_result,
-            price_resp.data or {}, feedback_context,
+            price_payload, feedback_context,
+            market=market_code,
             product_context=product_context,
             current_position_context=current_position_context,
             portfolio_snapshot=snap,
@@ -593,6 +598,7 @@ class AnalysisMixin:
 
             final = await self._tier2_review(
                 symbol, name, current_price, strategy_type, analysis,
+                market=market_code,
                 feedback_context=feedback_context,
                 product_context=product_context,
                 current_position_context=current_position_context,
@@ -1175,6 +1181,7 @@ class AnalysisMixin:
         self, symbol: str, name: str, current_price: float,
         chart_result: ChartAnalysisResult, price_data: dict,
         feedback_context: str = "",
+        market: str | None = None,
         product_context: dict | None = None,
         current_position_context: str = "현재 포지션 없음 (신규 진입 후보)",
         portfolio_snapshot: dict | None = None,
@@ -1186,7 +1193,7 @@ class AnalysisMixin:
         cycle_id: str | None = None,
     ) -> dict | None:
         """Tier 1 AI 심층 분석"""
-        market_code = normalize_market(price_data.get("market", settings.primary_market_code))
+        market_code = normalize_market(market or price_data.get("market", settings.primary_market_code))
         scope = market_scope(market_code)
         currency = price_data.get("currency", market_currency(market_code))
         exchange_rate_to_krw = float(price_data.get("exchange_rate_to_krw", 1.0) or 1.0)
@@ -1201,6 +1208,12 @@ class AnalysisMixin:
             orderable_amount_context=orderable_amount_context,
         )
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
+        trade_value = float(price_data.get("trade_value") or 0)
+        trade_value_text = (
+            f"{trade_value:,.0f}원"
+            if currency == "KRW"
+            else f"{trade_value:,.2f}{currency}"
+        )
         change_value = self._resolve_prompt_change_value(price_data, scope=scope)
         change_text = f"{change_value:+,.2f}{'원' if currency == 'KRW' else currency}"
         prompt_template = get_stock_analysis_prompt(market_code)
@@ -1213,6 +1226,7 @@ class AnalysisMixin:
             change_text=change_text,
             change_rate=float(price_data.get("change_rate") or 0),
             volume=int(float(price_data.get("volume") or 0)),
+            trade_value_text=trade_value_text,
             technical_indicators=chart_result.indicators_text or "지표 데이터 없음",
             chart_patterns=chart_result.patterns_text or "차트 패턴 데이터 없음",
             daily_data=chart_result.trend_text or "추세 데이터 없음",
@@ -1244,6 +1258,7 @@ class AnalysisMixin:
                 parsed["currency"] = currency
                 parsed["exchange_rate_to_krw"] = exchange_rate_to_krw
                 parsed["price_krw"] = float(price_data.get("price_krw", current_price) or 0.0)
+                parsed["trade_value"] = trade_value
                 parsed["product_context"] = dict(product_context or {})
             return parsed
         except Exception as e:
@@ -1254,6 +1269,7 @@ class AnalysisMixin:
         self, symbol: str, name: str, current_price: float,
         strategy_type: str, tier1_analysis: dict,
         feedback_context: str = "",
+        market: str | None = None,
         product_context: dict | None = None,
         current_position_context: str = "현재 포지션 없음 (신규 진입 후보)",
         current_position: dict | None = None,
@@ -1267,7 +1283,7 @@ class AnalysisMixin:
     ) -> dict | None:
         """Tier 2 최종 검토"""
         snap = portfolio_snapshot or {}
-        market_code = normalize_market(tier1_analysis.get("market", settings.primary_market_code))
+        market_code = normalize_market(market or tier1_analysis.get("market", settings.primary_market_code))
         scope = market_scope(market_code)
         strategy = self._get_state(scope).strategies.get(strategy_type)
         currency = tier1_analysis.get("currency", market_currency(market_code))
@@ -1283,6 +1299,12 @@ class AnalysisMixin:
             orderable_amount_context=orderable_amount_context,
         )
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
+        trade_value = float(tier1_analysis.get("trade_value") or 0)
+        trade_value_text = (
+            f"{trade_value:,.0f}원"
+            if currency == "KRW"
+            else f"{trade_value:,.2f}{currency}"
+        )
         tier1_prompt_payload = {
             key: value
             for key, value in tier1_analysis.items()
@@ -1323,6 +1345,7 @@ class AnalysisMixin:
             chart_snapshot=chart_snapshot,
             product_context=self._format_product_context_for_prompt(product_context),
             current_price_text=current_price_text,
+            trade_value_text=trade_value_text,
             exchange_rate_to_krw=exchange_rate_to_krw,
             strategy_type=strategy_type,
             max_amount=account_context["max_additional_amount"] or 0,
