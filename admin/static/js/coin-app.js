@@ -364,7 +364,7 @@ function createBubble(data) {
   card.className = `activity-card coin-card outcome-${outcome}`;
   card.dataset.activityType = data.activity_type || '';
   card.innerHTML = `
-    <div class="coin-card-header">
+    <div class="coin-card-header" ${hasDetail ? `onclick="toggleDetail('${detailId}')"` : ''}>
       <div class="min-w-0 flex-1">
         <div class="flex items-start justify-between gap-3">
           <div class="min-w-0">
@@ -379,16 +379,13 @@ function createBubble(data) {
           <div class="flex items-center gap-2 shrink-0">
             <span class="text-[11px] text-gray-500">${escapeHtml(formatTime(data.created_at) || formatTimeAgo(data.created_at))}</span>
             ${hasDetail ? `
-              <button
-                type="button"
+              <div
                 data-detail-target="${detailId}"
-                onclick="toggleDetail('${detailId}')"
-                class="text-[11px] text-gray-500 hover:text-gray-300 flex items-center gap-1"
-                aria-expanded="false"
+                class="text-[11px] text-gray-500 hover:text-gray-300 flex items-center gap-1 transition-transform duration-200"
               >
-                <i data-lucide="${isLLMCall ? 'message-square' : 'chevron-down'}" data-detail-arrow="${detailId}" class="w-3 h-3"></i>
-                ${isLLMCall ? 'LLM 대화' : '상세'}
-              </button>
+                ${isLLMCall ? 'LLM' : '상세'}
+                <i data-lucide="${isLLMCall ? 'message-square' : 'chevron-down'}" data-detail-arrow="${detailId}" class="w-3 h-3 transition-transform duration-200"></i>
+              </div>
             ` : ''}
           </div>
         </div>
@@ -419,10 +416,11 @@ function toggleDetail(id) {
   const btn = document.querySelector(`[data-detail-target="${id}"]`);
   if (btn) {
     const expanded = body.classList.contains('open');
-    btn.setAttribute('aria-expanded', String(expanded));
     const icon = btn.querySelector(`[data-detail-arrow="${id}"]`);
-    if (icon && !icon.dataset.lucide) {
-      icon.style.transform = expanded ? 'rotate(180deg)' : 'rotate(0deg)';
+    if (icon) {
+      if (icon.dataset.lucide === 'chevron-down') {
+        icon.style.transform = expanded ? 'rotate(180deg)' : 'rotate(0deg)';
+      }
     }
   }
 }
@@ -476,15 +474,31 @@ function formatLLMConversation(detail) {
   const model = obj.llm_model || obj.model || '';
   let html = '';
 
+  const makeCollapsible = (role, bodyText, defaultOpen = false) => {
+    const id = `llm-${Math.random().toString(36).substr(2, 6)}`;
+    const iconClass = defaultOpen ? 'lucide-chevron-up' : 'lucide-chevron-down';
+    const bodyClass = defaultOpen ? 'llm-body open' : 'llm-body';
+    // Using inline onclick for simplicity similar to existing detail toggle
+    return `
+      <div class="llm-msg">
+        <div class="llm-role" onclick="document.getElementById('${id}').classList.toggle('open'); this.querySelector('i').classList.toggle('rotate-180')">
+          <span>${role}</span>
+          <i data-lucide="chevron-down" class="w-3.5 h-3.5 transition-transform duration-200 ${defaultOpen ? 'rotate-180' : ''}"></i>
+        </div>
+        <div id="${id}" class="${bodyClass}">${escapeHtml(formatAdminAgentText(bodyText))}</div>
+      </div>
+    `;
+  };
+
   if (model) html += `<div class="llm-model-tag">${escapeHtml(String(model))}</div>`;
   if (systemPrompt) {
-    html += `<div class="llm-msg"><div class="llm-role">SYSTEM</div><div class="llm-body">${escapeHtml(formatAdminAgentText(systemPrompt))}</div></div>`;
+    html += makeCollapsible('SYSTEM', systemPrompt, false);
   }
   if (prompt) {
-    html += `<div class="llm-msg"><div class="llm-role">PROMPT</div><div class="llm-body">${escapeHtml(formatAdminAgentText(prompt))}</div></div>`;
+    html += makeCollapsible('PROMPT', prompt, false);
   }
   if (response) {
-    html += `<div class="llm-msg"><div class="llm-role">RESPONSE</div><div class="llm-body">${escapeHtml(formatAdminAgentText(response))}</div></div>`;
+    html += makeCollapsible('RESPONSE', response, true);
   }
 
   return `<div class="llm-conversation">${html || '<div class="text-gray-500">표시할 LLM 상세가 없습니다.</div>'}</div>`;

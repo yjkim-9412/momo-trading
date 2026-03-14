@@ -26,6 +26,8 @@
     /* ── Base ── */
     body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
     ::-webkit-scrollbar { width: 6px; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
     ::-webkit-scrollbar-track { background: #1a1520; }
     ::-webkit-scrollbar-thumb { background: #4b4060; border-radius: 3px; }
 
@@ -201,6 +203,14 @@
       letter-spacing: 0.08em;
       color: #c4b5fd;
       background: rgba(42, 34, 53, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+    }
+    .llm-role:hover {
+      background: rgba(60, 48, 77, 0.8);
     }
     .llm-body {
       padding: 10px;
@@ -208,6 +218,19 @@
       word-break: break-word;
       color: #d1d5db;
       line-height: 1.45;
+      max-height: 0;
+      overflow: hidden;
+      opacity: 0;
+      transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease;
+    }
+    .llm-body.open {
+      max-height: 2000px; /* arbitrary large value */
+      opacity: 1;
+    }
+    /* Add padding zero state for smooth collapse */
+    .llm-msg:not(:has(.llm-body.open)) .llm-body {
+      padding-top: 0;
+      padding-bottom: 0;
     }
     .tech-table {
       width: 100%;
@@ -389,7 +412,7 @@
     </div>
 
     <!-- Status Badges -->
-    <div class="flex items-center gap-3 text-sm">
+    <div class="flex items-center gap-3 text-sm whitespace-nowrap overflow-x-auto no-scrollbar">
       <span id="badge-crypto" class="px-2 py-0.5 rounded text-xs font-medium bg-green-900/50 text-green-300">CRYPTO</span>
       <span id="badge-trading" class="px-2 py-0.5 rounded text-xs font-medium"></span>
       <span id="badge-mode" class="px-2 py-0.5 rounded bg-purple-900/50 text-purple-300 text-xs"></span>
@@ -404,7 +427,7 @@
   </header>
 
   <!-- ════════ Main 3-Column Layout ════════ -->
-  <div class="flex flex-1 overflow-hidden">
+  <div class="flex flex-1 overflow-x-auto overflow-y-hidden">
 
     <!-- ──── Left Sidebar (280px) ──── -->
     <aside id="left-sidebar" class="sidebar-left bg-dark-800 border-r border-[#3d3350] flex flex-col shrink-0 relative" style="width:280px; min-width:280px;">
@@ -516,7 +539,7 @@
     </aside>
 
     <!-- ──── Center (Main Feed) ──── -->
-    <main class="flex-1 flex flex-col overflow-hidden relative">
+    <main class="flex-1 flex flex-col overflow-hidden relative" style="min-width: 500px;">
 
       <!-- Filter Bar -->
       <div class="bg-dark-800 border-b border-[#3d3350] px-4 py-2 shrink-0 flex justify-between items-center">
