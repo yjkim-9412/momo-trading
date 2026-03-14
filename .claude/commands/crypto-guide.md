@@ -101,6 +101,8 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 | `MAX_DAILY_TRADES` | `CRYPTO_MAX_DAILY_TRADES` | 일일 거래 한도 |
 | `MIN_CASH_RATIO` | `CRYPTO_MIN_CASH_RATIO` | 최소 현금 비중 |
 | `MAX_SINGLE_ORDER_KRW` | `CRYPTO_MAX_SINGLE_ORDER_KRW` | 1회 주문 한도 |
+| — | `CRYPTO_DISCOVERY_REFRESH_MINUTES` | discovery universe 새로고침 주기 |
+| — | `CRYPTO_DISCOVERY_UNIVERSE_SIZE` | 유지할 상위 유동성 코인 수 |
 
 ## 24/7 스케줄 구조
 
@@ -125,7 +127,9 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - 코인 기본 시장 fallback은 주식 `PRIMARY_MARKET`를 공유하지 않는다. 코인 경로는 `CRYPTO_PRIMARY_MARKET`를 우선 사용하고, 값이 비어 있거나 잘못되면 `BITHUMB`로 고정한다.
 - 코인 프롬프트 스택(`market_scan.py`, `stock_analysis.py`, `final_review.py`)은 `빗썸 KRW 현물`, `수시간~2일`, `BUY/HOLD 전용`, `24h 거래대금 기반 유동성 확인`을 공통 계약으로 유지한다.
 - Product Policy: 크립토는 항상 `COMMON` (Spot only), 레버리지/인버스 분류 Skip.
-- 코인 스캔은 `CRYPTO_DYNAMIC_DISCOVERY_ENABLED=true`일 때 전체 KRW 마켓 overview에서 동적 discovery 후보를 만들고, `CRYPTO_WATCHLIST_SYMBOLS`는 discovery와 별도로 항상 병합되는 시드 목록으로 유지한다.
+- 코인 스캔은 `CRYPTO_DYNAMIC_DISCOVERY_ENABLED=true`일 때 `get_discovery_universe()`로 저빈도 broad refresh를 수행하고, `CRYPTO_DISCOVERY_UNIVERSE_SIZE` 상위 유동성 코인을 메모리 캐시에 유지한다.
+- broad refresh 기본 주기는 `CRYPTO_DISCOVERY_REFRESH_MINUTES=360`이며, 평소 스캔은 cached universe 심볼과 `CRYPTO_WATCHLIST_SYMBOLS`만 `get_ticker_snapshots()`로 selective 조회한다.
+- live broad refresh가 실패해도 stale discovery cache가 있으면 `DISCOVERY` 후보를 계속 유지하고, cache도 없을 때만 watchlist/보유 코인 현재가 기반 degraded 스캔으로 내려간다.
 - 코인 스캔은 `get_market_overview()` 1회 조회 결과를 `get_volume_rank(..., overview_data=...)` / `get_surge_data(..., overview_data=...)`에 재사용한다. overview 실패 시 watchlist/보유 코인 현재가로 degraded 스캔을 시도한다.
 - 코인 후보/선정 결과에는 `scan_source`가 붙는다. 정상 경로는 `DISCOVERY` / `WATCHLIST`, degraded 경로는 `WATCHLIST_FALLBACK` / `HOLDING_FALLBACK`를 사용한다.
 - `BithumbClient.get_current_price()` / overview ticker 정규화에서 공통 `change` 필드는 숫자 변화량으로 맞춘다. 원본 방향 문자열은 `change_direction`, 부호 있는 변화량은 `signed_change_price`로 별도 보존한다.
