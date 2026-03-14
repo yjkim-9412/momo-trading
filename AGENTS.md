@@ -10,6 +10,16 @@ KIS Open API 구현, 디버깅, 새 API 연동 시 반드시 `kis-api-ref` 스�
 - 스킬: `.codex/skills/kis-api-ref/`
 - LLM용 샘플은 `examples_llm/` 폴더에, 사용자용 통합 예제는 `examples_user/` 폴더에 위치
 
+## 코인(빗썸) 시스템 가이드
+
+코인 관련 개발·디버깅 시 `crypto-guide` 스킬을 사용하여 코인 시스템 구조를 참조할 것.
+
+- 스킬: `.codex/skills/crypto-guide/`
+- 도메인 구조 다이어그램: `docs/crypto-architecture.md` (Mermaid 6종)
+- 환경변수 예제: `.env.example-coin`
+- 빗썸 API 레퍼런스: `docs/bithumb-api/` (34개 엔드포인트)
+- **코인 관련 코드 변경(파일 추가/삭제, 인터페이스 변경, 환경변수 추가 등) 시 반드시 `crypto-guide` 스킬(`.codex/skills/crypto-guide/SKILL.md`)도 함께 업데이트할 것.**
+
 ## 기술 스택
 
 | 구분 | 기술 |
@@ -63,6 +73,8 @@ Scheduler (고정 오픈 스캔 + adaptive 장중 재스캔)
 | MarketScanner | `agent/market_scanner.py` | `scan()` |
 | DecisionMaker | `agent/decision_maker.py` | `execute()`, `_execute_autonomous()` |
 | TradingScheduler | `scheduler/scheduler.py` | `start()`, `_market_open_scan()`, `_adaptive_rescan()`, `_schedule_next_adaptive_rescan()` |
+| CryptoScanner | `agent/crypto_scanner.py` | `scan()` |
+| BithumbClient | `trading/bithumb_client.py` | `get_current_price()`, `place_order()`, `get_market_overview()` |
 | StableShortStrategy | `strategy/stable_short.py` | `evaluate()` |
 | AggressiveShortStrategy | `strategy/aggressive_short.py` | `evaluate()` |
 | RiskManager | `strategy/risk_manager.py` | `check()` |
@@ -104,10 +116,33 @@ WebSocket → EventDetector → EventBus:
 
 ## 분리된 장 구조
 
-- 운영 장은 `KRX` 와 `US` 두 runtime scope로 분리한다.
+- 운영 장은 `KRX`, `US`, `CRYPTO` 세 runtime scope로 분리한다.
 - `market_scope` 는 스케줄, 리포트, 리스크, LLM 세션, 실시간 구독을 나누는 기준이다.
-- 실제 주문/시세용 `market` 코드는 `KRX`, `NASDAQ`, `NYSE`, `AMEX` 같은 거래소 코드를 그대로 유지한다.
+- 실제 주문/시세용 `market` 코드는 `KRX`, `NASDAQ`, `NYSE`, `AMEX`, `BITHUMB` 같은 거래소 코드를 그대로 유지한다.
 - 미국장은 거래소 단위로 주문하지만, 장중 런타임과 장후 리뷰는 `US` scope로 묶어 처리한다.
+- 코인은 `BITHUMB` 거래소 코드를 사용하며, `CRYPTO` scope로 묶어 24/7 운영한다.
+
+### 인터페이스 추상화
+
+| Protocol | 파일 | 역할 |
+|----------|------|------|
+| `BrokerClient` | `trading/broker_base.py` | 시세 조회·주문·잔고 계약 |
+| `MarketDataProvider` | `trading/broker_base.py` | 스캐닝용 벌크 데이터 |
+| `RealtimeProvider` | `trading/broker_base.py` | WebSocket 실시간 시세 |
+| `MarketScannerProtocol` | `agent/scanner_base.py` | 시장 스캔 결과 반환 |
+
+## 코인(빗썸) 구현 회고
+
+- 코인 장은 `CRYPTO` scope로 주식과 완전 격리. `MarketState`는 `normalize_market_scope("BITHUMB")` → `"CRYPTO"` 기준 자동 생성.
+- 환경변수는 주식과 완전 분리 (`CRYPTO_TRADING_ENABLED`, `CRYPTO_AUTONOMY_MODE` 등).
+- 빗썸 인증은 JWT Bearer (PyJWT + HS256). KIS OAuth2와 다른 체계.
+- 빗썸 rate limit: public 10/s, private 5/s. KIS와 독립 semaphore.
+- 캔들 정렬: newest-first → oldest-first 재정렬 (미국장과 동일 방어).
+- 수량 소수점: `OrderRequest.quantity = float`. 주식은 정수만 전달.
+- 24/7 시장: buy cutoff / force liquidation 없음.
+- R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게).
+- `/admin-coin` 별도 SPA, API prefix `/api/v1/coin/*`, 독립 SSE.
+- 코인 수정 시 확인할 테스트: 프로필 정규화, 캔들 정렬, rate limit, 환경변수 독립성.
 
 ## 미국장 구현 회고
 

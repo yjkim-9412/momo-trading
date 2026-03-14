@@ -39,12 +39,22 @@ Codex CLI 관련 개발·디버깅 시 `/codex-ref` 스킬을 사용하여 공�
 
 Mixin 파일은 서로를 임포트하지 않으며, 상호 호출은 `self.*`로 런타임 해결한다.
 
+## 코인(빗썸) 시스템 가이드
+
+코인 관련 개발·디버깅 시 `/crypto-guide` 스킬을 사용하여 코인 시스템 구조를 참조할 것.
+
+- 스킬 사용법: `/crypto-guide {검색어}` (예: `/crypto-guide 주문`, `/crypto-guide 스캐너`)
+- 도메인 구조 다이어그램: `docs/crypto-architecture.md` (Mermaid 6종)
+- 환경변수 예제: `.env.example-coin`
+- **코인 관련 코드 변경(파일 추가/삭제, 인터페이스 변경, 환경변수 추가 등) 시 반드시 `/crypto-guide` 스킬(`.claude/commands/crypto-guide.md`)도 함께 업데이트할 것.**
+
 ## 분리된 장 구조
 
-- 운영 장은 `KRX` 와 `US` 두 runtime scope로 분리한다.
+- 운영 장은 `KRX`, `US`, `CRYPTO` 세 runtime scope로 분리한다.
 - `market_scope` 는 스케줄, 리포트, 리스크, LLM 세션, 실시간 구독을 나누는 기준이다.
-- 실제 주문/시세용 `market` 코드는 `KRX`, `NASDAQ`, `NYSE`, `AMEX` 같은 거래소 코드를 그대로 유지한다.
+- 실제 주문/시세용 `market` 코드는 `KRX`, `NASDAQ`, `NYSE`, `AMEX`, `BITHUMB` 같은 거래소 코드를 그대로 유지한다.
 - 미국장은 거래소 단위로 주문하지만, 장중 런타임과 장후 리뷰는 `US` scope로 묶어 처리한다.
+- 코인은 `BITHUMB` 거래소 코드를 사용하며, `CRYPTO` scope로 묶어 처리한다.
 
 ## 스케줄 구조
 
@@ -76,6 +86,24 @@ Mixin 파일은 서로를 임포트하지 않으며, 상호 호출은 `self.*`�
   - 해외 일봉/분봉 정렬
   - 해외 quote 직렬화 및 rate limit 재시도
   - 분석 전 데이터 정합성 차단
+
+## 코인(빗썸) 구현 회고
+
+- 코인 장은 `CRYPTO` scope로 주식(KRX/US)과 완전 격리 운영된다. `MarketState`는 `normalize_market_scope("BITHUMB")` → `"CRYPTO"` 기준으로 자동 생성되므로, 독립 `cycle_lock`, `session_ids`, `trading_date`를 갖는다.
+- 코인 환경변수는 주식과 완전 분리한다. `CRYPTO_TRADING_ENABLED`, `CRYPTO_AUTONOMY_MODE`, `CRYPTO_MAX_DAILY_TRADES` 등은 주식의 `TRADING_ENABLED`, `AUTONOMY_MODE`와 독립이다. 코인 설정을 주식 설정에 섞지 말 것.
+- 빗썸 API 인증은 JWT Bearer (PyJWT + HS256). KIS의 OAuth2 토큰과 완전 다른 체계이므로 `BithumbClient`에서 자체 관리한다. 빗썸 인증 로직을 KIS 경로에 섞지 말 것.
+- 빗썸 rate limit은 public 10 req/s, private 5 req/s. KIS의 8 req/s + 해외 1 req/s와 독립된 `BithumbClient` 내부 semaphore로 관리한다. 두 브로커의 rate limiter를 공유하지 말 것.
+- 빗썸 캔들 응답은 newest-first일 수 있다. KIS 해외 일봉과 동일한 방어로 `BithumbClient`에서 oldest-first 정렬한다. 분석 파이프라인의 이중 정렬 방어는 코인에도 적용된다.
+- 코인 수량은 소수점이다 (`OrderRequest.quantity = float`). 주식은 항상 정수만 전달하므로 하위호환. `Decimal`은 `BithumbClient` 내부 계산에서만 사용하고, API 경계에서 float로 변환한다.
+- 코인은 24/7 시장이므로 `buy_cutoff`, `force_liquidation`, `장 시작/마감` 개념이 없다. `market_calendar.is_trading_hours("BITHUMB")`는 항상 True를 반환한다. 코인에 시간 기반 매수 차단을 넣지 말 것.
+- 코인 시장 국면은 `BULL_RUN`/`BEAR_MARKET`/`CONSOLIDATION`/`ALTSEASON`이다. 주식의 `BULL`/`BEAR`/`SIDEWAYS`/`THEME`와 다르지만, `risk_manager.CRYPTO_RR_FLOOR`에서 두 체계 모두 매핑한다.
+- 코인 Tier2 스트레스 테스트는 -10%/-7% (주식의 -5%/-3%보다 넓다). 코인 변동성 기준을 주식 수준으로 좁히지 말 것.
+- `/admin-coin` 페이지는 주식 `/admin`과 완전 별도 SPA이다. API prefix는 `/api/v1/coin/*`, SSE는 독립 `coin_sse_manager`를 사용한다. 주식 SSE와 코인 SSE를 공유하지 말 것.
+- 코인 구현 수정 시 반드시 같이 확인할 테스트:
+  - `is_crypto_market()` 정규화 (기존 KRX/US 회귀 포함)
+  - 빗썸 캔들 oldest-first 정렬
+  - 빗썸 rate limit 동작
+  - `CRYPTO_*` 환경변수 독립성 (주식 설정 영향 없음)
 
 ## 테스트
 
