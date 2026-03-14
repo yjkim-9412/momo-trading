@@ -91,3 +91,101 @@ async def test_get_surge_data_reuses_overview_data_without_refetch():
     overview_mock.assert_not_awaited()
     assert response.success is True
     assert [item["symbol"] for item in response.data["items"]] == ["XRP", "ETH"]
+
+
+@pytest.mark.asyncio
+async def test_get_account_balance_excludes_non_tradeable_assets_from_summary():
+    client = BithumbClient()
+    accounts = MCPResponse(
+        success=True,
+        data={
+            "items": [
+                {"currency": "KRW", "balance": "1000", "locked": "0"},
+                {"currency": "BTC", "balance": "0.1", "locked": "0", "avg_buy_price": "120000000"},
+                {"currency": "P", "balance": "75", "locked": "0", "avg_buy_price": "0"},
+            ]
+        },
+    )
+
+    with patch.object(client, "_private_request", AsyncMock(return_value=accounts)), patch.object(
+        client,
+        "_get_tradable_krw_symbols",
+        AsyncMock(return_value=({"BTC"}, "live")),
+    ), patch.object(
+        client,
+        "_fetch_coin_prices",
+        AsyncMock(return_value={"BTC": 150000000.0}),
+    ), patch("trading.bithumb_client.logger.warning") as warning_mock:
+        response = await client.get_account_balance()
+
+    assert response.success is True
+    assert response.data["holdings_count"] == 1
+    assert response.data["holdings_summary"] == [
+        {
+            "currency": "BTC",
+            "balance": 0.1,
+            "locked": 0.0,
+            "avg_buy_price": 120000000.0,
+            "current_price": 150000000.0,
+            "coin_value_krw": 15000000.0,
+        }
+    ]
+    assert response.data["stock_value"] == 15000000.0
+    assert response.data["total_asset"] == 15001000.0
+    assert warning_mock.call_count >= 1
+    assert any(
+        "빗썸 비거래성 자산 제외" in str(call.args[0])
+        for call in warning_mock.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_holdings_degraded_filter_drops_zero_cost_zero_price_assets():
+    client = BithumbClient()
+    accounts = MCPResponse(
+        success=True,
+        data={
+            "items": [
+                {"currency": "KRW", "balance": "1000", "locked": "0"},
+                {"currency": "P", "balance": "75", "locked": "0", "avg_buy_price": "0"},
+            ]
+        },
+    )
+
+    with patch.object(client, "_private_request", AsyncMock(return_value=accounts)), patch.object(
+        client,
+        "_get_tradable_krw_symbols",
+        AsyncMock(return_value=(None, "degraded")),
+    ), patch.object(
+        client,
+        "_fetch_coin_prices",
+        AsyncMock(return_value={}),
+    ), patch("trading.bithumb_client.logger.warning") as warning_mock:
+        response = await client.get_holdings()
+
+    assert response.success is True
+    assert response.data == {"holdings": [], "count": 0}
+    assert warning_mock.call_count >= 1
+    assert any(
+        "빗썸 비거래성 자산 제외" in str(call.args[0])
+        for call in warning_mock.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_tradable_krw_symbols_uses_stale_cache_when_market_catalog_fails():
+    client = BithumbClient()
+    client._tradable_krw_symbols_cache = {"BTC"}
+    client._tradable_krw_symbols_cached_at = 0.0
+
+    with patch.object(
+        client,
+        "_public_get",
+        AsyncMock(return_value=MCPResponse(success=False, error="dns failure")),
+    ), patch("trading.bithumb_client.logger.warning") as warning_mock:
+        symbols, source = await client._get_tradable_krw_symbols()
+
+    assert symbols == {"BTC"}
+    assert source == "stale_cache"
+    assert warning_mock.call_count == 1
+    assert "캐시 사용" in str(warning_mock.call_args.args[0])

@@ -27,6 +27,7 @@ _PUBLIC_RATE_LIMIT_PER_SEC = 10
 _PRIVATE_RATE_LIMIT_PER_SEC = 5
 _RATE_LIMIT_WINDOW = 1.0  # 초
 _MAX_CANDLE_COUNT = 200  # 빗썸 캔들 API 최대 조회 건수
+_TRADEABLE_SYMBOL_CACHE_TTL = 300.0  # 초
 
 # 분봉 단위 매핑: 내부 interval(분) → 빗썸 API path unit
 _MINUTE_UNIT_MAP: dict[int, int] = {
@@ -97,6 +98,8 @@ class BithumbClient:
         self._api_secret: str = settings.BITHUMB_API_SECRET
 
         self._client: httpx.AsyncClient | None = None
+        self._tradable_krw_symbols_cache: set[str] = set()
+        self._tradable_krw_symbols_cached_at: float | None = None
 
         # Rate limiter: 슬라이딩 윈도우 타임스탬프 + 세마포어
         self._public_timestamps: list[float] = []
@@ -392,6 +395,138 @@ class BithumbClient:
                 prices[symbol] = price
         return prices
 
+    def _get_cached_tradable_krw_symbols(self, *, allow_stale: bool = False) -> set[str] | None:
+        """캐시된 KRW 거래 가능 심볼 집합을 반환한다."""
+        if not self._tradable_krw_symbols_cache:
+            return None
+        if allow_stale or self._tradable_krw_symbols_cached_at is None:
+            return set(self._tradable_krw_symbols_cache)
+
+        age = time.monotonic() - self._tradable_krw_symbols_cached_at
+        if age <= _TRADEABLE_SYMBOL_CACHE_TTL:
+            return set(self._tradable_krw_symbols_cache)
+        return None
+
+    def _set_tradable_krw_symbols_cache(self, symbols: set[str]) -> None:
+        """KRW 거래 가능 심볼 캐시를 갱신한다."""
+        self._tradable_krw_symbols_cache = set(symbols)
+        self._tradable_krw_symbols_cached_at = time.monotonic()
+
+    async def _get_tradable_krw_symbols(self) -> tuple[set[str] | None, str]:
+        """실제 KRW 마켓에서 거래 가능한 심볼 집합을 반환한다."""
+        cached = self._get_cached_tradable_krw_symbols()
+        if cached is not None:
+            return cached, "cache"
+
+        markets_resp = await self._public_get("/v1/market/all")
+        if markets_resp.success and markets_resp.data:
+            symbols = {
+                _symbol_from_market_code(str(item.get("market", "")))
+                for item in markets_resp.data.get("items", [])
+                if isinstance(item, dict) and str(item.get("market", "")).startswith("KRW-")
+            }
+            if symbols:
+                self._set_tradable_krw_symbols_cache(symbols)
+                return symbols, "live"
+
+        stale_cached = self._get_cached_tradable_krw_symbols(allow_stale=True)
+        if stale_cached is not None:
+            logger.warning(
+                "빗썸 KRW 마켓 코드 조회 실패 → 캐시 사용: {}",
+                markets_resp.error or "unknown error",
+            )
+            return stale_cached, "stale_cache"
+
+        logger.warning(
+            "빗썸 KRW 마켓 코드 조회 실패 → degraded holdings filter 사용: {}",
+            markets_resp.error or "unknown error",
+        )
+        return None, "degraded"
+
+    async def _prepare_tradeable_account_assets(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        log_exclusions: bool = False,
+    ) -> tuple[Decimal, Decimal, list[dict[str, Any]], dict[str, float]]:
+        """계좌 응답에서 KRW 잔고와 거래 가능 코인 보유분만 추린다."""
+        krw_balance = Decimal("0")
+        krw_locked = Decimal("0")
+        raw_coin_data: list[dict[str, Any]] = []
+
+        for item in items:
+            currency = str(item.get("currency", "")).upper()
+            balance = _to_decimal(item.get("balance"))
+            locked = _to_decimal(item.get("locked"))
+            avg_buy_price = _to_decimal(item.get("avg_buy_price"))
+
+            if currency == "KRW":
+                krw_balance = balance
+                krw_locked = locked
+                continue
+
+            total_qty = balance + locked
+            if total_qty <= 0:
+                continue
+
+            raw_coin_data.append({
+                "currency": currency,
+                "balance": balance,
+                "locked": locked,
+                "total_qty": total_qty,
+                "avg_buy_price": avg_buy_price,
+            })
+
+        if not raw_coin_data:
+            return krw_balance, krw_locked, [], {}
+
+        tradable_symbols, source = await self._get_tradable_krw_symbols()
+        filtered_coin_data: list[dict[str, Any]] = []
+        excluded_coin_data: list[dict[str, Any]] = []
+        prices: dict[str, float] = {}
+
+        if tradable_symbols is not None:
+            for coin in raw_coin_data:
+                if coin["currency"] in tradable_symbols:
+                    filtered_coin_data.append(coin)
+                else:
+                    excluded_coin_data.append({**coin, "reason": "no_krw_market"})
+
+            if filtered_coin_data:
+                prices = await self._fetch_coin_prices([coin["currency"] for coin in filtered_coin_data])
+        else:
+            prices = await self._fetch_coin_prices([coin["currency"] for coin in raw_coin_data])
+            for coin in raw_coin_data:
+                current_price = prices.get(coin["currency"], 0.0)
+                if current_price > 0 or coin["avg_buy_price"] > 0:
+                    filtered_coin_data.append(coin)
+                else:
+                    excluded_coin_data.append({**coin, "reason": "no_price_and_zero_cost"})
+
+            filtered_symbols = {coin["currency"] for coin in filtered_coin_data}
+            prices = {
+                symbol: price
+                for symbol, price in prices.items()
+                if symbol in filtered_symbols
+            }
+
+        if excluded_coin_data and log_exclusions:
+            preview = ", ".join(
+                f"{coin['currency']} qty={float(coin['total_qty']):g} avg={float(coin['avg_buy_price']):g} reason={coin['reason']}"
+                for coin in excluded_coin_data[:5]
+            )
+            suffix = ""
+            if len(excluded_coin_data) > 5:
+                suffix = f" (+{len(excluded_coin_data) - 5} more)"
+            logger.warning(
+                "빗썸 비거래성 자산 제외 (source={}): {}{}",
+                source,
+                preview,
+                suffix,
+            )
+
+        return krw_balance, krw_locked, filtered_coin_data, prices
+
     # ===================================================================
     # BrokerClient Protocol 구현
     # ===================================================================
@@ -474,45 +609,13 @@ class BithumbClient:
         if not items:
             return MCPResponse(success=False, error="계좌 데이터 없음")
 
-        krw_balance = Decimal("0")
-        krw_locked = Decimal("0")
+        krw_balance, krw_locked, coin_data, prices = await self._prepare_tradeable_account_assets(
+            items,
+            log_exclusions=True,
+        )
         total_coin_value = Decimal("0")
-
-        holdings: list[dict[str, Any]] = []
-
-        # 1단계: KRW 잔고 + 코인 보유량 파싱
-        coin_symbols: list[str] = []
-        coin_data: list[dict] = []
-
-        for item in items:
-            currency = str(item.get("currency", "")).upper()
-            balance = _to_decimal(item.get("balance"))
-            locked = _to_decimal(item.get("locked"))
-            avg_buy_price = _to_decimal(item.get("avg_buy_price"))
-
-            if currency == "KRW":
-                krw_balance = balance
-                krw_locked = locked
-                continue
-
-            total_qty = balance + locked
-            if total_qty <= 0:
-                continue
-
-            coin_symbols.append(currency)
-            coin_data.append({
-                "currency": currency,
-                "balance": balance,
-                "locked": locked,
-                "total_qty": total_qty,
-                "avg_buy_price": avg_buy_price,
-            })
-
-        # 2단계: 벌크 현재가 조회
-        prices = await self._fetch_coin_prices(coin_symbols) if coin_symbols else {}
-
-        # 3단계: 현재가 기반 평가
         total_pnl = Decimal("0")
+        holdings: list[dict[str, Any]] = []
 
         for cd in coin_data:
             sym = cd["currency"]
@@ -563,38 +666,15 @@ class BithumbClient:
             return resp
 
         items: list[dict[str, Any]] = resp.data.get("items", [])
-
-        # 1단계: 코인 보유량 파싱
-        coin_list: list[dict] = []
-        symbols: list[str] = []
-        for item in items:
-            currency = str(item.get("currency", "")).upper()
-            if currency == "KRW":
-                continue
-
-            balance = _to_decimal(item.get("balance"))
-            locked = _to_decimal(item.get("locked"))
-            total_qty = balance + locked
-            if total_qty <= 0:
-                continue
-
-            avg_buy_price = _to_decimal(item.get("avg_buy_price"))
-            symbols.append(currency)
-            coin_list.append({
-                "symbol": currency,
-                "balance": balance,
-                "locked": locked,
-                "total_qty": total_qty,
-                "avg_buy_price": avg_buy_price,
-            })
-
-        # 2단계: 벌크 현재가 조회
-        prices = await self._fetch_coin_prices(symbols) if symbols else {}
+        _, _, coin_list, prices = await self._prepare_tradeable_account_assets(
+            items,
+            log_exclusions=True,
+        )
 
         # 3단계: PnL 계산
         holdings: list[dict[str, Any]] = []
         for cd in coin_list:
-            sym = cd["symbol"]
+            sym = cd["currency"]
             qty = float(cd["total_qty"])
             avg = float(cd["avg_buy_price"])
             cur_price = prices.get(sym, 0.0)

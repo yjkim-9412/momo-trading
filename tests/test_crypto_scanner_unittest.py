@@ -262,6 +262,8 @@ async def test_scan_uses_watchlist_only_when_discovery_disabled():
     prompt = generate_tier1.await_args.args[0]
     assert "비트코인(BTC)" in prompt
     assert "솔라나(SOL)" not in prompt
+    assert "보유 코인 없음" in prompt
+    assert "P(P)" not in prompt
     assert result["selected"][0]["scan_source"] == "WATCHLIST"
 
 
