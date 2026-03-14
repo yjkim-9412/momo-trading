@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import AsyncMock, patch
 
 from analysis.llm.llm_factory import llm_factory
 from core.config import settings
@@ -8,8 +9,18 @@ from trading.enums import LLMProvider, LLMTier, Tier1Profile
 class DummyCodexProvider:
     _sessions: dict[tuple[str, str], str | None] = {("KRX", "cycle"): "dummy-session"}
 
-    def __init__(self, tier: LLMTier):
+    def __init__(
+        self,
+        tier: LLMTier,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ):
         self._tier = tier
+        self._model = model or "gpt-5.4"
+        self._reasoning_effort = reasoning_effort or (
+            "medium" if self._tier == LLMTier.TIER1 else "high"
+        )
 
     @property
     def provider(self) -> LLMProvider:
@@ -25,11 +36,11 @@ class DummyCodexProvider:
 
     @property
     def configured_model(self) -> str:
-        return "gpt-5.4"
+        return self._model
 
     @property
     def configured_reasoning_effort(self) -> str | None:
-        return "medium" if self._tier == LLMTier.TIER1 else "high"
+        return self._reasoning_effort
 
     @property
     def model_id(self) -> str:
@@ -46,7 +57,10 @@ class DummyCodexProvider:
     ) -> str:
         session = self.get_session_id(scope, phase) or "no-session"
         effort = reasoning_effort_override or self.configured_reasoning_effort or "none"
-        return f"{scope or 'NONE'}:{phase}:{session}:{effort}|{system_prompt}|{prompt}"
+        return (
+            f"{self.provider.value}:{self.configured_model}:{scope or 'NONE'}:"
+            f"{phase}:{session}:{effort}|{system_prompt}|{prompt}"
+        )
 
     async def is_available(self) -> bool:
         return True
@@ -117,8 +131,11 @@ class DummyCodexProvider:
 @pytest.fixture(autouse=True)
 def reset_llm_factory(monkeypatch):
     monkeypatch.setattr(settings, "LLM_PROVIDER", LLMProvider.CLAUDE_CODE.value)
+    monkeypatch.setattr(settings, "CRYPTO_LLM_PROVIDER", "")
     monkeypatch.setattr(llm_factory, "_selected_provider", None)
     monkeypatch.setattr(llm_factory, "_providers", {})
+    monkeypatch.setattr(llm_factory, "_crypto_provider", None)
+    monkeypatch.setattr(llm_factory, "_crypto_providers", {})
     DummyCodexProvider._sessions = {("KRX", "cycle"): "dummy-session"}
 
 
@@ -135,7 +152,7 @@ async def test_generate_routes_to_selected_provider(monkeypatch):
         phase="cycle",
     )
 
-    assert result == "KRX:cycle:dummy-session:low|SYSTEM|PROMPT"
+    assert result == "CODEX_CLI:gpt-5.4:KRX:cycle:dummy-session:low|SYSTEM|PROMPT"
     assert provider == LLMProvider.CODEX_CLI.value
 
 
@@ -196,3 +213,86 @@ def test_session_methods_are_scope_aware(monkeypatch):
     assert us_sid == "us-cycle-session"
     assert llm_factory.get_session_id("KRX", "cycle") == "krx-cycle-session"
     assert llm_factory.get_session_id("US", "cycle") == "us-cycle-session"
+
+
+class FailingCodexProvider(DummyCodexProvider):
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        *,
+        scope: str | None = None,
+        phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
+    ) -> str:
+        raise RuntimeError(
+            'Codex CLI 실패 (exit 1): Auth(TokenRefreshFailed("Failed to parse server response"))'
+        )
+
+
+class NonFallbackCodexProvider(DummyCodexProvider):
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        *,
+        scope: str | None = None,
+        phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
+    ) -> str:
+        raise RuntimeError("prompt parse failed")
+
+
+class DummyClaudeProvider(DummyCodexProvider):
+    @property
+    def provider(self) -> LLMProvider:
+        return LLMProvider.CLAUDE_CODE
+
+    @property
+    def display_name(self) -> str:
+        return "Claude Code (테스트)"
+
+    @property
+    def model_id(self) -> str:
+        return f"dummy-claude:{self._tier.value}"
+
+
+@pytest.mark.asyncio
+async def test_crypto_codex_auth_failure_falls_back_to_claude(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
+    monkeypatch.setattr(settings, "CRYPTO_LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
+    monkeypatch.setattr(settings, "CRYPTO_LLM_MODEL_TIER1_SCAN", "claude-crypto-scan")
+    monkeypatch.setattr(settings, "CRYPTO_CODEX_MODEL", "codex-crypto")
+    monkeypatch.setitem(llm_factory.PROVIDER_CLASSES, LLMProvider.CODEX_CLI, FailingCodexProvider)
+    monkeypatch.setitem(llm_factory.PROVIDER_CLASSES, LLMProvider.CLAUDE_CODE, DummyClaudeProvider)
+
+    with patch("services.activity_logger.activity_logger.log", AsyncMock()) as log_activity:
+        result, provider = await llm_factory.generate_tier1(
+            "PROMPT",
+            system_prompt="SYSTEM",
+            profile=Tier1Profile.SCAN,
+            scope="CRYPTO",
+            phase="cycle",
+            cycle_id="cycle-1",
+        )
+
+    assert provider == LLMProvider.CLAUDE_CODE.value
+    assert result.startswith("CLAUDE_CODE:claude-crypto-scan:CRYPTO:cycle:")
+    assert any("fallback" in call.args[2] for call in log_activity.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_crypto_non_auth_failure_does_not_fallback(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
+    monkeypatch.setattr(settings, "CRYPTO_LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
+    monkeypatch.setitem(llm_factory.PROVIDER_CLASSES, LLMProvider.CODEX_CLI, NonFallbackCodexProvider)
+    monkeypatch.setitem(llm_factory.PROVIDER_CLASSES, LLMProvider.CLAUDE_CODE, DummyClaudeProvider)
+
+    with pytest.raises(RuntimeError, match="prompt parse failed"):
+        await llm_factory.generate_tier1(
+            "PROMPT",
+            system_prompt="SYSTEM",
+            profile=Tier1Profile.SCAN,
+            scope="CRYPTO",
+            phase="cycle",
+        )

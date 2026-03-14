@@ -85,6 +85,21 @@ class TradingAgentAfterHoursGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(preview["skipped"])
         self.assertEqual(preview["reason"], "mcp_unavailable")
 
+    async def test_preview_cycle_allows_crypto_without_mcp(self):
+        agent = TradingAgent()
+        trading_date = date(2026, 3, 13)
+
+        with patch("agent.trading_agent.market_calendar.is_trading_hours", return_value=True), \
+                patch("agent.trading_agent.market_calendar.market_date", return_value=trading_date), \
+                patch.object(type(mcp_client), "is_connected", new_callable=PropertyMock, return_value=False):
+            preview = await agent.preview_cycle(market="BITHUMB")
+
+        self.assertFalse(preview.get("skipped", False))
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["mode"], "TRADING")
+        self.assertEqual(preview["market_scope"], "CRYPTO")
+        self.assertEqual(preview["trading_date"], trading_date.isoformat())
+
 
 class StartupIdempotencyTest(unittest.IsolatedAsyncioTestCase):
     async def test_trading_agent_start_is_idempotent(self):

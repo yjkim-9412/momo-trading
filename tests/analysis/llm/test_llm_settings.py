@@ -108,6 +108,47 @@ def test_get_llm_reasoning_effort_ignores_invalid_value():
     assert tier2 == "xhigh"
 
 
+def test_crypto_scope_provider_specific_model_and_effort():
+    settings = Settings(
+        _env_file=None,
+        CRYPTO_LLM_PROVIDER=LLMProvider.CODEX_CLI.value,
+        CRYPTO_LLM_MODEL_TIER1_SCAN="claude-crypto-scan",
+        CRYPTO_CODEX_MODEL="codex-crypto",
+        CRYPTO_CLAUDE_EFFORT_TIER1_SCAN="high",
+        CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN="minimal",
+    )
+
+    claude_model = settings.get_llm_model_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CLAUDE_CODE,
+        LLMTier.TIER1,
+        Tier1Profile.SCAN,
+    )
+    codex_model = settings.get_llm_model_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CODEX_CLI,
+        LLMTier.TIER1,
+        Tier1Profile.SCAN,
+    )
+    claude_effort = settings.get_llm_reasoning_effort_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CLAUDE_CODE,
+        LLMTier.TIER1,
+        Tier1Profile.SCAN,
+    )
+    codex_effort = settings.get_llm_reasoning_effort_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CODEX_CLI,
+        LLMTier.TIER1,
+        Tier1Profile.SCAN,
+    )
+
+    assert claude_model == "claude-crypto-scan"
+    assert codex_model == "codex-crypto"
+    assert claude_effort == "high"
+    assert codex_effort == "minimal"
+
+
 def test_validate_on_startup_warns_for_invalid_codex_reasoning_effort(monkeypatch):
     dummy_logger = DummyLogger()
     monkeypatch.setattr(config_module, "logger", dummy_logger)

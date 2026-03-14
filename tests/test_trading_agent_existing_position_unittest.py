@@ -121,6 +121,50 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("이 종목 기준 주문가능금액", prompt)
         self.assertIn("현재 이 종목 비중: 73.8%", prompt)
 
+    async def test_crypto_tier1_analysis_falls_back_to_change_price_when_change_is_direction_string(self):
+        chart_result = ChartAnalysisResult(
+            indicators_text="지표",
+            patterns_text="패턴",
+            trend_text="추세",
+        )
+
+        with patch(
+            "agent.trading_agent.llm_factory.generate_tier1",
+            AsyncMock(return_value=('{"recommendation":"HOLD","confidence":0.4}', "CODEX_CLI")),
+        ) as tier1_mock:
+            result = await self.agent._tier1_analysis(
+                symbol="BTC",
+                name="비트코인",
+                current_price=145_000_000,
+                chart_result=chart_result,
+                price_data={
+                    "market": "BITHUMB",
+                    "currency": "KRW",
+                    "price": 145_000_000,
+                    "change": "FALL",
+                    "change_price": 1_250_000,
+                    "change_rate": -0.85,
+                    "volume": 12_345.67,
+                },
+                feedback_context="매매 이력 없음",
+                current_position_context="현재 포지션 없음 (신규 진입 후보)",
+                portfolio_snapshot={
+                    "cash": 50_000,
+                    "total_asset": 50_000,
+                    "holding_count": 0,
+                },
+                current_position=None,
+                dynamic_limits={"max_single_order_krw": 30_000, "max_position_pct": 90.0, "min_cash_ratio": 0.05},
+                market_context="시장 컨텍스트 없음",
+                trading_context="현재 세션: CRYPTO_ACTIVE",
+                orderable_amount_context=None,
+                cycle_id="cycle-crypto-1",
+            )
+
+        self.assertIsNotNone(result)
+        prompt = tier1_mock.await_args.args[0]
+        self.assertIn("-1,250,000.00원", prompt)
+
     async def test_on_market_event_analyzes_held_symbol(self):
         self.agent._running = True
         event = Event(

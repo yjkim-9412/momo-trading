@@ -37,6 +37,22 @@ class TradingAgentBrokerAvailabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.last_cycle_status, "SKIPPED")
         self.assertIsNone(runtime.last_cycle_error)
 
+    async def test_run_cycle_allows_crypto_without_mcp(self):
+        agent = TradingAgent()
+        expected = {"market_scope": "CRYPTO", "scanned": 1}
+
+        with patch.object(settings, "DAY_TRADING_ONLY", False), \
+                patch("agent.trading_agent.market_calendar.is_trading_hours", return_value=True), \
+                patch.object(type(mcp_client), "is_connected", new_callable=PropertyMock, return_value=False), \
+                patch.object(agent, "_run_trading_cycle", AsyncMock(return_value=expected)) as run_trading_cycle:
+            result = await agent.run_cycle(market="BITHUMB")
+
+        run_trading_cycle.assert_awaited_once_with(
+            "BITHUMB",
+            scheduled_budget_remaining=None,
+        )
+        self.assertEqual(result, expected)
+
 
 class TradingAgentCycleFailureHandlingTest(unittest.IsolatedAsyncioTestCase):
     async def test_run_trading_cycle_records_error_and_cleans_up_runtime_state(self):

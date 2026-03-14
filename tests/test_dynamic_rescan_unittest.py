@@ -178,6 +178,38 @@ class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
             any("실시간 감시 2종목" in call.args[2] for call in log_schedule.await_args_list)
         )
 
+    async def test_execute_trading_scan_allows_crypto_without_mcp(self):
+        with patch.object(market_calendar, "is_holiday", return_value=False), patch.object(
+            type(mcp_client),
+            "is_connected",
+            new_callable=PropertyMock,
+            return_value=False,
+        ), patch(
+            "agent.trading_agent.trading_agent.run_cycle",
+            AsyncMock(return_value={"analyzed": 1, "executed": 0, "selected_symbols": [("BTC", "BITHUMB")]}),
+        ) as run_cycle, patch(
+            "services.watchlist_sync.reconcile_market_watchlist",
+            AsyncMock(return_value=[("BTC", "BITHUMB")]),
+        ), patch.object(
+            self.scheduler,
+            "_log_schedule",
+            AsyncMock(),
+        ) as log_schedule:
+            await self.scheduler._execute_trading_scan(
+                "BITHUMB",
+                trigger_reason="adaptive_rescan",
+                include_gap_check=False,
+            )
+
+        run_cycle.assert_awaited_once()
+        self.assertEqual(run_cycle.await_args.kwargs["market"], "BITHUMB")
+        self.assertFalse(
+            any(
+                call.args[1] == "ERROR" and "MCP 미연결" in call.args[2]
+                for call in log_schedule.await_args_list
+            )
+        )
+
     async def test_adaptive_rescan_clears_stale_next_run_at_before_execution(self):
         state = self.scheduler._adaptive_state("KRX")
         state.next_adaptive_run_at = datetime(2026, 3, 14, 9, 35)
