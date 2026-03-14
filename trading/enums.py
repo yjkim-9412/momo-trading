@@ -2,12 +2,13 @@ from enum import Enum
 
 
 class Market(str, Enum):
-    """주식 시장"""
+    """거래 시장"""
     KOSPI = "KOSPI"
     KOSDAQ = "KOSDAQ"
     NASDAQ = "NASDAQ"
     NYSE = "NYSE"
     AMEX = "AMEX"
+    BITHUMB = "BITHUMB"
 
 
 class OrderSide(str, Enum):
