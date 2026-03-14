@@ -85,6 +85,8 @@ class Settings(BaseSettings):
     CRYPTO_WATCHLIST_SYMBOLS: str = "BTC,ETH,XRP,SOL,ADA,DOGE"
     CRYPTO_SCAN_LIMIT: int = 15
     CRYPTO_DYNAMIC_DISCOVERY_ENABLED: bool = True  # 전체 overview 발굴 + watchlist 시드 병합
+    CRYPTO_DISCOVERY_REFRESH_MINUTES: int = 360  # 전체 market universe 새로고침 주기
+    CRYPTO_DISCOVERY_UNIVERSE_SIZE: int = 30  # broad refresh 후 유지할 상위 유동성 코인 수
 
     # === Crypto 리스크 (주식 리스크 설정과 독립) ===
     CRYPTO_MAX_POSITION_PCT: float = 20.0

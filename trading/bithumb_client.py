@@ -12,6 +12,7 @@ import hmac
 import json
 import time
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 from urllib.parse import urlencode
@@ -125,6 +126,11 @@ class BithumbClient:
         self._client: httpx.AsyncClient | None = None
         self._tradable_krw_symbols_cache: set[str] = set()
         self._tradable_krw_symbols_cached_at: float | None = None
+        self._discovery_universe_cache: list[dict[str, Any]] = []
+        self._discovery_universe_cached_at: float | None = None
+        self._discovery_universe_cached_at_epoch: float | None = None
+        self._discovery_universe_last_error: str | None = None
+        self._discovery_universe_last_source: str = "empty"
 
         # Rate limiter: 슬라이딩 윈도우 타임스탬프 + 세마포어
         self._public_timestamps: list[float] = []
@@ -420,6 +426,62 @@ class BithumbClient:
                 prices[symbol] = price
         return prices
 
+    @staticmethod
+    def _dedupe_symbols(symbols: list[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for symbol in symbols:
+            sym = str(symbol or "").upper().strip()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            unique.append(sym)
+        return unique
+
+    def _discovery_universe_ttl_seconds(self) -> float:
+        refresh_minutes = max(1, int(settings.CRYPTO_DISCOVERY_REFRESH_MINUTES or 360))
+        return float(refresh_minutes * 60)
+
+    def _get_cached_discovery_universe(
+        self,
+        *,
+        allow_stale: bool = False,
+    ) -> list[dict[str, Any]] | None:
+        if not self._discovery_universe_cache:
+            return None
+        if allow_stale or self._discovery_universe_cached_at is None:
+            return list(self._discovery_universe_cache)
+
+        age = time.monotonic() - self._discovery_universe_cached_at
+        if age <= self._discovery_universe_ttl_seconds():
+            return list(self._discovery_universe_cache)
+        return None
+
+    def _set_discovery_universe_cache(self, items: list[dict[str, Any]]) -> None:
+        self._discovery_universe_cache = list(items)
+        self._discovery_universe_cached_at = time.monotonic()
+        self._discovery_universe_cached_at_epoch = time.time()
+
+    def get_discovery_cache_status(self) -> dict[str, Any]:
+        refreshed_at = None
+        age_seconds = None
+        if self._discovery_universe_cached_at_epoch is not None:
+            refreshed_at = datetime.fromtimestamp(
+                self._discovery_universe_cached_at_epoch,
+                tz=timezone.utc,
+            ).isoformat()
+            age_seconds = max(
+                0,
+                int(time.time() - self._discovery_universe_cached_at_epoch),
+            )
+        return {
+            "source": self._discovery_universe_last_source,
+            "symbol_count": len(self._discovery_universe_cache),
+            "refreshed_at": refreshed_at,
+            "age_seconds": age_seconds,
+            "last_error": self._discovery_universe_last_error,
+        }
+
     def _get_cached_tradable_krw_symbols(self, *, allow_stale: bool = False) -> set[str] | None:
         """캐시된 KRW 거래 가능 심볼 집합을 반환한다."""
         if not self._tradable_krw_symbols_cache:
@@ -569,6 +631,31 @@ class BithumbClient:
 
         normalized = self._normalize_ticker(items[0])
         return MCPResponse(success=True, data=normalized)
+
+    async def get_ticker_snapshots(
+        self,
+        symbols: list[str],
+        market: str = "",
+    ) -> MCPResponse:
+        """지정 심볼 현재가 스냅샷을 벌크 조회한다."""
+        unique_symbols = self._dedupe_symbols(symbols)
+        if not unique_symbols:
+            return MCPResponse(success=True, data={"items": [], "count": 0, "symbols": []})
+
+        market_codes = ",".join(_to_market_code(symbol) for symbol in unique_symbols)
+        resp = await self._public_get("/v1/ticker", params={"markets": market_codes})
+        if not resp.success or not resp.data:
+            return resp
+
+        items = [
+            self._normalize_ticker(item)
+            for item in resp.data.get("items", [])
+            if isinstance(item, dict)
+        ]
+        return MCPResponse(
+            success=True,
+            data={"items": items, "count": len(items), "symbols": unique_symbols},
+        )
 
     async def get_daily_price(
         self,
@@ -980,6 +1067,78 @@ class BithumbClient:
             success=True,
             data={"items": overview, "count": len(overview)},
         )
+
+    async def get_discovery_universe(
+        self,
+        market: str = "",
+        *,
+        force_refresh: bool = False,
+    ) -> MCPResponse:
+        """동적 discovery용 상위 유동성 코인 universe를 반환한다."""
+        if not force_refresh:
+            cached = self._get_cached_discovery_universe()
+            if cached is not None:
+                self._discovery_universe_last_source = "cache"
+                return MCPResponse(
+                    success=True,
+                    data={
+                        "items": cached,
+                        "count": len(cached),
+                        "cache_source": "cache",
+                        "cached_at": self._discovery_universe_cached_at_epoch,
+                        "last_error": self._discovery_universe_last_error,
+                    },
+                )
+
+        overview = await self.get_market_overview(market)
+        if overview.success and overview.data:
+            limit = max(1, int(settings.CRYPTO_DISCOVERY_UNIVERSE_SIZE or 30))
+            items = [
+                item
+                for item in overview.data.get("items", [])
+                if isinstance(item, dict)
+            ]
+            universe = sorted(
+                items,
+                key=lambda item: float(item.get("trade_value", 0) or 0),
+                reverse=True,
+            )[:limit]
+            if universe:
+                self._set_discovery_universe_cache(universe)
+                self._discovery_universe_last_source = "live"
+                self._discovery_universe_last_error = None
+                return MCPResponse(
+                    success=True,
+                    data={
+                        "items": universe,
+                        "count": len(universe),
+                        "cache_source": "live",
+                        "cached_at": self._discovery_universe_cached_at_epoch,
+                        "last_error": None,
+                    },
+                )
+
+        error = str(getattr(overview, "error", "") or "discovery universe unavailable")
+        self._discovery_universe_last_error = error
+        stale_cached = self._get_cached_discovery_universe(allow_stale=True)
+        if stale_cached is not None:
+            self._discovery_universe_last_source = "stale_cache"
+            logger.warning("빗썸 discovery universe live refresh 실패 → stale cache 사용: {}", error)
+            return MCPResponse(
+                success=True,
+                data={
+                    "items": stale_cached,
+                    "count": len(stale_cached),
+                    "cache_source": "stale_cache",
+                    "cached_at": self._discovery_universe_cached_at_epoch,
+                    "last_error": error,
+                },
+            )
+
+        self._discovery_universe_last_source = "empty"
+        if overview.success:
+            return MCPResponse(success=False, error="discovery universe unavailable")
+        return overview
 
     async def get_volume_rank(
         self,
