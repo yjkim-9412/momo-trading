@@ -35,6 +35,9 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 |------|------|
 | `trading/broker_base.py` | BrokerClient / MarketDataProvider / RealtimeProvider Protocol |
 | `trading/bithumb_client.py` | 빗썸 REST 클라이언트 (JWT 인증, rate limiting) |
+| `trading/bithumb_websocket.py` | 빗썸 Public/Private WS 런타임 (`ticker`/`trade` + `myOrder`/`myAsset`) |
+| `realtime/coin_stream_manager.py` | 코인 desired/active 구독 상태, admin stream status |
+| `realtime/coin_monitor.py` | WS 수신 → `event_detector` / broker ledger / cache 동기화 |
 | `agent/scanner_base.py` | MarketScannerProtocol |
 | `agent/crypto_scanner.py` | 코인 스캐너 (24h 거래대금/등락률 기반) |
 | `analysis/llm/llm_factory.py` | 코인 scope LLM provider 선택 및 Codex 장애 시 Claude fallback |
@@ -55,6 +58,7 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 | `api/routes/admin_coin.py` | `/admin-coin` 전용 API (`/api/v1/admin-coin/*`, `/system/status`, `/agent/state`, 활동/LLM 상세) |
 | `start-coin.sh` | 코인 전용 실행 (Docker 불필요) |
 | `.env.example-coin` | 환경변수 예제 |
+| `docs/bithumb-api/websocket/` | 빗썸 WebSocket API 문서 6개 (기본정보, ticker, trade, orderbook, myOrder, myAsset) |
 
 ## 환경변수 (주식과 완전 독립)
 
@@ -62,6 +66,7 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 
 ```
 BITHUMB_API_KEY / BITHUMB_API_SECRET    # API 인증
+BITHUMB_WS_URL_PUBLIC / BITHUMB_WS_URL_PRIVATE  # 빗썸 Public/Private WS 엔드포인트
 CRYPTO_ENABLED                          # 코인 기능 on/off
 CRYPTO_TRADING_ENABLED                  # 실제 주문 허용
 CRYPTO_AUTONOMY_MODE                    # SEMI_AUTO / AUTONOMOUS
@@ -86,6 +91,8 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 ## 코인 구현 주의사항
 
 - 빗썸 rate limit: 공식 Public **150**/s, Private **140**/s, 주문 **10**/s. 코드는 보수적 10/5 semaphore
+- 빗썸 WebSocket: 최신 공식 엔드포인트는 `wss://ws-api.bithumb.com/websocket/v1` / `/private`
+- Public WS는 `ticker`, `trade`, `orderbook`으로 가격/거래량/호가 이벤트를 만들고, Private WS는 `myOrder`, `myAsset`로 주문/자산 동기화를 수행한다
 - 소수점 수량: `OrderRequest.quantity = float` (주식은 정수만 전달)
 - 캔들 정렬: newest-first → oldest-first 재정렬 (미국장과 동일 방어)
 - JWT 인증: PyJWT HS256. `Authorization: Bearer {jwt}`. Payload: access_key, nonce(UUID), timestamp(ms), query_hash(SHA512)
@@ -104,12 +111,25 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - DB 완전 분리: 10개 `coin_*` 테이블, 주식 FK 없음
 - 활동 로그 → CoinActivityLog, 추천 → CoinRecommendation (직접 쿼리)
 - 코인 어드민 상태 패널은 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
+- 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`를 사용해 WS 감시 상태를 렌더링한다.
+- 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`를 함께 사용한다.
 - 코인 활동 피드는 `CoinActivityLog.detail`와 `execution_time_ms`를 그대로 노출해 LLM system prompt / prompt / response를 인라인으로 점검한다.
 - 코인 어드민 수동 스캔 버튼은 HTML inline handler를 쓰지 않고 단일 JS 바인딩만 사용한다. 버튼 상태는 `agent/state`를 기준으로 `요청 중 → 시작 대기 → 진행 중 → 완료/스킵` 흐름을 표시한다.
 - SSE: `coin_sse_manager` 독립 인스턴스 (activity_logger 자동 분기)
 - 주요 에러: 400 `invalid_parameter`/`invalid_price`, 401 `jwt_verification`/`expired_jwt`/`NotAllowIP`, 422 `order_not_ready`, 500 `server_error`
 - Content-Type: `application/json; charset=utf-8`
 - API 버전: v2.1.0
+
+## 빗썸 WebSocket API
+
+- **Public**: `wss://ws-api.bithumb.com/websocket/v1` (인증 불필요)
+- **Private**: `wss://ws-api.bithumb.com/websocket/v1/private` (JWT Bearer)
+- **구독 5종**: `ticker` / `trade` / `orderbook` (Public), `myOrder` / `myAsset` (Private)
+- **요청 형식**: JSON 배열 `[{ticket}, {type}, ..., {type}, {format}]`
+- **연결 제한**: 10 conn/sec/IP, 메시지 5/sec + 100/min, 수신 무제한
+- **연결 유지**: RFC 6455 PING/PONG, 120초 idle timeout, 서버 `{"status":"UP"}` 매 10초
+- **에러 코드**: `WRONG_FORMAT`, `NO_TICKET`, `NO_TYPE`, `NO_CODES`, `INVALID_PARAM`
+- **상세 문서**: `docs/bithumb-api/websocket/` (6개 파일)
 
 ## 에이전트 파이프라인 (코인)
 

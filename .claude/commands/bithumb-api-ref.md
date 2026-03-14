@@ -1,6 +1,6 @@
 # Bithumb API 레퍼런스 조회
 
-빗썸 거래소 API 참조가 필요할 때 로컬 레퍼런스를 조회한다.
+빗썸 거래소 API 참조가 필요할 때 로컬 레퍼런스를 조회한다. REST API(PUBLIC 9개 + PRIVATE 25개)와 WebSocket API(PUBLIC 3개 + PRIVATE 2개)를 포함한다.
 
 **공식 문서:** https://apidocs.bithumb.com/v2.1.0/reference/
 
@@ -23,32 +23,39 @@ docs/bithumb-api/
 │   ├── 현재가-정보.md
 │   ├── 호가-정보-조회.md
 │   └── 경보제.md
-└── private/           # PRIVATE API (JWT 인증 필요, 25개)
-    ├── 전체-계좌-조회.md
-    ├── 주문-가능-정보.md
-    ├── 개별-주문-조회.md
-    ├── 주문-리스트-조회.md
-    ├── 주문-취소-접수.md
-    ├── 주문하기.md
-    ├── twap-주문내역-조회.md
-    ├── twap-주문-취소.md
-    ├── twap-주문-요청.md
-    ├── 출금-리스트-조회.md
-    ├── 원화-출금-리스트-조회.md
-    ├── 개별-출금-조회.md
-    ├── 출금-가능-정보.md
-    ├── 디지털-자산-출금하기.md
-    ├── 원화-출금하기.md
-    ├── 출금-허용-주소-리스트-조회.md
-    ├── 입금-리스트-조회.md
-    ├── 원화-입금-리스트-조회.md
-    ├── 개별-입금-조회.md
-    ├── 입금-주소-생성-요청.md
-    ├── 전체-입금-주소-조회.md
-    ├── 개별-입금-주소-조회.md
-    ├── 원화-입금하기.md
-    ├── 입출금-현황.md
-    └── api-키-리스트-조회.md
+├── private/           # PRIVATE API (JWT 인증 필요, 25개)
+│   ├── 전체-계좌-조회.md
+│   ├── 주문-가능-정보.md
+│   ├── 개별-주문-조회.md
+│   ├── 주문-리스트-조회.md
+│   ├── 주문-취소-접수.md
+│   ├── 주문하기.md
+│   ├── twap-주문내역-조회.md
+│   ├── twap-주문-취소.md
+│   ├── twap-주문-요청.md
+│   ├── 출금-리스트-조회.md
+│   ├── 원화-출금-리스트-조회.md
+│   ├── 개별-출금-조회.md
+│   ├── 출금-가능-정보.md
+│   ├── 디지털-자산-출금하기.md
+│   ├── 원화-출금하기.md
+│   ├── 출금-허용-주소-리스트-조회.md
+│   ├── 입금-리스트-조회.md
+│   ├── 원화-입금-리스트-조회.md
+│   ├── 개별-입금-조회.md
+│   ├── 입금-주소-생성-요청.md
+│   ├── 전체-입금-주소-조회.md
+│   ├── 개별-입금-주소-조회.md
+│   ├── 원화-입금하기.md
+│   ├── 입출금-현황.md
+│   └── api-키-리스트-조회.md
+└── websocket/         # WEBSOCKET API (Public 3 + Private 2)
+    ├── 기본-정보.md        # 연결, 인증, 요청 포맷, rate limit, 에러 코드
+    ├── 현재가-ticker.md    # Public: 현재가 실시간 (32개 필드)
+    ├── 체결-trade.md       # Public: 체결 내역 (14개 필드)
+    ├── 호가-orderbook.md   # Public: 호가 + depth aggregation
+    ├── 내-주문-myOrder.md  # Private: 내 주문 상태 변경 (20개 필드)
+    └── 내-자산-myAsset.md  # Private: 내 자산 변동
 ```
 
 ## 주요 API 카테고리
@@ -66,6 +73,12 @@ docs/bithumb-api/
 | 출금 | PRIVATE | 코인·원화 출금 (`/v1/withdraws/*`) |
 | 입금 | PRIVATE | 코인·원화 입금 (`/v1/deposits/*`) |
 | 서비스 | PRIVATE | 입출금현황, API키 조회 |
+| WebSocket 기본 | WS | 연결, 인증, 요청 포맷 (`wss://ws-api.bithumb.com/websocket/v1`) |
+| WS 현재가 | WS PUBLIC | ticker 실시간 (`type: "ticker"`) |
+| WS 체결 | WS PUBLIC | trade 실시간 (`type: "trade"`) |
+| WS 호가 | WS PUBLIC | orderbook 실시간 + depth aggregation (`type: "orderbook"`) |
+| WS 내주문 | WS PRIVATE | myOrder 주문 상태 변경 (`type: "myOrder"`) |
+| WS 내자산 | WS PRIVATE | myAsset 잔고 변동 (`type: "myAsset"`) |
 
 ## 실행 절차
 
@@ -80,8 +93,10 @@ docs/bithumb-api/
 
 매칭된 엔드포인트의 상세 파일을 읽는다:
 ```
-docs/bithumb-api/{public|private}/{엔드포인트}.md
+docs/bithumb-api/{public|private|websocket}/{엔드포인트}.md
 ```
+
+WebSocket 관련 키워드(websocket, 웹소켓, 실시간, realtime, stream, ticker, trade, orderbook, myOrder, myAsset)는 `websocket/` 폴더에서 조회한다.
 
 여러 개가 매칭되면 가장 관련도 높은 1~3개를 선택한다.
 

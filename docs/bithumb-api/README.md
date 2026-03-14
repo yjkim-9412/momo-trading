@@ -4,6 +4,18 @@
 
 Base URL: `https://api.bithumb.com`
 
+WebSocket URL:
+- Public: `wss://ws-api.bithumb.com/websocket/v1`
+- Private: `wss://ws-api.bithumb.com/websocket/v1/private`
+
+WebSocket 주요 타입:
+- Public: `ticker`, `trade`, `orderbook`
+- Private: `myOrder`, `myAsset`
+
+WebSocket 인증:
+- Private WS는 REST와 동일하게 `Authorization: Bearer {jwt}` 헤더를 사용한다.
+- Request payload는 `ticket`, `type`, `format` 필드를 담은 JSON 배열 형식이다.
+
 ---
 
 ## PUBLIC API (인증 불필요)
@@ -40,6 +52,28 @@ Base URL: `https://api.bithumb.com`
 | 엔드포인트 | Method | Path | 파일 | 키워드 |
 |-----------|--------|------|------|--------|
 | 경보제 | GET | `/v1/market/virtual_asset_warning` | `public/경보제.md` | warning, 경보, 유의, 주의, 경고 |
+
+---
+
+## WEBSOCKET API
+
+### WebSocket 기본 정보
+| 엔드포인트 | 파일 | 키워드 |
+|-----------|------|--------|
+| 기본 정보 (연결, 인증, 요청 포맷, 에러 코드) | `websocket/기본-정보.md` | websocket, 웹소켓, 연결, connection, heartbeat, ping, pong, ticket, format |
+
+### WebSocket Public 구독 (인증 불필요)
+| 엔드포인트 | type | 파일 | 키워드 |
+|-----------|------|------|--------|
+| 현재가 (Ticker) | `ticker` | `websocket/현재가-ticker.md` | websocket, ticker, 현재가, 실시간, realtime, stream |
+| 체결 (Trade) | `trade` | `websocket/체결-trade.md` | websocket, trade, 체결, 실시간, realtime, stream |
+| 호가 (Orderbook) | `orderbook` | `websocket/호가-orderbook.md` | websocket, orderbook, 호가, 실시간, depth, level |
+
+### WebSocket Private 구독 (JWT 인증 필요)
+| 엔드포인트 | type | 파일 | 키워드 |
+|-----------|------|------|--------|
+| 내 주문 (MyOrder) | `myOrder` | `websocket/내-주문-myOrder.md` | websocket, myOrder, 내주문, 주문상태, 실시간, order |
+| 내 자산 (MyAsset) | `myAsset` | `websocket/내-자산-myAsset.md` | websocket, myAsset, 내자산, 잔고변동, 실시간, balance |
 
 ---
 
