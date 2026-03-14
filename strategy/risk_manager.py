@@ -5,7 +5,7 @@ from core.config import settings
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
 from trading.enums import ActivityPhase, ActivityType, SignalAction
-from trading.market_profile import is_us_market
+from trading.market_profile import is_crypto_market, is_us_market
 from trading.risk_policy import DEFAULT_RR_FLOOR, resolve_rr_floor as resolve_shared_rr_floor
 from trading.product_policy import (
     build_product_context,
@@ -23,6 +23,19 @@ class RiskManager:
     - 일일 매매 한도
     - 단일 주문 금액 한도
     """
+
+    # 크립토 전용 R:R floor (주식보다 넓은 스탑 반영)
+    CRYPTO_RR_FLOOR = {
+        "BULL_RUN": 2.0,
+        "BEAR_MARKET": 1.5,
+        "CONSOLIDATION": 1.5,
+        "ALTSEASON": 2.0,
+        # 주식 regime 호환
+        "BULL": 2.0,
+        "BEAR": 1.5,
+        "SIDEWAYS": 1.5,
+        "THEME": 2.0,
+    }
 
     def __init__(self):
         self.max_daily_trades = settings.MAX_DAILY_TRADES
@@ -96,12 +109,23 @@ class RiskManager:
         symbol = signal.symbol
         product_context = self._signal_product_context(signal)
 
-        # 동적 한도 적용 (AI 결정값 또는 기본값)
-        eff_max_daily = self.max_daily_trades
-        eff_max_order = self.max_single_order_krw
-        eff_min_qty = settings.MIN_BUY_QUANTITY
-        eff_min_cash_ratio = self.min_cash_ratio
-        eff_max_pos_pct = max_position_pct
+        # 크립토 전용 기본값 적용
+        metadata = signal.metadata or {}
+        market_code = str(metadata.get("market") or "KRX")
+        _is_crypto = is_crypto_market(market_code)
+
+        if _is_crypto:
+            eff_max_daily = settings.CRYPTO_MAX_DAILY_TRADES
+            eff_max_order = settings.CRYPTO_MAX_SINGLE_ORDER_KRW
+            eff_min_qty = settings.CRYPTO_MIN_BUY_QUANTITY
+            eff_min_cash_ratio = settings.CRYPTO_MIN_CASH_RATIO
+            eff_max_pos_pct = settings.CRYPTO_MAX_POSITION_PCT
+        else:
+            eff_max_daily = self.max_daily_trades
+            eff_max_order = self.max_single_order_krw
+            eff_min_qty = settings.MIN_BUY_QUANTITY
+            eff_min_cash_ratio = self.min_cash_ratio
+            eff_max_pos_pct = max_position_pct
 
         if dynamic_limits:
             eff_max_daily = dynamic_limits.get("max_daily_trades", eff_max_daily)
@@ -118,8 +142,9 @@ class RiskManager:
             )
             return result
 
-        # 매매 비활성화 검사
-        if not settings.TRADING_ENABLED:
+        # 매매 비활성화 검사 (크립토는 독립 설정)
+        trading_enabled = settings.CRYPTO_TRADING_ENABLED if _is_crypto else settings.TRADING_ENABLED
+        if not trading_enabled:
             result = {"approved": False, "reason": "매매가 비활성화되어 있습니다"}
             await self._log_result(
                 symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
@@ -145,8 +170,6 @@ class RiskManager:
             )
             return result
 
-        metadata = signal.metadata or {}
-        market_code = str(metadata.get("market") or "KRX")
         classification = classification_from_metadata(symbol, market_code, metadata)
         allowed, policy_reason = is_product_trade_allowed(
             classification,
@@ -174,7 +197,10 @@ class RiskManager:
         broker_cash_krw = float(portfolio_cash or 0.0)
         cash_basis_krw = broker_cash_krw
 
-        if is_us_market(market_code):
+        # 크립토는 orderable_cash 별도 조회 불필요 (잔고 기반)
+        if _is_crypto:
+            cash_basis_krw = broker_cash_krw
+        elif is_us_market(market_code):
             if orderable_cash_krw is None:
                 result = {
                     "approved": False,
@@ -212,7 +238,10 @@ class RiskManager:
             risk = abs(entry - stop)
             if risk > 0:
                 rr_ratio = reward / risk
-                min_rr = self.resolve_rr_floor(market_regime, rr_floor_overrides)
+                if _is_crypto:
+                    min_rr = self.CRYPTO_RR_FLOOR.get(market_regime, 1.5)
+                else:
+                    min_rr = self.resolve_rr_floor(market_regime, rr_floor_overrides)
                 if rr_ratio < min_rr:
                     result = {
                         "approved": False,

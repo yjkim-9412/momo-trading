@@ -5,7 +5,7 @@ import re
 
 from core.config import settings
 from scheduler.market_calendar import market_calendar
-from trading.market_profile import is_us_market, normalize_market
+from trading.market_profile import is_crypto_market, is_us_market, normalize_market
 
 _RESTRICTED_PRODUCT_TYPES = {"LEVERAGED_ETF", "INVERSE_ETF"}
 _LEVERAGE_MULTIPLIER_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
@@ -198,7 +198,14 @@ def classify_product(
     name: str = "",
     category: str = "",
 ) -> ProductClassification:
-    """티커/이름/카테고리 기준 상품 분류"""
+    """티커/이름/카테고리 기준 상품 분류 (크립토는 항상 COMMON/Spot)"""
+    if is_crypto_market(market):
+        return _build_classification(
+            symbol, normalize_market(market),
+            name=name, category=category or "암호화폐",
+            product_type="COMMON",
+            classification_source="crypto_spot",
+        )
     classification = _classify_from_text(symbol, market, name=name, category=category)
     symbol_upper = classification.symbol
 

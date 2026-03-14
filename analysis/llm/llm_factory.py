@@ -53,6 +53,9 @@ class LLMFactory:
     def __init__(self):
         self._selected_provider: LLMProvider | None = None
         self._providers: dict[LLMTier, LLMProviderProtocol] = {}
+        # 코인 전용 provider 캐시 (주식과 독립)
+        self._crypto_provider: LLMProvider | None = None
+        self._crypto_providers: dict[LLMTier, LLMProviderProtocol] = {}
 
     def _ensure_provider_cache(self) -> None:
         """settings 기준으로 provider 인스턴스 갱신"""
@@ -67,8 +70,29 @@ class LLMFactory:
         }
         self._selected_provider = selected_provider
 
-    def _get_provider(self, tier: LLMTier) -> LLMProviderProtocol:
-        """Tier별 provider 인스턴스 반환"""
+    def _ensure_crypto_provider_cache(self) -> None:
+        """코인 전용 provider 인스턴스 갱신 (주식 provider와 동일하면 재사용)"""
+        crypto_provider = settings.crypto_llm_provider
+        if self._crypto_provider == crypto_provider and self._crypto_providers:
+            return
+
+        # 주식과 동일 provider면 주식 캐시 재사용
+        self._ensure_provider_cache()
+        if crypto_provider == self._selected_provider:
+            self._crypto_providers = self._providers
+        else:
+            provider_class = self.PROVIDER_CLASSES[crypto_provider]
+            self._crypto_providers = {
+                LLMTier.TIER1: provider_class(LLMTier.TIER1),
+                LLMTier.TIER2: provider_class(LLMTier.TIER2),
+            }
+        self._crypto_provider = crypto_provider
+
+    def _get_provider(self, tier: LLMTier, scope: str | None = None) -> LLMProviderProtocol:
+        """Tier별 provider 인스턴스 반환 (CRYPTO scope면 코인 전용 provider)"""
+        if scope and scope.upper() == "CRYPTO":
+            self._ensure_crypto_provider_cache()
+            return self._crypto_providers[tier]
         self._ensure_provider_cache()
         return self._providers[tier]
 
@@ -129,7 +153,7 @@ class LLMFactory:
         Returns:
             (생성 텍스트, 사용된 provider 이름)
         """
-        provider = self._get_provider(tier)
+        provider = self._get_provider(tier, scope=scope)
 
         if not await provider.is_available():
             raise RuntimeError(f"{provider.provider.value} CLI를 찾을 수 없습니다 (PATH 확인)")
