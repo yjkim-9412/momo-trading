@@ -102,6 +102,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 활동 로그 → CoinActivityLog, 추천 → CoinRecommendation (직접 쿼리)
 - 코인 어드민 상태 패널은 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
 - 코인 활동 피드는 `CoinActivityLog.detail`와 `execution_time_ms`를 그대로 노출해 LLM system prompt / prompt / response를 인라인으로 점검한다.
+- 코인 어드민 수동 스캔 버튼은 HTML inline handler를 쓰지 않고 단일 JS 바인딩만 사용한다. 버튼 상태는 `agent/state`를 기준으로 `요청 중 → 시작 대기 → 진행 중 → 완료/스킵` 흐름을 표시한다.
 - SSE: `coin_sse_manager` 독립 인스턴스 (activity_logger 자동 분기)
 - 주요 에러: 400 `invalid_parameter`/`invalid_price`, 401 `jwt_verification`/`expired_jwt`/`NotAllowIP`, 422 `order_not_ready`, 500 `server_error`
 - Content-Type: `application/json; charset=utf-8`

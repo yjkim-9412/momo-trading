@@ -12,6 +12,11 @@ let missedCount = 0;
 let scanCountdownTimer = null;
 let lastSystemStatus = null;
 let lastAgentState = null;
+let manualScanRequestPending = false;
+let manualScanQueuedAt = null;
+let manualScanNotice = null;
+let manualScanSessionObserved = false;
+let lastManualCycleActive = false;
 const LLM_AGENT_DEFAULTS = {
   tier1: {
     display_name: '후보 분석 에이전트',
@@ -28,6 +33,7 @@ const ADMIN_AGENT_LABELS = {
 };
 const AGENT_PHASE_LABELS = {
   BOOTSTRAP: '준비',
+  SCAN: '스캔',
   ANALYSIS: '분석',
   DECISION: '판단',
   COMPLETE: '완료',
@@ -185,6 +191,100 @@ function setStatusText(text, color = '') {
   if (!el) return;
   el.textContent = text;
   el.style.color = color || '';
+}
+
+function setManualScanNotice(label, icon, colorClass, durationMs = 3500) {
+  manualScanNotice = {
+    label,
+    icon,
+    colorClass,
+    expiresAt: Date.now() + durationMs,
+  };
+}
+
+function clearManualScanNotice() {
+  manualScanNotice = null;
+}
+
+function renderTriggerButton() {
+  const btn = document.getElementById('btn-trigger-scan');
+  if (!btn) return;
+
+  if (manualScanNotice && manualScanNotice.expiresAt <= Date.now()) {
+    manualScanNotice = null;
+  }
+
+  const cycleActive = !!lastAgentState?.cycle_active;
+  const cryptoEnabled = lastSystemStatus?.crypto_enabled !== false;
+  const phase = AGENT_PHASE_LABELS[lastAgentState?.phase] || lastAgentState?.phase || '스캔';
+  const analyzedCount = Number(lastAgentState?.analyzed_count || 0);
+  const scannedCount = Number(lastAgentState?.scanned_count || 0);
+
+  let label = '수동 스캔 실행';
+  let icon = 'scan';
+  let disabled = false;
+  let baseClasses = 'w-full bg-coin-purple/20 hover:bg-coin-purple/30 text-coin-purple border border-coin-purple/30 text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2';
+  let title = '코인 수동 스캔 실행';
+
+  if (!cryptoEnabled) {
+    label = '코인 비활성';
+    icon = 'ban';
+    disabled = true;
+    title = 'CRYPTO_ENABLED=false 상태입니다';
+    baseClasses = 'w-full bg-gray-800 text-gray-500 border border-gray-700 text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2 cursor-not-allowed';
+  } else if (manualScanRequestPending) {
+    label = '요청 전송 중...';
+    icon = 'loader';
+    disabled = true;
+    title = '수동 스캔 요청을 전송하고 있습니다';
+    baseClasses = 'w-full bg-coin-gold/15 text-coin-gold border border-coin-gold/30 text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2 cursor-wait';
+  } else if (cycleActive) {
+    label = `${phase} 진행 중${scannedCount ? ` · ${analyzedCount}/${scannedCount}` : ''}`;
+    icon = 'loader';
+    disabled = true;
+    title = '현재 코인 사이클이 실행 중입니다';
+    baseClasses = 'w-full bg-coin-gold/15 text-coin-gold border border-coin-gold/30 text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2 cursor-wait';
+  } else if (manualScanQueuedAt && (Date.now() - manualScanQueuedAt) < 10000) {
+    label = '사이클 시작 대기...';
+    icon = 'clock-3';
+    disabled = true;
+    title = '요청은 접수되었고 사이클 시작을 기다리는 중입니다';
+    baseClasses = 'w-full bg-blue-900/20 text-blue-300 border border-blue-400/20 text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2 cursor-wait';
+  } else if (manualScanNotice) {
+    label = manualScanNotice.label;
+    icon = manualScanNotice.icon;
+    title = manualScanNotice.label;
+    baseClasses = `w-full ${manualScanNotice.colorClass} border text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2`;
+  }
+
+  btn.className = baseClasses;
+  btn.disabled = disabled;
+  btn.title = title;
+  btn.setAttribute('aria-label', title);
+  btn.innerHTML = `<i data-lucide="${icon}" class="w-4 h-4 inline-block ${icon === 'loader' ? 'animate-spin' : ''}"></i> ${escapeHtml(label)}`;
+  refreshIcons();
+}
+
+function showToast(message, type = 'info', duration = 3000) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  container.prepend(toast);
+
+  while (container.children.length > 5) {
+    container.lastElementChild?.remove();
+  }
+
+  window.setTimeout(() => {
+    toast.classList.add('toast-fade-out');
+  }, Math.max(0, duration - 300));
+
+  window.setTimeout(() => {
+    toast.remove();
+  }, duration);
 }
 
 function getTypeColor(type) {
@@ -478,9 +578,10 @@ function formatLLMConversation(detail) {
     const id = `llm-${Math.random().toString(36).substr(2, 6)}`;
     const iconClass = defaultOpen ? 'lucide-chevron-up' : 'lucide-chevron-down';
     const bodyClass = defaultOpen ? 'llm-body open' : 'llm-body';
+    const typeClass = `type-${role.toLowerCase()}`;
     // Using inline onclick for simplicity similar to existing detail toggle
     return `
-      <div class="llm-msg">
+      <div class="llm-msg ${typeClass}">
         <div class="llm-role" onclick="document.getElementById('${id}').classList.toggle('open'); this.querySelector('i').classList.toggle('rotate-180')">
           <span>${role}</span>
           <i data-lucide="chevron-down" class="w-3.5 h-3.5 transition-transform duration-200 ${defaultOpen ? 'rotate-180' : ''}"></i>
@@ -822,6 +923,7 @@ async function loadSystemStatus() {
     updateScanTimeline();
     renderScanScheduleSummary(s);
     renderAgentState(lastAgentState);
+    renderTriggerButton();
   } catch (err) {
     console.error('[coin] system status error:', err);
   }
@@ -842,6 +944,7 @@ async function loadAgentState() {
   } catch (err) {
     console.error('[coin] agent state error:', err);
     renderAgentState(null);
+    renderTriggerButton();
   }
 }
 
@@ -849,6 +952,22 @@ function renderAgentState(state) {
   lastAgentState = state;
   const container = document.getElementById('watchlist-agent-state');
   if (!container) return;
+  const cycleActive = !!state?.cycle_active;
+  const manualCycleActive = cycleActive && manualScanSessionObserved;
+
+  if (manualCycleActive) {
+    manualScanQueuedAt = null;
+    clearManualScanNotice();
+  } else if (lastManualCycleActive) {
+    setManualScanNotice('최근 스캔 완료', 'check', 'bg-green-900/20 text-green-300 border-green-400/20');
+    manualScanSessionObserved = false;
+  } else if (manualScanQueuedAt && (Date.now() - manualScanQueuedAt) >= 10000) {
+    manualScanQueuedAt = null;
+    manualScanSessionObserved = false;
+    setManualScanNotice('시작 확인 지연', 'alert-triangle', 'bg-yellow-900/20 text-yellow-300 border-yellow-400/20', 4500);
+  }
+  lastManualCycleActive = manualCycleActive;
+  renderTriggerButton();
 
   if (!state) {
     container.innerHTML = '<div class="text-gray-500">현재 사이클 상태를 가져오지 못했습니다.</div>';
@@ -856,7 +975,6 @@ function renderAgentState(state) {
   }
 
   const selected = Array.isArray(state.selected_symbols) ? state.selected_symbols : [];
-  const cycleActive = !!state.cycle_active;
   const watchlistCount = Number(lastSystemStatus?.watchlist_count ?? 0);
   const lastStatus = lastSystemStatus?.last_cycle_status;
   const lastError = lastSystemStatus?.last_cycle_error;
@@ -1064,37 +1182,46 @@ async function updateSetting(key, value) {
 async function triggerScan() {
   const btn = document.getElementById('btn-trigger-scan');
   if (!btn) return;
+  if (manualScanRequestPending || lastAgentState?.cycle_active || (manualScanQueuedAt && (Date.now() - manualScanQueuedAt) < 10000)) {
+    return;
+  }
 
-  const originalHTML = btn.innerHTML;
-  btn.disabled = true;
-  btn.innerHTML = '<i data-lucide="loader" class="w-4 h-4 inline-block animate-spin"></i> 스캔 중...';
-  refreshIcons();
+  manualScanRequestPending = true;
+  clearManualScanNotice();
+  renderTriggerButton();
 
   try {
     const json = await fetchJSON(`${API}/agent/trigger`, { method: 'POST' });
     const data = json.data;
-    const msg = data && data.message ? data.message : '스캔 트리거 완료';
-    btn.innerHTML = `<i data-lucide="check" class="w-4 h-4 inline-block"></i> ${escapeHtml(msg)}`;
-    btn.style.color = '#34d399';
-    refreshIcons();
+    const msg = json.message || (data && data.message) || '스캔 트리거 완료';
 
-    // Reset scan timeline
-    lastCycleTime = Date.now();
-    updateScanTimeline();
-    setTimeout(loadAgentState, 500);
-    setTimeout(loadSystemStatus, 800);
+    if (data?.skipped) {
+      const reason = data.reason || 'skipped';
+      manualScanQueuedAt = null;
+      manualScanSessionObserved = false;
+      setManualScanNotice(`스캔 스킵 · ${reason}`, 'pause-circle', 'bg-yellow-900/20 text-yellow-300 border-yellow-400/20', 4500);
+      showToast(msg, 'info');
+    } else {
+      manualScanQueuedAt = Date.now();
+      manualScanSessionObserved = true;
+      lastCycleTime = Date.now();
+      updateScanTimeline();
+      setStatusText('수동 스캔 요청 접수됨', '#fbbf24');
+      showToast(msg, 'success');
+    }
+
+    setTimeout(loadAgentState, 300);
+    setTimeout(loadSystemStatus, 600);
   } catch (err) {
     console.error('[coin] scan trigger error:', err);
-    btn.innerHTML = '<i data-lucide="x" class="w-4 h-4 inline-block"></i> 실패';
-    btn.style.color = '#f87171';
-    refreshIcons();
+    manualScanQueuedAt = null;
+    manualScanSessionObserved = false;
+    setManualScanNotice('요청 실패', 'x', 'bg-red-900/20 text-red-300 border-red-400/20', 5000);
+    setStatusText(`수동 스캔 요청 실패 · ${truncateText(err.message, 80)}`, '#f87171');
+    showToast(`수동 스캔 실패: ${err.message}`, 'error');
   } finally {
-    setTimeout(() => {
-      btn.innerHTML = originalHTML;
-      btn.disabled = false;
-      btn.style.color = '';
-      refreshIcons();
-    }, 3000);
+    manualScanRequestPending = false;
+    renderTriggerButton();
   }
 }
 
@@ -1236,6 +1363,7 @@ function refreshFeed() {
 document.addEventListener('DOMContentLoaded', () => {
   // Setup
   setupFeedScroll();
+  renderTriggerButton();
   const fab = document.getElementById('scroll-to-bottom');
   if (fab) fab.addEventListener('click', scrollToBottom);
   const scanBtn = document.getElementById('btn-trigger-scan');
