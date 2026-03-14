@@ -37,6 +37,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 |------|------|
 | `trading/broker_base.py` | BrokerClient / MarketDataProvider / RealtimeProvider Protocol 정의 |
 | `trading/bithumb_client.py` | 빗썸 REST API 클라이언트 (BrokerClient 구현체, JWT 인증) |
+| `trading/quantity_policy.py` | 코인/주식 수량 정책 분기 (코인 8자리 소수점, 주식 정수) |
 | `trading/bithumb_websocket.py` | 빗썸 Public/Private WS 런타임 |
 | `realtime/coin_stream_manager.py` | 코인 실시간 desired/active 구독 상태 관리 |
 | `realtime/coin_monitor.py` | WS 수신 → 이벤트 감지 / 주문·자산 동기화 |
@@ -111,6 +112,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 
 - 빗썸 rate limit: 공식 한도 Public **150 req/s**, Private **140 req/s**, 주문(생성/취소) **10 req/s**. 코드(`BithumbClient`)는 보수적으로 Public 10, Private 5 semaphore 설정. 필요 시 상향 가능.
 - 소수점 수량: `OrderRequest.quantity`가 `float`. 주식은 정수만 전달하므로 하위호환.
+- 코인 소수점 수량은 `trading/quantity_policy.py`를 기준으로 end-to-end 8자리 floor 정책을 유지한다. 포지션 스냅샷, 계좌 컨텍스트, 리스크 캡, Tier2 제안 수량, 빗썸 주문 payload는 코인만 fractional 을 보존하고 주식 API/스키마는 그대로 둔다.
 - 캔들 정렬: 빗썸은 newest-first → `BithumbClient`에서 oldest-first로 재정렬 (미국장과 동일 방어).
 - JWT 인증: `PyJWT` (HS256). `Authorization: Bearer {jwt_token}` 헤더. Content-Type: `application/json; charset=utf-8`.
 - 빗썸 WebSocket 최신 공식 엔드포인트: `wss://ws-api.bithumb.com/websocket/v1`, `wss://ws-api.bithumb.com/websocket/v1/private`

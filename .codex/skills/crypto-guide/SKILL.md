@@ -35,6 +35,7 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 |------|------|
 | `trading/broker_base.py` | BrokerClient / MarketDataProvider / RealtimeProvider Protocol |
 | `trading/bithumb_client.py` | 빗썸 REST 클라이언트 (JWT 인증, rate limiting) |
+| `trading/quantity_policy.py` | 코인/주식 수량 정책 분기 (코인 8자리 소수점, 주식 정수) |
 | `trading/bithumb_websocket.py` | 빗썸 Public/Private WS 런타임 (`ticker`/`trade` + `myOrder`/`myAsset`) |
 | `realtime/coin_stream_manager.py` | 코인 desired/active 구독 상태, admin stream status |
 | `realtime/coin_monitor.py` | WS 수신 → `event_detector` / broker ledger / cache 동기화 |
@@ -94,6 +95,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 빗썸 WebSocket: 최신 공식 엔드포인트는 `wss://ws-api.bithumb.com/websocket/v1` / `/private`
 - Public WS는 `ticker`, `trade`, `orderbook`으로 가격/거래량/호가 이벤트를 만들고, Private WS는 `myOrder`, `myAsset`로 주문/자산 동기화를 수행한다
 - 소수점 수량: `OrderRequest.quantity = float` (주식은 정수만 전달)
+- 코인 소수점 수량은 `trading/quantity_policy.py`를 기준으로 end-to-end 8자리 floor 정책을 유지한다. 포지션 스냅샷, 계좌 컨텍스트, 리스크 캡, Tier2 제안 수량, 빗썸 주문 payload는 코인만 fractional 을 보존하고 주식 API/스키마는 그대로 둔다.
 - 캔들 정렬: newest-first → oldest-first 재정렬 (미국장과 동일 방어)
 - JWT 인증: PyJWT HS256. `Authorization: Bearer {jwt}`. Payload: access_key, nonce(UUID), timestamp(ms), query_hash(SHA512)
 - 시장 국면: BULL_RUN / BEAR_MARKET / CONSOLIDATION / ALTSEASON / ALT_SEASON (R:R floor에 양쪽 변형 매핑)
@@ -111,14 +113,15 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - `get_account_balance()` / `get_holdings()`는 `/v1/market/all`의 실제 `KRW-*` 마켓에 없는 자산을 비거래성 자산으로 간주해 제외한다. 마켓 카탈로그 조회가 깨지면 stale cache를 우선 쓰고, cache도 없으면 `avg_buy_price=0` 이고 현재가도 없는 자산만 degraded 규칙으로 제외한다.
 - DB 완전 분리: 10개 `coin_*` 테이블, 주식 FK 없음
 - 활동 로그 → CoinActivityLog, 추천 → CoinRecommendation (직접 쿼리)
-- 코인 어드민 상태 패널은 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
+- 코인 어드민 중앙 라이브 워크스페이스는 주식 어드민과 동일한 `Agent Monitor → grouped symbol cards → 중요도 기반 toast/브라우저 알림/탭 강조 → SSE reconnect banner` 흐름을 사용한다.
+- 코인 어드민 상태/중앙 모니터는 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
 - 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`를 사용해 WS 감시 상태를 렌더링한다.
 - 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`를 함께 사용한다.
-- 코인 활동 피드는 `CoinActivityLog.detail`와 `execution_time_ms`를 그대로 노출해 LLM system prompt / prompt / response를 인라인으로 점검한다.
+- 코인 활동 피드는 `CoinActivityLog.detail`와 `execution_time_ms`를 그대로 노출해 LLM system prompt / prompt / response를 인라인으로 점검하고, `/api/v1/admin-coin/activities/feed`는 stock admin과 동일하게 `resolved_trading_date`, `has_more`, `next_cursor(before_created_at,before_id)`를 반환한다.
 - 코인 어드민 수동 스캔 버튼은 HTML inline handler를 쓰지 않고 단일 JS 바인딩만 사용한다. 버튼 상태는 `agent/state`를 기준으로 `요청 중 → 시작 대기 → 진행 중 → 완료/스킵` 흐름을 표시한다.
 - 수동 코인 스캔(`/api/v1/admin-coin/agent/trigger`)은 `run_cycle()` 완료 후 `reconcile_market_watchlist("BITHUMB")`를 다시 호출해 최근 선정 종목이 즉시 코인 WebSocket desired set에 반영되도록 유지한다.
 - 크립토 스캔 결과의 `monitoring` 필드는 `null`을 포함할 수 있으므로 `_apply_scan_thresholds()`에서는 `None`/빈값을 float 캐스팅하지 말고 무시해야 한다.
-- SSE: `coin_sse_manager` 독립 인스턴스 (activity_logger 자동 분기)
+- SSE: `coin_sse_manager` 독립 인스턴스 (activity_logger 자동 분기). 코인 admin stream(`/api/v1/admin-coin/stream`)은 `activity`뿐 아니라 `agent_state` 이벤트도 받아 중앙 Agent Monitor를 실시간 갱신한다.
 - 주요 에러: 400 `invalid_parameter`/`invalid_price`, 401 `jwt_verification`/`expired_jwt`/`NotAllowIP`, 422 `order_not_ready`, 500 `server_error`
 - Content-Type: `application/json; charset=utf-8`
 - API 버전: v2.1.0
