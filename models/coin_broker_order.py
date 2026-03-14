@@ -20,6 +20,7 @@ class CoinBrokerOrder(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="SUBMITTED", index=True)
     strategy_type: Mapped[str] = mapped_column(String(30), nullable=False, default="")
     order_type: Mapped[str] = mapped_column(String(10), nullable=False, default="LIMIT")
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="AI")
 
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     requested_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)

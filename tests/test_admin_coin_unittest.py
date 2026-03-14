@@ -8,14 +8,27 @@ from agent.trading_agent._state_mixin import StateMixin
 from agent.trading_agent._types import MarketState
 from api.routes import admin_coin
 from api.routes.admin_coin import (
+    cancel_coin_order,
+    get_coin_order,
     _serialize_recommendation,
     get_coin_activity_feed,
     get_coin_overview,
     get_coin_system_status,
     get_coin_watchlist,
+    place_coin_order,
+    preview_coin_order,
 )
 from realtime.coin_monitor import coin_realtime_monitor
 from scheduler.scheduler import trading_scheduler
+from schemas.coin_order_schema import (
+    CoinOrderCancelResponse,
+    CoinOrderExecutionResponse,
+    CoinOrderPlaceRequest,
+    CoinOrderPreviewRequest,
+    CoinOrderPreviewResponse,
+    CoinOrderStatusResponse,
+)
+from trading.enums import OrderSide, OrderType
 from trading.models import AccountBalance, AccountOverview, HoldingInfo, PendingOrderInfo
 
 
@@ -36,6 +49,83 @@ class _ExecuteResult:
 
 
 class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
+    async def test_preview_coin_order_wraps_service_result(self):
+        preview = CoinOrderPreviewResponse(
+            symbol="BTC",
+            side="BUY",
+            order_type="MARKET",
+            broker_order_type="PRICE",
+            placeable=True,
+        )
+
+        with patch("api.routes.admin_coin.CoinOrderService.preview_order", AsyncMock(return_value=preview)):
+            response = await preview_coin_order(
+                CoinOrderPreviewRequest(
+                    symbol="BTC",
+                    side=OrderSide.BUY,
+                    order_type=OrderType.MARKET,
+                    amount_krw=5000,
+                ),
+                db=AsyncMock(),
+            )
+
+        self.assertEqual(response.data.symbol, "BTC")
+        self.assertEqual(response.message, "코인 주문 미리보기 계산 완료")
+
+    async def test_place_and_cancel_coin_order_wrap_service_result(self):
+        execution = CoinOrderExecutionResponse(
+            order_id="order-1",
+            symbol="BTC",
+            side="BUY",
+            order_type="MARKET",
+            broker_order_type="PRICE",
+            status="SUBMITTED",
+            message="주문이 접수되었습니다",
+            preview=CoinOrderPreviewResponse(
+                symbol="BTC",
+                side="BUY",
+                order_type="MARKET",
+                broker_order_type="PRICE",
+                placeable=True,
+            ),
+        )
+        status = CoinOrderStatusResponse(
+            order_id="order-1",
+            symbol="BTC",
+            side="BUY",
+            order_type="MARKET",
+            broker_order_type="PRICE",
+            status="SUBMITTED",
+        )
+        cancel = CoinOrderCancelResponse(
+            order_id="order-1",
+            status="CANCELED",
+            canceled=True,
+            message="주문이 취소되었습니다",
+        )
+
+        with (
+            patch("api.routes.admin_coin.CoinOrderService.place_order", AsyncMock(return_value=execution)),
+            patch("api.routes.admin_coin.CoinOrderService.get_order_status", AsyncMock(return_value=status)),
+            patch("api.routes.admin_coin.CoinOrderService.cancel_order", AsyncMock(return_value=cancel)),
+        ):
+            place_response = await place_coin_order(
+                CoinOrderPlaceRequest(
+                    symbol="BTC",
+                    side=OrderSide.BUY,
+                    order_type=OrderType.MARKET,
+                    amount_krw=5000,
+                ),
+                db=AsyncMock(),
+            )
+            get_response = await get_coin_order("order-1", db=AsyncMock())
+            cancel_response = await cancel_coin_order("order-1", db=AsyncMock())
+
+        self.assertEqual(place_response.data.order_id, "order-1")
+        self.assertEqual(get_response.data.status, "SUBMITTED")
+        self.assertEqual(cancel_response.data.status, "CANCELED")
+        self.assertEqual(cancel_response.message, "주문이 취소되었습니다")
+
     async def test_serialize_recommendation_exposes_amount_first_fields(self):
         row = SimpleNamespace(
             id="rec-1",

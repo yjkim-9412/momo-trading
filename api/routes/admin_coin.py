@@ -12,16 +12,25 @@ from sqlalchemy import func, select
 
 from admin.sse_manager import SSEManager
 from core.config import settings
-from core.database import get_async_db
+from core.database import get_async_db, get_async_db_with_transaction
 from models.coin_activity_log import CoinActivityLog
 from models.coin_broker_order import CoinBrokerOrder
 from models.coin_recommendation import CoinRecommendation
 from repositories.daily_report_repository import DailyReportRepository
 from scheduler.market_calendar import market_calendar
+from schemas.coin_order_schema import (
+    CoinOrderCancelResponse,
+    CoinOrderExecutionResponse,
+    CoinOrderPlaceRequest,
+    CoinOrderPreviewRequest,
+    CoinOrderPreviewResponse,
+    CoinOrderStatusResponse,
+)
 from schemas.activity_schema import ActivityFeedCursor, ActivityFeedResponse
 from schemas.common import SuccessResponse
 from schemas.daily_report_schema import DailyReportResponse
 from services.activity_logger import activity_logger
+from services.coin_order_service import CoinOrderService
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
 from trading.market_profile import MARKET_SCOPE_CRYPTO
@@ -91,6 +100,51 @@ async def get_coin_pending_orders():
     except Exception as e:
         logger.error("코인 미체결 주문 조회 실패: {}", str(e))
         return SuccessResponse(data=[], message=f"코인 미체결 주문 조회 실패: {str(e)[:100]}")
+
+
+# ── 수동 코인 주문 API ──
+@router.post("/orders/preview", response_model=SuccessResponse[CoinOrderPreviewResponse])
+async def preview_coin_order(
+    request: CoinOrderPreviewRequest,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """코인 수동 주문 미리보기"""
+    service = CoinOrderService(db)
+    preview = await service.preview_order(request)
+    return SuccessResponse(data=preview, message="코인 주문 미리보기 계산 완료")
+
+
+@router.post("/orders", response_model=SuccessResponse[CoinOrderExecutionResponse])
+async def place_coin_order(
+    request: CoinOrderPlaceRequest,
+    db: AsyncSession = Depends(get_async_db_with_transaction),
+):
+    """코인 수동 주문 실행"""
+    service = CoinOrderService(db)
+    result = await service.place_order(request)
+    return SuccessResponse(data=result, message=result.message)
+
+
+@router.get("/orders/{order_id}", response_model=SuccessResponse[CoinOrderStatusResponse])
+async def get_coin_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """코인 단건 주문 상태 조회"""
+    service = CoinOrderService(db)
+    result = await service.get_order_status(order_id)
+    return SuccessResponse(data=result)
+
+
+@router.delete("/orders/{order_id}", response_model=SuccessResponse[CoinOrderCancelResponse])
+async def cancel_coin_order(
+    order_id: str,
+    db: AsyncSession = Depends(get_async_db_with_transaction),
+):
+    """코인 주문 취소"""
+    service = CoinOrderService(db)
+    result = await service.cancel_order(order_id)
+    return SuccessResponse(data=result, message=result.message)
 
 
 # ── 활동 피드 ──

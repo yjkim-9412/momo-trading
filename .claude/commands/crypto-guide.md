@@ -44,6 +44,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 | `agent/scanner_base.py` | MarketScannerProtocol 정의 |
 | `agent/crypto_scanner.py` | 코인 시장 스캐너 (24h 거래대금/등락률 기반, shared prompt 사용, canonical regime 정규화) |
 | `analysis/llm/llm_factory.py` | 코인 scope LLM provider 라우팅 및 Codex 장애 fallback |
+| `services/coin_order_service.py` | 코인 수동 주문 preview/place/get/cancel helper + 브로커 에러 표준화 |
 | `trading/market_profile.py` | `is_crypto_market()`, `MARKET_SCOPE_CRYPTO`, BITHUMB 프로필 |
 | `trading/risk_policy.py` | 코인 canonical regime alias 정규화, shared RR floor 상수 |
 | `core/config.py` | `CRYPTO_*`, `BITHUMB_*` 환경변수 (주식과 완전 독립) |
@@ -78,6 +79,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 | 파일 | 역할 |
 |------|------|
 | `api/routes/admin_coin.py` | `/admin-coin` 전용 API (`/api/v1/admin-coin/*`, `/system/status`, `/agent/state`, 활동/LLM 상세) |
+| `schemas/coin_order_schema.py` | 코인 수동 주문 preview/place/get/cancel 요청·응답 스키마 |
 | `start-coin.sh` | 코인 전용 실행 스크립트 (Docker/MCP 불필요) |
 | `.env.example-coin` | 코인 환경변수 예제 (5만원~적극적 프로필) |
 | `docs/crypto-architecture.md` | Mermaid 다이어그램 6종 |
@@ -149,7 +151,11 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - 코인 DB는 주식 테이블과 완전 분리 (10개 `coin_*` 테이블). FK는 코인 도메인 내부만 참조.
 - 코인 활동 로그 → `CoinActivityLog`, 코인 추천 → `CoinRecommendation`. `admin_coin.py`는 주식 Repository가 아닌 직접 쿼리 사용.
 - `coin_recommendations`는 `suggested_amount_krw`를 저장하고, `coin_broker_orders`는 `order_type`, `requested_amount_krw`를 저장한다.
+- 코인 수동 주문 API는 `/api/v1/admin-coin/orders/preview`, `POST /orders`, `GET /orders/{order_id}`, `DELETE /orders/{order_id}` 로 노출된다.
+- 수동 주문은 `CoinOrderService`가 브로커 계약을 계산한다. BUY는 `amount_krw`, SELL은 `quantity`가 authoritative 하며, preview 응답이 실제 빗썸 payload를 미리 보여준다.
+- `coin_broker_orders`는 `source`를 저장한다. AI 자동주문은 `AI`, admin 수동 주문 API는 `MANUAL_API`를 사용한다.
 - 빗썸 `ord_type="price"` 시장가 매수의 체결가는 `executed_funds / executed_volume`으로 평균 체결단가를 계산한다. REST/WS payload의 `price`를 체결단가로 그대로 신뢰하지 말 것.
+- 코인 수동 주문 API 에러는 `validation`, `funds`, `auth`, `order_state`, `upstream` 으로 표준화하고, `broker_error_code`/`broker_error_message`를 함께 반환한다.
 - 코인 어드민 상태 패널은 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
 - 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`로 WS 감시 상태를 렌더링한다.
 - 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`까지 함께 본다.
