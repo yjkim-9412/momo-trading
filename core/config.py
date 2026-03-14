@@ -69,6 +69,8 @@ class Settings(BaseSettings):
     # === Bithumb API 인증 (주식 KIS와 완전 별도) ===
     BITHUMB_API_KEY: str = ""
     BITHUMB_API_SECRET: str = ""
+    BITHUMB_WS_URL_PUBLIC: str = "wss://ws-api.bithumb.com/websocket/v1"
+    BITHUMB_WS_URL_PRIVATE: str = "wss://ws-api.bithumb.com/websocket/v1/private"
 
     # === Crypto 운영 (주식 TRADING_ENABLED, AUTONOMY_MODE 등과 독립) ===
     CRYPTO_ENABLED: bool = False
@@ -223,6 +225,13 @@ class Settings(BaseSettings):
         from trading.market_profile import is_crypto_market
 
         return any(not is_crypto_market(m) for m in self.enabled_market_groups)
+
+    @property
+    def has_crypto_markets(self) -> bool:
+        """코인 시장이 활성화되어 있는지 확인"""
+        from trading.market_profile import is_crypto_market
+
+        return any(is_crypto_market(m) for m in self.enabled_market_groups)
 
     @property
     def primary_market_code(self) -> str:
