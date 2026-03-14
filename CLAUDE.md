@@ -112,6 +112,23 @@ Mixin 파일은 서로를 임포트하지 않으며, 상호 호출은 `self.*`�
 
 ## 테스트
 
-- 테스트 실행 시 반드시 `.venv` 가상환경의 Python을 사용할 것.
-- 실행: `.venv/bin/python -m pytest tests/ -v`
-- `.venv`가 없으면 `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`로 먼저 생성할 것.
+- 테스트는 항상 저장소 루트(`/mnt/c/Users/KYJ/projects/momo-trading`)에서 실행할 것.
+- **OS/셸에 맞는 가상환경 Python을 직접 호출할 것.** bare `pytest`, `python -m pytest`, `python3 -m pytest` 사용 금지.
+- 이 저장소는 가상환경이 분리돼 있을 수 있다:
+  - WSL / Linux / macOS (bash, zsh): `venv/`
+  - Windows (PowerShell, cmd): `.venv\\Scripts\\`
+- WSL / Linux / macOS 실행:
+  - 전체: `venv/bin/python -m pytest tests/ -v`
+  - 파일: `venv/bin/python -m pytest tests/test_admin_coin_unittest.py -v`
+  - 키워드: `venv/bin/python -m pytest tests/ -k watchlist -v`
+  - 시작 확인: `test -x venv/bin/python && venv/bin/python --version`
+- Windows 실행:
+  - 전체: `.venv\\Scripts\\python.exe -m pytest tests\\ -v`
+  - 파일: `.venv\\Scripts\\python.exe -m pytest tests\\test_admin_coin_unittest.py -v`
+  - 시작 확인: `if exist .venv\\Scripts\\python.exe .venv\\Scripts\\python.exe --version`
+- 가상환경이 없으면 OS에 맞게 생성/복구:
+  - WSL / Linux / macOS: `python3 -m venv venv && venv/bin/pip install -r requirements.txt`
+  - Windows: `py -m venv .venv && .venv\\Scripts\\pip.exe install -r requirements.txt`
+- bash 세션에서는 `.venv/bin/python`을 가정하지 말 것. 이 저장소의 `.venv`는 Windows 레이아웃일 수 있다.
+- Windows 세션에서는 `venv/bin/python`을 사용하지 말 것.
+- 테스트가 실패하면 system Python으로 재시도하지 말고, 먼저 현재 세션이 WSL/Linux/mac인지 Windows인지 확인한 뒤 해당 가상환경 경로를 사용할 것.

@@ -171,7 +171,29 @@ WebSocket → EventDetector → EventBus:
 - Type hints 필수 (Pydantic v2 모델, Protocol 기반 인터페이스)
 - loguru 로깅 (logger.info/warning/error)
 - 테스트: `pytest` + `pytest-asyncio` + `unittest` 혼용, `tests/` 디렉토리
-- 테스트 실행 시 반드시 `.venv` 가상환경 사용: `.venv/bin/python -m pytest tests/ -v`
+
+## 테스트 실행 규칙
+
+- 테스트는 항상 저장소 루트(`/mnt/c/Users/KYJ/projects/momo-trading`)에서 실행할 것.
+- **OS/셸에 맞는 가상환경 Python을 직접 호출할 것.** bare `pytest`, `python -m pytest`, `python3 -m pytest` 사용 금지.
+- 이 저장소는 환경이 분리돼 있을 수 있다:
+  - WSL / Linux / macOS (bash, zsh): `venv/`
+  - Windows (PowerShell, cmd): `.venv\\Scripts\\`
+- WSL / Linux / macOS 실행 규칙:
+  - 기본 전체 실행: `venv/bin/python -m pytest tests/ -v`
+  - 파일 단위 실행: `venv/bin/python -m pytest tests/test_admin_coin_unittest.py -v`
+  - 키워드 실행: `venv/bin/python -m pytest tests/ -k watchlist -v`
+  - 세션 시작 확인: `test -x venv/bin/python && venv/bin/python --version`
+- Windows 실행 규칙:
+  - 기본 전체 실행: `.venv\\Scripts\\python.exe -m pytest tests\\ -v`
+  - 파일 단위 실행: `.venv\\Scripts\\python.exe -m pytest tests\\test_admin_coin_unittest.py -v`
+  - 세션 시작 확인: `if exist .venv\\Scripts\\python.exe .venv\\Scripts\\python.exe --version`
+- 가상환경이 없으면 OS에 맞게 생성/복구:
+  - WSL / Linux / macOS: `python3 -m venv venv && venv/bin/pip install -r requirements.txt`
+  - Windows: `py -m venv .venv && .venv\\Scripts\\pip.exe install -r requirements.txt`
+- bash 세션에서는 `.venv/bin/python`을 가정하지 말 것. 이 저장소의 `.venv`는 Windows 레이아웃일 수 있다.
+- Windows 세션에서는 `venv/bin/python`을 사용하지 말 것.
+- 테스트가 실패해도 system Python으로 재시도하지 말고, 먼저 현재 세션이 어느 OS/셸인지와 해당 가상환경 경로를 확인할 것.
 
 ## 주요 디렉토리
 
