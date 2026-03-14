@@ -66,6 +66,44 @@ class Settings(BaseSettings):
     US_LEVERAGE_KEYWORDS: str = "2X,3X,ULTRA,ULTRAPRO,LEVERAGED"
     US_INVERSE_KEYWORDS: str = "INVERSE,SHORT,BEAR"
 
+    # === Bithumb API 인증 (주식 KIS와 완전 별도) ===
+    BITHUMB_API_KEY: str = ""
+    BITHUMB_API_SECRET: str = ""
+
+    # === Crypto 운영 (주식 TRADING_ENABLED, AUTONOMY_MODE 등과 독립) ===
+    CRYPTO_ENABLED: bool = False
+    CRYPTO_TRADING_ENABLED: bool = False
+    CRYPTO_AUTONOMY_MODE: str = "SEMI_AUTO"  # SEMI_AUTO / AUTONOMOUS
+    CRYPTO_RECOMMENDATION_EXPIRE_MIN: int = 30
+
+    # === Crypto 스캔 ===
+    CRYPTO_SCAN_INTERVAL_HOURS: int = 4
+    CRYPTO_HOLDINGS_CHECK_INTERVAL_HOURS: int = 2
+    CRYPTO_WATCHLIST_SYMBOLS: str = "BTC,ETH,XRP,SOL,ADA,DOGE"
+    CRYPTO_SCAN_LIMIT: int = 15
+
+    # === Crypto 리스크 (주식 리스크 설정과 독립) ===
+    CRYPTO_MAX_POSITION_PCT: float = 20.0
+    CRYPTO_MIN_CASH_RATIO: float = 0.10
+    CRYPTO_MAX_SINGLE_ORDER_KRW: int = 0  # 0 = AI 자율 결정
+    CRYPTO_MAX_DAILY_TRADES: int = 0  # 0 = 무제한
+    CRYPTO_MIN_BUY_QUANTITY: float = 0.0
+
+    # === Crypto LLM (비어있으면 주식 LLM 설정을 그대로 사용) ===
+    CRYPTO_LLM_PROVIDER: str = ""  # CLAUDE_CODE / CODEX_CLI, 비어있으면 LLM_PROVIDER 사용
+    CRYPTO_LLM_MODEL_TIER1_SCAN: str = ""  # 코인 스캔용 모델 (비어있으면 주식 Tier1 모델)
+    CRYPTO_LLM_MODEL_TIER1_ANALYSIS: str = ""  # 코인 분석용 모델 (비어있으면 스캔 모델 → 주식 모델)
+    CRYPTO_LLM_MODEL_TIER2: str = ""  # 코인 최종검토 모델
+    # Claude Code effort (비어있으면 주식 기본값: TIER1=medium, TIER2=high)
+    CRYPTO_CLAUDE_EFFORT_TIER1_SCAN: str = ""  # 코인 스캔 effort
+    CRYPTO_CLAUDE_EFFORT_TIER1_ANALYSIS: str = ""  # 코인 분석 effort
+    CRYPTO_CLAUDE_EFFORT_TIER2: str = ""  # 코인 최종검토 effort
+    # Codex CLI 설정
+    CRYPTO_CODEX_MODEL: str = ""  # 코인 전용 Codex 모델, 비어있으면 CODEX_MODEL 사용
+    CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN: str = ""  # 코인 스캔 추론 강도
+    CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS: str = ""  # 코인 분석 추론 강도
+    CRYPTO_CODEX_REASONING_EFFORT_TIER2: str = ""  # 코인 최종검토 추론 강도
+
     # === AI / LLM ===
     LLM_PROVIDER: str = LLMProvider.CLAUDE_CODE.value
 
@@ -156,15 +194,22 @@ class Settings(BaseSettings):
 
     @property
     def enabled_market_groups(self) -> list[str]:
-        """스케줄링용 시장 그룹 목록 (US → NASDAQ 대표)"""
-        from trading.market_profile import is_us_market, normalize_market
+        """스케줄링용 시장 그룹 목록 (US → NASDAQ 대표, CRYPTO → BITHUMB)"""
+        from trading.market_profile import is_crypto_market, is_us_market, normalize_market
 
         raw = self._parse_csv(self.ENABLED_MARKETS) or [self.PRIMARY_MARKET]
+        # CRYPTO_ENABLED이면 CRYPTO도 시장 그룹에 포함
+        if self.CRYPTO_ENABLED and not any(
+            s.upper() in {"CRYPTO", "BITHUMB", "BTH", "COIN"} for s in raw
+        ):
+            raw.append("CRYPTO")
         seen: list[str] = []
         for m in raw:
             norm = normalize_market(m)
-            # US 계열은 대표 마켓(NASDAQ)으로 통합
-            if is_us_market(norm):
+            if is_crypto_market(norm):
+                if not any(is_crypto_market(s) for s in seen):
+                    seen.append(norm)
+            elif is_us_market(norm):
                 if not any(is_us_market(s) for s in seen):
                     seen.append(norm)
             elif norm not in seen:
@@ -185,19 +230,31 @@ class Settings(BaseSettings):
 
     def scan_markets_for(self, market: str) -> list[str]:
         """지정 시장의 스캔 대상 목록"""
-        from trading.market_profile import expand_scan_markets, is_us_market, normalize_market
+        from trading.market_profile import (
+            expand_scan_markets, is_crypto_market, is_us_market, normalize_market,
+        )
 
         m = normalize_market(market)
+        if is_crypto_market(m):
+            return [m]
         if is_us_market(m):
             items = self._parse_csv(self.US_SCAN_MARKETS)
             return expand_scan_markets(items)
         return [m]
 
     def get_market_config(self, market: str) -> dict:
-        """시장별 매수마감/강제청산 시간 설정 반환"""
-        from trading.market_profile import is_us_market, normalize_market
+        """시장별 매수마감/강제청산 시간 설정 반환 (크립토는 24/7 → 제한 없음)"""
+        from trading.market_profile import is_crypto_market, is_us_market, normalize_market
 
-        if is_us_market(normalize_market(market)):
+        norm = normalize_market(market)
+        if is_crypto_market(norm):
+            return {
+                "buy_cutoff_hour": None,
+                "buy_cutoff_minute": None,
+                "force_liquidation_hour": None,
+                "force_liquidation_minute": None,
+            }
+        if is_us_market(norm):
             return {
                 "buy_cutoff_hour": self.US_BUY_CUTOFF_HOUR,
                 "buy_cutoff_minute": self.US_BUY_CUTOFF_MINUTE,
@@ -210,6 +267,85 @@ class Settings(BaseSettings):
             "force_liquidation_hour": self.FORCE_LIQUIDATION_HOUR,
             "force_liquidation_minute": self.FORCE_LIQUIDATION_MINUTE,
         }
+
+    @property
+    def crypto_watchlist_symbols(self) -> list[str]:
+        """크립토 스캔용 감시 코인 목록"""
+        return self._parse_csv(self.CRYPTO_WATCHLIST_SYMBOLS, upper=True)[: self.CRYPTO_SCAN_LIMIT]
+
+    @property
+    def crypto_llm_provider(self) -> LLMProvider:
+        """코인 전용 LLM provider (비어있으면 주식 설정 사용)"""
+        raw = (self.CRYPTO_LLM_PROVIDER or "").strip().upper()
+        if not raw:
+            return self.llm_provider
+        try:
+            return LLMProvider(raw)
+        except ValueError:
+            logger.warning("알 수 없는 CRYPTO_LLM_PROVIDER={} → 주식 설정 사용", raw)
+            return self.llm_provider
+
+    def get_crypto_llm_model(
+        self,
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str:
+        """크립토 전용 LLM 모델 반환 (SCAN/ANALYSIS 프로필 분리, 비어있으면 주식 설정)"""
+        provider = self.crypto_llm_provider
+        if tier == LLMTier.TIER1:
+            if profile == Tier1Profile.SCAN:
+                return (
+                    self.CRYPTO_LLM_MODEL_TIER1_SCAN
+                    or self.CRYPTO_LLM_MODEL_TIER1_ANALYSIS
+                    or self.get_llm_model(provider, tier)
+                )
+            # ANALYSIS 또는 None
+            return (
+                self.CRYPTO_LLM_MODEL_TIER1_ANALYSIS
+                or self.CRYPTO_LLM_MODEL_TIER1_SCAN
+                or self.get_llm_model(provider, tier)
+            )
+        return self.CRYPTO_LLM_MODEL_TIER2 or self.get_llm_model(provider, tier)
+
+    def get_crypto_codex_model(self) -> str:
+        """코인 전용 Codex 모델 (비어있으면 주식 CODEX_MODEL 사용)"""
+        return self.CRYPTO_CODEX_MODEL or self.CODEX_MODEL
+
+    def get_crypto_llm_reasoning_effort(
+        self,
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str | None:
+        """코인 전용 추론 강도 (Claude/Codex 모두 지원, 비어있으면 주식 설정)"""
+        provider = self.crypto_llm_provider
+
+        if provider == LLMProvider.CLAUDE_CODE:
+            # Claude Code: 코인 전용 effort → 주식 기본값 (medium/high) 폴백
+            if tier == LLMTier.TIER1:
+                if profile == Tier1Profile.SCAN:
+                    raw = self.CRYPTO_CLAUDE_EFFORT_TIER1_SCAN
+                else:
+                    raw = self.CRYPTO_CLAUDE_EFFORT_TIER1_ANALYSIS
+                default = "medium"
+            else:
+                raw = self.CRYPTO_CLAUDE_EFFORT_TIER2
+                default = "high"
+            normalized = (raw or "").strip().lower()
+            return normalized if normalized else default
+
+        # Codex CLI: 코인 전용 → 주식 설정 폴백
+        if tier == LLMTier.TIER1:
+            if profile == Tier1Profile.SCAN:
+                raw = self.CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN
+            else:
+                raw = self.CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS
+        else:
+            raw = self.CRYPTO_CODEX_REASONING_EFFORT_TIER2
+
+        normalized = (raw or "").strip().lower()
+        if normalized and normalized in VALID_CODEX_REASONING_EFFORTS:
+            return normalized
+        return self.get_llm_reasoning_effort(provider, tier, profile)
 
     @property
     def us_watchlist_symbols(self) -> list[str]:
