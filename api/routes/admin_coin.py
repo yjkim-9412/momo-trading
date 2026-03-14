@@ -333,6 +333,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
     from realtime.coin_monitor import coin_realtime_monitor
     from realtime.coin_stream_manager import coin_stream_manager
     from scheduler.scheduler import trading_scheduler
+    from trading.bithumb_client import bithumb_client
 
     crypto_market = _crypto_market_code()
     session_schedule = market_calendar.get_session_schedule(market=crypto_market)
@@ -353,6 +354,10 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         )
     )
     uptime_seconds = max(0, int((now_kst() - APP_STARTED_AT).total_seconds()))
+    discovery_cache = {
+        "enabled": bool(settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED),
+        **bithumb_client.get_discovery_cache_status(),
+    }
 
     return SuccessResponse(data={
         "crypto_enabled": settings.CRYPTO_ENABLED,
@@ -377,6 +382,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "scan_interval_hours": settings.CRYPTO_SCAN_INTERVAL_HOURS,
         "watchlist_symbols": settings.crypto_watchlist_symbols,
         "watchlist_count": len(watchlist),
+        "discovery_cache": discovery_cache,
         "coin_sse_clients": coin_sse_manager.client_count,
         "sse_clients": coin_sse_manager.client_count,
         "app_started_at": APP_STARTED_AT.isoformat(),

@@ -64,9 +64,9 @@ class CryptoScanner:
     ) -> dict[str, Any]:
         """코인 시장 스캔 + AI 종목 선별
 
-        1. 빗썸 전체 overview 조회
-        2. discovery 후보(거래대금/상승률/하락률) 계산
-        3. CRYPTO_WATCHLIST_SYMBOLS 시드 병합
+        1. discovery universe 캐시 조회/갱신
+        2. cached universe + watchlist 심볼 selective ticker 조회
+        3. discovery 후보(거래대금/상승률/하락률) 계산
         4. _untradeable 필터링
         5. 성과 데이터 로드 (PerformanceTracker)
         6. LLM 스캔 프롬프트로 후보 선별
@@ -92,6 +92,8 @@ class CryptoScanner:
 
         logger.info("크립토 시장 스캔 시작: {}", target)
         timer = activity_logger.timer()
+        discovery_enabled = bool(settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED)
+        watchlist = settings.crypto_watchlist_symbols
 
         await activity_logger.log(
             ActivityType.SCAN, ActivityPhase.START,
@@ -119,38 +121,28 @@ class CryptoScanner:
         if account_snapshot is None:
             (
                 account_snapshot,
-                overview_data,
                 performance_summary,
             ) = await asyncio.gather(
                 account_manager.get_account_snapshot(target),
-                _safe_call(bithumb_client.get_market_overview),
                 self._get_performance_summary(target),
             )
         else:
-            (
-                overview_data,
-                performance_summary,
-            ) = await asyncio.gather(
-                _safe_call(bithumb_client.get_market_overview),
-                self._get_performance_summary(target),
-            )
-        if overview_data is None:
-            overview_data = MCPResponse(success=False, error="market overview unavailable")
+            performance_summary = await self._get_performance_summary(target)
 
-        volume_rank_data, surge_data = await asyncio.gather(
-            _safe_call(
-                bithumb_client.get_volume_rank,
-                market=target,
-                overview_data=overview_data,
-                limit=settings.CRYPTO_SCAN_LIMIT,
-            ),
-            _safe_call(
-                bithumb_client.get_surge_data,
-                market=target,
-                overview_data=overview_data,
-                limit=settings.CRYPTO_SCAN_LIMIT,
-            ),
+        discovery_data = MCPResponse(
+            success=True,
+            data={"items": [], "count": 0, "cache_source": "disabled"},
         )
+        if discovery_enabled:
+            discovery_data = await _safe_call(
+                bithumb_client.get_discovery_universe,
+                market=target,
+            )
+            if discovery_data is None:
+                discovery_data = MCPResponse(
+                    success=False,
+                    error="discovery universe unavailable",
+                )
 
         balance, holdings = account_snapshot
         available_cash = balance.effective_cash
@@ -163,31 +155,112 @@ class CryptoScanner:
         logger.info("크립토 데이터 수집 완료: {}ms", data_elapsed)
 
         # --- 2. 데이터 정리: discovery + watchlist 하이브리드 ---
-        discovery_enabled = bool(settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED)
-        watchlist = settings.crypto_watchlist_symbols
-        overview_all_coins = self._extract_coins(overview_data, limit=10_000)
+        discovery_cache_source = "disabled"
+        if hasattr(discovery_data, "data") and isinstance(discovery_data.data, dict):
+            discovery_cache_source = str(
+                discovery_data.data.get("cache_source") or "disabled"
+            ).lower()
+        elif discovery_enabled:
+            discovery_cache_source = "error"
+
+        discovery_universe = [
+            self._normalize_scan_candidate(item, scan_source="DISCOVERY")
+            for item in self._extract_coins(
+                discovery_data,
+                limit=max(1, int(settings.CRYPTO_DISCOVERY_UNIVERSE_SIZE or 30)),
+            )
+        ]
+        selective_symbols = self._build_selective_scan_symbols(
+            discovery_universe,
+            watchlist=watchlist,
+        )
+        overview_data = MCPResponse(success=True, data={"items": [], "count": 0})
+        if selective_symbols:
+            overview_data = await _safe_call(
+                bithumb_client.get_ticker_snapshots,
+                selective_symbols,
+                market=target,
+            )
+            if overview_data is None:
+                overview_data = MCPResponse(
+                    success=False,
+                    error="selective ticker unavailable",
+                )
+
+        overview_all_coins = [
+            self._normalize_scan_candidate(item, scan_source="DISCOVERY")
+            for item in self._extract_coins(overview_data, limit=10_000)
+        ]
+        if not overview_all_coins and discovery_universe:
+            watchlist_seed_coins = await self._build_watchlist_fallback_coins(
+                bithumb_client,
+                watchlist=watchlist,
+                holdings=[],
+                watchlist_scan_source="WATCHLIST",
+                include_holdings=False,
+            )
+            overview_all_coins = self._merge_unique_candidates(
+                discovery_universe,
+                watchlist_seed_coins,
+                limit=max(
+                    len(discovery_universe) + len(watchlist_seed_coins),
+                    settings.CRYPTO_SCAN_LIMIT * 3,
+                ),
+            )
+            if overview_all_coins:
+                logger.warning(
+                    "크립토 selective ticker 조회 실패 → discovery cache 기반 스캔 사용: {}개",
+                    len(overview_all_coins),
+                )
         if not overview_all_coins:
             overview_all_coins = await self._build_watchlist_fallback_coins(
                 bithumb_client,
-                watchlist=settings.crypto_watchlist_symbols,
+                watchlist=watchlist,
                 holdings=holdings,
             )
             if overview_all_coins:
                 logger.warning(
-                    "크립토 overview 조회 실패 → watchlist/보유 코인 기반 degraded 스캔 사용: {}개",
+                    "크립토 discovery/selective 조회 실패 → watchlist/보유 코인 기반 degraded 스캔 사용: {}개",
                     len(overview_all_coins),
                 )
 
-        fallback_only = bool(overview_all_coins and str(overview_all_coins[0].get("scan_source", "")).endswith("_FALLBACK"))
-        normalized_overview = (
-            list(overview_all_coins)
-            if fallback_only
-            else [self._normalize_scan_candidate(item, scan_source="DISCOVERY") for item in overview_all_coins]
+        fallback_only = bool(overview_all_coins) and all(
+            str(item.get("scan_source", "")).upper().endswith("_FALLBACK")
+            for item in overview_all_coins
+        )
+        normalized_overview = [
+            self._normalize_scan_candidate(
+                item,
+                scan_source=str(item.get("scan_source") or "DISCOVERY"),
+            )
+            for item in overview_all_coins
+        ]
+        overview_snapshot = MCPResponse(
+            success=True,
+            data={
+                "items": normalized_overview,
+                "count": len(normalized_overview),
+                "cache_source": discovery_cache_source,
+            },
         )
 
         volume_discovery = []
         surge_discovery = []
         drop_discovery = []
+        volume_rank_data, surge_data = await asyncio.gather(
+            _safe_call(
+                bithumb_client.get_volume_rank,
+                market=target,
+                overview_data=overview_snapshot,
+                limit=settings.CRYPTO_SCAN_LIMIT,
+            ),
+            _safe_call(
+                bithumb_client.get_surge_data,
+                market=target,
+                overview_data=overview_snapshot,
+                limit=settings.CRYPTO_SCAN_LIMIT,
+            ),
+        )
         if discovery_enabled and normalized_overview and not fallback_only:
             volume_discovery = [
                 self._normalize_scan_candidate(item, scan_source="DISCOVERY")
@@ -259,6 +332,8 @@ class CryptoScanner:
             overview_error = ""
             if hasattr(overview_data, "error"):
                 overview_error = str(overview_data.error or "")
+            if not overview_error and hasattr(discovery_data, "error"):
+                overview_error = str(discovery_data.error or "")
             logger.error("크립토 스캔 시장 데이터 부족: {}", overview_error or "overview/보조 입력 모두 비어있음")
             await activity_logger.log(
                 ActivityType.SCAN,
@@ -268,9 +343,10 @@ class CryptoScanner:
                 detail={
                     "reason": "market_data_unavailable",
                     "overview_error": overview_error,
-                    "watchlist_size": len(settings.crypto_watchlist_symbols),
+                    "watchlist_size": len(watchlist),
                     "holding_count": len(holdings),
                     "discovery_enabled": discovery_enabled,
+                    "discovery_cache_source": discovery_cache_source,
                 },
                 execution_time_ms=data_elapsed,
             )
@@ -366,6 +442,7 @@ class CryptoScanner:
                     "discovery_enabled": discovery_enabled,
                     "discovery_count": len([c for c in candidate_pool if c.get("scan_source") == "DISCOVERY"]),
                     "watchlist_count": len([c for c in candidate_pool if c.get("scan_source") != "DISCOVERY"]),
+                    "discovery_cache_source": discovery_cache_source,
                     "market_regime": market_regime,
                     "market_analysis": market_analysis,
                     "available_cash": available_cash,
@@ -387,6 +464,7 @@ class CryptoScanner:
                 "provider": provider,
                 "scan_source": "crypto_overview",
                 "selected_count_by_source": selected_count_by_source,
+                "discovery_cache_source": discovery_cache_source,
             }
         except Exception as e:
             elapsed = activity_logger.elapsed_ms(timer)
@@ -586,6 +664,28 @@ class CryptoScanner:
         return counts
 
     @staticmethod
+    def _build_selective_scan_symbols(
+        discovery_coins: list[dict[str, Any]],
+        *,
+        watchlist: list[str],
+    ) -> list[str]:
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for coin in discovery_coins:
+            symbol = str(coin.get("symbol", "")).upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            symbols.append(symbol)
+        for symbol in watchlist:
+            sym = str(symbol or "").upper()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            symbols.append(sym)
+        return symbols
+
+    @staticmethod
     def _enrich_selected_candidates(
         selected: list[dict[str, Any]],
         *,
@@ -642,24 +742,28 @@ class CryptoScanner:
         *,
         watchlist: list[str],
         holdings: list[Any],
+        watchlist_scan_source: str = "WATCHLIST_FALLBACK",
+        holding_scan_source: str = "HOLDING_FALLBACK",
+        include_holdings: bool = True,
     ) -> list[dict]:
         """overview 실패 시 watchlist/보유 코인 현재가로 최소 스캔 입력 구성"""
         fallback_items: list[tuple[str, str]] = []
         seen: set[str] = set()
-        for holding in holdings:
-            symbol = ""
-            if isinstance(holding, dict):
-                symbol = str(holding.get("symbol", "") or "").upper()
-            else:
-                symbol = str(getattr(holding, "symbol", "") or "").upper()
-            if symbol and symbol not in seen:
-                seen.add(symbol)
-                fallback_items.append((symbol, "HOLDING_FALLBACK"))
+        if include_holdings:
+            for holding in holdings:
+                symbol = ""
+                if isinstance(holding, dict):
+                    symbol = str(holding.get("symbol", "") or "").upper()
+                else:
+                    symbol = str(getattr(holding, "symbol", "") or "").upper()
+                if symbol and symbol not in seen:
+                    seen.add(symbol)
+                    fallback_items.append((symbol, holding_scan_source))
         for symbol in watchlist:
             sym = str(symbol or "").upper()
             if sym and sym not in seen:
                 seen.add(sym)
-                fallback_items.append((sym, "WATCHLIST_FALLBACK"))
+                fallback_items.append((sym, watchlist_scan_source))
         if not fallback_items:
             return []
 
