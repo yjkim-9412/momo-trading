@@ -1,5 +1,7 @@
 import asyncio
 import unittest
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from core.config import settings
@@ -222,6 +224,9 @@ def test_get_account_overview_uses_sequential_snapshot_then_orders():
     overview, calls = asyncio.run(scenario())
 
     assert calls == [("snapshot", "NASDAQ"), ("orders", "NASDAQ")]
+    assert overview.balance.total_asset == 1000
+    assert overview.holdings[0].symbol == "NVDA"
+    assert overview.pending_orders[0].order_id == "A1"
 
 
 def test_parse_pending_orders_reads_overseas_fill_fields():
@@ -252,9 +257,83 @@ def test_parse_pending_orders_reads_overseas_fill_fields():
     assert orders[0].filled_qty == 250
     assert orders[0].remaining_qty == 750
     assert orders[0].exchange_rate_to_krw == 1450.0
-    assert overview.balance.total_asset == 1000
-    assert overview.holdings[0].symbol == "NVDA"
-    assert overview.pending_orders[0].order_id == "A1"
+
+
+def test_get_pending_orders_reads_crypto_broker_ledger():
+    class _ScalarResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _ExecuteResult:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return _ScalarResult(self._rows)
+
+    class _SessionContext:
+        def __init__(self, session):
+            self._session = session
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def scenario():
+        manager = AccountManager()
+        now = datetime(2026, 3, 14, 12, 0, tzinfo=timezone.utc)
+        rows = [
+            SimpleNamespace(
+                bithumb_order_id="order-2",
+                symbol="ETH",
+                coin_name="이더리움",
+                side="SELL",
+                quantity=2.0,
+                filled_quantity=0.5,
+                requested_price=4200000.0,
+                currency="KRW",
+                status="PARTIAL",
+                status_detail="partial fill",
+                submitted_at=now,
+                updated_at=now,
+                created_at=now,
+            ),
+            SimpleNamespace(
+                bithumb_order_id="order-1",
+                symbol="BTC",
+                coin_name="비트코인",
+                side="BUY",
+                quantity=1.0,
+                filled_quantity=0.0,
+                requested_price=150000000.0,
+                currency="KRW",
+                status="SUBMITTED",
+                status_detail="submitted",
+                submitted_at=now,
+                updated_at=None,
+                created_at=now.replace(hour=11),
+            ),
+        ]
+        session = AsyncMock()
+        session.execute.return_value = _ExecuteResult(rows)
+
+        with patch("trading.account_manager.AsyncSessionLocal", return_value=_SessionContext(session)):
+            return await manager.get_pending_orders("BITHUMB")
+
+    orders = asyncio.run(scenario())
+
+    assert [order.order_id for order in orders] == ["order-2", "order-1"]
+    assert orders[0].side == "매도"
+    assert orders[0].remaining_qty == 1.5
+    assert orders[0].status == "PARTIAL"
+    assert orders[1].side == "매수"
+    assert orders[1].remaining_qty == 1.0
+    assert orders[1].submitted_at is not None
 
 
 def test_get_account_snapshot_deduplicates_concurrent_intraday_requests():

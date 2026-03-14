@@ -5,8 +5,11 @@ import asyncio
 import time
 
 from loguru import logger
+from sqlalchemy import select
 
 from core.config import settings
+from core.database import AsyncSessionLocal
+from models.coin_broker_order import CoinBrokerOrder
 from scheduler.market_calendar import market_calendar
 from trading.mcp_client import mcp_client
 from trading.market_profile import is_crypto_market, is_us_market, market_currency, normalize_market
@@ -17,6 +20,8 @@ _INTRADAY_SNAPSHOT_TTL_SECONDS = 2.0
 
 class AccountManager:
     """계좌 관리 (MCP/REST 통신)"""
+
+    _CRYPTO_OPEN_ORDER_STATUSES = {"PENDING", "SUBMITTED", "OPEN", "PARTIAL"}
 
     def __init__(self):
         self._balance_cache: dict[str, AccountBalance] = {}
@@ -256,6 +261,7 @@ class AccountManager:
                 total_asset=total_asset,
                 cash=cash,
                 stock_value=stock_value,
+                locked_krw=0.0,
                 total_pnl=total_pnl,
                 total_pnl_rate=total_pnl_rate,
                 raw_total_pnl=raw_total_pnl,
@@ -274,6 +280,7 @@ class AccountManager:
         cash = self._to_float(data.get("cash", 0))
         total_asset = self._to_float(data.get("total_asset", 0))
         stock_value = self._to_float(data.get("stock_value", 0))
+        locked_krw = self._to_float(data.get("locked_krw", 0))
         effective_cash, cash_source = self._resolve_effective_cash(
             normalized_market,
             cash,
@@ -299,6 +306,7 @@ class AccountManager:
             total_asset=total_asset,
             cash=cash,
             stock_value=stock_value,
+            locked_krw=locked_krw,
             total_pnl=total_pnl,
             total_pnl_rate=total_pnl_rate,
             raw_total_pnl=raw_total_pnl,
@@ -425,8 +433,67 @@ class AccountManager:
                 ),
                 order_time=self._first_value(item, "order_time", "ord_tmd", "thco_ord_tmd") or "",
                 exchange_rate_to_krw=self._to_float(item.get("exchange_rate_to_krw", data.get("exchange_rate_to_krw", 1.0)), 1.0),
+                status=str(item.get("status") or ""),
+                status_detail=str(item.get("status_detail") or ""),
+                submitted_at=str(item.get("submitted_at") or "") or None,
+                updated_at=str(item.get("updated_at") or "") or None,
             ))
         return orders
+
+    @staticmethod
+    def _coin_order_side_label(side: str) -> str:
+        return "매수" if str(side or "").upper() == "BUY" else "매도"
+
+    async def _fetch_crypto_pending_orders(self, market_code: str) -> list[PendingOrderInfo]:
+        """코인 미체결 주문을 coin_broker_orders 원장에서 조회한다."""
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(CoinBrokerOrder).where(
+                        CoinBrokerOrder.status.in_(self._CRYPTO_OPEN_ORDER_STATUSES)
+                    )
+                )
+            ).scalars().all()
+
+        ordered_rows = sorted(
+            rows,
+            key=lambda row: row.updated_at or row.created_at,
+            reverse=True,
+        )
+        pending_orders: list[PendingOrderInfo] = []
+        for row in ordered_rows:
+            remaining_qty = max(
+                self._to_float(row.quantity) - self._to_float(row.filled_quantity),
+                0.0,
+            )
+            if remaining_qty <= 0:
+                continue
+
+            submitted_at = row.submitted_at or row.created_at
+            updated_at = row.updated_at or row.created_at
+            pending_orders.append(
+                PendingOrderInfo(
+                    order_id=row.bithumb_order_id,
+                    symbol=row.symbol,
+                    name=row.coin_name or row.symbol,
+                    market=market_code,
+                    currency=row.currency or "KRW",
+                    side=self._coin_order_side_label(row.side),
+                    order_qty=self._to_float(row.quantity),
+                    filled_qty=self._to_float(row.filled_quantity),
+                    remaining_qty=remaining_qty,
+                    order_price=self._to_float(row.requested_price),
+                    order_time=submitted_at.strftime("%H%M%S") if submitted_at else "",
+                    exchange_rate_to_krw=1.0,
+                    status=str(row.status or ""),
+                    status_detail=str(row.status_detail or ""),
+                    submitted_at=submitted_at.isoformat() if submitted_at else None,
+                    updated_at=updated_at.isoformat() if updated_at else None,
+                )
+            )
+
+        self._pending_orders_cache[market_code] = pending_orders
+        return pending_orders
 
     def _has_fresh_snapshot_cache(self, market: str, now: float | None = None) -> bool:
         cached_balance = self._balance_cache.get(market)
@@ -567,6 +634,9 @@ class AccountManager:
     async def get_pending_orders(self, market: str | None = None) -> list[PendingOrderInfo]:
         """미체결 주문 목록 조회"""
         market_code = normalize_market(market or settings.primary_market_code)
+        if is_crypto_market(market_code):
+            return await self._fetch_crypto_pending_orders(market_code)
+
         if not market_calendar.is_trading_hours(market_code):
             if market_code in self._pending_orders_cache:
                 logger.debug("장외 시간 → 미체결 주문 캐시 반환")

@@ -41,6 +41,7 @@ def _serialize_balance(balance: AccountBalance) -> dict[str, object]:
         "effective_cash": balance.effective_cash,
         "cash_source": balance.cash_source,
         "stock_value": balance.stock_value,
+        "locked_krw": balance.locked_krw,
         "total_pnl": balance.total_pnl,
         "total_pnl_rate": balance.total_pnl_rate,
         "raw_total_pnl": balance.raw_total_pnl,
@@ -86,6 +87,11 @@ def _serialize_pending_orders(orders: list[PendingOrderInfo]) -> list[dict[str, 
             "remaining_qty": o.remaining_qty,
             "order_price": o.order_price,
             "order_time": o.order_time,
+            "exchange_rate_to_krw": o.exchange_rate_to_krw,
+            "status": o.status,
+            "status_detail": o.status_detail,
+            "submitted_at": o.submitted_at,
+            "updated_at": o.updated_at,
         }
         for o in orders
     ]

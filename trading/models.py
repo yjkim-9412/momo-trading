@@ -70,6 +70,7 @@ class AccountBalance(BaseModel):
     total_asset: float
     cash: float
     stock_value: float
+    locked_krw: float = 0.0
     total_pnl: float
     total_pnl_rate: float
     raw_total_pnl: float = 0.0
@@ -113,6 +114,10 @@ class PendingOrderInfo(BaseModel):
     order_price: float      # 주문단가
     order_time: str         # 주문시각
     exchange_rate_to_krw: float = 1.0
+    status: str = ""
+    status_detail: str = ""
+    submitted_at: str | None = None
+    updated_at: str | None = None
 
 
 class AccountOverview(BaseModel):

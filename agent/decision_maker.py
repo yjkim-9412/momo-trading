@@ -365,7 +365,61 @@ class DecisionMaker:
             }
         return None
 
-    async def sync_coin_ws_order(self, order_data: dict | None) -> None:
+    @staticmethod
+    def _coin_ws_activity_phase(status: str) -> ActivityPhase:
+        if status == "FILLED":
+            return ActivityPhase.COMPLETE
+        if status == "CANCELED":
+            return ActivityPhase.SKIP
+        return ActivityPhase.PROGRESS
+
+    @staticmethod
+    def _coin_ws_status_label(status: str) -> str:
+        labels = {
+            "SUBMITTED": "주문 접수",
+            "OPEN": "주문 대기",
+            "PARTIAL": "부분 체결",
+            "FILLED": "체결 완료",
+            "CANCELED": "주문 취소",
+        }
+        return labels.get(status, status or "상태 변경")
+
+    @staticmethod
+    def _coin_ws_side_label(side: str) -> str:
+        return "매수" if str(side or "").upper() == "BUY" else "매도"
+
+    async def _log_coin_ws_order_activity(
+        self,
+        *,
+        cycle_id: str | None,
+        symbol: str,
+        side: str,
+        status: str,
+        quantity: float,
+        filled_qty: float,
+        detail: dict,
+    ) -> None:
+        """코인 주문 상태 변경을 activity feed에 남긴다."""
+        remaining_qty = max(quantity - filled_qty, 0.0)
+        phase = self._coin_ws_activity_phase(status)
+        side_label = self._coin_ws_side_label(side)
+        summary = f"[{symbol}] {side_label} {self._coin_ws_status_label(status)}"
+        if status in {"PARTIAL", "FILLED"}:
+            summary += f" ({self._quantity_text(filled_qty, 'BITHUMB')} / {self._quantity_text(quantity, 'BITHUMB')})"
+        elif status in {"SUBMITTED", "OPEN"}:
+            summary += f" (미체결 {self._quantity_text(remaining_qty, 'BITHUMB')})"
+
+        await activity_logger.log(
+            ActivityType.ORDER,
+            phase,
+            summary,
+            cycle_id=cycle_id,
+            symbol=symbol,
+            detail=detail,
+            market_scope=normalize_market_scope("BITHUMB"),
+        )
+
+    async def sync_coin_ws_order(self, order_data: dict | None) -> dict | None:
         """Private MyOrder 수신 시 coin broker ledger를 즉시 동기화."""
         payload = order_data or {}
         order_id = str(payload.get("order_id") or "").strip()
@@ -375,7 +429,7 @@ class DecisionMaker:
             default=settings.crypto_primary_market_code,
         )
         if not order_id or not symbol or not is_crypto_market(market_code):
-            return
+            return None
 
         existing = await self._load_broker_order(order_id, market_code)
         prev_status = str(getattr(existing, "status", "") or "")
@@ -387,7 +441,7 @@ class DecisionMaker:
             market_code,
         )
         if quantity <= 0:
-            return
+            return None
 
         filled_qty = self._order_quantity(
             payload.get("filled_qty") or payload.get("filled_quantity"),
@@ -395,14 +449,15 @@ class DecisionMaker:
         )
         filled_price = float(payload.get("filled_price") or payload.get("order_price") or 0.0)
         detail_text = json.dumps(payload, ensure_ascii=False, default=str)
+        side = str(payload.get("side") or getattr(existing, "side", "") or "").upper()
 
-        await self._upsert_broker_order(
+        record = await self._upsert_broker_order(
             cycle_id=getattr(existing, "cycle_id", None),
             order_id=order_id,
             symbol=symbol,
             stock_name=str(payload.get("name") or getattr(existing, "coin_name", "") or symbol),
             market=market_code,
-            side=str(payload.get("side") or getattr(existing, "side", "") or "").upper(),
+            side=side,
             status=status,
             quantity=quantity,
             requested_price=float(payload.get("order_price") or getattr(existing, "requested_price", 0.0) or 0.0),
@@ -419,18 +474,37 @@ class DecisionMaker:
             filled_at=payload.get("filled_at") if status in {"FILLED", "PARTIAL"} else None,
         )
 
-        if status != prev_status or filled_qty > prev_filled_qty:
-            from trading.account_manager import account_manager
+        if status == prev_status and filled_qty <= prev_filled_qty:
+            return None
 
-            account_manager.invalidate_cache()
-            logger.info(
-                "[CoinWS] 주문 상태 동기화: {} {} {} → {} (filled={})",
-                symbol,
-                order_id,
-                prev_status or "NEW",
-                status,
-                self._quantity_text(filled_qty, market_code),
-            )
+        from trading.account_manager import account_manager
+
+        account_manager.invalidate_cache()
+        logger.info(
+            "[CoinWS] 주문 상태 동기화: {} {} {} → {} (filled={})",
+            symbol,
+            order_id,
+            prev_status or "NEW",
+            status,
+            self._quantity_text(filled_qty, market_code),
+        )
+        await self._log_coin_ws_order_activity(
+            cycle_id=getattr(record, "cycle_id", None) if record is not None else getattr(existing, "cycle_id", None),
+            symbol=symbol,
+            side=side,
+            status=status,
+            quantity=quantity,
+            filled_qty=filled_qty,
+            detail=payload,
+        )
+        return {
+            "reason": "order_update",
+            "symbol": symbol,
+            "order_id": order_id,
+            "status": status,
+            "filled_qty": filled_qty,
+            "remaining_qty": max(quantity - filled_qty, 0.0),
+        }
 
     @staticmethod
     def _extract_broker_order_payload(activity: AgentActivityLog) -> dict | None:

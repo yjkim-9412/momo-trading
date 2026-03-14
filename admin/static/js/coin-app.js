@@ -24,6 +24,8 @@ let monitorExpanded = true;
 let monitorUpdateTimer = null;
 let monitorElapsedTimer = null;
 let titleFlashInterval = null;
+let accountRefreshTimer = null;
+const metricDeltaTimers = {};
 
 function createFeedState() {
   return {
@@ -947,8 +949,7 @@ function connectSSE() {
       }
 
       if (msg.type === 'account_changed') {
-        loadBalance();
-        loadWatchlist();
+        scheduleAccountOverviewRefresh();
       }
     } catch (err) {
       console.error('[coin-sse] parse error', err);
@@ -1671,6 +1672,7 @@ async function loadBalance() {
     if (!data) return;
     renderBalance(data.balance || data);
     renderHoldings(data.holdings || []);
+    renderPendingOrders(data.pending_orders || []);
   } catch (err) {
     console.error('[coin] balance load error:', err);
     setInlineStatus('sys-exchange', '오류', '#f87171');
@@ -1685,12 +1687,14 @@ function renderBalance(b) {
   const totalAsset = Number(b.total_asset ?? 0);
   const cash = Number(b.cash ?? 0);
   const coinValue = Number(b.coin_value ?? b.stock_value ?? 0);
+  const lockedKrw = Number(b.locked_krw ?? 0);
   const totalPnl = Number(b.total_pnl ?? 0);
   const totalPnlRate = Number(b.total_pnl_rate ?? 0);
 
-  setTextContent('total-asset', formatKRW(totalAsset));
-  setTextContent('cash-balance', formatKRW(cash));
-  setTextContent('coin-eval', formatKRW(coinValue));
+  updateMetricValue('total-asset', 'total-asset-delta', totalAsset, formatKRW(totalAsset));
+  updateMetricValue('cash-balance', 'cash-balance-delta', cash, formatKRW(cash));
+  updateMetricValue('coin-eval', 'coin-eval-delta', coinValue, formatKRW(coinValue));
+  updateMetricValue('locked-krw', 'locked-krw-delta', lockedKrw, formatKRW(lockedKrw));
 
   const pnlEl = document.getElementById('total-pnl');
   if (pnlEl) {
@@ -1743,6 +1747,91 @@ function renderHoldings(holdings) {
           <span>평가 ${evalAmt}</span>
           <span style="color:${pnlColor};">${pnlSign}${formatKRW(pnlVal)}</span>
         </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function formatPendingOrderTime(order) {
+  if (order?.updated_at) return formatTime(order.updated_at);
+  if (order?.submitted_at) return formatTime(order.submitted_at);
+  const orderTime = String(order?.order_time || '');
+  if (orderTime.length === 6) {
+    return `${orderTime.slice(0, 2)}:${orderTime.slice(2, 4)}:${orderTime.slice(4, 6)}`;
+  }
+  return '';
+}
+
+function getPendingOrderStatusMeta(status) {
+  const normalized = String(status || '').toUpperCase();
+  switch (normalized) {
+    case 'PARTIAL':
+      return { label: '부분체결', className: 'status-partial' };
+    case 'FILLED':
+      return { label: '체결완료', className: 'status-filled' };
+    case 'CANCELED':
+      return { label: '취소', className: 'status-canceled' };
+    case 'OPEN':
+      return { label: '대기', className: '' };
+    case 'SUBMITTED':
+      return { label: '접수', className: '' };
+    default:
+      return { label: normalized || '대기', className: '' };
+  }
+}
+
+function renderPendingOrders(orders) {
+  const container = document.getElementById('pending-list');
+  const countEl = document.getElementById('pending-count');
+  if (!container || !countEl) return;
+
+  if (!orders || !orders.length) {
+    countEl.textContent = '0건';
+    container.innerHTML = '<div style="color:#6b7280; font-size:13px; padding:12px; text-align:center;">미체결 주문 없음</div>';
+    return;
+  }
+
+  const totalAmount = orders.reduce((sum, order) => (
+    sum + (Number(order.order_price || 0) * Number(order.remaining_qty || 0))
+  ), 0);
+  countEl.textContent = `${orders.length}건 (${formatKRW(totalAmount)})`;
+
+  container.innerHTML = orders.map((order) => {
+    const isBuy = order.side === '매수';
+    const sideClass = isBuy ? 'buy' : 'sell';
+    const statusMeta = getPendingOrderStatusMeta(order.status);
+    const updatedAt = formatPendingOrderTime(order);
+    const remainingQty = formatCoinQty(order.remaining_qty);
+    const orderQty = formatCoinQty(order.order_qty);
+    const filledQty = formatCoinQty(order.filled_qty);
+    const statusDetail = order.status_detail
+      ? `<div class="text-[10px] text-gray-500 truncate" title="${escapeHtml(order.status_detail)}">${escapeHtml(order.status_detail)}</div>`
+      : '';
+    return `
+      <div class="coin-pending-card">
+        <div class="flex items-start justify-between gap-2">
+          <div class="min-w-0">
+            <div class="text-gray-100 font-medium truncate" title="${escapeHtml(order.symbol)}">${escapeHtml(order.name || order.symbol)}</div>
+            <div class="text-[11px] text-gray-500">${escapeHtml(order.symbol || '')}</div>
+          </div>
+          <div class="flex items-center gap-1.5 shrink-0">
+            <span class="coin-side-chip ${sideClass}">${escapeHtml(order.side || '')}</span>
+            <span class="coin-status-chip ${statusMeta.className}">${escapeHtml(statusMeta.label)}</span>
+          </div>
+        </div>
+        <div class="flex justify-between items-center gap-2 mt-1.5 text-[11px] text-gray-300">
+          <span>주문가</span>
+          <span>${formatPrice(order.order_price)} KRW</span>
+        </div>
+        <div class="flex justify-between items-center gap-2 text-[11px] text-gray-400 mt-1">
+          <span>미체결 ${remainingQty} / 주문 ${orderQty}</span>
+          <span>${formatKRW(Number(order.order_price || 0) * Number(order.remaining_qty || 0))}</span>
+        </div>
+        <div class="flex justify-between items-center gap-2 text-[11px] text-gray-500 mt-1">
+          <span>체결 ${filledQty}</span>
+          <span>${escapeHtml(updatedAt || '')}</span>
+        </div>
+        ${statusDetail}
       </div>
     `;
   }).join('');
@@ -2296,6 +2385,49 @@ function startScanCountdown() {
 function setTextContent(id, text) {
   const el = document.getElementById(id);
   if (el) el.textContent = text;
+}
+
+function scheduleAccountOverviewRefresh(delay = 250) {
+  if (accountRefreshTimer) clearTimeout(accountRefreshTimer);
+  accountRefreshTimer = setTimeout(() => {
+    accountRefreshTimer = null;
+    loadBalance();
+  }, delay);
+}
+
+function flashMetricDelta(deltaId, deltaValue) {
+  const el = document.getElementById(deltaId);
+  if (!el) return;
+
+  const absDelta = Math.abs(Number(deltaValue || 0));
+  if (absDelta < 1) {
+    el.textContent = '';
+    el.className = 'metric-delta';
+    return;
+  }
+
+  const isPositive = deltaValue > 0;
+  el.textContent = `${isPositive ? '+' : '-'}${formatKRW(absDelta)}`;
+  el.className = `metric-delta show ${isPositive ? 'positive' : 'negative'}`;
+
+  if (metricDeltaTimers[deltaId]) clearTimeout(metricDeltaTimers[deltaId]);
+  metricDeltaTimers[deltaId] = setTimeout(() => {
+    el.className = 'metric-delta';
+    el.textContent = '';
+    delete metricDeltaTimers[deltaId];
+  }, 3000);
+}
+
+function updateMetricValue(id, deltaId, numericValue, formattedValue, threshold = 1) {
+  const el = document.getElementById(id);
+  if (!el) return;
+
+  const prevValue = Number(el.dataset.value);
+  el.textContent = formattedValue;
+  el.dataset.value = String(numericValue);
+  if (!Number.isNaN(prevValue) && Math.abs(numericValue - prevValue) >= threshold) {
+    flashMetricDelta(deltaId, numericValue - prevValue);
+  }
 }
 
 // ── Sidebar Toggle ──

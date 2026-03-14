@@ -7,9 +7,15 @@ from agent.trading_agent import trading_agent
 from agent.trading_agent._state_mixin import StateMixin
 from agent.trading_agent._types import MarketState
 from api.routes import admin_coin
-from api.routes.admin_coin import get_coin_activity_feed, get_coin_system_status, get_coin_watchlist
+from api.routes.admin_coin import (
+    get_coin_activity_feed,
+    get_coin_overview,
+    get_coin_system_status,
+    get_coin_watchlist,
+)
 from realtime.coin_monitor import coin_realtime_monitor
 from scheduler.scheduler import trading_scheduler
+from trading.models import AccountBalance, AccountOverview, HoldingInfo, PendingOrderInfo
 
 
 class _ScalarResult:
@@ -164,6 +170,65 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data.next_cursor.before_created_at, rows[1].created_at)
         self.assertEqual(response.data.resolved_trading_date, resolved_date)
         self.assertEqual([item.id for item in response.data.items], ["log-3", "log-2"])
+
+    async def test_get_coin_overview_serializes_pending_orders_and_locked_krw(self):
+        overview = AccountOverview(
+            balance=AccountBalance(
+                total_asset=10000000,
+                cash=4200000,
+                raw_cash=4200000,
+                effective_cash=4200000,
+                cash_source="BROKER",
+                stock_value=5100000,
+                locked_krw=700000,
+                total_pnl=120000,
+                total_pnl_rate=1.2,
+                market="BITHUMB",
+                currency="KRW",
+            ),
+            holdings=[
+                HoldingInfo(
+                    symbol="BTC",
+                    name="비트코인",
+                    market="BITHUMB",
+                    currency="KRW",
+                    quantity=0.12,
+                    avg_buy_price=145000000,
+                    current_price=150000000,
+                    pnl=600000,
+                    pnl_rate=3.44,
+                )
+            ],
+            pending_orders=[
+                PendingOrderInfo(
+                    order_id="order-1",
+                    symbol="BTC",
+                    name="비트코인",
+                    market="BITHUMB",
+                    currency="KRW",
+                    side="매수",
+                    order_qty=0.05,
+                    filled_qty=0.01,
+                    remaining_qty=0.04,
+                    order_price=149500000,
+                    order_time="120501",
+                    exchange_rate_to_krw=1.0,
+                    status="PARTIAL",
+                    status_detail="partial fill",
+                    submitted_at="2026-03-14T12:05:01+09:00",
+                    updated_at="2026-03-14T12:05:10+09:00",
+                )
+            ],
+        )
+
+        with patch.object(admin_coin.account_manager, "get_account_overview", AsyncMock(return_value=overview)):
+            response = await get_coin_overview()
+
+        self.assertEqual(response.data["balance"]["locked_krw"], 700000)
+        self.assertEqual(response.data["holdings"][0]["symbol"], "BTC")
+        self.assertEqual(response.data["pending_orders"][0]["order_id"], "order-1")
+        self.assertEqual(response.data["pending_orders"][0]["status"], "PARTIAL")
+        self.assertEqual(response.data["pending_orders"][0]["updated_at"], "2026-03-14T12:05:10+09:00")
 
     @staticmethod
     def _make_activity(activity_id: str, created_at: datetime, symbol: str) -> SimpleNamespace:

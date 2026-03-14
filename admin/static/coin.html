@@ -106,6 +106,82 @@
       transition: background 0.15s;
     }
     .coin-holding-card:hover { background: rgba(42, 34, 53, 0.7); }
+    .coin-pending-card {
+      border: 1px solid #3d3350; border-radius: 8px; padding: 8px 10px;
+      margin-bottom: 4px; background: rgba(26, 21, 32, 0.5);
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .coin-pending-card:hover {
+      background: rgba(42, 34, 53, 0.68);
+      border-color: rgba(167, 139, 250, 0.35);
+    }
+    .coin-side-chip,
+    .coin-status-chip,
+    .metric-delta {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .coin-side-chip {
+      padding: 2px 7px;
+      border: 1px solid rgba(75, 64, 96, 0.9);
+    }
+    .coin-side-chip.buy {
+      color: #fca5a5;
+      border-color: rgba(248, 113, 113, 0.22);
+      background: rgba(127, 29, 29, 0.28);
+    }
+    .coin-side-chip.sell {
+      color: #93c5fd;
+      border-color: rgba(96, 165, 250, 0.22);
+      background: rgba(30, 58, 138, 0.28);
+    }
+    .coin-status-chip {
+      padding: 2px 6px;
+      border: 1px solid rgba(75, 64, 96, 0.8);
+      color: #cbd5e1;
+      background: rgba(15, 13, 21, 0.82);
+    }
+    .coin-status-chip.status-partial {
+      color: #fde68a;
+      border-color: rgba(251, 191, 36, 0.22);
+      background: rgba(120, 53, 15, 0.28);
+    }
+    .coin-status-chip.status-filled {
+      color: #86efac;
+      border-color: rgba(52, 211, 153, 0.22);
+      background: rgba(21, 128, 61, 0.24);
+    }
+    .coin-status-chip.status-canceled {
+      color: #cbd5e1;
+      border-color: rgba(148, 163, 184, 0.2);
+      background: rgba(51, 65, 85, 0.28);
+    }
+    .metric-delta {
+      opacity: 0;
+      transform: translateY(2px);
+      transition: opacity 0.2s ease, transform 0.2s ease;
+      padding: 1px 6px;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }
+    .metric-delta.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .metric-delta.positive {
+      color: #86efac;
+      background: rgba(22, 101, 52, 0.22);
+      border-color: rgba(52, 211, 153, 0.2);
+    }
+    .metric-delta.negative {
+      color: #fca5a5;
+      background: rgba(127, 29, 29, 0.22);
+      border-color: rgba(248, 113, 113, 0.2);
+    }
 
     /* ── Scan Timeline Bar ── */
     .scan-timeline-bar {
@@ -668,15 +744,31 @@
             <div id="account-info" class="space-y-2 animate-fade-in">
               <div class="flex justify-between items-baseline">
                 <span class="text-xs text-gray-400">KRW 현금</span>
-                <span id="cash-balance" class="text-sm font-bold text-white">--</span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                  <span id="cash-balance" class="text-sm font-bold text-white">--</span>
+                  <span id="cash-balance-delta" class="metric-delta"></span>
+                </span>
               </div>
               <div class="flex justify-between items-baseline">
                 <span class="text-xs text-gray-400">코인 평가</span>
-                <span id="coin-eval" class="text-sm font-bold text-coin-gold">--</span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                  <span id="coin-eval" class="text-sm font-bold text-coin-gold">--</span>
+                  <span id="coin-eval-delta" class="metric-delta"></span>
+                </span>
+              </div>
+              <div class="flex justify-between items-baseline">
+                <span class="text-xs text-gray-400">잠금 KRW</span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                  <span id="locked-krw" class="text-sm font-bold text-gray-300">--</span>
+                  <span id="locked-krw-delta" class="metric-delta"></span>
+                </span>
               </div>
               <div class="flex justify-between items-baseline border-t border-[#3d3350] pt-1">
                 <span class="text-xs text-gray-400">총 자산</span>
-                <span id="total-asset" class="text-sm font-bold text-coin-purple">--</span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                  <span id="total-asset" class="text-sm font-bold text-coin-purple">--</span>
+                  <span id="total-asset-delta" class="metric-delta"></span>
+                </span>
               </div>
               <div class="flex justify-between items-baseline">
                 <span class="text-xs text-gray-400">총 수익률</span>
@@ -701,6 +793,21 @@
             <div id="holdings-list" class="section-body text-xs space-y-1 max-h-64 overflow-y-auto" style="max-height:256px">
               <!-- Coin holding cards rendered by JS -->
               <div class="text-gray-500 text-xs py-2">로딩 중...</div>
+            </div>
+          </div>
+
+          <div class="border-t border-[#3d3350] mt-3 pt-3"></div>
+
+          <div id="pending-section" class="mt-3">
+            <button onclick="toggleSection('pending')" class="flex items-center justify-between w-full text-left mb-1" aria-expanded="true">
+              <span class="flex items-center gap-1">
+                <span class="section-toggle-icon" id="pending-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+                <span class="text-xs text-coin-gold font-medium">미체결 주문</span>
+              </span>
+              <span id="pending-count" class="text-xs text-coin-dim">0건</span>
+            </button>
+            <div id="pending-list" class="section-body text-xs space-y-1 max-h-64 overflow-y-auto" style="max-height:256px">
+              <div class="text-gray-500 text-xs py-2">미체결 주문 없음</div>
             </div>
           </div>
         </div>
