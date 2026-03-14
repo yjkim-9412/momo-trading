@@ -11,11 +11,19 @@ from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from trading.enums import ActivityPhase, ActivityType
 from trading.market_profile import (
+    is_crypto_market,
     market_currency,
     normalize_market,
     normalize_market_scope,
 )
 from trading.product_policy import build_product_context
+from trading.quantity_policy import (
+    cap_quantity_for_amount,
+    format_quantity,
+    format_quantity_with_unit,
+    has_quantity,
+    normalize_quantity,
+)
 
 from agent.trading_agent._types import (
     _AVERAGE_DOWN_DAILY_LIMIT,
@@ -127,7 +135,7 @@ class PortfolioMixin:
             key = self._instrument_key(symbol, market_code)
             currency = str(getattr(holding, "currency", market_currency(market_code)) or market_currency(market_code))
             exchange_rate = float(getattr(holding, "exchange_rate_to_krw", 1.0) or 1.0)
-            quantity = int(getattr(holding, "quantity", 0) or 0)
+            quantity = normalize_quantity(getattr(holding, "quantity", 0), market_code)
             current_price = float(getattr(holding, "current_price", 0.0) or 0.0)
             avg_buy_price = float(getattr(holding, "avg_buy_price", 0.0) or 0.0)
             market_value = current_price * quantity if current_price > 0 and quantity > 0 else avg_buy_price * quantity
@@ -167,8 +175,9 @@ class PortfolioMixin:
         if not position:
             return "현재 포지션 없음 (신규 진입 후보)"
 
+        market_code = normalize_market(position.get("market") or "KRX")
         currency = str(position.get("currency") or "KRW")
-        quantity = int(position.get("quantity") or 0)
+        quantity = normalize_quantity(position.get("quantity") or 0, market_code)
         avg_buy_price = float(position.get("avg_buy_price") or 0.0)
         pnl = float(position.get("pnl") or 0.0)
         pnl_rate = float(position.get("pnl_rate") or 0.0)
@@ -180,7 +189,7 @@ class PortfolioMixin:
         return "\n".join(
             [
                 f"- 현재 보유 여부: 보유 중",
-                f"- 보유 수량: {quantity}주",
+                f"- 보유 수량: {format_quantity_with_unit(quantity, market_code)}",
                 f"- 평균단가: {price_text}",
                 f"- 평가손익: {pnl_rate:+.2f}% ({pnl_text})",
                 f"- 현재 비중: {position_pct:.1f}% (약 {current_value_krw:,.0f}원)",
@@ -191,12 +200,19 @@ class PortfolioMixin:
     @staticmethod
     def _resolve_effective_limits(
         dynamic_limits: dict | None,
+        market: str,
         *,
         default_max_position_pct: float = 20.0,
     ) -> dict[str, float]:
-        eff_max_order = float(settings.MAX_SINGLE_ORDER_KRW or 0)
-        eff_min_cash_ratio = float(settings.MIN_CASH_RATIO or 0)
-        eff_max_pos_pct = float(default_max_position_pct or 0)
+        market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            eff_max_order = float(settings.CRYPTO_MAX_SINGLE_ORDER_KRW or 0)
+            eff_min_cash_ratio = float(settings.CRYPTO_MIN_CASH_RATIO or 0)
+            eff_max_pos_pct = float(settings.CRYPTO_MAX_POSITION_PCT or default_max_position_pct or 0)
+        else:
+            eff_max_order = float(settings.MAX_SINGLE_ORDER_KRW or 0)
+            eff_min_cash_ratio = float(settings.MIN_CASH_RATIO or 0)
+            eff_max_pos_pct = float(default_max_position_pct or 0)
         if dynamic_limits:
             eff_max_order = float(dynamic_limits.get("max_single_order_krw", eff_max_order) or 0)
             eff_min_cash_ratio = float(dynamic_limits.get("min_cash_ratio", eff_min_cash_ratio) or 0)
@@ -210,6 +226,7 @@ class PortfolioMixin:
     def _build_account_context(
         self,
         *,
+        market: str,
         portfolio_snapshot: dict | None,
         current_position: dict | None,
         dynamic_limits: dict | None,
@@ -217,8 +234,9 @@ class PortfolioMixin:
         currency: str,
         exchange_rate_to_krw: float,
         orderable_amount_context: dict | None = None,
-    ) -> dict[str, float | int | str]:
+    ) -> dict[str, float | int | str | None]:
         snap = portfolio_snapshot or {}
+        market_code = normalize_market(market)
         total_asset = float(snap.get("total_asset") or 0.0)
         broker_cash_krw = float(snap.get("cash") or 0.0)
         holding_count = int(snap.get("holding_count") or 0)
@@ -234,7 +252,7 @@ class PortfolioMixin:
         if orderable_amount_source:
             symbol_orderable_amount_krw = float(orderable_context.get("orderable_amount_krw") or 0.0)
             symbol_orderable_amount_foreign = float(orderable_context.get("orderable_amount_foreign") or 0.0)
-            symbol_orderable_qty = int(orderable_context.get("orderable_qty") or 0)
+            symbol_orderable_qty = normalize_quantity(orderable_context.get("orderable_qty") or 0, market_code)
         else:
             symbol_orderable_amount_krw = None
             symbol_orderable_amount_foreign = None
@@ -243,7 +261,7 @@ class PortfolioMixin:
         if symbol_orderable_amount_krw is not None:
             cash_cap_krw = symbol_orderable_amount_krw
 
-        limits = self._resolve_effective_limits(dynamic_limits)
+        limits = self._resolve_effective_limits(dynamic_limits, market_code)
         hard_caps: list[float] = [max(cash_cap_krw, 0.0)]
         if limits["max_single_order_krw"] > 0:
             hard_caps.append(limits["max_single_order_krw"])
@@ -256,7 +274,7 @@ class PortfolioMixin:
 
         max_additional_amount = min(hard_caps) if hard_caps else 0.0
         max_additional_amount = max(max_additional_amount, 0.0)
-        max_additional_quantity = int(max_additional_amount / unit_price_krw) if unit_price_krw > 0 else 0
+        max_additional_quantity = cap_quantity_for_amount(max_additional_amount, unit_price_krw, market_code)
         projected_combined_position_pct = (
             (current_position_value_krw + max_additional_amount) / total_asset * 100
             if total_asset > 0
@@ -270,14 +288,14 @@ class PortfolioMixin:
             f"- 현재 보유 종목 수: {holding_count}개",
             f"- 현재 이 종목 비중: {current_position_pct:.1f}%",
             f"- {add_label}: {max_additional_amount:,.0f}원",
-            f"- 현재가 기준 최대 수량: {max_additional_quantity}주",
+            f"- 현재가 기준 최대 수량: {format_quantity(max_additional_quantity, market_code)}",
             f"- 하드 가드 기준 최대 집행 시 예상 합산 비중: {projected_combined_position_pct:.1f}%",
         ]
         if orderable_amount_source and symbol_orderable_amount_krw is not None:
             foreign_text = f"{symbol_orderable_amount_foreign:,.2f}{currency}"
             qty_text = (
-                f"{symbol_orderable_qty}주"
-                if symbol_orderable_qty and symbol_orderable_qty > 0
+                format_quantity_with_unit(symbol_orderable_qty, market_code)
+                if symbol_orderable_qty is not None and symbol_orderable_qty > 0
                 else "수량 정보 없음"
             )
             lines.insert(2, f"- 이 종목 기준 주문가능금액: {symbol_orderable_amount_krw:,.0f}원 ({foreign_text}, 최대 {qty_text})")
@@ -529,8 +547,8 @@ class PortfolioMixin:
         chart_result: ChartAnalysisResult,
         current_price: float,
     ) -> dict[str, object]:
-        quantity = int((current_position or {}).get("quantity") or 0)
-        if quantity <= 0:
+        quantity = normalize_quantity((current_position or {}).get("quantity") or 0, market_code)
+        if not has_quantity(quantity, market_code):
             return {"approved": True, "entry_mode": _ENTRY_MODE_NEW, "detail": None}
 
         normalized = self._normalize_position_intent(entry_mode, has_current_position=True)
@@ -604,7 +622,8 @@ class PortfolioMixin:
         source: str,
         event_type: str | None = None,
     ) -> None:
-        quantity = int((position or {}).get("quantity") or 0)
+        market_code = normalize_market(market)
+        quantity = normalize_quantity((position or {}).get("quantity") or 0, market_code)
         prefix = "기보유 종목 이벤트 감지" if source == "event" else "기보유 종목 추가매수 차단"
         suffix = (
             "추가매수는 정규 사이클에서만 평가, 모니터링 유지"
@@ -613,7 +632,7 @@ class PortfolioMixin:
         )
         summary = f"\U0001f6ab [{name}] {prefix} — {suffix}"
         if quantity > 0:
-            summary += f" ({quantity}주 보유 중)"
+            summary += f" ({format_quantity_with_unit(quantity, market_code)} 보유 중)"
 
         detail = {
             "reason": prefix,

@@ -24,6 +24,7 @@ from trading.market_profile import (
     requires_mcp_connection,
 )
 from trading.mcp_client import mcp_client
+from trading.quantity_policy import normalize_quantity
 
 
 class CycleMixin:
@@ -448,10 +449,22 @@ class CycleMixin:
                     executed_count = 0
 
                     # 최소 주문 금액 (사전 차단용)
-                    eff_min_order_amount = (
-                        (dynamic_limits.get("min_buy_quantity", settings.MIN_BUY_QUANTITY) if dynamic_limits else settings.MIN_BUY_QUANTITY)
-                        * 1000  # 보수적 추정: 최소 수량 × 1000원
-                    )
+                    if is_crypto_market(target):
+                        eff_min_qty = normalize_quantity(
+                            dynamic_limits.get("min_buy_quantity", settings.CRYPTO_MIN_BUY_QUANTITY)
+                            if dynamic_limits
+                            else settings.CRYPTO_MIN_BUY_QUANTITY,
+                            target,
+                        )
+                        eff_min_order_amount = max(eff_min_qty * 1000, 5000.0)
+                    else:
+                        eff_min_qty = normalize_quantity(
+                            dynamic_limits.get("min_buy_quantity", settings.MIN_BUY_QUANTITY)
+                            if dynamic_limits
+                            else settings.MIN_BUY_QUANTITY,
+                            target,
+                        )
+                        eff_min_order_amount = eff_min_qty * 1000  # 보수적 추정: 최소 수량 × 1000원
 
                     async def _analyze_with_limit(stock_info: dict) -> dict:
                         nonlocal executed_count

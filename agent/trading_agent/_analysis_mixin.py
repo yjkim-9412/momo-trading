@@ -51,6 +51,7 @@ from trading.product_policy import (
     coerce_strategy_for_product,
     is_product_trade_allowed,
 )
+from trading.quantity_policy import format_quantity, format_quantity_with_unit, has_quantity
 
 from agent.trading_agent._types import _ENTRY_MODE_NEW
 
@@ -553,7 +554,9 @@ class AnalysisMixin:
             tier1_confidence=tier1_confidence,
             market_regime=mkt_state.market_regime,
             recommendation=str(analysis.get("recommendation") or ""),
-            has_current_position=bool(current_position and int(current_position.get("quantity") or 0) > 0),
+            has_current_position=bool(
+                current_position and has_quantity(current_position.get("quantity") or 0, market_code)
+            ),
         )
 
         if skip_tier2:
@@ -628,7 +631,11 @@ class AnalysisMixin:
             await activity_logger.log(
                 ActivityType.TIER2_REVIEW, ActivityPhase.COMPLETE,
                 f"\U0001f9e0 [{name}] Tier2: \u2705 승인"
-                + (f" | 수량 {final.get('suggested_quantity')}주" if final.get("suggested_quantity") else ""),
+                + (
+                    f" | 수량 {format_quantity_with_unit(final.get('suggested_quantity'), market_code)}"
+                    if final.get("suggested_quantity")
+                    else ""
+                ),
                 cycle_id=cycle_id, symbol=symbol,
                 detail=self._enrich_activity_detail(
                     {
@@ -653,7 +660,9 @@ class AnalysisMixin:
 
         entry_mode = self._normalize_position_intent(
             (final or {}).get("position_intent") or analysis.get("position_intent"),
-            has_current_position=bool(current_position and int(current_position.get("quantity") or 0) > 0),
+            has_current_position=bool(
+                current_position and has_quantity(current_position.get("quantity") or 0, market_code)
+            ),
         )
         # 4. 전략 적용
         strategy = mkt_state.strategies.get(strategy_type)
@@ -721,7 +730,8 @@ class AnalysisMixin:
             await activity_logger.log(
                 ActivityType.STRATEGY_EVAL, ActivityPhase.COMPLETE,
                 f"\U0001f4c8 [{name}] Tier2 승인 기반 시그널: {action.value} "
-                f"{signal.suggested_quantity}주 @{signal.suggested_price:,.2f}{currency}",
+                f"{format_quantity_with_unit(signal.suggested_quantity, market_code)} "
+                f"@{signal.suggested_price:,.2f}{currency}",
                 cycle_id=cycle_id, symbol=symbol,
                 detail=self._enrich_activity_detail(
                     {
@@ -769,7 +779,8 @@ class AnalysisMixin:
             await activity_logger.log(
                 ActivityType.STRATEGY_EVAL, ActivityPhase.COMPLETE,
                 f"\U0001f4c8 [{name}] 전략({strategy_type}): {signal.action.value} "
-                f"{signal.suggested_quantity or 0}주 @{(signal.suggested_price or 0):,.0f}원",
+                f"{format_quantity_with_unit(signal.suggested_quantity or 0, market_code)} "
+                f"@{(signal.suggested_price or 0):,.0f}원",
                 cycle_id=cycle_id, symbol=symbol,
                 detail=self._enrich_activity_detail(
                     {
@@ -1180,6 +1191,7 @@ class AnalysisMixin:
         currency = price_data.get("currency", market_currency(market_code))
         exchange_rate_to_krw = float(price_data.get("exchange_rate_to_krw", 1.0) or 1.0)
         account_context = self._build_account_context(
+            market=market_code,
             portfolio_snapshot=portfolio_snapshot,
             current_position=current_position,
             dynamic_limits=dynamic_limits,
@@ -1261,6 +1273,7 @@ class AnalysisMixin:
         currency = tier1_analysis.get("currency", market_currency(market_code))
         exchange_rate_to_krw = float(tier1_analysis.get("exchange_rate_to_krw", 1.0) or 1.0)
         account_context = self._build_account_context(
+            market=market_code,
             portfolio_snapshot=portfolio_snapshot,
             current_position=current_position,
             dynamic_limits=dynamic_limits,
@@ -1313,7 +1326,7 @@ class AnalysisMixin:
             exchange_rate_to_krw=exchange_rate_to_krw,
             strategy_type=strategy_type,
             max_amount=account_context["max_additional_amount"] or 0,
-            max_quantity=account_context["max_additional_quantity"] or 0,
+            max_quantity=format_quantity(account_context["max_additional_quantity"] or 0, market_code),
             holding_count=snap.get("holding_count") or 0,
             current_position_pct=account_context["current_position_pct"] or 0,
             position_pct=account_context["projected_combined_position_pct"] or 0,

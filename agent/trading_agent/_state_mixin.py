@@ -10,7 +10,12 @@ from core.events import Event, event_bus
 from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from trading.enums import ActivityPhase, ActivityType
-from trading.market_profile import market_scope, normalize_market, normalize_market_scope
+from trading.market_profile import (
+    MARKET_SCOPE_CRYPTO,
+    market_scope,
+    normalize_market,
+    normalize_market_scope,
+)
 from trading.mcp_client import mcp_client
 
 from admin.sse_manager import sse_manager
@@ -99,12 +104,26 @@ class StateMixin:
         *,
         stage: str,
     ) -> None:
+        resolved_scope = normalize_market_scope(scope)
+        manager = sse_manager
+        if resolved_scope == MARKET_SCOPE_CRYPTO:
+            try:
+                from api.routes.admin_coin import coin_sse_manager
+
+                manager = coin_sse_manager
+            except ImportError:
+                pass
         try:
-            await sse_manager.broadcast(payload)
+            await manager.broadcast(payload)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning("[{}] agent_state 브로드캐스트 실패 ({}): {}", scope, stage, str(e))
+            logger.warning(
+                "[{}] agent_state 브로드캐스트 실패 ({}): {}",
+                resolved_scope,
+                stage,
+                str(e),
+            )
 
     def _schedule_cycle_error_log(
         self,

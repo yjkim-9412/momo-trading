@@ -11,6 +11,7 @@ from services.activity_logger import activity_logger
 from trading.enums import ActivityPhase, ActivityType
 from trading.market_profile import is_crypto_market, market_scope, market_timezone, normalize_market
 from trading.mcp_client import mcp_client
+from trading.quantity_policy import format_quantity_with_unit
 
 
 class EventMixin:
@@ -195,7 +196,7 @@ class EventMixin:
                         )
                         await activity_logger.log(
                             ActivityType.ORDER, ActivityPhase.COMPLETE,
-                            f"\U0001f6a8 손절 매도: {symbol} {holding.quantity}주 "
+                            f"\U0001f6a8 손절 매도: {symbol} {format_quantity_with_unit(holding.quantity, market_code)} "
                             f"({'성공' if resp.success else '실패: ' + (resp.error or '')})",
                             symbol=symbol,
                         )
@@ -247,7 +248,7 @@ class EventMixin:
                         )
                         await activity_logger.log(
                             ActivityType.ORDER, ActivityPhase.COMPLETE,
-                            f"\U0001f3af 익절 매도: {symbol} {holding.quantity}주 "
+                            f"\U0001f3af 익절 매도: {symbol} {format_quantity_with_unit(holding.quantity, market_code)} "
                             f"({'성공' if resp.success else '실패: ' + (resp.error or '')})",
                             symbol=symbol,
                         )

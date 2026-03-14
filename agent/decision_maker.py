@@ -26,6 +26,7 @@ from trading.enums import ActivityPhase, ActivityType, AutonomyMode, OrderSource
 from trading.market_profile import is_crypto_market, is_us_market, normalize_market, normalize_market_scope
 from trading.mcp_client import mcp_client
 from trading.product_policy import build_product_context
+from trading.quantity_policy import format_quantity, format_quantity_with_unit, normalize_quantity
 from scheduler.market_calendar import market_calendar
 from util.time_util import now_kst
 
@@ -161,18 +162,11 @@ class DecisionMaker:
 
     @staticmethod
     def _order_quantity(value: object, market: str) -> float:
-        market_code = normalize_market(market)
-        if is_crypto_market(market_code):
-            return max(0.0, mcp_client._to_float(value))
-        return float(max(0, mcp_client._to_int(value)))
+        return normalize_quantity(value, market)
 
     @staticmethod
     def _quantity_text(quantity: float, market: str) -> str:
-        market_code = normalize_market(market)
-        if is_crypto_market(market_code):
-            formatted = f"{float(quantity or 0.0):.8f}".rstrip("0").rstrip(".")
-            return formatted or "0"
-        return str(int(float(quantity or 0.0)))
+        return format_quantity(quantity, market)
 
     async def _upsert_broker_order(
         self,
@@ -594,7 +588,7 @@ class DecisionMaker:
         await activity_logger.log(
             ActivityType.DECISION, ActivityPhase.START,
             f"\U0001f4b0 [{signal.symbol}] 자동 주문 실행: "
-            f"{signal.action.value} {qty}주 "
+            f"{signal.action.value} {format_quantity_with_unit(qty, market_code)} "
             f"{self._price_display(price, currency, price_krw)}",
             cycle_id=cycle_id,
             symbol=signal.symbol,
@@ -1519,9 +1513,11 @@ class DecisionMaker:
             qty, expires_at,
         )
 
+        market_code = normalize_market(signal.metadata.get("market", "KRX"))
+
         await activity_logger.log(
             ActivityType.DECISION, ActivityPhase.COMPLETE,
-            f"\U0001f4dd 매수 추천 생성: {signal.symbol} {qty}주 "
+            f"\U0001f4dd 매수 추천 생성: {signal.symbol} {format_quantity_with_unit(qty, market_code)} "
             f"@{price:,.2f}{signal.metadata.get('currency', 'KRW')} ({amount:,.0f}원)"
             f"\n   \u2192 사용자 승인 대기 (SEMI_AUTO 모드)",
             cycle_id=cycle_id,
