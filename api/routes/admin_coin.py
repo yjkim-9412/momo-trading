@@ -18,6 +18,7 @@ from models.coin_broker_order import CoinBrokerOrder
 from models.coin_recommendation import CoinRecommendation
 from repositories.daily_report_repository import DailyReportRepository
 from scheduler.market_calendar import market_calendar
+from schemas.activity_schema import ActivityFeedCursor, ActivityFeedResponse
 from schemas.common import SuccessResponse
 from schemas.daily_report_schema import DailyReportResponse
 from services.activity_logger import activity_logger
@@ -78,7 +79,7 @@ async def get_coin_overview():
 
 
 # ── 활동 피드 ──
-@router.get("/activities/feed")
+@router.get("/activities/feed", response_model=SuccessResponse[ActivityFeedResponse])
 async def get_coin_activity_feed(
     limit: int = Query(100, ge=1, le=200),
     target_date: str | None = Query(None, description="YYYY-MM-DD"),
@@ -90,7 +91,7 @@ async def get_coin_activity_feed(
     resolved_date = (
         date.fromisoformat(target_date)
         if target_date
-        else market_calendar.market_date(market="BITHUMB")
+        else market_calendar.market_date(market=MARKET_SCOPE_CRYPTO)
     )
     stmt = (
         select(CoinActivityLog)
@@ -106,11 +107,19 @@ async def get_coin_activity_feed(
     rows = (await db.execute(stmt)).scalars().all()
     has_more = len(rows) > limit
     items = list(rows[:limit])
-    return SuccessResponse(data={
-        "items": [_serialize_activity(a) for a in items],
-        "resolved_trading_date": resolved_date.isoformat(),
-        "has_more": has_more,
-    })
+    next_cursor = None
+    if has_more and items:
+        last_item = items[-1]
+        next_cursor = ActivityFeedCursor(
+            before_created_at=last_item.created_at,
+            before_id=last_item.id,
+        )
+    return SuccessResponse(data=ActivityFeedResponse(
+        items=[_serialize_activity(a) for a in items],
+        resolved_trading_date=resolved_date,
+        has_more=has_more,
+        next_cursor=next_cursor,
+    ))
 
 
 # ── SSE 스트림 (코인 전용) ──

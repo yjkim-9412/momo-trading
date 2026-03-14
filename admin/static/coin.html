@@ -22,6 +22,7 @@
       }
     }
   </script>
+  <link rel="stylesheet" href="/admin/static/css/admin.css">
   <style>
     /* ── Base ── */
     body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
@@ -419,6 +420,145 @@
     }
     .scroll-fab.hidden { opacity: 0; pointer-events: none; transform: translateY(12px); }
 
+    @keyframes cardPulseGreen {
+      0% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.35); }
+      70% { box-shadow: 0 0 0 4px rgba(52, 211, 153, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+    }
+    @keyframes cardPulseGold {
+      0% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.35); }
+      70% { box-shadow: 0 0 0 4px rgba(251, 191, 36, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0); }
+    }
+    @keyframes cardHighlightCoin {
+      0% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.45); }
+      50% { box-shadow: 0 0 18px 4px rgba(167, 139, 250, 0.25); }
+      100% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0); }
+    }
+
+    .coin-admin-theme .agent-monitor {
+      background: rgba(18, 15, 28, 0.96);
+      border-bottom: 1px solid rgba(61, 51, 80, 0.9);
+    }
+    .coin-admin-theme .agent-monitor-bar:hover { background: rgba(255, 255, 255, 0.02); }
+    .coin-admin-theme .agent-monitor-icon {
+      background: rgba(42, 34, 53, 0.9);
+      border-color: rgba(75, 64, 96, 0.9);
+    }
+    .coin-admin-theme .agent-monitor-icon.active {
+      background: rgba(167, 139, 250, 0.14);
+      border-color: rgba(167, 139, 250, 0.35);
+      color: #c4b5fd;
+    }
+    .coin-admin-theme .agent-monitor-progress { background: rgba(42, 34, 53, 0.9); }
+    .coin-admin-theme .agent-monitor-progress-bar {
+      background: linear-gradient(90deg, #a78bfa 0%, #fbbf24 100%);
+    }
+    .coin-admin-theme .monitor-slot {
+      background: rgba(26, 21, 32, 0.88);
+      border-color: rgba(75, 64, 96, 0.9);
+    }
+    .coin-admin-theme .monitor-slot::before {
+      background: linear-gradient(90deg, transparent 0%, #c4b5fd 50%, transparent 100%);
+    }
+    .coin-admin-theme .pipeline-step {
+      background: rgba(42, 34, 53, 0.9);
+      border-color: rgba(75, 64, 96, 0.9);
+    }
+    .coin-admin-theme .pipeline-step.step-done {
+      background: #34d399;
+      border-color: #34d399;
+      box-shadow: 0 0 6px rgba(52, 211, 153, 0.24);
+    }
+    .coin-admin-theme .pipeline-step.step-active {
+      background: #a78bfa;
+      border-color: #c4b5fd;
+      box-shadow: 0 0 8px rgba(167, 139, 250, 0.3);
+    }
+    .coin-admin-theme .pipeline-connector { background: rgba(75, 64, 96, 0.8); }
+    .coin-admin-theme .pipeline-connector.conn-done { background: rgba(52, 211, 153, 0.65); }
+    .coin-admin-theme .monitor-completed-badge {
+      background: rgba(26, 21, 32, 0.92);
+      border-color: rgba(75, 64, 96, 0.9);
+    }
+    .coin-admin-theme .monitor-completed-badge.badge-buy {
+      border-color: rgba(52, 211, 153, 0.3);
+      color: #86efac;
+    }
+    .coin-admin-theme .monitor-completed-badge.badge-sell {
+      border-color: rgba(251, 191, 36, 0.3);
+      color: #fde68a;
+    }
+
+    .coin-admin-theme .feed-load-more-bar {
+      border-bottom-color: rgba(61, 51, 80, 0.9);
+      background: rgba(18, 15, 28, 0.96);
+    }
+    .coin-admin-theme .feed-load-more-btn {
+      border-color: rgba(75, 64, 96, 0.9);
+      background: rgba(26, 21, 32, 0.88);
+    }
+    .coin-admin-theme .feed-load-more-btn:hover:not(:disabled) {
+      background: rgba(167, 139, 250, 0.14);
+      border-color: rgba(167, 139, 250, 0.45);
+    }
+
+    .coin-admin-theme .stock-card {
+      border-color: rgba(75, 64, 96, 0.9);
+      background: rgba(18, 15, 28, 0.5);
+    }
+    .coin-admin-theme .stock-card.outcome-progress { border-left-color: #a78bfa; }
+    .coin-admin-theme .stock-card.outcome-buy {
+      border-left-color: #34d399;
+      animation: fadeIn 0.3s ease-out, cardPulseGreen 2s infinite;
+    }
+    .coin-admin-theme .stock-card.outcome-sell {
+      border-left-color: #fbbf24;
+      animation: fadeIn 0.3s ease-out, cardPulseGold 2s infinite;
+    }
+    .coin-admin-theme .stock-card.outcome-error { border-left-color: #f87171; }
+    .coin-admin-theme .stock-card-header:hover { background: rgba(255, 255, 255, 0.025); }
+    .coin-admin-theme .stock-card-body { background: rgba(18, 15, 28, 0.2); }
+    .coin-admin-theme .stock-step { border-top-color: rgba(75, 64, 96, 0.65); }
+    .coin-admin-theme .stock-card.highlighted { animation: cardHighlightCoin 1.5s ease-out 2; }
+    .coin-admin-theme .cycle-divider::before,
+    .coin-admin-theme .cycle-divider::after { background: rgba(167, 139, 250, 0.18); }
+    .coin-admin-theme .cycle-divider.cycle-start::before,
+    .coin-admin-theme .cycle-divider.cycle-start::after { border-top-color: rgba(167, 139, 250, 0.32); }
+
+    .coin-admin-theme .sse-disconnect-banner {
+      border-bottom-color: rgba(248, 113, 113, 0.35);
+      background: rgba(80, 20, 20, 0.35);
+    }
+    .coin-admin-theme .scroll-fab {
+      border-color: rgba(167, 139, 250, 0.25);
+      background: rgba(26, 21, 32, 0.9);
+      color: #cbd5e1;
+    }
+    .coin-admin-theme .scroll-fab:hover {
+      border-color: rgba(167, 139, 250, 0.45);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5), 0 0 12px rgba(167, 139, 250, 0.16);
+    }
+    .coin-admin-theme .scroll-fab-badge {
+      background: #a78bfa;
+      box-shadow: 0 0 8px rgba(167, 139, 250, 0.25);
+    }
+    .coin-admin-theme .toast-info {
+      background: rgba(42, 24, 84, 0.92);
+      color: #ddd6fe;
+      border-color: rgba(167, 139, 250, 0.3);
+    }
+    .coin-admin-theme .toast-high {
+      background: rgba(120, 53, 15, 0.94);
+      color: #fde68a;
+      border-color: rgba(251, 191, 36, 0.45);
+    }
+    .coin-admin-theme .toast-critical {
+      background: rgba(20, 83, 45, 0.95);
+      color: #bbf7d0;
+      border-color: rgba(52, 211, 153, 0.45);
+    }
+
     /* ── Progress Spinner ── */
     .progress-spinner {
       display: inline-block; width: 12px; height: 12px;
@@ -478,7 +618,7 @@
     .sched-item.sched-next .sched-label { color: #e5e7eb; font-weight: 500; }
   </style>
 </head>
-<body class="dark bg-dark-900 text-gray-200 h-screen flex flex-col overflow-hidden">
+<body class="coin-admin-theme dark bg-dark-900 text-gray-200 h-screen flex flex-col overflow-hidden">
 
   <!-- ════════ Header ════════ -->
   <header class="bg-dark-800 border-b border-[#3d3350] px-4 py-2 flex items-center justify-between shrink-0">
@@ -627,53 +767,50 @@
       <div class="bg-dark-800 border-b border-[#3d3350] px-4 py-2 shrink-0 flex justify-between items-center">
         <div class="text-xs font-medium text-gray-400 flex items-center gap-2">
           <i data-lucide="activity" class="w-3.5 h-3.5 text-coin-purple"></i>
-          Coin Activity Feed
+          Activity Feed
         </div>
         <div class="log-filter-track">
-          <button type="button" class="log-filter-btn active" data-filter="ALL" onclick="setLogFilter('ALL')">전체</button>
-          <button type="button" class="log-filter-btn" data-filter="SIGNAL" onclick="setLogFilter('SIGNAL')">시그널</button>
-          <button type="button" class="log-filter-btn" data-filter="TRADE" onclick="setLogFilter('TRADE')">체결</button>
+          <button type="button" class="log-filter-btn active" data-filter="ALL" onclick="setLogFilter('ALL')">전체 로그</button>
+          <button type="button" class="log-filter-btn" data-filter="SIGNAL" onclick="setLogFilter('SIGNAL')">시그널만 보기</button>
         </div>
       </div>
 
-      <!-- Scan Timeline Bar -->
-      <div class="bg-dark-800/80 border-b border-[#3d3350] px-4 py-3 shrink-0">
-        <div class="scan-timeline-bar">
-          <div class="flex items-center justify-between mb-2">
-            <div class="flex items-center gap-2">
-              <i data-lucide="radar" class="w-4 h-4 text-coin-purple"></i>
-              <span class="text-xs font-semibold text-gray-300">스캔 타임라인</span>
-              <span id="scan-cycle-label" class="text-[10px] text-coin-dim px-2 py-0.5 rounded bg-dark-700">4h 주기</span>
-            </div>
-            <div class="flex items-center gap-2">
-              <span class="text-xs text-gray-500">다음 스캔</span>
-              <span id="scan-countdown" class="text-xs font-mono font-semibold text-coin-purple" style="animation: countdownPulse 2s infinite;">--:--:--</span>
-            </div>
+      <!-- Agent Pipeline Monitor -->
+      <div id="agent-monitor" class="agent-monitor shrink-0">
+        <div class="agent-monitor-bar" onclick="toggleMonitorExpand()">
+          <div class="flex items-center gap-2">
+            <span class="agent-monitor-icon" id="monitor-status-icon">
+              <i data-lucide="cpu" class="w-3.5 h-3.5"></i>
+            </span>
+            <span class="text-xs font-semibold text-gray-300" id="monitor-title">Agent Monitor</span>
+            <span class="text-xs text-gray-500" id="monitor-status">대기 중</span>
           </div>
-          <div class="scan-progress-track">
-            <div id="scan-progress-fill" class="scan-progress-fill" style="width: 0%"></div>
+          <div class="flex items-center gap-3">
+            <div class="agent-monitor-progress" id="monitor-progress-wrap" style="display:none">
+              <div class="agent-monitor-progress-bar" id="monitor-progress-bar" style="width:0%"></div>
+            </div>
+            <span class="text-xs text-gray-500 font-mono" id="monitor-elapsed"></span>
           </div>
-          <div class="flex items-center justify-between mt-1.5">
-            <span id="scan-last-time" class="text-[10px] text-coin-dim">마지막: --</span>
-            <span id="scan-next-time" class="text-[10px] text-coin-dim">다음: --</span>
+        </div>
+        <div class="agent-monitor-body" id="monitor-body" style="display:none">
+          <div class="agent-monitor-slots" id="monitor-slots"></div>
+          <div class="agent-monitor-completed" id="monitor-completed" style="display:none">
+            <div class="text-[10px] text-gray-600 uppercase tracking-wider mb-1">완료</div>
+            <div class="flex flex-wrap gap-1.5" id="monitor-completed-list"></div>
           </div>
         </div>
       </div>
 
-      <!-- Recommendation Queue (SEMI_AUTO) -->
-      <div id="rec-queue-section" class="bg-dark-800/50 border-b border-[#3d3350] px-4 py-3 shrink-0 hidden">
-        <div class="flex items-center gap-2 mb-2">
-          <i data-lucide="bell-ring" class="w-4 h-4 text-coin-gold"></i>
-          <span class="text-xs font-semibold text-coin-gold">승인 대기 추천</span>
-          <span id="rec-count" class="text-[10px] bg-coin-gold/20 text-coin-gold px-2 py-0.5 rounded-full font-bold">0</span>
-        </div>
-        <div id="rec-queue" class="space-y-2 max-h-80 overflow-y-auto">
-          <!-- Recommendation cards rendered by JS -->
-        </div>
+      <div id="feed-load-more-bar" class="feed-load-more-bar hidden shrink-0">
+        <button id="feed-load-more-btn" type="button" class="feed-load-more-btn" onclick="loadMoreActivities()">
+          <i data-lucide="chevrons-up" class="w-3.5 h-3.5"></i>
+          <span>이전 내역 더보기</span>
+        </button>
+        <span id="feed-load-more-meta" class="feed-load-more-meta"></span>
       </div>
 
       <!-- Activity Feed -->
-      <div id="feed-container" class="flex-1 overflow-y-auto p-4 space-y-2" aria-live="polite" aria-atomic="false">
+      <div id="chat-container" class="flex-1 overflow-y-auto p-4 space-y-2" aria-live="polite" aria-atomic="false">
         <div class="text-center text-gray-500 text-sm py-8">
           <i data-lucide="loader" class="w-5 h-5 inline-block animate-spin text-coin-purple mb-2"></i>
           <br>연결 중...
@@ -681,9 +818,10 @@
       </div>
 
       <!-- Scroll to bottom FAB -->
-      <button id="scroll-to-bottom" onclick="scrollToBottom()" class="scroll-fab hidden" aria-label="최하단으로 이동" title="최신 활동으로 이동">
+      <button id="scroll-to-bottom" onclick="scrollToBottom()" class="scroll-fab hidden" aria-label="최하단으로 이동" title="최신 분석으로 이동">
         <i data-lucide="arrow-down" class="w-3.5 h-3.5"></i>
-        <span>최신 활동</span>
+        <span>최신 분석</span>
+        <span id="scroll-fab-badge" class="scroll-fab-badge"></span>
       </button>
 
       <!-- Bottom Bar -->
@@ -691,11 +829,11 @@
         <span id="status-text">연결 대기</span>
         <div class="flex items-center gap-3">
           <span id="activity-count">0건</span>
-          <button onclick="clearFeed()" title="화면 비우기" aria-label="활동 피드 클리어"
+          <button onclick="clearChat()" title="화면 비우기" aria-label="활동 피드 클리어"
             class="text-gray-500 hover:text-gray-300 transition flex items-center gap-1.5">
             <i data-lucide="trash-2" class="w-4 h-4"></i> 클리어
           </button>
-          <button onclick="refreshFeed()" title="새로고침" aria-label="활동 새로고침"
+          <button onclick="loadTodayActivities()" title="새로고침" aria-label="활동 새로고침"
             class="text-gray-500 hover:text-gray-300 transition flex items-center gap-1.5">
             <i data-lucide="refresh-cw" class="w-4 h-4"></i> 새로고침
           </button>
@@ -704,7 +842,7 @@
     </main>
 
     <!-- ──── Right Sidebar (260px) ──── -->
-    <aside id="right-sidebar" class="sidebar-right bg-dark-800 border-l border-[#3d3350] flex flex-col shrink-0 relative" style="width:260px; min-width:260px;">
+    <aside id="right-sidebar" class="sidebar-right bg-dark-800 border-l border-[#3d3350] flex flex-col shrink-0 relative" style="width:320px; min-width:320px;">
       <button onclick="toggleRightSidebar()" class="sidebar-toggle-btn sidebar-toggle-right" aria-label="우측 패널 접기/펼치기">
         <i data-lucide="panel-right-close" class="w-3 h-3 sidebar-collapse-icon"></i>
       </button>
@@ -721,12 +859,51 @@
               </div>
               <span id="watchlist-count" class="text-xs text-coin-dim">0종목</span>
             </div>
-            <div id="watchlist-agent-state" class="agent-state-panel text-xs text-gray-400">
-              현재 사이클 상태를 불러오는 중...
-            </div>
             <div id="watchlist-list" class="text-xs space-y-1 max-h-60 overflow-y-auto">
               <!-- Watchlist cards rendered by JS -->
               <div class="text-gray-500 text-xs py-1">로딩 중...</div>
+            </div>
+          </div>
+
+          <div class="border-t border-[#3d3350]"></div>
+
+          <!-- ── Scan Timeline ── -->
+          <div>
+            <div class="flex items-center gap-1.5 mb-2">
+              <i data-lucide="radar" class="w-3.5 h-3.5 text-coin-purple"></i>
+              <span class="text-xs text-coin-purple font-medium">스캔 타임라인</span>
+            </div>
+            <div class="scan-timeline-bar">
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <span id="scan-cycle-label" class="text-[10px] text-coin-dim px-2 py-0.5 rounded bg-dark-700">4h 주기</span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <span class="text-xs text-gray-500">다음 스캔</span>
+                  <span id="scan-countdown" class="text-xs font-mono font-semibold text-coin-purple" style="animation: countdownPulse 2s infinite;">--:--:--</span>
+                </div>
+              </div>
+              <div class="scan-progress-track">
+                <div id="scan-progress-fill" class="scan-progress-fill" style="width: 0%"></div>
+              </div>
+              <div class="flex items-center justify-between mt-1.5">
+                <span id="scan-last-time" class="text-[10px] text-coin-dim">마지막: --</span>
+                <span id="scan-next-time" class="text-[10px] text-coin-dim">다음: --</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="border-t border-[#3d3350]"></div>
+
+          <!-- ── Recommendation Queue (SEMI_AUTO) ── -->
+          <div id="rec-queue-section" class="hidden">
+            <div class="flex items-center gap-2 mb-2">
+              <i data-lucide="bell-ring" class="w-3.5 h-3.5 text-coin-gold"></i>
+              <span class="text-xs font-semibold text-coin-gold">승인 대기 추천</span>
+              <span id="rec-count" class="text-[10px] bg-coin-gold/20 text-coin-gold px-2 py-0.5 rounded-full font-bold">0</span>
+            </div>
+            <div id="rec-queue" class="space-y-2 max-h-80 overflow-y-auto">
+              <!-- Recommendation cards rendered by JS -->
             </div>
           </div>
 
@@ -773,7 +950,6 @@
               </div>
             </div>
           </div>
-
           <div class="border-t border-[#3d3350]"></div>
 
           <!-- ── Scan Schedule ── -->

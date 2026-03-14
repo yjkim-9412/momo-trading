@@ -7,7 +7,9 @@ const API = '/api/v1/admin-coin';
 
 // ── State ──
 let eventSource = null;
+let currentView = 'live';
 let autoScroll = true;
+let isNearTop = false;
 let missedCount = 0;
 let scanCountdownTimer = null;
 let lastSystemStatus = null;
@@ -17,6 +19,43 @@ let manualScanQueuedAt = null;
 let manualScanNotice = null;
 let manualScanSessionObserved = false;
 let lastManualCycleActive = false;
+let currentLogFilter = 'ALL';
+let monitorExpanded = true;
+let monitorUpdateTimer = null;
+let monitorElapsedTimer = null;
+let titleFlashInterval = null;
+
+function createFeedState() {
+  return {
+    stockCards: {},
+    activityCount: 0,
+    loaded: false,
+    scrollPos: 0,
+    feedItems: [],
+    feedTradingDate: null,
+    feedHasMore: false,
+    feedCursor: null,
+    feedLoading: false,
+    loadedActivityIds: new Set(),
+  };
+}
+
+let feedState = createFeedState();
+
+const PIPELINE_STEPS = ['data', 'tier1', 'tier2', 'strategy', 'decision'];
+const PIPELINE_LABELS = { data: '조회', tier1: 'Tier1', tier2: 'Tier2', strategy: '전략', decision: '결정' };
+let monitorState = {
+  cycleActive: false,
+  cycleId: null,
+  startedAt: null,
+  scannedCount: 0,
+  analyzedCount: 0,
+  slots: {},
+  completed: [],
+  lastCycleSummary: null,
+};
+const ORIGINAL_TITLE = document.title || 'MOMO Coin Admin';
+
 const LLM_AGENT_DEFAULTS = {
   tier1: {
     display_name: '후보 분석 에이전트',
@@ -38,6 +77,52 @@ const AGENT_PHASE_LABELS = {
   DECISION: '판단',
   COMPLETE: '완료',
 };
+
+function getStockCards() {
+  return feedState.stockCards;
+}
+
+function getActivityCount() {
+  return feedState.activityCount;
+}
+
+function setActivityCount(value) {
+  feedState.activityCount = value;
+}
+
+function incActivityCount() {
+  feedState.activityCount += 1;
+}
+
+function getActivityIdentity(data) {
+  return data.id || `${data.created_at || ''}|${data.activity_type || ''}|${data.phase || ''}|${data.symbol || ''}|${data.summary || ''}`;
+}
+
+function rememberFeedActivities(activities, { prepend = false } = {}) {
+  const accepted = [];
+  activities.forEach((activity) => {
+    const identity = getActivityIdentity(activity);
+    if (feedState.loadedActivityIds.has(identity)) return;
+    feedState.loadedActivityIds.add(identity);
+    accepted.push(activity);
+  });
+  if (!accepted.length) return 0;
+  feedState.feedItems = prepend
+    ? [...accepted, ...feedState.feedItems]
+    : [...feedState.feedItems, ...accepted];
+  return accepted.length;
+}
+
+function resetFeedState({ preserveLoaded = false } = {}) {
+  feedState.feedItems = [];
+  feedState.feedTradingDate = null;
+  feedState.feedHasMore = false;
+  feedState.feedCursor = null;
+  feedState.feedLoading = false;
+  feedState.loadedActivityIds = new Set();
+  feedState.activityCount = 0;
+  if (!preserveLoaded) feedState.loaded = false;
+}
 
 // ── Utility Functions ──
 
@@ -274,53 +359,72 @@ function renderTriggerButton() {
   refreshIcons();
 }
 
-function showToast(message, type = 'info', duration = 3000) {
+function showToast(message, optsOrType = 'info', legacyDuration) {
+  const opts = typeof optsOrType === 'string'
+    ? { type: optsOrType, duration: legacyDuration }
+    : optsOrType;
+  const { type = 'info', level, duration, persistent = false, onClick } = opts;
   const container = document.getElementById('toast-container');
   if (!container) return;
 
   const toast = document.createElement('div');
-  toast.className = `toast toast-${type}`;
-  toast.textContent = message;
-  container.prepend(toast);
+  const cls = level === 'CRITICAL' ? 'toast-critical' : level === 'HIGH' ? 'toast-high' : `toast-${type}`;
+  toast.className = `toast ${cls}`;
 
-  while (container.children.length > 5) {
-    container.lastElementChild?.remove();
+  const dur = persistent ? 0 : (duration || (level === 'HIGH' ? 8000 : 3000));
+
+  if (persistent || onClick) {
+    toast.innerHTML = `<div class="flex items-center justify-between gap-2"><span class="flex-1">${escapeHtml(message)}</span>${persistent ? '<button class="toast-dismiss text-white/60 hover:text-white ml-2">x</button>' : ''}</div>`;
+  } else {
+    toast.textContent = message;
   }
 
-  window.setTimeout(() => {
-    toast.classList.add('toast-fade-out');
-  }, Math.max(0, duration - 300));
+  if (onClick) {
+    toast.style.cursor = 'pointer';
+    toast.addEventListener('click', (e) => {
+      if (!e.target.closest('.toast-dismiss')) onClick();
+    });
+  }
+  if (persistent) {
+    const dismiss = toast.querySelector('.toast-dismiss');
+    if (dismiss) {
+      dismiss.addEventListener('click', (e) => {
+        e.stopPropagation();
+        _removeToast(toast);
+      });
+    }
+  }
 
-  window.setTimeout(() => {
-    toast.remove();
-  }, duration);
+  container.prepend(toast);
+  while (container.children.length > 5) _removeToast(container.lastChild);
+
+  if (dur > 0) {
+    window.setTimeout(() => toast.classList.add('toast-fade-out'), Math.max(0, dur - 300));
+    window.setTimeout(() => _removeToast(toast), dur);
+  }
+}
+
+function _removeToast(el) {
+  if (el && el.parentNode) el.remove();
 }
 
 function getTypeColor(type) {
   const map = {
-    CYCLE: '#60a5fa',
-    SCAN: '#22d3ee',
-    SCREENING: '#a78bfa',
-    TIER1_ANALYSIS: '#fbbf24',
-    TIER2_REVIEW: '#34d399',
-    DECISION: '#34d399',
-    ORDER: '#f87171',
-    TRADE_RESULT: '#34d399',
-    RISK_GATE: '#f87171',
-    EVENT: '#9ca3af',
-    REPORT: '#a78bfa',
-    LLM_CALL: '#67e8f9',
+    CYCLE: 'blue',
+    SCAN: 'cyan',
+    SCREENING: 'purple',
+    TIER1_ANALYSIS: 'yellow',
+    TIER2_REVIEW: 'green',
+    STRATEGY_EVAL: 'blue',
+    DECISION: 'green',
+    ORDER: 'red',
+    TRADE_RESULT: 'green',
+    RISK_GATE: 'red',
+    EVENT: 'gray',
+    REPORT: 'purple',
+    LLM_CALL: 'cyan',
   };
-  return map[type] || '#9ca3af';
-}
-
-function getActivityOutcome(data) {
-  const summary = String(data.summary || '').toUpperCase();
-  if (data.phase === 'ERROR' || data.error_message) return 'error';
-  if (summary.includes('BUY') || summary.includes('매수')) return 'buy';
-  if (summary.includes('SELL') || summary.includes('매도')) return 'sell';
-  if (summary.includes('HOLD') || summary.includes('관망')) return 'hold';
-  return 'progress';
+  return map[type] || 'gray';
 }
 
 function formatPhaseLabel(phase) {
@@ -359,9 +463,422 @@ function updateBadge(id, text, color) {
   el.className = `px-2 py-0.5 rounded text-xs font-medium ${colors[color] || colors.blue}`;
 }
 
-// ══════════════════════════════════════════════════════════
-// ── 1. SSE Connection + Activity Feed ──
-// ══════════════════════════════════════════════════════════
+// ── Importance / Notification ──
+
+function classifyImportance(data) {
+  const t = data.activity_type;
+  const p = data.phase;
+  const s = (data.summary || '').toUpperCase();
+
+  if ((t === 'ORDER' || t === 'TRADE_RESULT') && p === 'COMPLETE') {
+    return {
+      level: 'CRITICAL',
+      title: (s.includes('매도') || s.includes('SELL')) ? '매도 체결' : '매수 체결',
+      body: `${data.symbol || ''} — ${data.summary || ''}`,
+    };
+  }
+
+  if (t === 'TIER1_ANALYSIS' && p === 'COMPLETE' && (s.includes('BUY') || s.includes('SELL'))) {
+    return {
+      level: 'HIGH',
+      title: s.includes('BUY') ? '매수 신호' : '매도 신호',
+      body: `${data.symbol || ''} — ${data.summary || ''}`,
+    };
+  }
+
+  if (t === 'TIER2_REVIEW' && p === 'COMPLETE' && s.includes('미승인')) {
+    return {
+      level: 'HIGH',
+      title: 'TIER2 미승인',
+      body: `${data.symbol || ''} — ${data.summary || ''}`,
+    };
+  }
+
+  if (t === 'DECISION' && p === 'COMPLETE') {
+    return {
+      level: 'HIGH',
+      title: '주문 실행',
+      body: `${data.symbol || ''} — ${data.summary || ''}`,
+    };
+  }
+
+  return { level: 'NONE' };
+}
+
+function sendBrowserNotification(info) {
+  if (!document.hidden) return;
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  try {
+    const notification = new Notification(info.title, {
+      body: info.body,
+      tag: `momo-coin-${info.level}-${Date.now()}`,
+      requireInteraction: info.level === 'CRITICAL',
+    });
+    notification.onclick = () => {
+      window.focus();
+      notification.close();
+    };
+  } catch {
+    // Browser notification unavailable.
+  }
+}
+
+function requestNotificationPermission() {
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function flashTitle(alertText) {
+  if (titleFlashInterval) return;
+  let show = true;
+  titleFlashInterval = setInterval(() => {
+    document.title = show ? alertText : ORIGINAL_TITLE;
+    show = !show;
+  }, 1000);
+}
+
+function stopTitleFlash() {
+  if (!titleFlashInterval) return;
+  clearInterval(titleFlashInterval);
+  titleFlashInterval = null;
+  document.title = ORIGINAL_TITLE;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) stopTitleFlash();
+});
+
+// ── Agent Monitor ──
+
+function scheduleMonitorRender() {
+  if (monitorUpdateTimer) return;
+  monitorUpdateTimer = setTimeout(() => {
+    monitorUpdateTimer = null;
+    renderAgentMonitor();
+  }, 80);
+}
+
+function _extractName(summary, symbol) {
+  const match = summary && summary.match(/\[([^\]]+)\]/);
+  return match ? match[1] : symbol;
+}
+
+function _detectOutcome(summary, data) {
+  if (data?.phase === 'ERROR' || data?.error_message) return 'error';
+  if (!summary) return 'hold';
+  const normalized = summary.toLowerCase();
+  if (normalized.includes('매수') || normalized.includes('buy')) return 'buy';
+  if (normalized.includes('매도') || normalized.includes('sell')) return 'sell';
+  if (normalized.includes('오류') || normalized.includes('error') || normalized.includes('실패')) return 'error';
+  if (normalized.includes('스킵') || normalized.includes('skip') || normalized.includes('차단')) return 'skip';
+  return 'hold';
+}
+
+function _finishSlot(ms, symbol, outcome) {
+  const slot = ms.slots[symbol];
+  const elapsed = slot ? Math.round((Date.now() - slot.startedAt) / 1000) : 0;
+  ms.completed.push({ symbol, name: slot ? slot.name : symbol, outcome, elapsed });
+  delete ms.slots[symbol];
+  ms.analyzedCount = ms.completed.length;
+}
+
+function syncAgentSnapshot(state) {
+  lastAgentState = state || null;
+  const cycleActive = !!state?.cycle_active;
+  const manualCycleActive = cycleActive && manualScanSessionObserved;
+
+  if (manualCycleActive) {
+    manualScanQueuedAt = null;
+    clearManualScanNotice();
+  } else if (lastManualCycleActive) {
+    setManualScanNotice('최근 스캔 완료', 'check', 'bg-green-900/20 text-green-300 border-green-400/20');
+    manualScanSessionObserved = false;
+  } else if (manualScanQueuedAt && (Date.now() - manualScanQueuedAt) >= 10000) {
+    manualScanQueuedAt = null;
+    manualScanSessionObserved = false;
+    setManualScanNotice('시작 확인 지연', 'alert-triangle', 'bg-yellow-900/20 text-yellow-300 border-yellow-400/20', 4500);
+  }
+
+  lastManualCycleActive = manualCycleActive;
+  renderTriggerButton();
+}
+
+function updateMonitorFromActivity(data) {
+  const ms = monitorState;
+  const { activity_type: activityType, phase, symbol, summary } = data;
+
+  switch (activityType) {
+    case 'CYCLE':
+      if (phase === 'START') {
+        ms.cycleActive = true;
+        ms.cycleId = data.cycle_id;
+        ms.startedAt = Date.now();
+        ms.scannedCount = 0;
+        ms.analyzedCount = 0;
+        ms.slots = {};
+        ms.completed = [];
+      } else if (phase === 'COMPLETE' || phase === 'ERROR') {
+        ms.lastCycleSummary = {
+          analyzedCount: ms.analyzedCount,
+          scannedCount: ms.scannedCount,
+          elapsed: ms.startedAt ? Math.round((Date.now() - ms.startedAt) / 1000) : 0,
+          time: new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          error: phase === 'ERROR',
+        };
+        ms.cycleActive = false;
+        ms.slots = {};
+      }
+      break;
+    case 'SCAN':
+      if (phase === 'COMPLETE' && data.detail) {
+        try {
+          const detail = typeof data.detail === 'string' ? JSON.parse(data.detail) : data.detail;
+          ms.scannedCount = (detail.selected || []).length || ms.scannedCount;
+        } catch {
+          // Ignore malformed detail payload.
+        }
+      }
+      break;
+    case 'TIER1_ANALYSIS':
+      if (phase === 'START' && symbol) {
+        ms.slots[symbol] = { symbol, name: _extractName(summary, symbol), step: 'tier1', startedAt: Date.now() };
+      } else if (phase === 'COMPLETE' && symbol) {
+        if (ms.slots[symbol]) ms.slots[symbol].step = 'tier1_done';
+        const normalized = (summary || '').toUpperCase();
+        if (normalized.includes('HOLD') || normalized.includes('관망') || normalized.includes('보류')) {
+          _finishSlot(ms, symbol, 'hold');
+        }
+      } else if (phase === 'ERROR' && symbol) {
+        _finishSlot(ms, symbol, 'error');
+      } else if (phase === 'SKIP' && symbol) {
+        _finishSlot(ms, symbol, 'skip');
+      }
+      break;
+    case 'TIER2_REVIEW':
+      if (symbol && ms.slots[symbol]) {
+        ms.slots[symbol].step = phase === 'COMPLETE' ? 'tier2_done' : 'tier2';
+        if ((summary || '').includes('미승인')) _finishSlot(ms, symbol, 'hold');
+      }
+      break;
+    case 'STRATEGY_EVAL':
+      if (symbol && ms.slots[symbol]) ms.slots[symbol].step = 'strategy';
+      break;
+    case 'RISK_GATE':
+      if (phase === 'SKIP' && symbol) _finishSlot(ms, symbol, 'skip');
+      break;
+    case 'DECISION':
+      if ((phase === 'COMPLETE' || phase === 'ERROR') && symbol) {
+        _finishSlot(ms, symbol, _detectOutcome(summary, data));
+      } else if (symbol && ms.slots[symbol]) {
+        ms.slots[symbol].step = 'decision';
+      }
+      break;
+    case 'TRADE_RESULT': {
+      if (!symbol) break;
+      const existing = ms.completed.find((entry) => entry.symbol === symbol);
+      if (existing) {
+        const outcome = _detectOutcome(summary, data);
+        if (outcome !== 'hold') existing.outcome = outcome;
+      }
+      break;
+    }
+  }
+
+  scheduleMonitorRender();
+}
+
+function handleAgentStateEvent(data) {
+  syncAgentSnapshot(data);
+  const ms = monitorState;
+
+  if (data?.cycle_active) {
+    ms.cycleActive = true;
+    ms.cycleId = data.cycle_id;
+    ms.startedAt = data.started_at ? new Date(data.started_at).getTime() : Date.now();
+    ms.scannedCount = data.scanned_count || 0;
+    ms.analyzedCount = data.analyzed_count || 0;
+    ms.slots = ms.slots || {};
+  } else {
+    if (ms.cycleActive) {
+      ms.lastCycleSummary = {
+        analyzedCount: data?.analyzed_count || ms.analyzedCount,
+        scannedCount: data?.scanned_count || ms.scannedCount,
+        elapsed: ms.startedAt ? Math.round((Date.now() - ms.startedAt) / 1000) : 0,
+        time: new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      };
+    }
+    ms.cycleActive = false;
+    ms.slots = {};
+  }
+
+  scheduleMonitorRender();
+}
+
+function renderAgentMonitor() {
+  const ms = monitorState;
+  const iconEl = document.getElementById('monitor-status-icon');
+  const statusEl = document.getElementById('monitor-status');
+  const elapsedEl = document.getElementById('monitor-elapsed');
+  const progressWrap = document.getElementById('monitor-progress-wrap');
+  const progressBar = document.getElementById('monitor-progress-bar');
+  const body = document.getElementById('monitor-body');
+  const slotsEl = document.getElementById('monitor-slots');
+  const completedWrap = document.getElementById('monitor-completed');
+  const completedList = document.getElementById('monitor-completed-list');
+
+  if (!iconEl || !statusEl || !elapsedEl || !progressWrap || !progressBar || !body || !slotsEl || !completedWrap || !completedList) {
+    return;
+  }
+
+  if (ms.cycleActive) {
+    iconEl.classList.add('active');
+    statusEl.textContent = '코인 사이클 진행 중';
+    statusEl.style.color = '#c4b5fd';
+
+    progressWrap.style.display = '';
+    const total = ms.scannedCount || 1;
+    const done = ms.analyzedCount;
+    progressBar.style.width = `${Math.min(100, Math.round((done / total) * 100))}%`;
+
+    if (ms.startedAt) {
+      const sec = Math.round((Date.now() - ms.startedAt) / 1000);
+      elapsedEl.textContent = `${sec}s`;
+      _startElapsedTimer();
+    }
+
+    if (monitorExpanded) {
+      body.style.display = '';
+      const slotSymbols = Object.keys(ms.slots);
+      let slotsHTML = '';
+      slotSymbols.forEach((sym) => {
+        const slot = ms.slots[sym];
+        const stepIdx = PIPELINE_STEPS.indexOf(slot.step.replace('_done', ''));
+        const isDone = slot.step.endsWith('_done');
+        const slotSec = Math.round((Date.now() - slot.startedAt) / 1000);
+        slotsHTML += `<div class="monitor-slot slot-active">
+          <div class="monitor-slot-symbol">${escapeHtml(slot.symbol)}</div>
+          <div class="monitor-slot-name">${escapeHtml(slot.name)}</div>
+          <div class="pipeline-steps">${_renderPipeline(stepIdx, isDone)}</div>
+          <div class="monitor-slot-timer">${slotSec}s · ${PIPELINE_LABELS[slot.step.replace('_done', '')] || slot.step}</div>
+        </div>`;
+      });
+      if (!slotSymbols.length && !ms.completed.length) {
+        slotsHTML += `<div class="monitor-slot" style="opacity:0.3; grid-column: 1/-1; text-align:center;">
+          <div class="text-xs text-gray-600">스캔 완료 · 분석 대기 중...</div>
+        </div>`;
+      }
+      slotsEl.innerHTML = slotsHTML;
+
+      if (ms.completed.length > 0) {
+        completedWrap.style.display = '';
+        completedList.innerHTML = ms.completed.map((item) => {
+          const cls = `badge-${item.outcome}`;
+          const outcomeLabel = { buy: '매수', sell: '매도', hold: '관망', error: '오류', skip: '스킵' }[item.outcome] || item.outcome;
+          return `<span class="monitor-completed-badge ${cls}" title="${escapeHtml(item.name)} (${item.elapsed}s)">${escapeHtml(item.symbol)} <span style="opacity:0.7">${outcomeLabel}</span></span>`;
+        }).join('');
+      } else {
+        completedWrap.style.display = 'none';
+      }
+    } else {
+      body.style.display = 'none';
+    }
+  } else {
+    iconEl.classList.remove('active');
+    statusEl.style.color = '#6b7280';
+    progressWrap.style.display = 'none';
+    body.style.display = 'none';
+    _stopElapsedTimer();
+
+    if (ms.lastCycleSummary) {
+      const summary = ms.lastCycleSummary;
+      statusEl.textContent = '대기 중';
+      elapsedEl.textContent = `마지막: ${summary.time} (${summary.scannedCount}종목, ${summary.elapsed}s)`;
+    } else {
+      statusEl.textContent = '대기 중';
+      elapsedEl.textContent = '';
+    }
+  }
+
+  refreshIcons();
+}
+
+function _renderPipeline(activeIdx, isDone) {
+  let html = '';
+  for (let i = 0; i < PIPELINE_STEPS.length; i += 1) {
+    if (i > 0) {
+      const connectorClass = i <= activeIdx ? 'conn-done' : '';
+      html += `<div class="pipeline-connector ${connectorClass}"></div>`;
+    }
+    let cls = 'pipeline-step';
+    if (i < activeIdx || (i === activeIdx && isDone)) cls += ' step-done';
+    else if (i === activeIdx) cls += ' step-active';
+    html += `<div class="${cls}" title="${PIPELINE_LABELS[PIPELINE_STEPS[i]]}"></div>`;
+  }
+  return html;
+}
+
+function toggleMonitorExpand() {
+  monitorExpanded = !monitorExpanded;
+  renderAgentMonitor();
+}
+
+function _startElapsedTimer() {
+  if (monitorElapsedTimer) return;
+  monitorElapsedTimer = setInterval(() => {
+    if (!monitorState.cycleActive || !monitorState.startedAt) {
+      _stopElapsedTimer();
+      return;
+    }
+    const sec = Math.round((Date.now() - monitorState.startedAt) / 1000);
+    const elapsedEl = document.getElementById('monitor-elapsed');
+    if (elapsedEl) elapsedEl.textContent = `${sec}s`;
+  }, 1000);
+}
+
+function _stopElapsedTimer() {
+  if (!monitorElapsedTimer) return;
+  clearInterval(monitorElapsedTimer);
+  monitorElapsedTimer = null;
+}
+
+async function initAgentMonitor() {
+  await loadAgentState({ quiet: true });
+  renderAgentMonitor();
+}
+
+// ── SSE Connection / Feed ──
+
+function showSSEDisconnectBanner() {
+  if (document.getElementById('sse-disconnect-banner')) return;
+  const main = document.querySelector('main');
+  if (!main) return;
+  const banner = document.createElement('div');
+  banner.id = 'sse-disconnect-banner';
+  banner.className = 'sse-disconnect-banner shrink-0';
+  banner.innerHTML = '<i data-lucide="wifi-off" class="w-4 h-4"></i> 실시간 연결이 끊겼습니다. 재연결 중...';
+  main.insertBefore(banner, main.children[1]);
+  refreshIcons();
+}
+
+function removeSSEDisconnectBanner() {
+  document.getElementById('sse-disconnect-banner')?.remove();
+}
+
+function highlightCard(data) {
+  if (!data?.symbol) return;
+  const cards = Object.values(getStockCards());
+  const card = cards.find((item) => item.symbol === data.symbol);
+  if (!card?.element) return;
+  card.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.element.classList.add('highlighted');
+  setTimeout(() => card.element.classList.remove('highlighted'), 3000);
+}
+
+function navigateToCard(data) {
+  if (!data) return;
+  highlightCard(data);
+}
 
 window.addEventListener('beforeunload', () => {
   if (eventSource) eventSource.close();
@@ -372,12 +889,16 @@ function connectSSE() {
     eventSource.close();
     eventSource = null;
   }
+
   const es = new EventSource(`${API}/stream`);
   eventSource = es;
 
   es.onopen = () => {
-    updateBadge('badge-sse', 'SSE:ON', 'green');
-    setStatusText('실시간 스트림 연결됨', '#34d399');
+    updateBadge('badge-sse', '연결', 'green');
+    setStatusText('SSE 연결됨', '#34d399');
+    removeSSEDisconnectBanner();
+    requestNotificationPermission();
+    setTimeout(initAgentMonitor, 100);
   };
 
   es.onmessage = (e) => {
@@ -385,22 +906,42 @@ function connectSSE() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'connected') return;
 
+      if (msg.type === 'agent_state') {
+        handleAgentStateEvent(msg.data);
+        return;
+      }
+
       if (msg.type === 'activity') {
-        appendActivity(msg.data || msg);
-        // Refresh account on trade events
-        if (msg.data && msg.data.phase === 'COMPLETE' &&
-            ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
+        const data = msg.data || msg;
+        updateMonitorFromActivity(data);
+
+        const importance = classifyImportance(data);
+        if (importance.level !== 'NONE') {
+          showToast(`[CRYPTO] ${importance.title}: ${data.symbol || ''} ${data.summary || ''}`, {
+            level: importance.level,
+            persistent: importance.level === 'CRITICAL',
+            onClick: () => navigateToCard(data),
+          });
+          if (document.hidden) {
+            sendBrowserNotification({ ...importance, title: `[CRYPTO] ${importance.title}` });
+            flashTitle(`${importance.level === 'CRITICAL' ? '[긴급]' : '[알림]'} [CRYPTO] ${importance.title}`);
+          }
+        }
+
+        if (currentView === 'live') {
+          appendActivity(data);
+          if (importance.level === 'CRITICAL' || importance.level === 'HIGH') {
+            setTimeout(() => highlightCard(data), 100);
+          }
+        }
+
+        if (data.phase === 'COMPLETE' && ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(data.activity_type)) {
           setTimeout(loadBalance, 2000);
         }
-        // Refresh watchlist on scan/decision events
-        if (msg.data && msg.data.phase === 'COMPLETE' &&
-            ['SCAN', 'CYCLE', 'DECISION'].includes(msg.data.activity_type)) {
+        if (data.phase === 'COMPLETE' && ['SCAN', 'CYCLE', 'DECISION'].includes(data.activity_type)) {
           setTimeout(loadWatchlist, 1500);
         }
-        if (msg.data && ['CYCLE', 'SCAN', 'TIER1_ANALYSIS', 'TIER2_REVIEW', 'DECISION'].includes(msg.data.activity_type)) {
-          setTimeout(loadAgentState, 700);
-        }
-        if (msg.data && ['CYCLE', 'DECISION', 'ORDER', 'TRADE_RESULT'].includes(msg.data.activity_type)) {
+        if (['CYCLE', 'DECISION', 'ORDER', 'TRADE_RESULT'].includes(data.activity_type)) {
           setTimeout(loadSystemStatus, 900);
         }
       }
@@ -415,122 +956,404 @@ function connectSSE() {
   };
 
   es.onerror = () => {
-    updateBadge('badge-sse', 'SSE:OFF', 'red');
-    setStatusText('실시간 스트림 재연결 중', '#f87171');
+    updateBadge('badge-sse', '끊김', 'red');
+    setStatusText('SSE 재연결 중...', '#f87171');
+    showSSEDisconnectBanner();
     setTimeout(() => {
       if (es.readyState === EventSource.CLOSED) connectSSE();
     }, 3000);
+    setTimeout(initAgentMonitor, 4000);
   };
 }
 
-function appendActivity(data) {
-  const feed = document.getElementById('feed-container');
-  if (!feed) return;
-  const card = createBubble(data);
+function appendActivity(data, options = {}) {
+  const { skipStore = false } = options;
+  if (!skipStore && rememberFeedActivities([data]) === 0) return;
 
-  // Apply current filter
-  if (currentFilter !== 'ALL') {
-    const type = data.activity_type || '';
-    if (currentFilter === 'SIGNAL' && !['SCAN', 'DECISION', 'TIER1_ANALYSIS', 'TIER2_REVIEW', 'RISK_GATE'].includes(type)) {
-      card.style.display = 'none';
-    } else if (currentFilter === 'TRADE' && !['ORDER', 'TRADE_RESULT'].includes(type)) {
-      card.style.display = 'none';
-    }
+  const container = document.getElementById('chat-container');
+  if (!container) return;
+
+  if (container.children.length === 1 && container.children[0].classList.contains('text-center')) {
+    container.innerHTML = '';
   }
 
-  feed.appendChild(card);
-  refreshIcons();
+  const symbol = data.symbol;
+  const isCycleActivity = data.activity_type === 'CYCLE';
+  const isLLMCall = data.activity_type === 'LLM_CALL';
 
-  // Update activity count
-  const total = feed.querySelectorAll('.activity-card').length;
-  setTextContent('activity-count', `${total}건`);
-
-  // Auto-scroll logic
-  if (autoScroll) {
-    feed.scrollTop = feed.scrollHeight;
+  if (!symbol || isCycleActivity) {
+    if (isCycleActivity && data.phase === 'START') {
+      container.appendChild(createCycleDivider(data, true));
+    } else if (isCycleActivity && (data.phase === 'COMPLETE' || data.phase === 'ERROR')) {
+      const startKey = `cycle-start-${data.cycle_id}`;
+      const existing = container.querySelector(`[data-cycle-start="${startKey}"]`);
+      if (existing) {
+        existing.querySelector('.progress-spinner')?.remove();
+        const text = existing.querySelector('.cycle-text');
+        if (text) text.textContent += ' → 완료';
+      }
+      container.appendChild(createCycleDivider(data, false));
+    } else if (isLLMCall && !symbol) {
+      container.appendChild(createBubble(data));
+    } else {
+      container.appendChild(createBubble(data));
+    }
   } else {
-    missedCount++;
+    const cards = getStockCards();
+    const cardKey = `${data.cycle_id || 'ev'}:${symbol}`;
+    let card = cards[cardKey];
+
+    if (!card) {
+      Object.entries(cards).forEach(([key, existing]) => {
+        if (!card && key.endsWith(`:${symbol}`) && (!existing.outcome || existing.outcome === 'progress')) {
+          card = existing;
+          cards[cardKey] = card;
+        }
+      });
+    }
+
+    if (!card) {
+      if (isLLMCall) return;
+      card = createStockCard(symbol, data);
+      cards[cardKey] = card;
+      container.appendChild(card.element);
+    }
+
+    addStepToCard(card, data);
+    updateCardHeader(card);
+  }
+
+  incActivityCount();
+  const countEl = document.getElementById('activity-count');
+  if (countEl) countEl.textContent = `${getActivityCount()}건`;
+
+  if (!autoScroll) {
+    missedCount += 1;
     updateScrollFab();
   }
+
+  if (autoScroll) container.scrollTop = container.scrollHeight;
+  refreshIcons();
 }
 
-function createBubble(data) {
-  const card = document.createElement('div');
-  const detailId = `coin-detail-${data.id || Math.random().toString(36).slice(2, 8)}`;
-  const hasDetail = Boolean(data.detail || data.error_message);
-  const isLLMCall = data.activity_type === 'LLM_CALL';
-  const outcome = getActivityOutcome(data);
-  const meta = [];
-  const symbol = data.symbol ? `<span class="text-gray-200 font-medium">${escapeHtml(data.symbol)}</span>` : '';
-
-  if (data.llm_provider) meta.push(escapeHtml(data.llm_provider));
-  if (data.llm_tier) meta.push(escapeHtml(ADMIN_AGENT_LABELS[data.llm_tier] || data.llm_tier));
-  if (data.execution_time_ms) meta.push(`${(Number(data.execution_time_ms) / 1000).toFixed(1)}초`);
-  if (data.confidence != null && !Number.isNaN(Number(data.confidence))) {
-    meta.push(`신뢰도 ${Math.round(Number(data.confidence) * 100)}%`);
+function createCycleDivider(data, isStart) {
+  const div = document.createElement('div');
+  div.className = isStart ? 'cycle-divider cycle-start' : 'cycle-divider cycle-end';
+  const summary = formatAdminAgentText(data.summary);
+  if (isStart) {
+    div.setAttribute('data-cycle-start', `cycle-start-${data.cycle_id}`);
+    div.innerHTML = `<span class="progress-spinner"></span><span class="cycle-text">${escapeHtml(summary)}</span>`;
+  } else {
+    const time = formatTime(data.created_at);
+    const elapsed = data.execution_time_ms ? ` (${(data.execution_time_ms / 1000).toFixed(1)}초)` : '';
+    div.innerHTML = `<span>${escapeHtml(summary)}${elapsed}</span><span class="text-gray-500">${time}</span>`;
   }
+  return div;
+}
 
-  card.className = `activity-card coin-card outcome-${outcome}`;
-  card.dataset.activityType = data.activity_type || '';
-  card.innerHTML = `
-    <div class="coin-card-header" ${hasDetail ? `onclick="toggleDetail('${detailId}')"` : ''}>
-      <div class="min-w-0 flex-1">
-        <div class="flex items-start justify-between gap-3">
-          <div class="min-w-0">
-            <div class="flex items-center gap-2 text-[11px]">
-              <span style="color:${getTypeColor(data.activity_type)}; font-weight:600;">${escapeHtml(data.activity_type || 'EVENT')}</span>
-              ${data.phase ? `<span class="text-gray-500">${escapeHtml(formatPhaseLabel(data.phase))}</span>` : ''}
-              ${symbol}
-            </div>
-            <div class="text-sm text-gray-200 whitespace-pre-wrap mt-1 leading-5">${escapeHtml(formatAdminAgentText(data.summary || ''))}</div>
-            ${meta.length ? `<div class="text-[11px] text-gray-500 mt-1">${meta.join(' · ')}</div>` : ''}
-          </div>
-          <div class="flex items-center gap-2 shrink-0">
-            <span class="text-[11px] text-gray-500">${escapeHtml(formatTime(data.created_at) || formatTimeAgo(data.created_at))}</span>
-            ${hasDetail ? `
-              <div
-                data-detail-target="${detailId}"
-                class="text-[11px] text-gray-500 hover:text-gray-300 flex items-center gap-1 transition-transform duration-200"
-              >
-                ${isLLMCall ? 'LLM' : '상세'}
-                <i data-lucide="${isLLMCall ? 'message-square' : 'chevron-down'}" data-detail-arrow="${detailId}" class="w-3 h-3 transition-transform duration-200"></i>
-              </div>
-            ` : ''}
-          </div>
-        </div>
-      </div>
-    </div>
-    ${hasDetail ? `
-      <div id="${detailId}" class="coin-card-body">
-        <div class="px-3 pb-3">
-          <div class="detail-content open">
-            ${data.error_message ? `<div class="mb-3 rounded bg-red-950/30 border border-red-900/50 px-3 py-2 text-red-300 whitespace-pre-wrap">${escapeHtml(formatAdminAgentText(data.error_message))}</div>` : ''}
-            ${data.detail ? (
-              isLLMCall
-                ? formatLLMConversation(data.detail)
-                : `<div class="max-h-96 overflow-y-auto">${formatDetail(data.detail, data.activity_type)}</div>`
-            ) : ''}
-          </div>
-        </div>
-      </div>
-    ` : ''}
+function createStockCard(symbol, firstActivity) {
+  const el = document.createElement('div');
+  el.className = 'stock-card outcome-progress';
+
+  const nameMatch = (firstActivity.summary || '').match(/\[([^\]]+)\]/);
+  let coinName = nameMatch ? nameMatch[1] : symbol;
+  if (/^TIER\d/i.test(coinName)) coinName = symbol;
+
+  const header = document.createElement('div');
+  header.className = 'stock-card-header';
+
+  const badgeClass = 'bg-violet-900/40 text-violet-300';
+  header.innerHTML = `
+    <i data-lucide="activity" class="w-4 h-4 text-gray-400 shrink-0"></i>
+    <span class="text-sm font-medium text-white flex-1 truncate">
+      ${escapeHtml(coinName)} <span class="text-gray-500 text-xs">${escapeHtml(symbol)}</span>
+    </span>
+    <span class="stock-outcome flex items-center gap-1 text-xs px-2 py-0.5 rounded ${badgeClass}">
+      <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:2px"></span>분석 중
+    </span>
+    <span class="stock-elapsed text-xs text-gray-400"></span>
+    <span class="stock-expand text-gray-500 text-xs transition-transform" style="transform:rotate(-90deg)"><i data-lucide="chevron-down" class="w-4 h-4"></i></span>
   `;
+
+  const body = document.createElement('div');
+  body.className = 'stock-card-body';
+
+  const steps = document.createElement('div');
+  steps.className = 'stock-card-steps';
+  body.appendChild(steps);
+
+  el.appendChild(header);
+  el.appendChild(body);
+
+  const card = {
+    element: el,
+    headerEl: header,
+    bodyEl: body,
+    stepsEl: steps,
+    activities: [],
+    symbol,
+    stockName: coinName,
+    outcome: null,
+    confidence: null,
+    totalElapsed: 0,
+    isOpen: false,
+    startTime: Date.now(),
+    liveTimer: null,
+  };
+
+  header.onclick = () => toggleCardBody(card);
+  card.liveTimer = setInterval(() => {
+    if (card.outcome && card.outcome !== 'progress') {
+      clearInterval(card.liveTimer);
+      card.liveTimer = null;
+      return;
+    }
+    const elapsed = ((Date.now() - card.startTime) / 1000).toFixed(0);
+    const elapsedEl = card.headerEl.querySelector('.stock-elapsed');
+    if (elapsedEl) elapsedEl.textContent = `${elapsed}초`;
+  }, 1000);
+
   return card;
 }
 
-function toggleDetail(id) {
-  const body = document.getElementById(id);
-  if (!body) return;
-  body.classList.toggle('open');
-  const btn = document.querySelector(`[data-detail-target="${id}"]`);
-  if (btn) {
-    const expanded = body.classList.contains('open');
-    const icon = btn.querySelector(`[data-detail-arrow="${id}"]`);
-    if (icon) {
-      if (icon.dataset.lucide === 'chevron-down') {
-        icon.style.transform = expanded ? 'rotate(180deg)' : 'rotate(0deg)';
+function addStepToCard(card, data) {
+  card.activities.push(data);
+  const progressKey = getProgressKey(data);
+
+  if (data.phase === 'START') {
+    const step = document.createElement('div');
+    step.className = 'stock-step';
+    step.setAttribute('data-progress-key', progressKey);
+    const time = formatTime(data.created_at);
+    const label = formatAdminAgentText((data.summary || '').replace(/시작$/, '').trim());
+    step.innerHTML = `
+      <span class="text-xs text-gray-500 shrink-0 w-14">${time}</span>
+      <span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px"></span>
+      <span class="text-xs text-gray-400">${escapeHtml(label)}...</span>
+    `;
+    card.stepsEl.appendChild(step);
+    return;
+  }
+
+  if (data.phase === 'COMPLETE' || data.phase === 'ERROR') {
+    card.stepsEl.querySelector(`[data-progress-key="${progressKey}"]`)?.remove();
+  }
+
+  const step = document.createElement('div');
+  step.className = 'stock-step';
+  const time = formatTime(data.created_at);
+  const typeColor = getTypeColor(data.activity_type);
+  const elapsed = data.execution_time_ms ? `${(data.execution_time_ms / 1000).toFixed(1)}초` : '';
+
+  let html = `
+    <span class="text-xs text-gray-500 shrink-0 w-14">${time}</span>
+    <div class="flex-1 min-w-0">
+      <div class="text-xs">${escapeHtml(formatAdminAgentText(data.summary))}</div>`;
+
+  const meta = [];
+  if (data.llm_provider) meta.push(`<span class="text-${typeColor}-400">${escapeHtml(data.llm_provider)}</span>`);
+  if (elapsed) meta.push(elapsed);
+  if (data.confidence != null) {
+    const pct = Math.round(data.confidence * 100);
+    const confColor = pct >= 70 ? 'text-green-400' : pct >= 40 ? 'text-yellow-400' : 'text-red-400';
+    meta.push(`<span class="${confColor} font-medium">신뢰도 ${pct}%</span>`);
+  }
+  if (meta.length) {
+    html += `<div class="text-xs text-gray-400 mt-0.5">${meta.join(' · ')}</div>`;
+  }
+
+  if (data.detail) {
+    const detailId = `sd-${Math.random().toString(36).slice(2, 8)}`;
+    const isLLMCall = data.activity_type === 'LLM_CALL';
+    html += `
+      <button onclick="event.stopPropagation(); toggleDetail('${detailId}')" class="text-xs text-gray-500 hover:text-gray-300 mt-0.5 flex items-center gap-1">
+        ${isLLMCall ? '<i data-lucide="message-square" class="w-3 h-3"></i> LLM 대화' : '<i data-lucide="chevron-down" class="w-3 h-3"></i> 상세'}
+      </button>
+      <div id="${detailId}" class="detail-content mt-1 text-xs bg-dark-900/50 rounded p-2 text-gray-400">
+        ${isLLMCall ? formatLLMConversation(data.detail) : `<div class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${formatDetail(data.detail, data.activity_type)}</div>`}
+      </div>`;
+  }
+
+  if (data.error_message) {
+    html += `<div class="text-xs text-red-400 mt-0.5">${escapeHtml(formatAdminAgentText(data.error_message))}</div>`;
+  }
+
+  html += '</div>';
+  step.innerHTML = html;
+  card.stepsEl.appendChild(step);
+}
+
+function updateCardHeader(card) {
+  let outcome = 'progress';
+  let outcomeText = '<span class="progress-spinner" style="width:10px;height:10px;border-width:1.5px;margin-right:2px"></span>분석 중';
+  let outcomeBg = 'bg-violet-900/40 text-violet-300';
+  let totalMs = 0;
+
+  card.activities.forEach((activity) => {
+    if (activity.execution_time_ms) totalMs += activity.execution_time_ms;
+
+    if (activity.phase === 'ERROR' || activity.error_message) {
+      outcome = 'error';
+      outcomeText = '<i data-lucide="x-circle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 오류';
+      outcomeBg = 'bg-red-900/40 text-red-300';
+    }
+
+    if (activity.phase === 'SKIP' && outcome !== 'error') {
+      outcome = 'hold';
+      outcomeText = '<i data-lucide="skip-forward" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 스킵';
+      outcomeBg = 'bg-gray-700/60 text-gray-300';
+    }
+
+    if (activity.activity_type === 'TIER1_ANALYSIS' && activity.phase === 'COMPLETE') {
+      const summary = activity.summary || '';
+      if (summary.includes('HOLD') || summary.includes('관망') || summary.includes('실패')) {
+        outcome = 'hold';
+        outcomeText = summary.includes('실패')
+          ? '<i data-lucide="alert-triangle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 분석 실패'
+          : '<i data-lucide="pause-circle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> HOLD';
+        outcomeBg = 'bg-gray-700/60 text-gray-300';
+      } else if (summary.includes('BUY') || summary.includes('매수')) {
+        outcome = 'buy';
+        outcomeText = '<i data-lucide="trending-up" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매수';
+        outcomeBg = 'bg-green-900/40 text-green-300';
+      } else if (summary.includes('SELL') || summary.includes('매도')) {
+        outcome = 'sell';
+        outcomeText = '<i data-lucide="trending-down" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매도';
+        outcomeBg = 'bg-amber-900/40 text-amber-200';
       }
     }
+
+    if (activity.activity_type === 'TIER2_REVIEW' && activity.phase === 'COMPLETE') {
+      const summary = activity.summary || '';
+      if (summary.includes('미승인')) {
+        outcome = outcome !== 'error' ? 'hold' : outcome;
+        outcomeText = '<i data-lucide="minus-circle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 미승인';
+        outcomeBg = 'bg-gray-700/60 text-gray-300';
+      }
+    }
+
+    if (activity.activity_type === 'STRATEGY_EVAL' && activity.phase === 'COMPLETE') {
+      const summary = activity.summary || '';
+      if ((summary.includes('HOLD') || summary.includes('스킵')) && outcome !== 'error') {
+        outcome = 'hold';
+        outcomeText = '<i data-lucide="pause-circle" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> HOLD';
+        outcomeBg = 'bg-gray-700/60 text-gray-300';
+      }
+    }
+
+    if (activity.activity_type === 'DECISION' || activity.activity_type === 'ORDER' || activity.activity_type === 'TRADE_RESULT') {
+      const summary = activity.summary || '';
+      const isSell = outcome === 'sell' || summary.includes('SELL') || summary.includes('매도');
+      if (activity.phase === 'COMPLETE' && (summary.includes('주문 접수') || summary.includes('체결'))) {
+        outcome = isSell ? 'sell' : 'buy';
+        outcomeText = isSell
+          ? '<i data-lucide="trending-down" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매도 완료'
+          : '<i data-lucide="trending-up" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매수 완료';
+        outcomeBg = isSell ? 'bg-amber-900/40 text-amber-200' : 'bg-green-900/40 text-green-300';
+      } else if (summary.includes('주문 실행')) {
+        if (outcome !== 'buy' && outcome !== 'sell') {
+          outcome = isSell ? 'sell' : 'buy';
+          outcomeText = isSell
+            ? '<i data-lucide="trending-down" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매도'
+            : '<i data-lucide="trending-up" class="w-3 h-3 inline-block mb-0.5 mr-0.5"></i> 매수';
+          outcomeBg = isSell ? 'bg-amber-900/40 text-amber-200' : 'bg-green-900/40 text-green-300';
+        }
+      }
+    }
+
+    if (activity.confidence != null) {
+      card.confidence = activity.confidence;
+    }
+  });
+
+  card.outcome = outcome;
+  card.totalElapsed = totalMs;
+
+  const outcomeEl = card.headerEl.querySelector('.stock-outcome');
+  if (outcomeEl) {
+    outcomeEl.className = `stock-outcome flex items-center gap-1.5 text-xs px-2 py-0.5 rounded ${outcomeBg}`;
+    outcomeEl.innerHTML = outcomeText;
+  }
+
+  if (outcome !== 'progress') {
+    if (card.liveTimer) {
+      clearInterval(card.liveTimer);
+      card.liveTimer = null;
+    }
+    const elapsedEl = card.headerEl.querySelector('.stock-elapsed');
+    if (elapsedEl && totalMs > 0) {
+      elapsedEl.textContent = `${(totalMs / 1000).toFixed(1)}초`;
+    }
+  }
+
+  card.element.className = `stock-card outcome-${outcome}`;
+  applyFilterToCard(card);
+}
+
+function applyFilterToCard(card) {
+  if (currentLogFilter === 'ALL') {
+    card.element.style.display = '';
+    return;
+  }
+  card.element.style.display = ['buy', 'sell', 'hold'].includes(card.outcome) ? '' : 'none';
+}
+
+function toggleCardBody(card) {
+  card.isOpen = !card.isOpen;
+  card.bodyEl.classList.toggle('open', card.isOpen);
+  const arrow = card.headerEl.querySelector('.stock-expand');
+  if (arrow) arrow.style.transform = card.isOpen ? 'rotate(0deg)' : 'rotate(-90deg)';
+}
+
+function createBubble(data) {
+  const div = document.createElement('div');
+  div.className = 'chat-bubble';
+
+  const time = formatTime(data.created_at);
+  const typeColor = getTypeColor(data.activity_type);
+
+  let html = `
+    <div class="flex items-start gap-2 px-3 py-1.5 rounded-lg hover:bg-dark-700/50 transition group">
+      <span class="text-xs text-gray-500 mt-0.5 shrink-0 w-14">${time}</span>
+      <div class="flex-1 min-w-0">
+        <div class="text-sm whitespace-pre-wrap">${escapeHtml(formatAdminAgentText(data.summary))}</div>`;
+
+  const meta = [];
+  if (data.llm_provider) meta.push(`<span class="text-${typeColor}-400">${escapeHtml(data.llm_provider)}</span>`);
+  if (data.execution_time_ms) meta.push(`${(data.execution_time_ms / 1000).toFixed(1)}초`);
+  if (data.confidence != null) meta.push(`신뢰도 ${Math.round(data.confidence * 100)}%`);
+  if (meta.length) {
+    html += `<div class="flex items-center gap-3 mt-0.5 text-xs text-gray-500">${meta.join(' | ')}</div>`;
+  }
+
+  if (data.detail) {
+    const detailId = `detail-${data.id || Math.random().toString(36).slice(2, 8)}`;
+    const isLLMCall = data.activity_type === 'LLM_CALL';
+    html += `
+      <button onclick="toggleDetail('${detailId}')" class="text-xs text-gray-500 hover:text-gray-300 mt-1 flex items-center gap-1">
+        ${isLLMCall ? '<i data-lucide="message-square" class="w-3 h-3"></i> LLM 대화 보기' : '<i data-lucide="chevron-down" class="w-3 h-3"></i> 상세 보기'}
+      </button>
+      <div id="${detailId}" class="detail-content mt-1 text-xs bg-dark-900 rounded p-2 text-gray-400">
+        ${isLLMCall ? formatLLMConversation(data.detail) : `<div class="whitespace-pre-wrap break-all max-h-96 overflow-y-auto">${formatDetail(data.detail, data.activity_type)}</div>`}
+      </div>`;
+  }
+
+  if (data.error_message) {
+    html += `<div class="text-xs text-red-400 mt-1">${escapeHtml(formatAdminAgentText(data.error_message))}</div>`;
+  }
+
+  html += '</div></div>';
+  div.innerHTML = html;
+  return div;
+}
+
+function toggleDetail(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle('open');
+  const btn = el.previousElementSibling;
+  if (btn && btn.tagName === 'BUTTON') {
+    btn.setAttribute('aria-expanded', String(el.classList.contains('open')));
   }
 }
 
@@ -584,11 +1407,9 @@ function formatLLMConversation(detail) {
   let html = '';
 
   const makeCollapsible = (role, bodyText, defaultOpen = false) => {
-    const id = `llm-${Math.random().toString(36).substr(2, 6)}`;
-    const iconClass = defaultOpen ? 'lucide-chevron-up' : 'lucide-chevron-down';
+    const id = `llm-${Math.random().toString(36).slice(2, 8)}`;
     const bodyClass = defaultOpen ? 'llm-body open' : 'llm-body';
     const typeClass = `type-${role.toLowerCase()}`;
-    // Using inline onclick for simplicity similar to existing detail toggle
     return `
       <div class="llm-msg ${typeClass}">
         <div class="llm-role" onclick="document.getElementById('${id}').classList.toggle('open'); this.querySelector('i').classList.toggle('rotate-180')">
@@ -596,30 +1417,39 @@ function formatLLMConversation(detail) {
           <i data-lucide="chevron-down" class="w-3.5 h-3.5 transition-transform duration-200 ${defaultOpen ? 'rotate-180' : ''}"></i>
         </div>
         <div id="${id}" class="${bodyClass}">${escapeHtml(formatAdminAgentText(bodyText))}</div>
-      </div>
-    `;
+      </div>`;
   };
 
   if (model) html += `<div class="llm-model-tag">${escapeHtml(String(model))}</div>`;
-  if (systemPrompt) {
-    html += makeCollapsible('SYSTEM', systemPrompt, false);
-  }
-  if (prompt) {
-    html += makeCollapsible('PROMPT', prompt, false);
-  }
-  if (response) {
-    html += makeCollapsible('RESPONSE', response, true);
-  }
+  if (systemPrompt) html += makeCollapsible('SYSTEM', systemPrompt, false);
+  if (prompt) html += makeCollapsible('PROMPT', prompt, false);
+  if (response) html += makeCollapsible('RESPONSE', response, true);
 
   return `<div class="llm-conversation">${html || '<div class="text-gray-500">표시할 LLM 상세가 없습니다.</div>'}</div>`;
 }
 
-function setupFeedScroll() {
-  const feed = document.getElementById('feed-container');
-  if (!feed) return;
+function renderPlaceholder(container, type, message) {
+  if (!container) return;
+  let html = '';
+  if (type === 'loading') {
+    html = `<div class="text-center text-gray-500 text-sm py-4 flex items-center justify-center gap-2"><span class="progress-spinner"></span> ${escapeHtml(message || '불러오는 중...')}</div>`;
+  } else if (type === 'error') {
+    html = `<div class="text-center text-red-400 text-sm py-8">${escapeHtml(message || '로드 실패')}</div>`;
+  } else {
+    html = `<div class="text-center text-gray-500 text-sm py-8"><i data-lucide="inbox" class="w-6 h-6 mx-auto mb-2 opacity-50"></i><div>${escapeHtml(message || '데이터가 없습니다')}</div></div>`;
+  }
+  container.innerHTML = html;
+  refreshIcons();
+}
 
-  feed.addEventListener('scroll', () => {
-    const distFromBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight;
+function setupFeedScroll() {
+  const container = document.getElementById('chat-container');
+  if (!container) return;
+
+  container.addEventListener('scroll', () => {
+    feedState.scrollPos = container.scrollTop;
+    isNearTop = container.scrollTop < 64;
+    const distFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     if (distFromBottom < 40) {
       autoScroll = true;
       missedCount = 0;
@@ -627,42 +1457,207 @@ function setupFeedScroll() {
     } else {
       autoScroll = false;
     }
+    updateFeedLoadMore();
   });
 }
 
 function updateScrollFab() {
   const fab = document.getElementById('scroll-to-bottom');
-  if (!fab) return;
+  const badge = document.getElementById('scroll-fab-badge');
+  if (!fab || !badge) return;
   if (missedCount > 0) {
-    fab.textContent = `${missedCount}건 새 활동`;
-    fab.style.display = 'block';
+    badge.textContent = missedCount > 99 ? '99+' : String(missedCount);
+    badge.classList.add('visible');
+    fab.classList.remove('hidden');
   } else {
-    fab.style.display = 'none';
+    badge.classList.remove('visible');
+    fab.classList.add('hidden');
   }
 }
 
 function scrollToBottom() {
-  const feed = document.getElementById('feed-container');
-  if (!feed) return;
-  feed.scrollTop = feed.scrollHeight;
+  const container = document.getElementById('chat-container');
+  if (!container) return;
+  container.scrollTop = container.scrollHeight;
   autoScroll = true;
   missedCount = 0;
   updateScrollFab();
 }
 
-async function loadActivityFeed() {
-  try {
-    const json = await fetchJSON(`${API}/activities/feed?limit=100`);
-    const items = (json.data && json.data.items) || json.data || [];
-    const feed = document.getElementById('feed-container');
-    if (!feed) return;
-    feed.innerHTML = '';
-    const sorted = Array.isArray(items) ? [...items].reverse() : [];
-    sorted.forEach(item => appendActivity(item));
-    refreshIcons();
-  } catch (err) {
-    console.error('[coin] activity feed load error:', err);
+function buildActivityFeedUrl(options = {}) {
+  const params = new URLSearchParams();
+  params.set('limit', String(options.limit || 100));
+  if (options.targetDate) params.set('target_date', options.targetDate);
+  if (options.beforeCreatedAt) params.set('before_created_at', options.beforeCreatedAt);
+  if (options.beforeId) params.set('before_id', options.beforeId);
+  return `${API}/activities/feed?${params.toString()}`;
+}
+
+function updateFeedLoadMore() {
+  const bar = document.getElementById('feed-load-more-bar');
+  const btn = document.getElementById('feed-load-more-btn');
+  const meta = document.getElementById('feed-load-more-meta');
+  if (!bar || !btn || !meta) return;
+
+  const label = btn.querySelector('span');
+  if (currentView !== 'live') {
+    bar.classList.add('hidden');
+    btn.disabled = false;
+    if (label) label.textContent = '이전 내역 더보기';
+    meta.textContent = '';
+    return;
   }
+
+  const canShow = feedState.loaded && (feedState.feedHasMore || feedState.feedLoading) && isNearTop;
+  if (!canShow) {
+    bar.classList.add('hidden');
+    btn.disabled = false;
+    if (label) label.textContent = '이전 내역 더보기';
+  } else {
+    bar.classList.remove('hidden');
+    btn.disabled = feedState.feedLoading;
+    if (label) label.textContent = feedState.feedLoading ? '불러오는 중...' : '이전 내역 더보기';
+  }
+
+  meta.textContent = feedState.feedTradingDate ? `${feedState.feedTradingDate} 거래일` : '';
+}
+
+function renderLiveFeedFromState(options = {}) {
+  const {
+    restoreScroll = false,
+    preserveViewport = false,
+    previousScrollHeight = 0,
+    previousScrollTop = 0,
+  } = options;
+
+  if (currentView !== 'live') return;
+  const container = document.getElementById('chat-container');
+  if (!container) return;
+
+  cleanupStockCards();
+  container.innerHTML = '';
+  setActivityCount(0);
+
+  const visibleActivities = filterResolvedStarts(feedState.feedItems);
+  if (!visibleActivities.length) {
+    renderPlaceholder(container, 'empty', '현재 거래일 활동이 없습니다');
+  } else {
+    visibleActivities.forEach((activity) => appendActivity(activity, { skipStore: true }));
+  }
+
+  feedState.loaded = true;
+  feedState.activityCount = visibleActivities.length;
+  const countEl = document.getElementById('activity-count');
+  if (countEl) countEl.textContent = `${getActivityCount()}건`;
+  updateFeedLoadMore();
+  refreshIcons();
+
+  requestAnimationFrame(() => {
+    if (preserveViewport) {
+      const nextHeight = container.scrollHeight;
+      container.scrollTop = previousScrollTop + (nextHeight - previousScrollHeight);
+      return;
+    }
+    if (restoreScroll) {
+      container.scrollTop = feedState.scrollPos || 0;
+      return;
+    }
+    container.scrollTop = container.scrollHeight;
+  });
+}
+
+async function loadMoreActivities() {
+  if (feedState.feedLoading || !feedState.feedHasMore || !feedState.feedCursor) return;
+
+  const container = document.getElementById('chat-container');
+  if (!container) return;
+
+  const previousScrollHeight = container.scrollHeight;
+  const previousScrollTop = container.scrollTop;
+  feedState.feedLoading = true;
+  updateFeedLoadMore();
+
+  try {
+    const json = await fetchJSON(buildActivityFeedUrl({
+      limit: 100,
+      targetDate: feedState.feedTradingDate,
+      beforeCreatedAt: feedState.feedCursor.before_created_at,
+      beforeId: feedState.feedCursor.before_id,
+    }));
+    const feed = json.data || {};
+    const page = Array.isArray(feed.items) ? [...feed.items].reverse() : [];
+    rememberFeedActivities(page, { prepend: true });
+    feedState.feedTradingDate = feed.resolved_trading_date || feedState.feedTradingDate;
+    feedState.feedHasMore = !!feed.has_more;
+    feedState.feedCursor = feed.next_cursor || null;
+    renderLiveFeedFromState({
+      preserveViewport: true,
+      previousScrollHeight,
+      previousScrollTop,
+    });
+  } catch (err) {
+    showToast(`이전 내역 로드 실패: ${err.message}`, 'error');
+  } finally {
+    feedState.feedLoading = false;
+    updateFeedLoadMore();
+  }
+}
+
+async function loadTodayActivities() {
+  const container = document.getElementById('chat-container');
+  if (!container) return;
+
+  autoScroll = true;
+  missedCount = 0;
+  renderPlaceholder(container, 'loading', '불러오는 중...');
+  cleanupStockCards();
+  resetFeedState();
+  updateFeedLoadMore();
+  updateScrollFab();
+
+  try {
+    const json = await fetchJSON(buildActivityFeedUrl({ limit: 100 }));
+    const feed = json.data || {};
+    const page = Array.isArray(feed.items) ? [...feed.items].reverse() : [];
+    rememberFeedActivities(page);
+    feedState.feedTradingDate = feed.resolved_trading_date || null;
+    feedState.feedHasMore = !!feed.has_more;
+    feedState.feedCursor = feed.next_cursor || null;
+    feedState.loaded = true;
+    renderLiveFeedFromState();
+    setStatusText('현재 거래일 활동을 불러왔습니다', '#9ca3af');
+  } catch (err) {
+    renderPlaceholder(container, 'error', `로드 실패: ${err.message}`);
+    updateFeedLoadMore();
+    setStatusText(`활동 피드 로드 실패 · ${truncateText(err.message, 48)}`, '#f87171');
+  }
+}
+
+function filterResolvedStarts(activities) {
+  const resolved = new Set();
+  activities.forEach((activity) => {
+    if (activity.phase === 'COMPLETE' || activity.phase === 'ERROR') {
+      resolved.add(getProgressKey(activity));
+    }
+  });
+  return activities.filter((activity) => !(activity.phase === 'START' && resolved.has(getProgressKey(activity))));
+}
+
+function getProgressKey(data) {
+  const match = (data.summary || '').match(/\[([^\]]+)\]/);
+  const symbol = match ? match[1] : '';
+  return `${data.activity_type}:${symbol}`;
+}
+
+function cleanupStockCards() {
+  Object.values(feedState.stockCards).forEach((card) => {
+    if (card.liveTimer) clearInterval(card.liveTimer);
+  });
+  feedState.stockCards = {};
+}
+
+async function loadActivityFeed() {
+  await loadTodayActivities();
 }
 
 // ══════════════════════════════════════════════════════════
@@ -951,7 +1946,6 @@ async function loadSystemStatus() {
 
     updateScanTimeline();
     renderScanScheduleSummary(s);
-    renderAgentState(lastAgentState);
     renderTriggerButton();
   } catch (err) {
     console.error('[coin] system status error:', err);
@@ -966,85 +1960,16 @@ function getSessionLabel(session) {
   return labels[session] || session || '대기';
 }
 
-async function loadAgentState() {
+async function loadAgentState(options = {}) {
+  const { quiet = false } = options;
   try {
     const json = await fetchJSON(`${API}/agent/state`);
-    renderAgentState(json.data || {});
+    const state = json.data || {};
+    handleAgentStateEvent(state);
   } catch (err) {
-    console.error('[coin] agent state error:', err);
-    renderAgentState(null);
+    if (!quiet) console.error('[coin] agent state error:', err);
     renderTriggerButton();
   }
-}
-
-function renderAgentState(state) {
-  lastAgentState = state;
-  const container = document.getElementById('watchlist-agent-state');
-  if (!container) return;
-  const cycleActive = !!state?.cycle_active;
-  const manualCycleActive = cycleActive && manualScanSessionObserved;
-
-  if (manualCycleActive) {
-    manualScanQueuedAt = null;
-    clearManualScanNotice();
-  } else if (lastManualCycleActive) {
-    setManualScanNotice('최근 스캔 완료', 'check', 'bg-green-900/20 text-green-300 border-green-400/20');
-    manualScanSessionObserved = false;
-  } else if (manualScanQueuedAt && (Date.now() - manualScanQueuedAt) >= 10000) {
-    manualScanQueuedAt = null;
-    manualScanSessionObserved = false;
-    setManualScanNotice('시작 확인 지연', 'alert-triangle', 'bg-yellow-900/20 text-yellow-300 border-yellow-400/20', 4500);
-  }
-  lastManualCycleActive = manualCycleActive;
-  renderTriggerButton();
-
-  if (!state) {
-    container.innerHTML = '<div class="text-gray-500">현재 사이클 상태를 가져오지 못했습니다.</div>';
-    return;
-  }
-
-  const selected = Array.isArray(state.selected_symbols) ? state.selected_symbols : [];
-  const watchlistCount = Number(lastSystemStatus?.watchlist_count ?? 0);
-  const lastStatus = lastSystemStatus?.last_cycle_status;
-  const lastError = lastSystemStatus?.last_cycle_error;
-
-  if (!cycleActive) {
-    container.innerHTML = `
-      <div class="flex items-center justify-between gap-2">
-        <div>
-          <div class="text-[11px] text-gray-500">현재 사이클</div>
-          <div class="text-sm text-gray-200 font-medium">${lastStatus ? `대기 · 마지막 ${escapeHtml(lastStatus)}` : '대기 중'}</div>
-        </div>
-        <span class="agent-state-chip">${watchlistCount}개 감시</span>
-      </div>
-      ${lastSystemStatus?.last_cycle_time ? `<div class="text-[11px] text-gray-500 mt-2">최근 실행 ${escapeHtml(formatDateTime(lastSystemStatus.last_cycle_time))}</div>` : ''}
-      ${lastError ? `<div class="mt-2 text-[11px] text-red-300 whitespace-pre-wrap">${escapeHtml(truncateText(lastError, 120))}</div>` : ''}
-    `;
-    return;
-  }
-
-  const selectedHtml = selected.length
-    ? selected.map((item) => {
-        const symbol = typeof item === 'string' ? item : (item.symbol || '');
-        const name = typeof item === 'object' ? (item.name || item.symbol || '') : item;
-        const source = typeof item === 'object' ? formatCoinScanSource(item.scan_source) : '';
-        return `<span class="agent-state-chip">${escapeHtml(name)}${symbol && symbol !== name ? ` · ${escapeHtml(symbol)}` : ''}${source ? ` · ${escapeHtml(source)}` : ''}</span>`;
-      }).join('')
-    : '<span class="text-[11px] text-gray-500">선정 종목 집계 중...</span>';
-
-  container.innerHTML = `
-    <div class="flex items-center justify-between gap-2">
-      <div>
-        <div class="text-[11px] text-coin-dim">현재 사이클</div>
-        <div class="text-sm text-white font-medium">진행 중 · ${escapeHtml(AGENT_PHASE_LABELS[state.phase] || state.phase || '대기')}</div>
-      </div>
-      <span class="agent-state-chip">${selected.length || 0}개 선정</span>
-    </div>
-    <div class="text-[11px] text-gray-500 mt-2">
-      시작 ${escapeHtml(formatDateTime(state.started_at))} · 스캔 ${Number(state.scanned_count || 0)} · 분석 ${Number(state.analyzed_count || 0)}
-    </div>
-    <div class="mt-2 flex flex-wrap">${selectedHtml}</div>
-  `;
 }
 
 function renderScanScheduleSummary(status) {
@@ -1405,34 +2330,53 @@ function toggleSettings() {
 
 // ── Feed Filter / Actions ──
 
-let currentFilter = 'ALL';
-
 function setLogFilter(filter) {
-  currentFilter = filter;
+  if (currentLogFilter === filter) return;
+  currentLogFilter = filter;
   document.querySelectorAll('.log-filter-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.filter === filter);
   });
-  const feed = document.getElementById('feed-container');
-  if (!feed) return;
-  feed.querySelectorAll('.activity-card').forEach(card => {
-    if (filter === 'ALL') { card.style.display = ''; return; }
-    const type = card.dataset.activityType || '';
+  Object.values(getStockCards()).forEach((card) => {
+    applyFilterToCard(card);
+  });
+  document.querySelectorAll('.chat-bubble').forEach((el) => {
     if (filter === 'SIGNAL') {
-      card.style.display = ['SCAN', 'DECISION', 'TIER1_ANALYSIS', 'TIER2_REVIEW', 'RISK_GATE'].includes(type) ? '' : 'none';
-    } else if (filter === 'TRADE') {
-      card.style.display = ['ORDER', 'TRADE_RESULT'].includes(type) ? '' : 'none';
+      el.style.display = el.textContent.includes('매수') || el.textContent.includes('매도') || el.textContent.includes('BUY') || el.textContent.includes('SELL')
+        ? ''
+        : 'none';
+    } else {
+      el.style.display = '';
     }
   });
+  if (autoScroll) {
+    const container = document.getElementById('chat-container');
+    if (container) container.scrollTop = container.scrollHeight;
+  }
+}
+
+function clearChat() {
+  if (!confirm('화면을 비울까요? (DB는 유지됩니다)')) return;
+  const container = document.getElementById('chat-container');
+  if (!container) return;
+  container.innerHTML = '<div class="text-center text-gray-500 text-sm py-8">화면을 비웠습니다. 새 활동이 들어오면 여기에 표시됩니다.</div>';
+  resetFeedState({ preserveLoaded: true });
+  cleanupStockCards();
+  autoScroll = true;
+  missedCount = 0;
+  feedState.loaded = true;
+  setActivityCount(0);
+  setTextContent('activity-count', '0건');
+  updateFeedLoadMore();
+  updateScrollFab();
+  setStatusText('활동 피드를 비웠습니다', '#9ca3af');
 }
 
 function clearFeed() {
-  const feed = document.getElementById('feed-container');
-  if (feed) feed.innerHTML = '';
-  setTextContent('activity-count', '0건');
+  clearChat();
 }
 
 function refreshFeed() {
-  loadActivityFeed();
+  loadTodayActivities();
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1453,12 +2397,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Initial loads
   loadSystemStatus();
-  loadAgentState();
+  initAgentMonitor();
   loadBalance();
   loadRecommendations();
   loadWatchlist();
   loadSettings();
-  loadActivityFeed();
+  loadTodayActivities();
   loadLatestReport();
 
   // Polling intervals
