@@ -33,7 +33,7 @@ class WatchlistSyncTest(unittest.IsolatedAsyncioTestCase):
             desired = await reconcile_market_watchlist(
                 "NASDAQ",
                 selected_watchlist=[
-                    {"symbol": "NVDA", "market": "NASDAQ", "name": "NVIDIA"},
+                    {"symbol": "NVDA", "market": "NASDAQ", "name": "NVIDIA", "scan_source": "DISCOVERY"},
                     {"symbol": "pltr", "market": "NASDAQ", "name": "Palantir"},
                 ],
             )
@@ -41,7 +41,7 @@ class WatchlistSyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             runtime.last_selected_watchlist,
             [
-                {"symbol": "NVDA", "market": "NASDAQ", "name": "NVIDIA"},
+                {"symbol": "NVDA", "market": "NASDAQ", "name": "NVIDIA", "scan_source": "DISCOVERY"},
                 {"symbol": "PLTR", "market": "NASDAQ", "name": "Palantir"},
             ],
         )
