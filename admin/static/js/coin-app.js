@@ -179,6 +179,15 @@ function truncateText(text, limit = 72) {
   return normalized.length > limit ? `${normalized.slice(0, limit)}...` : normalized;
 }
 
+function formatCoinScanSource(scanSource) {
+  const source = String(scanSource || '').toUpperCase();
+  if (source === 'DISCOVERY') return '발견';
+  if (source === 'WATCHLIST') return '고정';
+  if (source === 'WATCHLIST_FALLBACK') return '고정 폴백';
+  if (source === 'HOLDING_FALLBACK') return '보유 폴백';
+  return '';
+}
+
 function setInlineStatus(id, text, color = '') {
   const el = document.getElementById(id);
   if (!el) return;
@@ -998,7 +1007,8 @@ function renderAgentState(state) {
     ? selected.map((item) => {
         const symbol = typeof item === 'string' ? item : (item.symbol || '');
         const name = typeof item === 'object' ? (item.name || item.symbol || '') : item;
-        return `<span class="agent-state-chip">${escapeHtml(name)}${symbol && symbol !== name ? ` · ${escapeHtml(symbol)}` : ''}</span>`;
+        const source = typeof item === 'object' ? formatCoinScanSource(item.scan_source) : '';
+        return `<span class="agent-state-chip">${escapeHtml(name)}${symbol && symbol !== name ? ` · ${escapeHtml(symbol)}` : ''}${source ? ` · ${escapeHtml(source)}` : ''}</span>`;
       }).join('')
     : '<span class="text-[11px] text-gray-500">선정 종목 집계 중...</span>';
 
@@ -1086,12 +1096,14 @@ function renderWatchlist(symbols) {
     const price = typeof s === 'object' && s.price != null ? formatPrice(s.price) : '';
     const changeRate = typeof s === 'object' && s.change_rate != null ? Number(s.change_rate) : null;
     const changeColor = changeRate == null ? '#6b7280' : (changeRate >= 0 ? '#34d399' : '#f87171');
+    const scanSource = typeof s === 'object' ? formatCoinScanSource(s.scan_source) : '';
 
     return `
       <div style="display:flex; align-items:center; justify-content:space-between; padding:6px 10px; border-radius:6px; background:rgba(30,30,46,0.4); margin-bottom:4px; font-size:12px;">
         <div style="min-width:0;">
           <span style="color:#e2e8f0; font-weight:500;">${escapeHtml(name)}</span>
           ${sym !== name ? `<span style="color:#6b7280; margin-left:4px;">${escapeHtml(sym)}</span>` : ''}
+          ${scanSource ? `<span style="color:#a78bfa; margin-left:6px; font-size:11px;">${escapeHtml(scanSource)}</span>` : ''}
           ${reason ? `<div style="color:#6b7280; font-size:11px; margin-top:1px;">${escapeHtml(reason)}</div>` : ''}
           ${price ? `<div style="color:#6b7280; font-size:11px; margin-top:1px;">현재가 ${escapeHtml(price)}</div>` : ''}
         </div>

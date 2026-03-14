@@ -158,12 +158,15 @@ async def get_coin_watchlist():
             if sym:
                 symbols_list.append({
                     "symbol": sym,
-                    "market": "BITHUMB",
+                    "market": str(sym_info.get("market", "BITHUMB") or "BITHUMB"),
                     "name": str(sym_info.get("name", "") or ""),
                     "price": sym_info.get("price"),
                     "change_rate": sym_info.get("change_rate"),
                     "volume": sym_info.get("volume"),
+                    "trade_value": sym_info.get("trade_value"),
                     "strategy_type": sym_info.get("strategy_type", ""),
+                    "reason": str(sym_info.get("reason", "") or ""),
+                    "scan_source": str(sym_info.get("scan_source", "") or ""),
                 })
 
     return SuccessResponse(data={"symbols": symbols_list})
@@ -252,6 +255,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "crypto_enabled": settings.CRYPTO_ENABLED,
         "crypto_trading_enabled": settings.CRYPTO_TRADING_ENABLED,
         "crypto_autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
+        "crypto_dynamic_discovery_enabled": settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED,
         "trading_enabled": settings.CRYPTO_TRADING_ENABLED,
         "autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
         "scheduler_running": trading_scheduler.is_running,

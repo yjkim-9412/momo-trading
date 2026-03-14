@@ -212,7 +212,7 @@ class CycleMixin:
             "executed": 0,
             "selected_symbols": [],
         }
-        selected_watchlist: list[dict[str, str]] = []
+        selected_watchlist: list[dict[str, object]] = []
         snapshot: dict = {
             "cash": 0,
             "total_asset": 0,
@@ -340,6 +340,13 @@ class CycleMixin:
                         "symbol": str(c.get("symbol", "")).upper(),
                         "market": normalize_market(c.get("market", target)),
                         "name": str(c.get("name", "") or ""),
+                        "price": c.get("price"),
+                        "change_rate": c.get("change_rate"),
+                        "volume": c.get("volume"),
+                        "trade_value": c.get("trade_value"),
+                        "strategy_type": c.get("strategy_type", ""),
+                        "reason": c.get("reason", ""),
+                        "scan_source": c.get("scan_source", ""),
                     }
                     for c in candidates if c.get("symbol")
                 ]
@@ -356,6 +363,7 @@ class CycleMixin:
                         "symbol": item["symbol"],
                         "market": item["market"],
                         "name": item["name"],
+                        "scan_source": item.get("scan_source", ""),
                     }
                     for item in selected_watchlist
                 ]

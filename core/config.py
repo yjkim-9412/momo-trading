@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     CRYPTO_HOLDINGS_CHECK_INTERVAL_HOURS: int = 2
     CRYPTO_WATCHLIST_SYMBOLS: str = "BTC,ETH,XRP,SOL,ADA,DOGE"
     CRYPTO_SCAN_LIMIT: int = 15
+    CRYPTO_DYNAMIC_DISCOVERY_ENABLED: bool = True  # 전체 overview 발굴 + watchlist 시드 병합
 
     # === Crypto 리스크 (주식 리스크 설정과 독립) ===
     CRYPTO_MAX_POSITION_PCT: float = 20.0

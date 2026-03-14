@@ -6,9 +6,9 @@ from trading.market_profile import normalize_market
 
 def _normalize_selected_watchlist(
     market: str,
-    selected_watchlist: list[dict[str, str]] | None,
-) -> list[dict[str, str]]:
-    normalized: list[dict[str, str]] = []
+    selected_watchlist: list[dict[str, object]] | None,
+) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
     for item in selected_watchlist or []:
         symbol = str(item.get("symbol", "")).upper().strip()
@@ -19,17 +19,30 @@ def _normalize_selected_watchlist(
         if key in seen:
             continue
         seen.add(key)
-        normalized.append({
+        enriched: dict[str, object] = {
             "symbol": symbol,
             "market": market_code,
             "name": str(item.get("name", "") or ""),
-        })
+        }
+        for meta_key in (
+            "scan_source",
+            "price",
+            "change_rate",
+            "volume",
+            "trade_value",
+            "strategy_type",
+            "reason",
+        ):
+            value = item.get(meta_key)
+            if value not in (None, ""):
+                enriched[meta_key] = value
+        normalized.append(enriched)
     return normalized
 
 
 async def reconcile_market_watchlist(
     market: str,
-    selected_watchlist: list[dict[str, str]] | None = None,
+    selected_watchlist: list[dict[str, object]] | None = None,
 ) -> list[tuple[str, str]]:
     """최근 선정 종목과 보유 종목을 합쳐 scope별 desired 구독을 재계산."""
     from agent.trading_agent import trading_agent

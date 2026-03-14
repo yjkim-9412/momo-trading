@@ -143,13 +143,13 @@ class CryptoScanner:
     ) -> dict[str, Any]:
         """코인 시장 스캔 + AI 종목 선별
 
-        1. 빗썸에서 전체 코인 데이터 수집 (get_market_overview)
-        2. 거래대금 상위 + 급등/급락 정렬
-        3. CRYPTO_WATCHLIST_SYMBOLS 병합
+        1. 빗썸 전체 overview 조회
+        2. discovery 후보(거래대금/상승률/하락률) 계산
+        3. CRYPTO_WATCHLIST_SYMBOLS 시드 병합
         4. _untradeable 필터링
         5. 성과 데이터 로드 (PerformanceTracker)
         6. LLM 스캔 프롬프트로 후보 선별
-        7. JSON 파싱 -> 선별 결과 반환
+        7. JSON 파싱 + source 메타데이터 재결합
         """
         target = normalize_market(market, default="BITHUMB")
 
@@ -235,7 +235,9 @@ class CryptoScanner:
         data_elapsed = activity_logger.elapsed_ms(timer)
         logger.info("크립토 데이터 수집 완료: {}ms", data_elapsed)
 
-        # --- 2. 데이터 정리: 거래대금 상위 + 급등/급락 ---
+        # --- 2. 데이터 정리: discovery + watchlist 하이브리드 ---
+        discovery_enabled = bool(settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED)
+        watchlist = settings.crypto_watchlist_symbols
         overview_all_coins = self._extract_coins(overview_data, limit=10_000)
         if not overview_all_coins:
             overview_all_coins = await self._build_watchlist_fallback_coins(
@@ -249,28 +251,82 @@ class CryptoScanner:
                     len(overview_all_coins),
                 )
 
-        volume_coins = self._extract_coins(volume_rank_data, limit=settings.CRYPTO_SCAN_LIMIT)
-        surge_coins = self._extract_coins(surge_data, limit=settings.CRYPTO_SCAN_LIMIT)
-        overview_coins = overview_all_coins[: settings.CRYPTO_SCAN_LIMIT]
+        fallback_only = bool(overview_all_coins and str(overview_all_coins[0].get("scan_source", "")).endswith("_FALLBACK"))
+        normalized_overview = (
+            list(overview_all_coins)
+            if fallback_only
+            else [self._normalize_scan_candidate(item, scan_source="DISCOVERY") for item in overview_all_coins]
+        )
 
-        # 급등/급락 분리: change_rate 기준
-        drop_coins = [c for c in overview_coins if float(c.get("change_rate", 0)) < 0]
-        drop_coins.sort(key=lambda c: float(c.get("change_rate", 0)))
-        drop_coins = drop_coins[:15]
+        volume_discovery = []
+        surge_discovery = []
+        drop_discovery = []
+        if discovery_enabled and normalized_overview and not fallback_only:
+            volume_discovery = [
+                self._normalize_scan_candidate(item, scan_source="DISCOVERY")
+                for item in self._extract_coins(volume_rank_data, limit=settings.CRYPTO_SCAN_LIMIT)
+            ]
+            if not volume_discovery:
+                volume_discovery = sorted(
+                    normalized_overview,
+                    key=lambda c: c.get("trade_value", 0.0),
+                    reverse=True,
+                )[: settings.CRYPTO_SCAN_LIMIT]
 
-        # 급등 코인: surge_data 우선, 부족하면 overview에서 보충
-        if not surge_coins:
-            surge_coins = [c for c in overview_coins if float(c.get("change_rate", 0)) > 0]
-            surge_coins.sort(key=lambda c: float(c.get("change_rate", 0)), reverse=True)
-            surge_coins = surge_coins[:15]
+            surge_discovery = [
+                self._normalize_scan_candidate(item, scan_source="DISCOVERY")
+                for item in self._extract_coins(surge_data, limit=settings.CRYPTO_SCAN_LIMIT)
+            ]
+            if not surge_discovery:
+                surge_discovery = sorted(
+                    normalized_overview,
+                    key=lambda c: c.get("change_rate", 0.0),
+                    reverse=True,
+                )[: settings.CRYPTO_SCAN_LIMIT]
 
-        # 거래대금 상위가 없으면 overview에서 대체
-        if not volume_coins:
-            volume_coins = sorted(
-                overview_coins,
-                key=lambda c: float(c.get("volume", c.get("acc_trade_value_24h", 0))),
-                reverse=True,
-            )[:15]
+            drop_discovery = sorted(
+                normalized_overview,
+                key=lambda c: c.get("change_rate", 0.0),
+            )[: settings.CRYPTO_SCAN_LIMIT]
+
+        watchlist_candidates = (
+            []
+            if fallback_only
+            else self._build_watchlist_candidates(normalized_overview, watchlist)
+        )
+        if fallback_only:
+            watchlist_candidates = list(normalized_overview)
+
+        watchlist_by_volume = sorted(
+            watchlist_candidates,
+            key=lambda c: c.get("trade_value", 0.0),
+            reverse=True,
+        )
+        watchlist_by_surge = sorted(
+            watchlist_candidates,
+            key=lambda c: c.get("change_rate", 0.0),
+            reverse=True,
+        )
+        watchlist_by_drop = sorted(
+            watchlist_candidates,
+            key=lambda c: c.get("change_rate", 0.0),
+        )
+
+        volume_coins = self._merge_discovery_and_watchlist(
+            volume_discovery,
+            watchlist_by_volume,
+            limit=settings.CRYPTO_SCAN_LIMIT,
+        )
+        surge_coins = self._merge_discovery_and_watchlist(
+            surge_discovery,
+            watchlist_by_surge,
+            limit=settings.CRYPTO_SCAN_LIMIT,
+        )
+        drop_coins = self._merge_discovery_and_watchlist(
+            drop_discovery,
+            watchlist_by_drop,
+            limit=settings.CRYPTO_SCAN_LIMIT,
+        )
 
         if not volume_coins and not surge_coins and not drop_coins:
             overview_error = ""
@@ -287,6 +343,7 @@ class CryptoScanner:
                     "overview_error": overview_error,
                     "watchlist_size": len(settings.crypto_watchlist_symbols),
                     "holding_count": len(holdings),
+                    "discovery_enabled": discovery_enabled,
                 },
                 execution_time_ms=data_elapsed,
             )
@@ -298,16 +355,19 @@ class CryptoScanner:
                 "scan_source": "crypto_overview",
             }
 
-        # --- 3. 워치리스트 병합 ---
-        watchlist = settings.crypto_watchlist_symbols
-        volume_coins = self._merge_watchlist(volume_coins, overview_coins, watchlist)
-
-        # --- 4. 매매불가 필터링 ---
+        # --- 3. 매매불가 필터링 ---
         volume_coins = self._filter_untradeable(volume_coins)
         surge_coins = self._filter_untradeable(surge_coins)
         drop_coins = self._filter_untradeable(drop_coins)
 
-        # --- 5. LLM 스캔 프롬프트 구성 ---
+        candidate_pool = self._merge_unique_candidates(
+            volume_coins,
+            surge_coins,
+            drop_coins,
+            limit=settings.CRYPTO_SCAN_LIMIT * 3,
+        )
+
+        # --- 4. LLM 스캔 프롬프트 구성 ---
         from util.time_util import now_kst
 
         now = now_kst()
@@ -325,7 +385,7 @@ class CryptoScanner:
             performance_summary=performance_summary,
         )
 
-        # --- 6. LLM 호출 + 결과 파싱 ---
+        # --- 5. LLM 호출 + 결과 파싱 ---
         try:
             result_text, provider = await llm_factory.generate_tier1(
                 prompt,
@@ -335,12 +395,13 @@ class CryptoScanner:
                 phase="cycle",
             )
             parsed = self._parse_json_response(result_text)
-            selected = parsed.get("selected", [])
-
-            # market 필드 정규화 + scan_source 추가
-            for item in selected:
-                item["market"] = "BITHUMB"
-                item["scan_source"] = "crypto_overview"
+            selected = self._enrich_selected_candidates(
+                parsed.get("selected", []),
+                candidate_pool=candidate_pool,
+                market=target,
+                default_scan_source="DISCOVERY" if discovery_enabled and not fallback_only else "WATCHLIST",
+            )
+            selected_count_by_source = self._count_by_source(selected)
 
             elapsed = activity_logger.elapsed_ms(timer)
             logger.info(
@@ -373,6 +434,10 @@ class CryptoScanner:
                 detail={
                     "selected_count": len(selected),
                     "selected": selected,
+                    "selected_count_by_source": selected_count_by_source,
+                    "discovery_enabled": discovery_enabled,
+                    "discovery_count": len([c for c in candidate_pool if c.get("scan_source") == "DISCOVERY"]),
+                    "watchlist_count": len([c for c in candidate_pool if c.get("scan_source") != "DISCOVERY"]),
                     "market_regime": parsed.get("market_regime", ""),
                     "market_analysis": market_analysis,
                     "available_cash": available_cash,
@@ -393,6 +458,7 @@ class CryptoScanner:
                 "max_per_stock": max_per_coin,
                 "provider": provider,
                 "scan_source": "crypto_overview",
+                "selected_count_by_source": selected_count_by_source,
             }
         except Exception as e:
             elapsed = activity_logger.elapsed_ms(timer)
@@ -459,27 +525,165 @@ class CryptoScanner:
         return []
 
     @staticmethod
-    def _merge_watchlist(
-        volume_coins: list[dict],
-        overview_coins: list[dict],
+    def _to_float(value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _normalize_scan_candidate(cls, item: dict[str, Any], *, scan_source: str) -> dict[str, Any]:
+        symbol = str(item.get("symbol", item.get("code", "")) or "").upper()
+        price = cls._to_float(item.get("price", item.get("closing_price", item.get("current_price", 0))))
+        change_rate = cls._to_float(item.get("change_rate", item.get("fluctate_rate_24H", 0)))
+        volume = cls._to_float(item.get("volume", item.get("acc_trade_value_24h", item.get("acc_trade_value", 0))))
+        trade_value = cls._to_float(item.get("trade_value", item.get("acc_trade_value_24h", item.get("volume", 0))))
+        normalized = dict(item)
+        normalized.update({
+            "symbol": symbol,
+            "name": str(item.get("name") or item.get("korean_name") or symbol),
+            "market": "BITHUMB",
+            "price": price,
+            "change_rate": change_rate,
+            "volume": volume,
+            "trade_value": trade_value,
+            "scan_source": str(item.get("scan_source") or scan_source).upper(),
+        })
+        return normalized
+
+    @classmethod
+    def _build_watchlist_candidates(
+        cls,
+        overview_coins: list[dict[str, Any]],
         watchlist: list[str],
-    ) -> list[dict]:
-        """워치리스트에 있지만 거래대금 상위에 없는 코인을 병합"""
-        existing_symbols = {c.get("symbol", "").upper() for c in volume_coins}
-        overview_map = {c.get("symbol", "").upper(): c for c in overview_coins}
-
-        added = 0
+    ) -> list[dict[str, Any]]:
+        overview_map = {
+            str(coin.get("symbol", "")).upper(): cls._normalize_scan_candidate(coin, scan_source="DISCOVERY")
+            for coin in overview_coins
+            if coin.get("symbol")
+        }
+        watchlist_candidates: list[dict[str, Any]] = []
         for symbol in watchlist:
-            sym = symbol.upper()
-            if sym in existing_symbols:
+            sym = str(symbol or "").upper()
+            base = overview_map.get(sym)
+            if not base:
                 continue
-            if sym in overview_map:
-                volume_coins.append(overview_map[sym])
-                added += 1
+            watchlist_candidates.append({
+                **base,
+                "scan_source": "WATCHLIST",
+            })
+        return watchlist_candidates
 
-        if added:
-            logger.info("크립토 워치리스트에서 {}개 코인 추가 병합", added)
-        return volume_coins
+    @staticmethod
+    def _merge_discovery_and_watchlist(
+        discovery_coins: list[dict[str, Any]],
+        watchlist_coins: list[dict[str, Any]],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        watchlist_unique: list[dict[str, Any]] = []
+        watchlist_symbols: set[str] = set()
+        for coin in watchlist_coins:
+            symbol = str(coin.get("symbol", "")).upper()
+            if not symbol or symbol in watchlist_symbols:
+                continue
+            watchlist_symbols.add(symbol)
+            watchlist_unique.append(coin)
+
+        watchlist_discovery: list[dict[str, Any]] = []
+        discovery_rest: list[dict[str, Any]] = []
+        seen_discovery: set[str] = set()
+        for coin in discovery_coins:
+            symbol = str(coin.get("symbol", "")).upper()
+            if not symbol or symbol in seen_discovery:
+                continue
+            seen_discovery.add(symbol)
+            if symbol in watchlist_symbols:
+                watchlist_discovery.append(coin)
+            else:
+                discovery_rest.append(coin)
+
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for coin in watchlist_discovery + watchlist_unique:
+            symbol = str(coin.get("symbol", "")).upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            merged.append(coin)
+            if len(merged) >= limit:
+                break
+
+        if len(merged) < limit:
+            for coin in discovery_rest:
+                symbol = str(coin.get("symbol", "")).upper()
+                if not symbol or symbol in seen:
+                    continue
+                seen.add(symbol)
+                merged.append(coin)
+                if len(merged) >= limit:
+                    break
+        return merged
+
+    @staticmethod
+    def _merge_unique_candidates(
+        *candidate_groups: list[dict[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for group in candidate_groups:
+            for coin in group:
+                symbol = str(coin.get("symbol", "")).upper()
+                if not symbol or symbol in seen:
+                    continue
+                seen.add(symbol)
+                merged.append(coin)
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
+    @staticmethod
+    def _count_by_source(items: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in items:
+            source = str(item.get("scan_source", "UNKNOWN") or "UNKNOWN").upper()
+            counts[source] = counts.get(source, 0) + 1
+        return counts
+
+    @staticmethod
+    def _enrich_selected_candidates(
+        selected: list[dict[str, Any]],
+        *,
+        candidate_pool: list[dict[str, Any]],
+        market: str,
+        default_scan_source: str,
+    ) -> list[dict[str, Any]]:
+        candidate_map = {
+            str(item.get("symbol", "")).upper(): item
+            for item in candidate_pool
+            if item.get("symbol")
+        }
+        enriched: list[dict[str, Any]] = []
+        for item in selected:
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            base = candidate_map.get(symbol, {})
+            merged = {
+                **base,
+                **item,
+                "symbol": symbol,
+                "name": str(item.get("name") or base.get("name") or symbol),
+                "market": normalize_market(item.get("market", market), default=market),
+                "scan_source": str(
+                    item.get("scan_source")
+                    or base.get("scan_source")
+                    or default_scan_source
+                ).upper(),
+            }
+            enriched.append(merged)
+        return enriched
 
     @staticmethod
     def _format_coin_data(coins: list[dict]) -> str:
@@ -506,28 +710,31 @@ class CryptoScanner:
         holdings: list[Any],
     ) -> list[dict]:
         """overview 실패 시 watchlist/보유 코인 현재가로 최소 스캔 입력 구성"""
-        fallback_symbols: list[str] = []
+        fallback_items: list[tuple[str, str]] = []
+        seen: set[str] = set()
         for holding in holdings:
             symbol = ""
             if isinstance(holding, dict):
                 symbol = str(holding.get("symbol", "") or "").upper()
             else:
                 symbol = str(getattr(holding, "symbol", "") or "").upper()
-            if symbol and symbol not in fallback_symbols:
-                fallback_symbols.append(symbol)
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                fallback_items.append((symbol, "HOLDING_FALLBACK"))
         for symbol in watchlist:
             sym = str(symbol or "").upper()
-            if sym and sym not in fallback_symbols:
-                fallback_symbols.append(sym)
-        if not fallback_symbols:
+            if sym and sym not in seen:
+                seen.add(sym)
+                fallback_items.append((sym, "WATCHLIST_FALLBACK"))
+        if not fallback_items:
             return []
 
         responses = await asyncio.gather(*[
             _safe_call(bithumb_client.get_current_price, symbol, market="BITHUMB")
-            for symbol in fallback_symbols
+            for symbol, _ in fallback_items
         ])
         coins: list[dict] = []
-        for symbol, resp in zip(fallback_symbols, responses, strict=False):
+        for (symbol, scan_source), resp in zip(fallback_items, responses, strict=False):
             if not hasattr(resp, "success") or not resp.success or not resp.data:
                 continue
             data = resp.data
@@ -539,6 +746,7 @@ class CryptoScanner:
                 "change_rate": float(data.get("change_rate", 0) or 0),
                 "volume": float(data.get("trade_value", data.get("volume", 0)) or 0),
                 "trade_value": float(data.get("trade_value", data.get("volume", 0)) or 0),
+                "scan_source": scan_source,
             })
         return coins
 
