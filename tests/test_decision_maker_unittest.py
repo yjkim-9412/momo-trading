@@ -184,6 +184,7 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch("agent.decision_maker.activity_logger.log", AsyncMock()) as log_mock,
             patch("agent.decision_maker.event_bus.publish", AsyncMock()),
+            patch("agent.decision_maker.market_calendar.get_market_session", return_value="US_REGULAR"),
             patch("agent.decision_maker.asyncio.create_task", side_effect=fake_create_task),
             patch(
                 "agent.decision_maker.mcp_client.place_order",

@@ -51,7 +51,13 @@ from trading.product_policy import (
     coerce_strategy_for_product,
     is_product_trade_allowed,
 )
-from trading.quantity_policy import format_quantity, format_quantity_with_unit, has_quantity
+from trading.quantity_policy import (
+    cap_quantity_for_amount,
+    format_quantity,
+    format_quantity_with_unit,
+    has_quantity,
+    normalize_quantity,
+)
 
 from agent.trading_agent._types import _ENTRY_MODE_NEW
 
@@ -65,6 +71,56 @@ class AnalysisMixin:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @classmethod
+    def _resolve_crypto_buy_plan(
+        cls,
+        final: dict | None,
+        *,
+        market_code: str,
+        exchange_rate_to_krw: float,
+    ) -> dict[str, float | None]:
+        payload = final or {}
+        entry_price = cls._try_float(payload.get("entry_price"))
+        entry_price_krw = cls._try_float(payload.get("entry_price_krw"))
+        if entry_price and (entry_price_krw is None or entry_price_krw <= 0):
+            entry_price_krw = entry_price * exchange_rate_to_krw
+
+        suggested_amount_krw = cls._try_float(payload.get("suggested_amount_krw"))
+        suggested_quantity = normalize_quantity(payload.get("suggested_quantity"), market_code)
+
+        if (suggested_amount_krw is None or suggested_amount_krw <= 0) and entry_price_krw and suggested_quantity > 0:
+            suggested_amount_krw = entry_price_krw * suggested_quantity
+
+        if suggested_amount_krw and suggested_amount_krw > 0 and entry_price_krw and entry_price_krw > 0:
+            if suggested_quantity <= 0:
+                suggested_quantity = cap_quantity_for_amount(
+                    suggested_amount_krw,
+                    entry_price_krw,
+                    market_code,
+                )
+
+        return {
+            "entry_price": entry_price,
+            "entry_price_krw": entry_price_krw,
+            "suggested_amount_krw": suggested_amount_krw,
+            "suggested_quantity": suggested_quantity or None,
+        }
+
+    @staticmethod
+    def _resolve_signal_amount_krw(signal: TradeSignal, exchange_rate_to_krw: float) -> float:
+        if isinstance(signal.suggested_amount_krw, (int, float)) and float(signal.suggested_amount_krw) > 0:
+            return float(signal.suggested_amount_krw)
+
+        entry_price_krw = (
+            signal.metadata.get("entry_price_krw")
+            or signal.metadata.get("price_krw")
+            or (signal.suggested_price or 0) * exchange_rate_to_krw
+        )
+        quantity = float(signal.suggested_quantity or 0)
+        if entry_price_krw and quantity > 0:
+            return float(entry_price_krw) * quantity
+        return 0.0
 
     @classmethod
     def _resolve_prompt_change_value(cls, price_data: dict, *, scope: str) -> float:
@@ -634,19 +690,34 @@ class AnalysisMixin:
                 logger.info("Tier 2 검토 미승인: {} - {}", symbol, reason)
                 return result
 
+            crypto_buy_plan = (
+                self._resolve_crypto_buy_plan(
+                    final,
+                    market_code=market_code,
+                    exchange_rate_to_krw=exchange_rate_to_krw,
+                )
+                if market_scope(market_code) == "CRYPTO"
+                else {}
+            )
+            tier2_amount_text = ""
+            if crypto_buy_plan.get("suggested_amount_krw"):
+                tier2_amount_text = f" | 금액 {float(crypto_buy_plan['suggested_amount_krw']):,.0f}원"
+            elif final.get("suggested_quantity"):
+                tier2_amount_text = (
+                    f" | 수량 {format_quantity_with_unit(final.get('suggested_quantity'), market_code)}"
+                )
             await activity_logger.log(
                 ActivityType.TIER2_REVIEW, ActivityPhase.COMPLETE,
-                f"\U0001f9e0 [{name}] Tier2: \u2705 승인"
-                + (
-                    f" | 수량 {format_quantity_with_unit(final.get('suggested_quantity'), market_code)}"
-                    if final.get("suggested_quantity")
-                    else ""
-                ),
+                f"\U0001f9e0 [{name}] Tier2: \u2705 승인{tier2_amount_text}",
                 cycle_id=cycle_id, symbol=symbol,
                 detail=self._enrich_activity_detail(
                     {
                         "approved": True,
                         "reason": final.get("reason", ""),
+                        "suggested_amount_krw": (
+                            crypto_buy_plan.get("suggested_amount_krw")
+                            or final.get("suggested_amount_krw")
+                        ),
                         "suggested_quantity": final.get("suggested_quantity"),
                         "entry_price": final.get("entry_price"),
                         "entry_price_currency": currency,
@@ -672,9 +743,28 @@ class AnalysisMixin:
         )
         # 4. 전략 적용
         strategy = mkt_state.strategies.get(strategy_type)
+        crypto_buy_plan = (
+            self._resolve_crypto_buy_plan(
+                final,
+                market_code=market_code,
+                exchange_rate_to_krw=exchange_rate_to_krw,
+            )
+            if market_scope(market_code) == "CRYPTO"
+            else {}
+        )
+        crypto_buy_has_size = bool(
+            crypto_buy_plan.get("entry_price")
+            and (
+                crypto_buy_plan.get("suggested_amount_krw")
+                or crypto_buy_plan.get("suggested_quantity")
+            )
+        )
 
         # Tier2가 수량/가격까지 제시한 경우 → AI 결정으로 직접 시그널 생성
-        if final.get("suggested_quantity") and final.get("entry_price"):
+        if (
+            (market_scope(market_code) == "CRYPTO" and crypto_buy_has_size)
+            or (market_scope(market_code) != "CRYPTO" and final.get("suggested_quantity") and final.get("entry_price"))
+        ):
             t2_action = str(final.get("action") or analysis.get("recommendation") or "BUY").upper()
             if t2_action != "BUY":
                 await activity_logger.log(
@@ -700,13 +790,25 @@ class AnalysisMixin:
                 tp_pct = getattr(strategy, "take_profit_pct", None) or 5
                 target_price = final["entry_price"] * (1 + tp_pct / 100)
 
+            signal_quantity = (
+                crypto_buy_plan.get("suggested_quantity")
+                if market_scope(market_code) == "CRYPTO"
+                else final.get("suggested_quantity")
+            )
+            signal_amount_krw = (
+                crypto_buy_plan.get("suggested_amount_krw")
+                if market_scope(market_code) == "CRYPTO"
+                else None
+            )
+
             signal = TradeSignal(
                 symbol=symbol,
                 stock_id=stock_info.get("stock_id", ""),
                 action=action,
                 strength=analysis.get("confidence", 0.7),
                 suggested_price=final["entry_price"],
-                suggested_quantity=final["suggested_quantity"],
+                suggested_quantity=signal_quantity,
+                suggested_amount_krw=signal_amount_krw,
                 target_price=target_price,
                 stop_loss_price=stop_loss_price,
                 urgency=SignalUrgency.IMMEDIATE,
@@ -733,15 +835,21 @@ class AnalysisMixin:
             )
 
             result["signal"] = True
+            signal_summary = (
+                f"{float(signal.suggested_amount_krw or 0):,.0f}원"
+                if market_scope(market_code) == "CRYPTO" and signal.suggested_amount_krw
+                else format_quantity_with_unit(signal.suggested_quantity, market_code)
+            )
             await activity_logger.log(
                 ActivityType.STRATEGY_EVAL, ActivityPhase.COMPLETE,
                 f"\U0001f4c8 [{name}] Tier2 승인 기반 시그널: {action.value} "
-                f"{format_quantity_with_unit(signal.suggested_quantity, market_code)} "
+                f"{signal_summary} "
                 f"@{signal.suggested_price:,.2f}{currency}",
                 cycle_id=cycle_id, symbol=symbol,
                 detail=self._enrich_activity_detail(
                     {
                         "action": action.value,
+                        "suggested_amount_krw": signal.suggested_amount_krw,
                         "suggested_quantity": signal.suggested_quantity,
                         "entry_price": signal.suggested_price,
                         "currency": currency,
@@ -782,15 +890,21 @@ class AnalysisMixin:
                 return result
 
             result["signal"] = True
+            strategy_signal_summary = (
+                f"{float(signal.suggested_amount_krw or 0):,.0f}원"
+                if market_scope(market_code) == "CRYPTO" and signal.suggested_amount_krw
+                else format_quantity_with_unit(signal.suggested_quantity or 0, market_code)
+            )
             await activity_logger.log(
                 ActivityType.STRATEGY_EVAL, ActivityPhase.COMPLETE,
                 f"\U0001f4c8 [{name}] 전략({strategy_type}): {signal.action.value} "
-                f"{format_quantity_with_unit(signal.suggested_quantity or 0, market_code)} "
+                f"{strategy_signal_summary} "
                 f"@{(signal.suggested_price or 0):,.0f}원",
                 cycle_id=cycle_id, symbol=symbol,
                 detail=self._enrich_activity_detail(
                     {
                         "action": signal.action.value,
+                        "suggested_amount_krw": signal.suggested_amount_krw,
                         "suggested_quantity": signal.suggested_quantity or 0,
                         "entry_price": signal.suggested_price or 0,
                         "currency": currency,
@@ -800,7 +914,11 @@ class AnalysisMixin:
             )
 
             # Tier 2에서 제안한 값이 있으면 적용
-            if final.get("suggested_quantity"):
+            if market_scope(market_code) == "CRYPTO" and crypto_buy_plan.get("suggested_amount_krw"):
+                signal.suggested_amount_krw = crypto_buy_plan["suggested_amount_krw"]
+            if market_scope(market_code) == "CRYPTO" and crypto_buy_plan.get("suggested_quantity"):
+                signal.suggested_quantity = crypto_buy_plan["suggested_quantity"]
+            elif final.get("suggested_quantity"):
                 signal.suggested_quantity = final["suggested_quantity"]
             if final.get("entry_price"):
                 signal.suggested_price = final["entry_price"]
@@ -896,6 +1014,8 @@ class AnalysisMixin:
             logger.info("리스크 검사 미통과: {} - {}", symbol, risk_result.get("reason"))
             return result
 
+        if risk_result.get("adjusted_amount_krw"):
+            signal.suggested_amount_krw = risk_result["adjusted_amount_krw"]
         if risk_result.get("adjusted_quantity"):
             signal.suggested_quantity = risk_result["adjusted_quantity"]
 
@@ -904,7 +1024,7 @@ class AnalysisMixin:
             or signal.metadata.get("price_krw")
             or (signal.suggested_price or 0) * (exchange_rate_to_krw if currency != "KRW" else 1.0)
         )
-        total_amount = unit_price_krw * float(signal.suggested_quantity or 0)
+        total_amount = self._resolve_signal_amount_krw(signal, exchange_rate_to_krw)
         current_value_krw = float((current_position or {}).get("current_value_krw") or 0.0)
         total_asset = float(snap.get("total_asset") or 0.0)
         cash_basis_krw = float(risk_result.get("cash_basis_krw") or broker_cash_krw)
@@ -920,6 +1040,8 @@ class AnalysisMixin:
         )
         signal.metadata.update({
             "entry_mode": entry_mode,
+            "requested_amount_krw": round(total_amount, 4),
+            "estimated_quantity": signal.suggested_quantity,
             "combined_position_pct": round(combined_position_pct, 4),
             "post_trade_cash_ratio": round(post_trade_cash_ratio, 4),
             "current_position": dict(current_position or {}),
@@ -964,7 +1086,10 @@ class AnalysisMixin:
 
         # 주문 금액 기록 (병렬 잔고 트래커용)
         if result["executed"] and signal.action == SignalAction.BUY:
-            result["order_amount"] = (signal.metadata.get("price_krw") or signal.suggested_price or 0) * (signal.suggested_quantity or 0)
+            result["order_amount"] = total_amount or (
+                (signal.metadata.get("price_krw") or signal.suggested_price or 0)
+                * (signal.suggested_quantity or 0)
+            )
 
         return result
 

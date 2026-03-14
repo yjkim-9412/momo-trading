@@ -72,9 +72,9 @@ class OrderExecutor:
             order_id=data.get("order_id"),
             message="크립토 주문 실행 완료",
             filled_quantity=float(data.get("executed_volume", 0)),
-            filled_price=float(data.get("price", 0)),
+            filled_price=float(data.get("filled_price", data.get("price", 0))),
             currency="KRW",
-            filled_price_krw=float(data.get("price", 0)),
+            filled_price_krw=float(data.get("filled_price", data.get("price", 0))),
         )
 
     async def cancel(self, order_id: str, market: str = "KRX") -> OrderResult:

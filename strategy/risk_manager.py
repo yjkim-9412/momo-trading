@@ -16,7 +16,12 @@ from trading.product_policy import (
     classification_from_metadata,
     is_product_trade_allowed,
 )
-from trading.quantity_policy import cap_quantity_for_amount, format_quantity, normalize_quantity
+from trading.quantity_policy import (
+    cap_quantity_for_amount,
+    format_quantity,
+    min_order_amount_krw,
+    normalize_quantity,
+)
 
 
 class RiskManager:
@@ -71,6 +76,18 @@ class RiskManager:
         market_code = str(metadata.get("market") or "KRX")
         return build_product_context(signal.symbol, market_code, metadata)
 
+    @classmethod
+    def _signal_amount_krw(cls, signal: TradeSignal, market_code: str) -> float:
+        amount = signal.suggested_amount_krw
+        if isinstance(amount, (int, float)) and float(amount) > 0:
+            return float(amount)
+
+        unit_price_krw = cls._unit_price_krw(signal)
+        quantity = normalize_quantity(signal.suggested_quantity, market_code)
+        if unit_price_krw > 0 and quantity > 0:
+            return unit_price_krw * quantity
+        return 0.0
+
     @staticmethod
     def _format_daily_trade_progress(today_trade_count: int, effective_max_daily: int) -> str:
         if effective_max_daily <= 0:
@@ -99,7 +116,7 @@ class RiskManager:
             dynamic_limits: AI가 결정한 동적 한도 (있으면 기본값 대신 사용)
 
         Returns:
-            {"approved": bool, "reason": str, "adjusted_quantity": float | None}
+            {"approved": bool, "reason": str, "adjusted_quantity": float | None, "adjusted_amount_krw": float | None}
         """
         symbol = signal.symbol
         product_context = self._signal_product_context(signal)
@@ -158,7 +175,29 @@ class RiskManager:
         # 주문 금액 계산
         price = signal.suggested_price or 0
         quantity = normalize_quantity(signal.suggested_quantity, market_code)
-        if price <= 0 or quantity <= 0:
+        unit_price_krw = self._unit_price_krw(signal)
+        requested_amount_krw = self._signal_amount_krw(signal, market_code)
+        crypto_min_order_amount = min_order_amount_krw(market_code) if _is_crypto else 0.0
+
+        if _is_crypto:
+            if price <= 0 or unit_price_krw <= 0 or requested_amount_krw <= 0:
+                result = {"approved": False, "reason": "가격 또는 주문금액이 유효하지 않습니다"}
+                await self._log_result(
+                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                )
+                return result
+            if crypto_min_order_amount > 0 and requested_amount_krw < crypto_min_order_amount:
+                result = {
+                    "approved": False,
+                    "reason": f"최소 주문금액 미달 ({crypto_min_order_amount:,.0f}원)",
+                }
+                await self._log_result(
+                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                )
+                return result
+            if quantity <= 0:
+                quantity = cap_quantity_for_amount(requested_amount_krw, unit_price_krw, market_code)
+        elif price <= 0 or quantity <= 0:
             result = {"approved": False, "reason": "가격 또는 수량이 유효하지 않습니다"}
             await self._log_result(
                 symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
@@ -186,8 +225,7 @@ class RiskManager:
             if leverage_ratio > 0:
                 eff_max_pos_pct *= leverage_ratio
 
-        unit_price_krw = self._unit_price_krw(signal)
-        total_amount = unit_price_krw * quantity
+        total_amount = requested_amount_krw if _is_crypto else unit_price_krw * quantity
         current_position_value_krw = float((current_position or {}).get("current_value_krw") or 0.0)
         broker_cash_krw = float(portfolio_cash or 0.0)
         cash_basis_krw = broker_cash_krw
@@ -247,6 +285,149 @@ class RiskManager:
                         symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
                     )
                     return result
+
+        if _is_crypto:
+            requested_quantity = quantity
+            requested_total_amount = total_amount
+            adjustment_labels: list[str] = []
+
+            def _apply_amount_cap(capped_amount: float, label: str) -> tuple[bool, dict | None]:
+                nonlocal quantity, total_amount
+                capped_amount = max(float(capped_amount or 0.0), 0.0)
+                if capped_amount >= total_amount:
+                    return False, None
+                if capped_amount <= 0:
+                    return True, {"approved": False, "reason": f"{label} 후 주문 가능 금액 없음"}
+                if crypto_min_order_amount > 0 and capped_amount < crypto_min_order_amount:
+                    return True, {
+                        "approved": False,
+                        "reason": f"{label} 후 최소 주문금액 미달 ({crypto_min_order_amount:,.0f}원)",
+                    }
+                estimated_qty = cap_quantity_for_amount(capped_amount, unit_price_krw, market_code)
+                if estimated_qty <= 0:
+                    return True, {"approved": False, "reason": f"{label} 후 주문 가능 수량 없음"}
+                total_amount = capped_amount
+                quantity = estimated_qty
+                adjustment_labels.append(label)
+                return True, None
+
+            if eff_max_order > 0 and total_amount > eff_max_order:
+                _, reject_result = _apply_amount_cap(eff_max_order, "단일 주문 한도")
+                if reject_result:
+                    reject_result.update({
+                        "broker_cash_krw": broker_cash_krw,
+                        "cash_basis_krw": cash_basis_krw,
+                        "orderable_cash_krw": orderable_cash_krw,
+                    })
+                    await self._log_result(
+                        symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
+                    )
+                    return reject_result
+
+            if cash_basis_krw <= 0:
+                result = {
+                    "approved": False,
+                    "reason": "가용 현금 없음",
+                    "broker_cash_krw": broker_cash_krw,
+                    "cash_basis_krw": cash_basis_krw,
+                    "orderable_cash_krw": orderable_cash_krw,
+                }
+                await self._log_result(
+                    symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                )
+                return result
+
+            if total_amount > cash_basis_krw:
+                _, reject_result = _apply_amount_cap(cash_basis_krw, "현금 부족")
+                if reject_result:
+                    reject_result.update({
+                        "broker_cash_krw": broker_cash_krw,
+                        "cash_basis_krw": cash_basis_krw,
+                        "orderable_cash_krw": orderable_cash_krw,
+                    })
+                    await self._log_result(
+                        symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
+                    )
+                    return reject_result
+
+            cash_after = cash_basis_krw - total_amount
+            if portfolio_budget > 0 and cash_after / portfolio_budget < eff_min_cash_ratio:
+                max_spend = cash_basis_krw - (portfolio_budget * eff_min_cash_ratio)
+                if max_spend <= 0:
+                    result = {
+                        "approved": False,
+                        "reason": "현금 비중 최소 한도 미달",
+                        "broker_cash_krw": broker_cash_krw,
+                        "cash_basis_krw": cash_basis_krw,
+                        "orderable_cash_krw": orderable_cash_krw,
+                    }
+                    await self._log_result(
+                        symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+                    )
+                    return result
+                _, reject_result = _apply_amount_cap(max_spend, "현금 비중 유지")
+                if reject_result:
+                    reject_result.update({
+                        "broker_cash_krw": broker_cash_krw,
+                        "cash_basis_krw": cash_basis_krw,
+                        "orderable_cash_krw": orderable_cash_krw,
+                    })
+                    await self._log_result(
+                        symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
+                    )
+                    return reject_result
+
+            if portfolio_budget > 0:
+                combined_position_pct = ((current_position_value_krw + total_amount) / portfolio_budget) * 100
+                if combined_position_pct > eff_max_pos_pct:
+                    remaining_amount = max(
+                        (portfolio_budget * eff_max_pos_pct / 100) - current_position_value_krw,
+                        0.0,
+                    )
+                    _, reject_result = _apply_amount_cap(remaining_amount, "합산 비중 한도")
+                    if reject_result:
+                        reject_result.update({
+                            "combined_position_pct": combined_position_pct,
+                            "current_position_value_krw": current_position_value_krw,
+                            "broker_cash_krw": broker_cash_krw,
+                            "cash_basis_krw": cash_basis_krw,
+                            "orderable_cash_krw": orderable_cash_krw,
+                        })
+                        await self._log_result(
+                            symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
+                        )
+                        return reject_result
+
+            combined_position_pct = (
+                ((current_position_value_krw + total_amount) / portfolio_budget) * 100
+                if portfolio_budget > 0
+                else 0.0
+            )
+            adjusted_amount_krw = None
+            adjusted_quantity = None
+            adjustment_reason = "리스크 검사 통과"
+            if abs(total_amount - requested_total_amount) > 1e-9:
+                adjusted_amount_krw = round(total_amount, 4)
+                adjusted_quantity = quantity
+                adjustment_reason = (
+                    f"주문금액 조정 ({', '.join(adjustment_labels)}): "
+                    f"{requested_total_amount:,.0f}원 → {total_amount:,.0f}원"
+                )
+            result = {
+                "approved": True,
+                "reason": adjustment_reason,
+                "adjusted_quantity": adjusted_quantity,
+                "adjusted_amount_krw": adjusted_amount_krw,
+                "combined_position_pct": combined_position_pct,
+                "current_position_value_krw": current_position_value_krw,
+                "broker_cash_krw": broker_cash_krw,
+                "cash_basis_krw": cash_basis_krw,
+                "orderable_cash_krw": orderable_cash_krw,
+            }
+            await self._log_result(
+                symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+            )
+            return result
 
         requested_quantity = quantity
         adjustment_labels: list[str] = []
@@ -381,6 +562,7 @@ class RiskManager:
             "approved": True,
             "reason": adjustment_reason,
             "adjusted_quantity": adjusted_quantity,
+            "adjusted_amount_krw": None,
             "combined_position_pct": combined_position_pct,
             "current_position_value_krw": current_position_value_krw,
             "broker_cash_krw": broker_cash_krw,

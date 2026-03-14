@@ -938,7 +938,7 @@ function connectSSE() {
         }
 
         if (data.phase === 'COMPLETE' && ['DECISION', 'ORDER', 'TRADE_RESULT'].includes(data.activity_type)) {
-          setTimeout(loadBalance, 2000);
+          scheduleAccountOverviewRefresh(2000);
         }
         if (data.phase === 'COMPLETE' && ['SCAN', 'CYCLE', 'DECISION'].includes(data.activity_type)) {
           setTimeout(loadWatchlist, 1500);
@@ -1868,8 +1868,16 @@ function renderRecommendations(recs) {
     const sideLabel = isBuy ? 'BUY' : 'SELL';
     const sideColor = isBuy ? '#fbbf24' : '#a78bfa';
     const coin = r.coin || r.symbol || '';
-    const price = formatPrice(r.price);
-    const qty = formatCoinQty(r.quantity);
+    const priceValue = r.suggested_price ?? r.price;
+    const qtyValue = r.suggested_quantity ?? r.quantity;
+    const amountValue = r.suggested_amount_krw ?? r.amount_krw ?? (
+      Number(priceValue) > 0 && Number(qtyValue) > 0
+        ? Number(priceValue) * Number(qtyValue)
+        : null
+    );
+    const price = formatPrice(priceValue);
+    const qty = formatCoinQty(qtyValue);
+    const amount = formatKRW(amountValue);
     const confidence = r.confidence != null ? `${(Number(r.confidence) * 100).toFixed(0)}%` : '-';
     const expiresAt = r.expires_at ? new Date(r.expires_at) : null;
     const recId = r.id || r.recommendation_id || '';
@@ -1884,8 +1892,12 @@ function renderRecommendations(recs) {
           <span style="color:#9ca3af; font-size:11px;">신뢰도 ${confidence}</span>
         </div>
         <div style="display:flex; justify-content:space-between; color:#9ca3af; font-size:12px; margin-bottom:6px;">
+          <span>금액 ${amount}</span>
+          <span>예상수량 ${qty}</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; color:#6b7280; font-size:11px; margin-bottom:6px;">
           <span>가격 ${price}</span>
-          <span>수량 ${qty}</span>
+          <span>${isBuy ? '금액 기준 BUY' : '수량 기준 SELL'}</span>
         </div>
         ${expiresAt ? `<div style="color:#6b7280; font-size:11px; margin-bottom:6px;" data-expires="${expiresAt.toISOString()}" class="rec-countdown">만료: 계산 중...</div>` : ''}
         <div style="display:flex; gap:8px;">

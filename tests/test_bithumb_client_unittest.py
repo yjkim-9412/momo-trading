@@ -66,6 +66,27 @@ def test_normalize_ticker_exposes_numeric_change_and_preserves_direction():
     assert normalized["signed_change_price"] == -1250000.0
 
 
+def test_normalize_order_payload_derives_market_buy_fill_price_from_executed_funds():
+    normalized = BithumbClient._normalize_order_payload(
+        {
+            "uuid": "order-1",
+            "market": "KRW-BTC",
+            "side": "bid",
+            "ord_type": "price",
+            "price": "5000",
+            "volume": "0.00004784",
+            "remaining_volume": "0",
+            "executed_volume": "0.00004784",
+            "executed_funds": "4999.952",
+        }
+    )
+
+    assert normalized["requested_amount_krw"] == 5000.0
+    assert normalized["executed_funds"] == 4999.952
+    assert normalized["order_type"] == "PRICE"
+    assert normalized["filled_price"] == pytest.approx(104_514_046.82274248)
+
+
 @pytest.mark.asyncio
 async def test_public_get_reports_http_status_and_body_for_non_json_response():
     client = BithumbClient()

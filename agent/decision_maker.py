@@ -22,9 +22,17 @@ from models.trade_result import TradeResult
 from repositories.trade_result_repository import TradeResultRepository
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
-from trading.enums import ActivityPhase, ActivityType, AutonomyMode, OrderSource, RecommendationStatus
+from trading.enums import (
+    ActivityPhase,
+    ActivityType,
+    AutonomyMode,
+    OrderSource,
+    RecommendationStatus,
+    SignalAction,
+)
 from trading.market_profile import is_crypto_market, is_us_market, normalize_market, normalize_market_scope
 from trading.mcp_client import mcp_client
+from trading.models import coin_side_label
 from trading.product_policy import build_product_context
 from trading.quantity_policy import format_quantity, format_quantity_with_unit, normalize_quantity
 from scheduler.market_calendar import market_calendar
@@ -125,6 +133,8 @@ class DecisionMaker:
         metadata = signal.metadata or {}
         for key in (
             "entry_mode",
+            "requested_amount_krw",
+            "estimated_quantity",
             "combined_position_pct",
             "post_trade_cash_ratio",
             "current_position",
@@ -168,6 +178,55 @@ class DecisionMaker:
     def _quantity_text(quantity: float, market: str) -> str:
         return format_quantity(quantity, market)
 
+    @staticmethod
+    def _signal_amount_krw(
+        signal: TradeSignal,
+        market_code: str,
+        *,
+        price_krw: float,
+    ) -> float:
+        if isinstance(signal.suggested_amount_krw, (int, float)) and float(signal.suggested_amount_krw) > 0:
+            return float(signal.suggested_amount_krw)
+        quantity = normalize_quantity(signal.suggested_quantity, market_code)
+        if price_krw > 0 and quantity > 0:
+            return price_krw * quantity
+        return 0.0
+
+    @classmethod
+    def _resolve_order_request(
+        cls,
+        signal: TradeSignal,
+        *,
+        market_code: str,
+        price_krw: float,
+    ) -> dict[str, float | None | str]:
+        quantity = normalize_quantity(signal.suggested_quantity, market_code)
+        requested_amount_krw = cls._signal_amount_krw(signal, market_code, price_krw=price_krw)
+
+        if is_crypto_market(market_code) and signal.action == SignalAction.BUY:
+            return {
+                "order_quantity": requested_amount_krw,
+                "order_price": None,
+                "estimated_quantity": quantity,
+                "requested_amount_krw": requested_amount_krw,
+                "order_type": "PRICE",
+            }
+
+        suggested_price = float(signal.suggested_price or 0.0)
+        order_type = "LIMIT"
+        if suggested_price <= 0:
+            order_type = "MARKET"
+        elif is_crypto_market(market_code) and signal.action == SignalAction.SELL:
+            order_type = "LIMIT"
+
+        return {
+            "order_quantity": quantity,
+            "order_price": signal.suggested_price,
+            "estimated_quantity": quantity,
+            "requested_amount_krw": requested_amount_krw,
+            "order_type": order_type,
+        }
+
     async def _upsert_broker_order(
         self,
         *,
@@ -181,8 +240,10 @@ class DecisionMaker:
         quantity: float,
         requested_price: float,
         requested_price_krw: float,
+        requested_amount_krw: float = 0.0,
         currency: str,
         exchange_rate_to_krw: float,
+        order_type: str = "",
         strategy_type: str = "",
         filled_quantity: float = 0,
         filled_price: float = 0.0,
@@ -211,7 +272,9 @@ class DecisionMaker:
                                 side=side,
                                 quantity=float(quantity),
                                 requested_price=requested_price,
+                                requested_amount_krw=float(requested_amount_krw or 0.0),
                                 currency=currency,
+                                order_type=order_type or "LIMIT",
                                 strategy_type=strategy_type,
                             )
                             session.add(existing)
@@ -222,7 +285,9 @@ class DecisionMaker:
                         existing.side = side
                         existing.quantity = float(quantity)
                         existing.requested_price = requested_price
+                        existing.requested_amount_krw = float(requested_amount_krw or 0.0)
                         existing.currency = currency
+                        existing.order_type = order_type or existing.order_type
                         existing.strategy_type = strategy_type or existing.strategy_type
                         existing.filled_quantity = float(filled_quantity)
                         existing.filled_price = filled_price
@@ -334,11 +399,13 @@ class DecisionMaker:
                 "symbol": record.symbol,
                 "name": record.coin_name,
                 "status": record.status,
+                "order_type": str(record.order_type or ""),
                 "order_qty": quantity,
                 "filled_qty": filled_quantity,
                 "filled_quantity": filled_quantity,
                 "remaining_qty": remaining_quantity,
                 "order_price": float(record.requested_price or 0.0),
+                "requested_amount_krw": float(record.requested_amount_krw or 0.0),
                 "filled_price": float(record.filled_price or 0.0),
                 "currency": record.currency or "KRW",
                 "exchange_rate_to_krw": 1.0,
@@ -386,7 +453,7 @@ class DecisionMaker:
 
     @staticmethod
     def _coin_ws_side_label(side: str) -> str:
-        return "매수" if str(side or "").upper() == "BUY" else "매도"
+        return coin_side_label(side)
 
     async def _log_coin_ws_order_activity(
         self,
@@ -440,7 +507,12 @@ class DecisionMaker:
             payload.get("order_qty") or payload.get("volume"),
             market_code,
         )
-        if quantity <= 0:
+        requested_amount_krw = float(
+            payload.get("requested_amount_krw")
+            or getattr(existing, "requested_amount_krw", 0.0)
+            or 0.0
+        )
+        if quantity <= 0 and requested_amount_krw <= 0:
             return None
 
         filled_qty = self._order_quantity(
@@ -448,9 +520,19 @@ class DecisionMaker:
             market_code,
         )
         filled_price = float(payload.get("filled_price") or payload.get("order_price") or 0.0)
-        detail_text = json.dumps(payload, ensure_ascii=False, default=str)
         side = str(payload.get("side") or getattr(existing, "side", "") or "").upper()
+        order_type = str(
+            payload.get("order_type")
+            or payload.get("ord_type")
+            or getattr(existing, "order_type", "")
+            or ("PRICE" if side == "BUY" and requested_amount_krw > 0 else "")
+        ).upper()
 
+        # 상태·체결수량 변경 없으면 DB upsert 및 후속 처리 생략
+        if status == prev_status and filled_qty <= prev_filled_qty:
+            return None
+
+        detail_text = json.dumps(payload, ensure_ascii=False, default=str)
         record = await self._upsert_broker_order(
             cycle_id=getattr(existing, "cycle_id", None),
             order_id=order_id,
@@ -462,8 +544,10 @@ class DecisionMaker:
             quantity=quantity,
             requested_price=float(payload.get("order_price") or getattr(existing, "requested_price", 0.0) or 0.0),
             requested_price_krw=float(payload.get("order_price") or getattr(existing, "requested_price", 0.0) or 0.0),
+            requested_amount_krw=requested_amount_krw,
             currency=str(payload.get("currency") or getattr(existing, "currency", "KRW") or "KRW"),
             exchange_rate_to_krw=float(payload.get("exchange_rate_to_krw") or 1.0),
+            order_type=order_type,
             strategy_type=str(getattr(existing, "strategy_type", "") or ""),
             filled_quantity=filled_qty,
             filled_price=filled_price,
@@ -473,9 +557,6 @@ class DecisionMaker:
             submitted_at=payload.get("submitted_at"),
             filled_at=payload.get("filled_at") if status in {"FILLED", "PARTIAL"} else None,
         )
-
-        if status == prev_status and filled_qty <= prev_filled_qty:
-            return None
 
         from trading.account_manager import account_manager
 
@@ -554,7 +635,8 @@ class DecisionMaker:
             or response_data.get("filled_quantity"),
             market_code,
         )
-        if quantity <= 0:
+        requested_amount_krw = float(detail.get("requested_amount_krw") or 0.0)
+        if quantity <= 0 and requested_amount_krw <= 0:
             return None
 
         side = str(detail.get("action") or "").upper()
@@ -576,8 +658,13 @@ class DecisionMaker:
             "quantity": quantity,
             "requested_price": requested_price,
             "requested_price_krw": requested_price_krw,
+            "requested_amount_krw": requested_amount_krw,
             "currency": currency,
             "exchange_rate_to_krw": exchange_rate,
+            "order_type": str(
+                detail.get("order_type")
+                or ("PRICE" if is_crypto_market(market_code) and side == "BUY" and requested_amount_krw > 0 else "LIMIT")
+            ),
             "strategy_type": "",
             "status_detail": str(response_data.get("msg1") or detail.get("message") or "주문 접수"),
             "submitted_at": activity.created_at,
@@ -645,28 +732,37 @@ class DecisionMaker:
     ) -> dict:
         """완전자율: MCP로 즉시 주문 실행"""
         logger.info(
-            "[AUTONOMOUS] 주문 실행: {} {} x{} @ {}",
+            "[AUTONOMOUS] 주문 실행: {} {} qty={} price={} amount={}",
             signal.symbol, signal.action.value,
-            signal.suggested_quantity, signal.suggested_price,
+            signal.suggested_quantity, signal.suggested_price, signal.suggested_amount_krw,
         )
 
         market = signal.metadata.get("market", "KRX")
         market_code = normalize_market(market)
         currency = signal.metadata.get("currency", "KRW")
         exchange_rate = float(signal.metadata.get("exchange_rate_to_krw") or 1.0)
-        qty = signal.suggested_quantity or 0
+        qty = normalize_quantity(signal.suggested_quantity, market_code)
         price = signal.suggested_price or 0
         price_krw = float(
             signal.metadata.get("entry_price_krw")
             or signal.metadata.get("price_krw")
             or (price * exchange_rate if currency != "KRW" else price)
         )
-        amount = price_krw * qty
+        order_request = self._resolve_order_request(signal, market_code=market_code, price_krw=price_krw)
+        order_quantity = float(order_request["order_quantity"] or 0.0)
+        order_price = order_request["order_price"]
+        requested_amount_krw = float(order_request["requested_amount_krw"] or 0.0)
+        estimated_quantity = float(order_request["estimated_quantity"] or 0.0)
+        order_type = str(order_request["order_type"] or "")
+        amount = requested_amount_krw
+        order_summary = (
+            f"{amount:,.0f}원 (예상 {format_quantity_with_unit(estimated_quantity, market_code)})"
+            if is_crypto_market(market_code) and signal.action == SignalAction.BUY
+            else f"{format_quantity_with_unit(qty, market_code)} {self._price_display(price, currency, price_krw)}"
+        )
         await activity_logger.log(
             ActivityType.DECISION, ActivityPhase.START,
-            f"\U0001f4b0 [{signal.symbol}] 자동 주문 실행: "
-            f"{signal.action.value} {format_quantity_with_unit(qty, market_code)} "
-            f"{self._price_display(price, currency, price_krw)}",
+            f"\U0001f4b0 [{signal.symbol}] 자동 주문 실행: {signal.action.value} {order_summary}",
             cycle_id=cycle_id,
             symbol=signal.symbol,
             detail=self._enrich_detail(
@@ -674,6 +770,9 @@ class DecisionMaker:
                 {
                     "market": market_code,
                     "currency": currency,
+                    "order_type": order_type,
+                    "requested_amount_krw": round(requested_amount_krw, 4),
+                    "estimated_quantity": estimated_quantity,
                     "requested_quantity": qty,
                     "requested_price": price,
                     "requested_price_krw": round(price_krw, 4),
@@ -728,8 +827,8 @@ class DecisionMaker:
         response = await mcp_client.place_order(
             symbol=signal.symbol,
             side=signal.action.value,
-            quantity=signal.suggested_quantity or 0,
-            price=signal.suggested_price,
+            quantity=order_quantity,
+            price=order_price,
             market=market,
         )
 
@@ -748,6 +847,9 @@ class DecisionMaker:
             "message": "주문 접수" if is_submitted else (response.error or "주문 응답 없음"),
             "requested_price": price,
             "requested_price_krw": round(price_krw, 4),
+            "requested_amount_krw": round(requested_amount_krw, 4),
+            "estimated_quantity": estimated_quantity,
+            "order_type": order_type,
             "currency": currency,
             "data": response.data,
         }
@@ -765,8 +867,10 @@ class DecisionMaker:
                 quantity=qty,
                 requested_price=float(price or 0.0),
                 requested_price_krw=float(price_krw or 0.0),
+                requested_amount_krw=float(requested_amount_krw or 0.0),
                 currency=str(currency),
                 exchange_rate_to_krw=float(exchange_rate or 1.0),
+                order_type=order_type,
                 strategy_type=str((analysis_context or {}).get("strategy_type", "")),
                 status_detail=str(order_data.get("msg1") or "주문 접수"),
                 submitted_at=order_submitted_at,
@@ -799,6 +903,7 @@ class DecisionMaker:
                     order_id=order_id,
                     quantity=qty,
                     expected_price=price,
+                    requested_amount_krw=requested_amount_krw,
                     analysis_context=analysis_context,
                     cycle_id=cycle_id,
                 )
@@ -843,6 +948,7 @@ class DecisionMaker:
         order_id: str,
         quantity: float,
         expected_price: float,
+        requested_amount_krw: float = 0.0,
         analysis_context: dict | None = None,
         cycle_id: str | None = None,
         exit_reason: str = "",
@@ -872,7 +978,12 @@ class DecisionMaker:
 
             for delay_seconds in _OVERSEAS_CONFIRM_DELAYS_SECONDS:
                 if matched_order is not None:
-                    break
+                    existing_filled_qty_value = matched_order.get("filled_qty")
+                    if existing_filled_qty_value in (None, ""):
+                        existing_filled_qty_value = matched_order.get("filled_quantity")
+                    existing_filled_qty = self._order_quantity(existing_filled_qty_value, market_code)
+                    if existing_filled_qty > 0:
+                        break
                 await asyncio.sleep(delay_seconds)
 
                 if is_crypto_market(market_code):
@@ -935,9 +1046,11 @@ class DecisionMaker:
                 if current_match is None:
                     continue
                 matched_order = current_match
+                current_filled_qty_value = current_match.get("filled_qty")
+                if current_filled_qty_value in (None, ""):
+                    current_filled_qty_value = current_match.get("filled_quantity")
                 current_filled_qty = self._order_quantity(
-                    current_match.get("filled_qty")
-                    or current_match.get("filled_quantity"),
+                    current_filled_qty_value,
                     market_code,
                 )
                 if current_filled_qty > 0:
@@ -949,10 +1062,13 @@ class DecisionMaker:
 
             currency = str(matched_order.get("currency") or currency)
             exchange_rate = float(matched_order.get("exchange_rate_to_krw") or exchange_rate or 1.0)
+            filled_qty_value = matched_order.get("filled_qty")
+            if filled_qty_value in (None, ""):
+                filled_qty_value = matched_order.get("filled_quantity")
+            if filled_qty_value in (None, ""):
+                filled_qty_value = quantity
             filled_qty = self._order_quantity(
-                matched_order.get("filled_qty")
-                or matched_order.get("filled_quantity")
-                or quantity,
+                filled_qty_value,
                 market_code,
             )
             remaining_qty = self._order_quantity(matched_order.get("remaining_qty"), market_code)
@@ -965,6 +1081,16 @@ class DecisionMaker:
             filled_price_krw = self._to_trade_krw(filled_price, currency, exchange_rate)
             status_text = str(matched_order.get("status") or "체결 대기")
             reject_reason = str(matched_order.get("reject_reason") or "")
+            resolved_requested_amount_krw = float(
+                matched_order.get("requested_amount_krw")
+                or requested_amount_krw
+                or 0.0
+            )
+            order_type = str(
+                matched_order.get("order_type")
+                or matched_order.get("ord_type")
+                or ("PRICE" if is_crypto_market(market_code) and side == "BUY" and resolved_requested_amount_krw > 0 else "")
+            )
 
             if filled_qty <= 0:
                 open_status = "OPEN" if remaining_qty > 0 else "SUBMITTED"
@@ -986,8 +1112,10 @@ class DecisionMaker:
                         currency,
                         exchange_rate,
                     ),
+                    requested_amount_krw=resolved_requested_amount_krw,
                     currency=currency,
                     exchange_rate_to_krw=exchange_rate,
+                    order_type=order_type,
                     strategy_type=str(ctx.get("strategy_type", "")),
                     filled_quantity=0,
                     filled_price=0.0,
@@ -1026,8 +1154,10 @@ class DecisionMaker:
                     currency,
                     exchange_rate,
                 ),
+                requested_amount_krw=resolved_requested_amount_krw,
                 currency=currency,
                 exchange_rate_to_krw=exchange_rate,
+                order_type=order_type,
                 strategy_type=str(ctx.get("strategy_type", "")),
                 filled_quantity=filled_qty,
                 filled_price=filled_price,
@@ -1669,7 +1799,7 @@ class DecisionMaker:
         # CoinRecommendation DB 저장
         qty = float(signal.suggested_quantity or 0)
         price = float(signal.suggested_price or 0)
-        amount = price * qty
+        amount = self._signal_amount_krw(signal, settings.crypto_primary_market_code, price_krw=price)
         coin_rec: CoinRecommendation | None = None
 
         if resolved_analysis_id:
@@ -1682,6 +1812,7 @@ class DecisionMaker:
                             action=signal.action.value,
                             suggested_price=price,
                             suggested_quantity=qty,
+                            suggested_amount_krw=amount,
                             reason=signal.reason or "",
                             confidence=signal.confidence,
                             status=RecommendationStatus.PENDING.value,
@@ -1701,6 +1832,7 @@ class DecisionMaker:
             "action": signal.action.value,
             "suggested_price": price,
             "suggested_quantity": qty,
+            "suggested_amount_krw": amount,
             "reason": signal.reason,
             "confidence": signal.confidence,
             "status": RecommendationStatus.PENDING.value,
@@ -1708,15 +1840,16 @@ class DecisionMaker:
         }
 
         logger.info(
-            "[SEMI_AUTO][CRYPTO] 코인 추천 생성: {} {} x{} (만료: {})",
+            "[SEMI_AUTO][CRYPTO] 코인 추천 생성: {} {} amount={} qty={} (만료: {})",
             signal.symbol, signal.action.value,
-            qty, expires_at,
+            amount, qty, expires_at,
         )
 
         await activity_logger.log(
             ActivityType.DECISION, ActivityPhase.COMPLETE,
-            f"\U0001f4dd 코인 추천 생성: {signal.symbol} {qty} "
-            f"@{price:,.2f}{signal.metadata.get('currency', 'KRW')} ({amount:,.0f}원)"
+            f"\U0001f4dd 코인 추천 생성: {signal.symbol} {amount:,.0f}원 "
+            f"(예상 {format_quantity_with_unit(qty, settings.crypto_primary_market_code)}) "
+            f"@{price:,.2f}{signal.metadata.get('currency', 'KRW')}"
             f"\n   \u2192 사용자 승인 대기 (SEMI_AUTO 모드)",
             cycle_id=cycle_id,
             market_scope="CRYPTO",

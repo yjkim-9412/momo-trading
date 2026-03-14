@@ -142,6 +142,8 @@ CRYPTO_ANALYSIS_SYSTEM = """당신은 암호화폐(코인) 시장 단기 매매 
 - 거래대금 확인: 단순 급등보다 **지속적인 24h 거래대금 유입**을 더 중요하게 보세요
 - 추세 우선: 추세에 역행하는 진입은 신뢰도 하향, 단 과매도 반등은 예외입니다
 - 이미 급등한 뒤 거래대금이 식거나 윗꼬리가 길면 추격 매수보다 HOLD 쪽으로 기울이세요
+- 코인 BUY는 **몇 개를 살지보다 얼마를 투입할지(KRW)**가 우선입니다
+- 빗썸 KRW 현물 BUY 최소 주문금액은 **5,000 KRW**입니다
 - 주문 금액 대비 유동성이 약해 체결 가능성이 낮으면 BUY가 아니라 HOLD입니다
 - 현재 코인 포지션이 있으면 신규 진입 후보가 아니라 기존 포지션 맥락으로 해석하세요
 - 보유 코인에서 BUY 판단 시 반드시 `position_intent`를 명시하세요.
@@ -175,6 +177,11 @@ CRYPTO_ANALYSIS_PROMPT = """## 코인 분석 요청: {stock_name} ({symbol})
 ### 계좌 상태
 {account_context}
 
+### 코인 BUY 실행 계약
+- BUY 판단은 수량이 아니라 KRW 투자금 기준으로 해석
+- 5,000 KRW 미만이면 실제 주문 불가
+- 현재가/거래대금 기준으로 소액 테스트 주문도 무리라면 HOLD
+
 ### 현재가 정보
 - 시장/통화: {market} / {currency}
 - 현재가: {current_price_text}
@@ -204,6 +211,7 @@ CRYPTO_ANALYSIS_PROMPT = """## 코인 분석 요청: {stock_name} ({symbol})
 - confidence: 이 매매가 손절 전에 목표가에 도달할 확률 (0.00~1.00)
 - position_intent: NEW / ADD_ON_PYRAMID / ADD_ON_AVERAGE_DOWN / HOLD
 - 거래대금이 약하거나 추격 매수 성격이 강하면 BUY보다 HOLD를 우선하세요
+- BUY를 생각하더라도 "5,000 KRW 이상 소액 주문이 실제로 들어갈 수 있는지"를 함께 판단하세요
 
 JSON 형식으로 답변:
 ```json

@@ -10,7 +10,7 @@ from strategy.signal import TradeSignal
 from trading.bithumb_client import BithumbClient
 from trading.enums import SignalAction, SignalUrgency
 from trading.models import MCPResponse
-from trading.quantity_policy import normalize_quantity
+from trading.quantity_policy import CRYPTO_MIN_ORDER_AMOUNT_KRW, normalize_quantity
 
 
 class CryptoQuantityPolicyTest(unittest.TestCase):
@@ -81,7 +81,7 @@ class RiskManagerCryptoFractionTest(unittest.IsolatedAsyncioTestCase):
         for field_name, value in self._original.items():
             setattr(settings, field_name, value)
 
-    async def test_crypto_risk_cap_returns_fractional_adjusted_quantity(self):
+    async def test_crypto_risk_cap_returns_amount_and_fractional_adjusted_quantity(self):
         manager = RiskManager()
         signal = TradeSignal(
             symbol="BTC",
@@ -90,6 +90,7 @@ class RiskManagerCryptoFractionTest(unittest.IsolatedAsyncioTestCase):
             strength=0.8,
             suggested_price=150_000_000.0,
             suggested_quantity=0.05,
+            suggested_amount_krw=7_500_000.0,
             urgency=SignalUrgency.IMMEDIATE,
             strategy_type="AGGRESSIVE_SHORT",
             metadata={
@@ -114,7 +115,36 @@ class RiskManagerCryptoFractionTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(result["approved"])
+        self.assertAlmostEqual(result["adjusted_amount_krw"], 4_500_000.0)
         self.assertAlmostEqual(result["adjusted_quantity"], 0.03)
+
+    async def test_crypto_risk_rejects_buy_below_minimum_order_amount(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="BTC",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.5,
+            suggested_price=150_000_000.0,
+            suggested_amount_krw=4_999.0,
+            urgency=SignalUrgency.IMMEDIATE,
+            metadata={
+                "market": "BITHUMB",
+                "price_krw": 150_000_000.0,
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=10_000_000.0,
+                portfolio_budget=30_000_000.0,
+                today_trade_count=0,
+                current_holding_count=0,
+            )
+
+        self.assertFalse(result["approved"])
+        self.assertIn(f"{CRYPTO_MIN_ORDER_AMOUNT_KRW:,.0f}원", result["reason"])
 
 
 class DecisionMakerCryptoFractionTest(unittest.IsolatedAsyncioTestCase):
@@ -128,7 +158,7 @@ class DecisionMakerCryptoFractionTest(unittest.IsolatedAsyncioTestCase):
         for field_name, value in self._original.items():
             setattr(settings, field_name, value)
 
-    async def test_execute_passes_fractional_crypto_quantity_to_order_call(self):
+    async def test_execute_passes_amount_based_crypto_buy_to_order_call(self):
         signal = TradeSignal(
             symbol="BTC",
             stock_id="coin-btc",
@@ -136,6 +166,7 @@ class DecisionMakerCryptoFractionTest(unittest.IsolatedAsyncioTestCase):
             strength=0.7,
             suggested_price=150_000_000.0,
             suggested_quantity=0.001,
+            suggested_amount_krw=150_000.0,
             urgency=SignalUrgency.IMMEDIATE,
             metadata={
                 "market": "BITHUMB",
@@ -170,7 +201,8 @@ class DecisionMakerCryptoFractionTest(unittest.IsolatedAsyncioTestCase):
             result = await maker.execute(signal, cycle_id="cycle-crypto-fraction")
 
         self.assertTrue(result["success"])
-        self.assertAlmostEqual(place_order_mock.await_args.kwargs["quantity"], 0.001)
+        self.assertAlmostEqual(place_order_mock.await_args.kwargs["quantity"], 150_000.0)
+        self.assertIsNone(place_order_mock.await_args.kwargs["price"])
 
 
 class BithumbClientFractionalPayloadTest(unittest.IsolatedAsyncioTestCase):
@@ -192,4 +224,3 @@ class BithumbClientFractionalPayloadTest(unittest.IsolatedAsyncioTestCase):
 
         body = request_mock.await_args.kwargs["body"]
         self.assertEqual(body["volume"], "0.001")
-

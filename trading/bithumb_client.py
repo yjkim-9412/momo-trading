@@ -866,6 +866,11 @@ class BithumbClient:
             return resp
 
         data = resp.data or {}
+        requested_amount_krw = 0.0
+        if body["ord_type"] == "price":
+            requested_amount_krw = _to_float(body.get("price"))
+        elif side.upper() == "BUY" and price is not None:
+            requested_amount_krw = float(price) * float(quantity)
         return MCPResponse(
             success=True,
             data={
@@ -873,12 +878,14 @@ class BithumbClient:
                 "side": side.upper(),
                 "market": "BITHUMB",
                 "market_pair": market_code,
-                "ord_type": data.get("ord_type", ""),
+                "ord_type": str(data.get("ord_type", "") or body["ord_type"]).lower(),
+                "order_type": str(data.get("ord_type", "") or body["ord_type"]).upper(),
                 "price": data.get("price", ""),
                 "state": data.get("state", ""),
                 "volume": data.get("volume", ""),
                 "remaining_volume": data.get("remaining_volume", ""),
                 "executed_volume": data.get("executed_volume", ""),
+                "requested_amount_krw": requested_amount_krw,
                 "trades_count": data.get("trades_count", 0),
                 "created_at": data.get("created_at", ""),
             },
@@ -894,7 +901,19 @@ class BithumbClient:
         filled_qty = _to_float(data.get("executed_volume"))
         remaining_qty = _to_float(data.get("remaining_volume"))
         order_qty = _to_float(data.get("volume"))
+        executed_funds = _to_float(data.get("executed_funds"))
         normalized_side = str(data.get("side", "") or "").lower()
+        filled_price = 0.0
+        if filled_qty > 0:
+            if executed_funds > 0:
+                filled_price = executed_funds / filled_qty
+            elif order_price > 0:
+                filled_price = order_price
+        requested_amount_krw = 0.0
+        if ord_type == "price":
+            requested_amount_krw = order_price
+        elif normalized_side == "bid" and order_price > 0 and order_qty > 0:
+            requested_amount_krw = order_price * order_qty
 
         return {
             "order_id": data.get("uuid", ""),
@@ -907,6 +926,7 @@ class BithumbClient:
             "status": str(data.get("state", "") or ""),
             "state": str(data.get("state", "") or ""),
             "ord_type": ord_type,
+            "order_type": ord_type.upper(),
             "order_price": order_price,
             "price": order_price,
             "order_qty": order_qty,
@@ -914,9 +934,11 @@ class BithumbClient:
             "filled_qty": filled_qty,
             "filled_quantity": filled_qty,
             "executed_volume": filled_qty,
+            "executed_funds": executed_funds,
             "remaining_qty": remaining_qty,
             "remaining_volume": remaining_qty,
-            "filled_price": order_price if ord_type == "limit" else 0.0,
+            "requested_amount_krw": requested_amount_krw,
+            "filled_price": filled_price,
             "currency": "KRW",
             "exchange_rate_to_krw": 1.0,
             "paid_fee": _to_float(data.get("paid_fee")),

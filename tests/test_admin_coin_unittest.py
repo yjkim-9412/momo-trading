@@ -8,6 +8,7 @@ from agent.trading_agent._state_mixin import StateMixin
 from agent.trading_agent._types import MarketState
 from api.routes import admin_coin
 from api.routes.admin_coin import (
+    _serialize_recommendation,
     get_coin_activity_feed,
     get_coin_overview,
     get_coin_system_status,
@@ -35,6 +36,27 @@ class _ExecuteResult:
 
 
 class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
+    async def test_serialize_recommendation_exposes_amount_first_fields(self):
+        row = SimpleNamespace(
+            id="rec-1",
+            coin_asset_id="coin-btc",
+            action="BUY",
+            suggested_price=150000000.0,
+            suggested_quantity=0.001,
+            suggested_amount_krw=150000.0,
+            reason="금액 기준 테스트",
+            confidence=0.82,
+            status="PENDING",
+            expires_at=datetime(2026, 3, 14, 13, 0, tzinfo=timezone.utc),
+            created_at=datetime(2026, 3, 14, 12, 0, tzinfo=timezone.utc),
+        )
+
+        payload = _serialize_recommendation(row)
+
+        self.assertEqual(payload["suggested_amount_krw"], 150000.0)
+        self.assertEqual(payload["suggested_quantity"], 0.001)
+        self.assertEqual(payload["suggested_price"], 150000000.0)
+
     async def test_get_coin_watchlist_exposes_scan_source_metadata(self):
         runtime = MarketState(
             scope="CRYPTO",

@@ -19,6 +19,7 @@ class CoinRecommendation(Base, TimestampMixin):
     action: Mapped[str] = mapped_column(String(10), nullable=False)  # BUY / SELL
     suggested_price: Mapped[float] = mapped_column(Float, nullable=False)
     suggested_quantity: Mapped[float] = mapped_column(Float, nullable=False)  # 소수점 수량
+    suggested_amount_krw: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(

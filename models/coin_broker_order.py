@@ -19,9 +19,11 @@ class CoinBrokerOrder(Base, TimestampMixin):
     side: Mapped[str] = mapped_column(String(10), nullable=False)  # BUY / SELL
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="SUBMITTED", index=True)
     strategy_type: Mapped[str] = mapped_column(String(30), nullable=False, default="")
+    order_type: Mapped[str] = mapped_column(String(10), nullable=False, default="LIMIT")
 
     quantity: Mapped[float] = mapped_column(Float, nullable=False)
     requested_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    requested_amount_krw: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     filled_quantity: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     filled_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     currency: Mapped[str] = mapped_column(String(10), nullable=False, default="KRW")

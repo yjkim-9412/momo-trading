@@ -13,6 +13,7 @@ class TradeSignal:
     strength: float  # 0~1
     suggested_price: float | None = None
     suggested_quantity: float | None = None
+    suggested_amount_krw: float | None = None
     target_price: float | None = None
     stop_loss_price: float | None = None
     urgency: SignalUrgency = SignalUrgency.WAIT

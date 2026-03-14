@@ -5,7 +5,7 @@ import asyncio
 import time
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from core.config import settings
 from core.database import AsyncSessionLocal
@@ -13,7 +13,7 @@ from models.coin_broker_order import CoinBrokerOrder
 from scheduler.market_calendar import market_calendar
 from trading.mcp_client import mcp_client
 from trading.market_profile import is_crypto_market, is_us_market, market_currency, normalize_market
-from trading.models import AccountBalance, AccountOverview, HoldingInfo, PendingOrderInfo
+from trading.models import AccountBalance, AccountOverview, HoldingInfo, PendingOrderInfo, coin_side_label
 
 _INTRADAY_SNAPSHOT_TTL_SECONDS = 2.0
 
@@ -440,28 +440,21 @@ class AccountManager:
             ))
         return orders
 
-    @staticmethod
-    def _coin_order_side_label(side: str) -> str:
-        return "매수" if str(side or "").upper() == "BUY" else "매도"
-
     async def _fetch_crypto_pending_orders(self, market_code: str) -> list[PendingOrderInfo]:
         """코인 미체결 주문을 coin_broker_orders 원장에서 조회한다."""
         async with AsyncSessionLocal() as session:
             rows = (
                 await session.execute(
-                    select(CoinBrokerOrder).where(
-                        CoinBrokerOrder.status.in_(self._CRYPTO_OPEN_ORDER_STATUSES)
+                    select(CoinBrokerOrder)
+                    .where(CoinBrokerOrder.status.in_(self._CRYPTO_OPEN_ORDER_STATUSES))
+                    .order_by(
+                        func.coalesce(CoinBrokerOrder.updated_at, CoinBrokerOrder.created_at).desc()
                     )
                 )
             ).scalars().all()
 
-        ordered_rows = sorted(
-            rows,
-            key=lambda row: row.updated_at or row.created_at,
-            reverse=True,
-        )
         pending_orders: list[PendingOrderInfo] = []
-        for row in ordered_rows:
+        for row in rows:
             remaining_qty = max(
                 self._to_float(row.quantity) - self._to_float(row.filled_quantity),
                 0.0,
@@ -478,7 +471,7 @@ class AccountManager:
                     name=row.coin_name or row.symbol,
                     market=market_code,
                     currency=row.currency or "KRW",
-                    side=self._coin_order_side_label(row.side),
+                    side=coin_side_label(row.side),
                     order_qty=self._to_float(row.quantity),
                     filled_qty=self._to_float(row.filled_quantity),
                     remaining_qty=remaining_qty,
@@ -530,7 +523,7 @@ class AccountManager:
         return balance, holdings
 
     async def _fetch_crypto_snapshot(self, market_code: str) -> tuple[AccountBalance, list[HoldingInfo]]:
-        """크립토 계좌 스냅샷: bithumb_client 잔고 + 보유 조회."""
+        """크립토 계좌 스냅샷: bithumb_client 잔고 1회 조회로 잔고 + 보유 모두 추출."""
         from trading.bithumb_client import bithumb_client
 
         balance_resp = await bithumb_client.get_account_balance(market=market_code)
@@ -541,24 +534,29 @@ class AccountManager:
         bal_data = balance_resp.data or {}
         logger.debug("[{}] 크립토 잔고 응답: {}", market_code, str(bal_data)[:500])
 
-        holdings_resp = await bithumb_client.get_holdings(market=market_code)
-        raw_holdings = (holdings_resp.data or {}).get("holdings", []) if holdings_resp.success else []
-
+        # holdings_summary는 get_account_balance 응답에 이미 포함되어 있다.
+        # 별도 get_holdings() 호출을 제거하여 동일 API 이중 호출을 방지한다.
+        raw_summary = bal_data.get("holdings_summary") or []
         holdings: list[HoldingInfo] = []
-        for item in raw_holdings:
-            qty = self._to_float(item.get("quantity", 0))
+        for item in raw_summary:
+            sym = item.get("currency", "")
+            qty = self._to_float(item.get("balance", 0)) + self._to_float(item.get("locked", 0))
             if qty <= 0:
                 continue
+            avg = self._to_float(item.get("avg_buy_price", 0))
+            cur_price = self._to_float(item.get("current_price", 0))
+            pnl = (cur_price - avg) * qty if cur_price > 0 and avg > 0 else 0.0
+            pnl_rate = ((cur_price / avg) - 1) * 100 if avg > 0 and cur_price > 0 else 0.0
             holdings.append(HoldingInfo(
-                symbol=item.get("symbol", ""),
-                name=item.get("name", item.get("symbol", "")),
+                symbol=sym,
+                name=sym,
                 market=market_code,
                 currency="KRW",
                 quantity=qty,
-                avg_buy_price=self._to_float(item.get("avg_buy_price", 0)),
-                current_price=self._to_float(item.get("current_price", 0)),
-                pnl=self._to_float(item.get("pnl", 0)),
-                pnl_rate=self._to_float(item.get("pnl_rate", 0)),
+                avg_buy_price=avg,
+                current_price=cur_price,
+                pnl=round(pnl, 2),
+                pnl_rate=round(pnl_rate, 2),
                 exchange_rate_to_krw=1.0,
             ))
 

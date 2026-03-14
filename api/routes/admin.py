@@ -34,67 +34,15 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 def _serialize_balance(balance: AccountBalance) -> dict[str, object]:
-    return {
-        "total_asset": balance.total_asset,
-        "cash": balance.cash,
-        "raw_cash": balance.raw_cash,
-        "effective_cash": balance.effective_cash,
-        "cash_source": balance.cash_source,
-        "stock_value": balance.stock_value,
-        "locked_krw": balance.locked_krw,
-        "total_pnl": balance.total_pnl,
-        "total_pnl_rate": balance.total_pnl_rate,
-        "raw_total_pnl": balance.raw_total_pnl,
-        "raw_total_pnl_rate": balance.raw_total_pnl_rate,
-        "pnl_source": balance.pnl_source,
-        "market": balance.market,
-        "currency": balance.currency,
-        "exchange_rate_to_krw": balance.exchange_rate_to_krw,
-        "status_message": balance.status_message,
-        "is_valid": balance.is_valid,
-    }
+    return balance.model_dump()
 
 
 def _serialize_holdings(holdings: list[HoldingInfo]) -> list[dict[str, object]]:
-    return [
-        {
-            "symbol": h.symbol,
-            "name": h.name,
-            "market": h.market,
-            "currency": h.currency,
-            "quantity": h.quantity,
-            "avg_buy_price": h.avg_buy_price,
-            "current_price": h.current_price,
-            "pnl": h.pnl,
-            "pnl_rate": h.pnl_rate,
-            "exchange_rate_to_krw": h.exchange_rate_to_krw,
-        }
-        for h in holdings
-    ]
+    return [h.model_dump() for h in holdings]
 
 
 def _serialize_pending_orders(orders: list[PendingOrderInfo]) -> list[dict[str, object]]:
-    return [
-        {
-            "order_id": o.order_id,
-            "symbol": o.symbol,
-            "name": o.name,
-            "market": o.market,
-            "currency": o.currency,
-            "side": o.side,
-            "order_qty": o.order_qty,
-            "filled_qty": o.filled_qty,
-            "remaining_qty": o.remaining_qty,
-            "order_price": o.order_price,
-            "order_time": o.order_time,
-            "exchange_rate_to_krw": o.exchange_rate_to_krw,
-            "status": o.status,
-            "status_detail": o.status_detail,
-            "submitted_at": o.submitted_at,
-            "updated_at": o.updated_at,
-        }
-        for o in orders
-    ]
+    return [o.model_dump() for o in orders]
 
 
 def _serialize_broker_orders(orders: list[BrokerOrder]) -> list[dict[str, object]]:

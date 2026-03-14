@@ -125,3 +125,8 @@ class AccountOverview(BaseModel):
     balance: AccountBalance
     holdings: list[HoldingInfo]
     pending_orders: list[PendingOrderInfo]
+
+
+def coin_side_label(side: str) -> str:
+    """코인 주문 방향을 한국어로 변환한다."""
+    return "매수" if str(side or "").upper() == "BUY" else "매도"

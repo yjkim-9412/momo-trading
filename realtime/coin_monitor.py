@@ -17,14 +17,14 @@ class CoinRealtimeMonitor:
 
     _ACCOUNT_CHANGE_DEBOUNCE_SECONDS = 0.3
 
+    @staticmethod
+    def _empty_pending() -> dict[str, object]:
+        return {"reasons": set(), "symbols": set(), "changed_currencies": set()}
+
     def __init__(self) -> None:
         self._running = False
         self._account_change_task: asyncio.Task | None = None
-        self._pending_account_change: dict[str, object] = {
-            "reasons": set(),
-            "symbols": set(),
-            "changed_currencies": set(),
-        }
+        self._pending_account_change: dict[str, object] = self._empty_pending()
 
     async def start(self) -> None:
         if self._running:
@@ -46,11 +46,7 @@ class CoinRealtimeMonitor:
             except asyncio.CancelledError:
                 pass
             self._account_change_task = None
-        self._pending_account_change = {
-            "reasons": set(),
-            "symbols": set(),
-            "changed_currencies": set(),
-        }
+        self._pending_account_change = self._empty_pending()
         await coin_stream_manager.stop()
         logger.info("코인 실시간 모니터 중지")
 
@@ -92,14 +88,13 @@ class CoinRealtimeMonitor:
     ) -> None:
         """계좌 갱신 신호를 짧게 모아서 SSE로 보낸다."""
         pending = self._pending_account_change
-        reasons = pending.setdefault("reasons", set())
-        symbols = pending.setdefault("symbols", set())
-        currencies = pending.setdefault("changed_currencies", set())
-        if isinstance(reasons, set):
-            reasons.add(reason)
-        if symbol and isinstance(symbols, set):
+        reasons: set = pending.setdefault("reasons", set())  # type: ignore[assignment]
+        symbols: set = pending.setdefault("symbols", set())  # type: ignore[assignment]
+        currencies: set = pending.setdefault("changed_currencies", set())  # type: ignore[assignment]
+        reasons.add(reason)
+        if symbol:
             symbols.add(symbol)
-        if changed_currencies and isinstance(currencies, set):
+        if changed_currencies:
             currencies.update(changed_currencies)
         if order_id:
             pending["order_id"] = order_id
@@ -126,28 +121,25 @@ class CoinRealtimeMonitor:
         except Exception as e:
             logger.warning("[CoinWS] account_changed 브로드캐스트 실패: {}", str(e))
         finally:
-            self._pending_account_change = {
-                "reasons": set(),
-                "symbols": set(),
-                "changed_currencies": set(),
-            }
+            self._pending_account_change = self._empty_pending()
             self._account_change_task = None
 
     def _build_account_change_payload(self) -> dict[str, object] | None:
-        reasons = self._pending_account_change.get("reasons", set())
+        pending = self._pending_account_change
+        reasons: set = pending.get("reasons") or set()  # type: ignore[assignment]
         if not reasons:
             return None
 
-        symbols = self._pending_account_change.get("symbols", set())
-        currencies = self._pending_account_change.get("changed_currencies", set())
+        symbols: set = pending.get("symbols") or set()  # type: ignore[assignment]
+        currencies: set = pending.get("changed_currencies") or set()  # type: ignore[assignment]
         return {
             "type": "account_changed",
             "reason": ",".join(sorted(reasons)),
-            "symbols": sorted(symbols) if isinstance(symbols, set) else [],
-            "changed_currencies": sorted(currencies) if isinstance(currencies, set) else [],
-            "order_id": self._pending_account_change.get("order_id"),
-            "status": self._pending_account_change.get("status"),
-            "asset_timestamp": self._pending_account_change.get("asset_timestamp"),
+            "symbols": sorted(symbols),
+            "changed_currencies": sorted(currencies),
+            "order_id": pending.get("order_id"),
+            "status": pending.get("status"),
+            "asset_timestamp": pending.get("asset_timestamp"),
         }
 
     @property

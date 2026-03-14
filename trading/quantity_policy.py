@@ -12,6 +12,7 @@ from trading.market_profile import is_crypto_market, normalize_market
 
 CRYPTO_QUANTITY_STEP = Decimal("0.00000001")
 _STOCK_QUANTITY_STEP = Decimal("1")
+CRYPTO_MIN_ORDER_AMOUNT_KRW = 5000.0
 
 
 def _to_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
@@ -28,6 +29,13 @@ def quantity_step(market: str) -> Decimal:
     if is_crypto_market(market_code):
         return CRYPTO_QUANTITY_STEP
     return _STOCK_QUANTITY_STEP
+
+
+def min_order_amount_krw(market: str) -> float:
+    market_code = normalize_market(market)
+    if is_crypto_market(market_code):
+        return CRYPTO_MIN_ORDER_AMOUNT_KRW
+    return 0.0
 
 
 def normalize_quantity(value: object, market: str) -> float:

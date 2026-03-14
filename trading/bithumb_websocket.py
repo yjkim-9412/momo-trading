@@ -474,6 +474,20 @@ class BithumbWebSocket:
         elif state in {"trade", "wait"}:
             status = "OPEN" if state == "trade" else "SUBMITTED"
 
+        order_type = str(payload.get("order_type") or "").lower()
+        executed_funds = _to_float(payload.get("executed_funds"))
+        filled_price = 0.0
+        if executed_volume > 0:
+            if executed_funds > 0:
+                filled_price = executed_funds / executed_volume
+            else:
+                filled_price = _to_float(payload.get("price"))
+        requested_amount_krw = 0.0
+        if order_type == "price":
+            requested_amount_krw = _to_float(payload.get("price"))
+        elif _normalize_side(payload.get("ask_bid")) == "BUY":
+            requested_amount_krw = _to_float(payload.get("price")) * order_qty
+
         submitted_at = _parse_ws_datetime(payload.get("order_timestamp") or payload.get("timestamp"))
         filled_at = _parse_ws_datetime(payload.get("trade_timestamp") or payload.get("timestamp"))
         if status not in {"FILLED", "PARTIAL"}:
@@ -489,7 +503,8 @@ class BithumbWebSocket:
             "side": _normalize_side(payload.get("ask_bid")),
             "status": status,
             "state": state.upper(),
-            "order_type": str(payload.get("order_type") or ""),
+            "order_type": order_type.upper(),
+            "ord_type": order_type,
             "order_price": _to_float(payload.get("price")),
             "price": _to_float(payload.get("price")),
             "order_qty": order_qty,
@@ -498,13 +513,14 @@ class BithumbWebSocket:
             "filled_quantity": executed_volume,
             "remaining_qty": remaining_volume,
             "remaining_volume": remaining_volume,
-            "filled_price": _to_float(payload.get("price")),
+            "requested_amount_krw": requested_amount_krw,
+            "filled_price": filled_price,
             "currency": "KRW",
             "exchange_rate_to_krw": 1.0,
             "reserved_fee": _to_float(payload.get("reserved_fee")),
             "remaining_fee": _to_float(payload.get("remaining_fee")),
             "paid_fee": _to_float(payload.get("paid_fee")),
-            "executed_funds": _to_float(payload.get("executed_funds")),
+            "executed_funds": executed_funds,
             "trades_count": int(payload.get("trades_count") or 0),
             "submitted_at": submitted_at,
             "filled_at": filled_at,

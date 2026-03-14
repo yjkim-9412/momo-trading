@@ -50,6 +50,8 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 | `analysis/llm/prompts/market_scan.py` | 크립토 스캔 프롬프트 |
 | `analysis/llm/prompts/stock_analysis.py` | 크립토 Tier1 분석 프롬프트 |
 | `analysis/llm/prompts/final_review.py` | 크립토 Tier2 리뷰 프롬프트 |
+| `strategy/signal.py` | 코인 BUY `suggested_amount_krw` 포함 공통 시그널 계약 |
+| `agent/decision_maker.py` | 코인 BUY 금액 주문 실행 (`price=None`, `quantity=<KRW amount>`) |
 
 ### 코인 전용 DB (주식과 완전 분리, 10개 테이블)
 `models/coin_asset.py`, `coin_order.py`, `coin_broker_order.py`, `coin_trade_result.py`, `coin_holding.py`, `coin_activity_log.py`, `coin_daily_report.py`, `coin_trading_rule.py`, `coin_analysis_result.py`, `coin_recommendation.py`
@@ -102,6 +104,9 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - `myAsset` payload 는 총자산/손익을 직접 주지 않고 `balance` / `locked` 변경만 주므로, 코인 어드민의 `총 자산`, `KRW 현금`, `코인 평가`, `잠금 KRW` 는 WS 이벤트를 트리거로 `/api/v1/admin-coin/account/overview` 를 재조회해 확정한다.
 - 소수점 수량: `OrderRequest.quantity = float` (주식은 정수만 전달)
 - 코인 소수점 수량은 `trading/quantity_policy.py`를 기준으로 end-to-end 8자리 floor 정책을 유지한다. 포지션 스냅샷, 계좌 컨텍스트, 리스크 캡, Tier2 제안 수량, 빗썸 주문 payload는 코인만 fractional 을 보존하고 주식 API/스키마는 그대로 둔다.
+- 코인 BUY 계약은 **수량 중심이 아니라 KRW 금액 중심**이다. `TradeSignal.suggested_amount_krw`가 authoritative 하고, `suggested_quantity`는 `entry_price` 기준 추정 수량이다.
+- 코인 BUY 실행은 빗썸 `ord_type="price"` 시장가 매수로 통일한다. `DecisionMaker`/`BithumbClient`는 `place_order(symbol, side="BUY", quantity=<KRW amount>, price=None)` 형태를 사용한다.
+- 빗썸 KRW 현물 BUY 최소 주문금액은 `5,000 KRW`이며, 코인 프롬프트와 `RiskManager`가 같은 기준을 공유한다.
 - 캔들 정렬: newest-first → oldest-first 재정렬 (미국장과 동일 방어)
 - JWT 인증: PyJWT HS256. `Authorization: Bearer {jwt}`. Payload: access_key, nonce(UUID), timestamp(ms), query_hash(SHA512)
 - 시장 국면 canonical 값: `BULL_RUN` / `BEAR_MARKET` / `CONSOLIDATION` / `ALTSEASON` / `THEME`
@@ -109,6 +114,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게)
 - 코인 기본 시장 fallback은 `PRIMARY_MARKET`를 공유하지 않는다. 코인 경로는 `CRYPTO_PRIMARY_MARKET`를 우선 사용하고, 값이 비어 있거나 잘못되면 `BITHUMB`로 고정한다.
 - 코인 프롬프트 스택(`market_scan.py`, `stock_analysis.py`, `final_review.py`)은 `빗썸 KRW 현물`, `수시간~2일`, `BUY/HOLD 전용`, `24h 거래대금 기반 유동성 확인`을 공통 계약으로 유지한다
+- 코인 프롬프트 스택은 `BUY 판단은 KRW 투자금 기준`, `Tier2 BUY는 suggested_amount_krw 필수`, `suggested_quantity는 추정치` 계약을 함께 유지한다.
 - Product Policy: 크립토는 항상 COMMON (Spot only)
 - 24/7 스케줄: buy cutoff / 강제 청산 없음
 - 코인 스캔은 `CRYPTO_DYNAMIC_DISCOVERY_ENABLED=true`일 때 `get_discovery_universe()`로 저빈도 broad refresh를 수행하고, `CRYPTO_DISCOVERY_UNIVERSE_SIZE` 상위 유동성 코인을 메모리 캐시에 유지한다.
@@ -123,6 +129,8 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - `get_account_balance()` / `get_holdings()`는 `/v1/market/all`의 실제 `KRW-*` 마켓에 없는 자산을 비거래성 자산으로 간주해 제외한다. 마켓 카탈로그 조회가 깨지면 stale cache를 우선 쓰고, cache도 없으면 `avg_buy_price=0` 이고 현재가도 없는 자산만 degraded 규칙으로 제외한다.
 - DB 완전 분리: 10개 `coin_*` 테이블, 주식 FK 없음
 - 활동 로그 → CoinActivityLog, 추천 → CoinRecommendation (직접 쿼리)
+- `coin_recommendations`는 `suggested_amount_krw`를 저장하고, `coin_broker_orders`는 `order_type`, `requested_amount_krw`를 저장한다.
+- 빗썸 `ord_type="price"` 시장가 매수의 체결가는 `executed_funds / executed_volume`으로 평균 체결단가를 계산한다. REST/WS payload의 `price`를 체결단가로 그대로 신뢰하지 말 것.
 - 코인 어드민 중앙 라이브 워크스페이스는 주식 어드민과 동일한 `Agent Monitor → grouped symbol cards → 중요도 기반 toast/브라우저 알림/탭 강조 → SSE reconnect banner` 흐름을 사용한다.
 - 코인 어드민 상태/중앙 모니터는 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
 - 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`를 사용해 WS 감시 상태를 렌더링한다.
