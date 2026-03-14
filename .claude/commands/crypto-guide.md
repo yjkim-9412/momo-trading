@@ -114,7 +114,9 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - 시장 국면: `BULL_RUN` / `BEAR_MARKET` / `CONSOLIDATION` / `ALTSEASON` / `ALT_SEASON` (주식의 BULL/BEAR/SIDEWAYS/THEME와 별도). `risk_manager.CRYPTO_RR_FLOOR`에 양쪽 변형 모두 매핑됨.
 - R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게).
 - Product Policy: 크립토는 항상 `COMMON` (Spot only), 레버리지/인버스 분류 Skip.
+- 코인 스캔은 `CRYPTO_DYNAMIC_DISCOVERY_ENABLED=true`일 때 전체 KRW 마켓 overview에서 동적 discovery 후보를 만들고, `CRYPTO_WATCHLIST_SYMBOLS`는 discovery와 별도로 항상 병합되는 시드 목록으로 유지한다.
 - 코인 스캔은 `get_market_overview()` 1회 조회 결과를 `get_volume_rank(..., overview_data=...)` / `get_surge_data(..., overview_data=...)`에 재사용한다. overview 실패 시 watchlist/보유 코인 현재가로 degraded 스캔을 시도한다.
+- 코인 후보/선정 결과에는 `scan_source`가 붙는다. 정상 경로는 `DISCOVERY` / `WATCHLIST`, degraded 경로는 `WATCHLIST_FALLBACK` / `HOLDING_FALLBACK`를 사용한다.
 - `BithumbClient.get_current_price()` / overview ticker 정규화에서 공통 `change` 필드는 숫자 변화량으로 맞춘다. 원본 방향 문자열은 `change_direction`, 부호 있는 변화량은 `signed_change_price`로 별도 보존한다.
 - `BithumbClient._public_get()`는 HTTP status, content-type, body preview를 함께 로그에 남긴다. `Expecting value`만 보이면 upstream HTML/빈 본문/5xx 가능성을 먼저 확인할 것.
 - 코인 scope에서 `CRYPTO_LLM_PROVIDER=CODEX_CLI`이고 Codex 인증/세션 갱신이 실패하면 `analysis/llm/llm_factory.py`가 `CLAUDE_CODE` fallback을 1회 시도한다.

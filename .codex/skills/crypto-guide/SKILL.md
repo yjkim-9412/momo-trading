@@ -67,6 +67,7 @@ CRYPTO_TRADING_ENABLED                  # 실제 주문 허용
 CRYPTO_AUTONOMY_MODE                    # SEMI_AUTO / AUTONOMOUS
 CRYPTO_SCAN_INTERVAL_HOURS              # 스캔 주기 (기본 4h)
 CRYPTO_WATCHLIST_SYMBOLS                # 감시 코인 목록
+CRYPTO_DYNAMIC_DISCOVERY_ENABLED        # 전체 시장 발굴 + watchlist 시드 병합
 CRYPTO_LLM_PROVIDER                     # CLAUDE_CODE / CODEX_CLI (비어있으면 LLM_PROVIDER)
 CRYPTO_LLM_MODEL_TIER1_SCAN             # Claude 스캔 모델
 CRYPTO_LLM_MODEL_TIER1_ANALYSIS         # Claude 분석 모델
@@ -92,7 +93,9 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게)
 - Product Policy: 크립토는 항상 COMMON (Spot only)
 - 24/7 스케줄: buy cutoff / 강제 청산 없음
+- 코인 스캔은 `CRYPTO_DYNAMIC_DISCOVERY_ENABLED=true`일 때 `get_market_overview()` 전체 KRW 마켓에서 동적 discovery 후보를 만들고, `CRYPTO_WATCHLIST_SYMBOLS`는 discovery와 별도로 항상 병합되는 시드 목록으로 유지한다.
 - 코인 스캔은 `get_market_overview()` 1회 조회 결과를 `get_volume_rank(..., overview_data=...)` / `get_surge_data(..., overview_data=...)`에 재사용한다. overview가 깨지면 watchlist/보유 코인 현재가로 degraded 스캔을 시도한다.
+- 코인 후보/선정 결과에는 `scan_source`가 붙는다. 정상 경로는 `DISCOVERY` / `WATCHLIST`, degraded 경로는 `WATCHLIST_FALLBACK` / `HOLDING_FALLBACK`를 사용한다.
 - `BithumbClient.get_current_price()` / overview ticker 정규화에서 공통 `change` 필드는 숫자 변화량으로 맞춘다. 원본 방향 문자열은 `change_direction`, 부호 있는 변화량은 `signed_change_price`로 별도 보존한다.
 - `BithumbClient._public_get()`는 HTTP status, content-type, body preview를 함께 로그에 남긴다. `Expecting value`만 보고 원인을 추측하지 말고 upstream HTML/빈 본문/5xx를 먼저 확인한다.
 - 코인 scope에서 `CRYPTO_LLM_PROVIDER=CODEX_CLI`이고 Codex 인증/세션 갱신이 실패하면 `analysis/llm/llm_factory.py`가 `CLAUDE_CODE` fallback을 1회 시도한다.
