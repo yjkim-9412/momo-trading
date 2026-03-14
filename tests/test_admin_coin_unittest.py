@@ -1,9 +1,29 @@
 import unittest
-from unittest.mock import patch
+from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from agent.trading_agent import trading_agent
+from agent.trading_agent._state_mixin import StateMixin
 from agent.trading_agent._types import MarketState
-from api.routes.admin_coin import get_coin_watchlist
+from api.routes import admin_coin
+from api.routes.admin_coin import get_coin_activity_feed, get_coin_watchlist
+
+
+class _ScalarResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _ExecuteResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def scalars(self):
+        return _ScalarResult(self._rows)
 
 
 class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
@@ -26,7 +46,21 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        with patch.object(trading_agent, "_market_states", {"CRYPTO": runtime}):
+        with patch.object(trading_agent, "_market_states", {"CRYPTO": runtime}), \
+                patch.object(admin_coin.account_manager, "get_holdings", AsyncMock(return_value=[])), \
+                patch(
+                    "realtime.coin_stream_manager.coin_stream_manager.desired_keys",
+                    return_value=set(),
+                ), \
+                patch(
+                    "realtime.coin_stream_manager.coin_stream_manager.active_keys",
+                    return_value=set(),
+                ), \
+                patch(
+                    "realtime.coin_stream_manager.coin_stream_manager.stream_status",
+                    return_value={"running": True, "active_count": 1},
+                ), \
+                patch("realtime.event_detector.event_detector._thresholds", {}):
             response = await get_coin_watchlist()
 
         self.assertEqual(len(response.data["symbols"]), 1)
@@ -36,6 +70,72 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["scan_source"], "DISCOVERY")
         self.assertEqual(item["trade_value"], 45678.0)
         self.assertEqual(item["reason"], "시장 기준점")
+
+    async def test_get_coin_activity_feed_returns_next_cursor_when_more_rows_exist(self):
+        resolved_date = date(2026, 3, 14)
+        newest = datetime(2026, 3, 14, 9, 0, tzinfo=timezone.utc)
+        rows = [
+            self._make_activity("log-3", newest, "BTC"),
+            self._make_activity("log-2", newest - timedelta(seconds=5), "ETH"),
+            self._make_activity("log-1", newest - timedelta(seconds=10), "XRP"),
+        ]
+        db = AsyncMock()
+        db.execute.return_value = _ExecuteResult(rows)
+
+        response = await get_coin_activity_feed(
+            limit=2,
+            target_date=resolved_date.isoformat(),
+            db=db,
+        )
+
+        self.assertTrue(response.data.has_more)
+        self.assertIsNotNone(response.data.next_cursor)
+        self.assertEqual(response.data.next_cursor.before_id, "log-2")
+        self.assertEqual(response.data.next_cursor.before_created_at, rows[1].created_at)
+        self.assertEqual(response.data.resolved_trading_date, resolved_date)
+        self.assertEqual([item.id for item in response.data.items], ["log-3", "log-2"])
+
+    @staticmethod
+    def _make_activity(activity_id: str, created_at: datetime, symbol: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=activity_id,
+            cycle_id="cycle-1",
+            activity_type="DECISION",
+            phase="COMPLETE",
+            symbol=symbol,
+            summary=f"{symbol} decision complete",
+            detail='{"decision":"BUY"}',
+            llm_provider="CODEX_CLI",
+            llm_tier="TIER2",
+            execution_time_ms=1200,
+            confidence=0.91,
+            error_message=None,
+            created_at=created_at,
+        )
+
+
+class AgentStateBroadcastRoutingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_broadcast_agent_state_routes_bithumb_scope_to_coin_sse_manager(self):
+        agent = StateMixin()
+        payload = {"type": "agent_state", "data": {"cycle_active": True}}
+
+        with patch.object(admin_coin.coin_sse_manager, "broadcast", AsyncMock()) as coin_broadcast, \
+                patch("agent.trading_agent._state_mixin.sse_manager.broadcast", AsyncMock()) as stock_broadcast:
+            await agent._broadcast_agent_state_safe("BITHUMB", payload, stage="unit-test")
+
+        coin_broadcast.assert_awaited_once_with(payload)
+        stock_broadcast.assert_not_awaited()
+
+    async def test_broadcast_agent_state_keeps_non_crypto_scope_on_stock_sse_manager(self):
+        agent = StateMixin()
+        payload = {"type": "agent_state", "data": {"cycle_active": False}}
+
+        with patch.object(admin_coin.coin_sse_manager, "broadcast", AsyncMock()) as coin_broadcast, \
+                patch("agent.trading_agent._state_mixin.sse_manager.broadcast", AsyncMock()) as stock_broadcast:
+            await agent._broadcast_agent_state_safe("KRX", payload, stage="unit-test")
+
+        stock_broadcast.assert_awaited_once_with(payload)
+        coin_broadcast.assert_not_awaited()
 
 
 if __name__ == "__main__":
