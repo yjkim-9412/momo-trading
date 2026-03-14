@@ -915,6 +915,26 @@ async function loadSystemStatus() {
       s.last_cycle_error ? '#f87171' : (s.agent_running ? '#34d399' : '#fbbf24')
     );
     setInlineStatus('sys-sse', `${sseClients}명 구독`, sseClients > 0 ? '#34d399' : '#9ca3af');
+    const realtime = s.realtime || {};
+    const desiredCount = Number(realtime.desired_count || 0);
+    const activeCount = Number(realtime.subscription_count || realtime.active_count || 0);
+    const realtimeLabel = realtime.connected
+      ? `연결 · ${activeCount}/${desiredCount || activeCount}`
+      : `${desiredCount ? `${desiredCount}종목 대기` : '감시 대기'}`;
+    setInlineStatus(
+      'sys-realtime',
+      realtimeLabel,
+      realtime.connected ? '#34d399' : (realtime.last_connect_error ? '#f87171' : '#9ca3af')
+    );
+    const privateSync = s.private_sync || {};
+    const privateLabel = privateSync.connected
+      ? `연결${privateSync.last_order_message_at ? ` · 주문 ${formatTimeAgo(privateSync.last_order_message_at)}` : ''}${privateSync.last_asset_message_at ? ` · 자산 ${formatTimeAgo(privateSync.last_asset_message_at)}` : ''}`
+      : (privateSync.configured === false ? '미설정' : (privateSync.last_error ? `오류 · ${truncateText(privateSync.last_error, 24)}` : '대기'));
+    setInlineStatus(
+      'sys-private-sync',
+      privateLabel,
+      privateSync.connected ? '#34d399' : (privateSync.last_error ? '#f87171' : '#9ca3af')
+    );
     setInlineStatus('sys-uptime', uptime, '#d1d5db');
     setInlineStatus('sys-trades-today', `${todayTrades}건`, todayTrades > 0 ? '#fbbf24' : '#9ca3af');
     if (typeof s.watchlist_count === 'number') {
@@ -1066,50 +1086,97 @@ async function loadWatchlist() {
   try {
     const json = await fetchJSON(`${API}/watchlist`);
     const data = json.data || {};
-    renderWatchlist(data.symbols || data);
+    renderWatchlist(data);
   } catch (err) {
     console.error('[coin] watchlist load error:', err);
   }
 }
 
-function renderWatchlist(symbols) {
+function renderWatchlist(data) {
   const container = document.getElementById('watchlist-list');
   const dot = document.getElementById('watchlist-stream-dot');
   if (!container) return;
 
-  const items = Array.isArray(symbols) ? symbols : [];
+  const payload = Array.isArray(data) ? { symbols: data } : (data || {});
+  const items = Array.isArray(payload.symbols) ? payload.symbols : [];
+  const stream = payload.stream_status || null;
   setTextContent('watchlist-count', `${items.length}종목`);
   if (dot) {
-    dot.className = `w-1.5 h-1.5 rounded-full ${items.length ? 'bg-green-400' : 'bg-gray-600'}`;
+    const dotClass = stream
+      ? (stream.connected ? 'bg-green-400' : (items.length ? 'bg-red-400' : 'bg-gray-600'))
+      : (items.length ? 'bg-green-400' : 'bg-gray-600');
+    dot.className = `w-1.5 h-1.5 rounded-full ${dotClass}`;
   }
 
+  const streamSummary = stream ? (() => {
+    const subscriptionLimit = Number(stream.subscription_limit || 0);
+    const subscriptionCount = Number(stream.subscription_count || 0);
+    const pct = subscriptionLimit > 0
+      ? Math.max(0, Math.min(100, Math.round((subscriptionCount / subscriptionLimit) * 100)))
+      : 0;
+    const statusColor = stream.connected ? '#34d399' : (stream.last_connect_error ? '#f87171' : '#9ca3af');
+    const stateText = stream.connected ? '연결됨' : (stream.last_connect_error ? '연결 오류' : '대기');
+    const lastSeen = stream.last_message_at ? formatTimeAgo(stream.last_message_at) : '';
+    return `
+      <div class="coin-watchlist-stream">
+        <div class="coin-watchlist-gauge">
+          <span style="min-width:18px; color:${statusColor};">WS</span>
+          <span class="coin-watchlist-gauge-track"><span class="coin-watchlist-gauge-fill" style="width:${pct}%"></span></span>
+          <span>${subscriptionCount}/${subscriptionLimit || 0}</span>
+        </div>
+        <div class="flex items-center justify-between mt-2 text-[10px] text-gray-500">
+          <span style="color:${statusColor};">${escapeHtml(stateText)}</span>
+          <span>${escapeHtml(lastSeen ? `${lastSeen} 수신` : '수신 이력 없음')}</span>
+        </div>
+      </div>
+    `;
+  })() : '';
+
   if (!items.length) {
-    container.innerHTML = '<div style="color:#6b7280; font-size:13px; padding:12px; text-align:center;">감시 코인 없음</div>';
+    container.innerHTML = `${streamSummary}<div style="color:#6b7280; font-size:13px; padding:12px; text-align:center;">감시 코인 없음</div>`;
     return;
   }
 
-  container.innerHTML = items.map(s => {
+  container.innerHTML = streamSummary + items.map(s => {
     const sym = typeof s === 'string' ? s : (s.symbol || '');
     const name = typeof s === 'string' ? s : (s.name || s.symbol || '');
     const reason = typeof s === 'object' && s.reason ? s.reason : '';
-    const score = typeof s === 'object' && s.score != null ? `${(Number(s.score) * 100).toFixed(0)}점` : '';
     const price = typeof s === 'object' && s.price != null ? formatPrice(s.price) : '';
     const changeRate = typeof s === 'object' && s.change_rate != null ? Number(s.change_rate) : null;
     const changeColor = changeRate == null ? '#6b7280' : (changeRate >= 0 ? '#34d399' : '#f87171');
     const scanSource = typeof s === 'object' ? formatCoinScanSource(s.scan_source) : '';
+    const isHolding = typeof s === 'object' && !!s.is_holding;
+    const isSubscribed = typeof s === 'object' && !!s.is_subscribed;
+    const statusLabel = isHolding ? '보유' : (isSubscribed ? '감시' : '대기');
+    const statusClass = isHolding ? 'holding' : (isSubscribed ? 'watching' : 'pending');
+    const thresholds = typeof s === 'object' ? (s.thresholds || null) : null;
+    const thresholdItems = [];
+    if (thresholds) {
+      if (thresholds.surge_pct != null) thresholdItems.push(`<span class="coin-watchlist-threshold">급등 +${Number(thresholds.surge_pct).toFixed(1)}%</span>`);
+      if (thresholds.drop_pct != null) thresholdItems.push(`<span class="coin-watchlist-threshold">급락 ${Number(thresholds.drop_pct).toFixed(1)}%</span>`);
+      if (thresholds.volume_spike_ratio) thresholdItems.push(`<span class="coin-watchlist-threshold">거래량 x${Number(thresholds.volume_spike_ratio).toFixed(1)}</span>`);
+      if (Number(thresholds.stop_loss || 0) > 0) thresholdItems.push(`<span class="coin-watchlist-threshold">SL ${escapeHtml(formatPrice(thresholds.stop_loss))}</span>`);
+      if (Number(thresholds.take_profit || 0) > 0) thresholdItems.push(`<span class="coin-watchlist-threshold">TP ${escapeHtml(formatPrice(thresholds.take_profit))}</span>`);
+      if (Number(thresholds.trailing_stop_pct || 0) > 0) thresholdItems.push(`<span class="coin-watchlist-threshold">Trail ${Number(thresholds.trailing_stop_pct).toFixed(1)}%</span>`);
+    }
 
     return `
-      <div style="display:flex; align-items:center; justify-content:space-between; padding:6px 10px; border-radius:6px; background:rgba(30,30,46,0.4); margin-bottom:4px; font-size:12px;">
-        <div style="min-width:0;">
-          <span style="color:#e2e8f0; font-weight:500;">${escapeHtml(name)}</span>
-          ${sym !== name ? `<span style="color:#6b7280; margin-left:4px;">${escapeHtml(sym)}</span>` : ''}
-          ${scanSource ? `<span style="color:#a78bfa; margin-left:6px; font-size:11px;">${escapeHtml(scanSource)}</span>` : ''}
-          ${reason ? `<div style="color:#6b7280; font-size:11px; margin-top:1px;">${escapeHtml(reason)}</div>` : ''}
-          ${price ? `<div style="color:#6b7280; font-size:11px; margin-top:1px;">현재가 ${escapeHtml(price)}</div>` : ''}
-        </div>
-        <div style="text-align:right;">
-          ${score ? `<div style="color:#a78bfa; font-size:11px;">${score}</div>` : ''}
-          ${changeRate != null ? `<div style="color:${changeColor}; font-size:11px; margin-top:2px;">${changeRate >= 0 ? '+' : ''}${changeRate.toFixed(2)}%</div>` : ''}
+      <div class="coin-watchlist-card">
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <div class="flex items-center gap-1.5 min-w-0">
+              <span style="color:#e2e8f0; font-weight:600;">${escapeHtml(sym)}</span>
+              ${name && sym !== name ? `<span style="color:#9ca3af; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(name)}</span>` : ''}
+              ${scanSource ? `<span style="color:#a78bfa; font-size:10px;">${escapeHtml(scanSource)}</span>` : ''}
+            </div>
+            ${reason ? `<div style="color:#6b7280; font-size:11px; margin-top:3px;">${escapeHtml(reason)}</div>` : ''}
+            ${price ? `<div style="color:#9ca3af; font-size:11px; margin-top:3px;">현재가 ${escapeHtml(price)}</div>` : ''}
+            ${thresholdItems.length ? `<div class="coin-watchlist-thresholds">${thresholdItems.join('')}</div>` : ''}
+          </div>
+          <div class="text-right shrink-0">
+            <span class="coin-watchlist-chip ${statusClass}">${statusLabel}</span>
+            ${changeRate != null ? `<div style="color:${changeColor}; font-size:11px; margin-top:6px;">${changeRate >= 0 ? '+' : ''}${changeRate.toFixed(2)}%</div>` : ''}
+          </div>
         </div>
       </div>
     `;

@@ -1,5 +1,6 @@
 """코인 관리자 대시보드 API — 주식 admin과 독립된 /admin-coin 전용 라우트"""
 import asyncio
+from dataclasses import asdict
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, Query
@@ -148,28 +149,113 @@ async def coin_sse_stream():
 async def get_coin_watchlist():
     """AI 감시 중인 코인 목록"""
     from agent.trading_agent import trading_agent
+    from realtime.coin_stream_manager import coin_stream_manager
+    from realtime.event_detector import DEFAULT_THRESHOLDS, event_detector
 
     state = trading_agent._market_states.get(MARKET_SCOPE_CRYPTO)
+    default_thresholds = asdict(DEFAULT_THRESHOLDS)
+    holdings = await account_manager.get_holdings("BITHUMB")
+    holding_keys = {
+        (str(h.market or "BITHUMB").upper(), str(h.symbol or "").upper())
+        for h in holdings
+        if getattr(h, "symbol", None)
+    }
+    name_map = {
+        (str(h.market or "BITHUMB").upper(), str(h.symbol or "").upper()): str(h.name or "")
+        for h in holdings
+        if getattr(h, "symbol", None)
+    }
+    selected_map: dict[tuple[str, str], dict] = {}
+    all_symbols: dict[tuple[str, str], dict[str, bool]] = {}
+
+    for sym_info in getattr(state, "last_selected_watchlist", []) if state else []:
+        market_code = str(sym_info.get("market", "BITHUMB") or "BITHUMB").upper()
+        symbol = str(sym_info.get("symbol", "")).upper()
+        if not symbol:
+            continue
+        key = (market_code, symbol)
+        selected_map[key] = {
+            "name": str(sym_info.get("name", "") or ""),
+            "price": sym_info.get("price"),
+            "change_rate": sym_info.get("change_rate"),
+            "volume": sym_info.get("volume"),
+            "trade_value": sym_info.get("trade_value"),
+            "strategy_type": sym_info.get("strategy_type", ""),
+            "reason": str(sym_info.get("reason", "") or ""),
+            "scan_source": str(sym_info.get("scan_source", "") or ""),
+        }
+        all_symbols.setdefault(key, {
+            "selected_in_last_cycle": False,
+            "in_desired_set": False,
+        })
+        all_symbols[key]["selected_in_last_cycle"] = True
+
+    desired_set = coin_stream_manager.desired_keys(MARKET_SCOPE_CRYPTO)
+    active_set = coin_stream_manager.active_keys(MARKET_SCOPE_CRYPTO)
+    for key in desired_set:
+        all_symbols.setdefault(key, {
+            "selected_in_last_cycle": False,
+            "in_desired_set": False,
+        })
+        all_symbols[key]["in_desired_set"] = True
+
+    for key in holding_keys:
+        all_symbols.setdefault(key, {
+            "selected_in_last_cycle": False,
+            "in_desired_set": False,
+        })
+
+    for instrument_key in event_detector.monitored_symbols:
+        if not instrument_key.startswith("BITHUMB:"):
+            continue
+        _, symbol = instrument_key.split(":", 1)
+        key = ("BITHUMB", symbol)
+        all_symbols.setdefault(key, {
+            "selected_in_last_cycle": False,
+            "in_desired_set": False,
+        })
+
     symbols_list = []
+    for (market_code, symbol), flags in all_symbols.items():
+        threshold_obj = event_detector._thresholds.get(f"{market_code}:{symbol}")
+        threshold_data = None
+        if threshold_obj:
+            threshold_dict = asdict(threshold_obj)
+            if threshold_dict != default_thresholds:
+                threshold_data = threshold_dict
+        meta = selected_map.get((market_code, symbol), {})
+        symbols_list.append({
+            "symbol": symbol,
+            "market": market_code,
+            "name": meta.get("name") or name_map.get((market_code, symbol), ""),
+            "price": meta.get("price"),
+            "change_rate": meta.get("change_rate"),
+            "volume": meta.get("volume"),
+            "trade_value": meta.get("trade_value"),
+            "strategy_type": meta.get("strategy_type", ""),
+            "reason": meta.get("reason", ""),
+            "scan_source": meta.get("scan_source", ""),
+            "is_holding": (market_code, symbol) in holding_keys,
+            "is_subscribed": (market_code, symbol) in active_set,
+            "in_desired_set": flags["in_desired_set"],
+            "selected_in_last_cycle": flags["selected_in_last_cycle"],
+            "has_thresholds": threshold_data is not None,
+            "thresholds": threshold_data,
+        })
 
-    if state:
-        for sym_info in getattr(state, "last_selected_watchlist", []):
-            sym = str(sym_info.get("symbol", "")).upper()
-            if sym:
-                symbols_list.append({
-                    "symbol": sym,
-                    "market": str(sym_info.get("market", "BITHUMB") or "BITHUMB"),
-                    "name": str(sym_info.get("name", "") or ""),
-                    "price": sym_info.get("price"),
-                    "change_rate": sym_info.get("change_rate"),
-                    "volume": sym_info.get("volume"),
-                    "trade_value": sym_info.get("trade_value"),
-                    "strategy_type": sym_info.get("strategy_type", ""),
-                    "reason": str(sym_info.get("reason", "") or ""),
-                    "scan_source": str(sym_info.get("scan_source", "") or ""),
-                })
-
-    return SuccessResponse(data={"symbols": symbols_list})
+    symbols_list.sort(
+        key=lambda item: (
+            not item["is_holding"],
+            not item["selected_in_last_cycle"],
+            not item["in_desired_set"],
+            not item["has_thresholds"],
+            item["symbol"],
+        )
+    )
+    return SuccessResponse(data={
+        "symbols": symbols_list,
+        "stream_status": coin_stream_manager.stream_status(MARKET_SCOPE_CRYPTO),
+    })
 
 
 # ── 추천 목록 (SEMI_AUTO) ──
@@ -230,6 +316,8 @@ async def reject_coin_recommendation(
 async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
     """코인 시스템 상태"""
     from agent.trading_agent import trading_agent
+    from realtime.coin_monitor import coin_realtime_monitor
+    from realtime.coin_stream_manager import coin_stream_manager
     from scheduler.scheduler import trading_scheduler
 
     session_schedule = market_calendar.get_session_schedule(market="BITHUMB")
@@ -269,6 +357,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "last_cycle_attempt_at": cycle_runtime.get("last_cycle_attempt_at"),
         "last_cycle_status": cycle_runtime.get("last_cycle_status"),
         "last_cycle_error": cycle_runtime.get("last_cycle_error"),
+        "realtime_monitor_running": coin_realtime_monitor.is_running,
         "scan_interval_hours": settings.CRYPTO_SCAN_INTERVAL_HOURS,
         "watchlist_symbols": settings.crypto_watchlist_symbols,
         "watchlist_count": len(watchlist),
@@ -277,6 +366,8 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "app_started_at": APP_STARTED_AT.isoformat(),
         "uptime_seconds": uptime_seconds,
         "today_filled_order_count": int(today_filled_order_count or 0),
+        "realtime": coin_stream_manager.stream_status(MARKET_SCOPE_CRYPTO),
+        "private_sync": coin_stream_manager.private_sync_status(),
     })
 
 

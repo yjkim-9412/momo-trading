@@ -287,6 +287,78 @@
       transition: background 0.15s;
     }
     .coin-watchlist-card:hover { background: rgba(42, 34, 53, 0.6); }
+    .coin-watchlist-stream {
+      border: 1px solid rgba(75, 64, 96, 0.9);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      background: rgba(15, 13, 21, 0.75);
+    }
+    .coin-watchlist-gauge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #cbd5e1;
+    }
+    .coin-watchlist-gauge-track {
+      flex: 1;
+      min-width: 0;
+      height: 5px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(75, 64, 96, 0.5);
+    }
+    .coin-watchlist-gauge-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #a78bfa 0%, #34d399 100%);
+      transition: width 0.4s ease;
+    }
+    .coin-watchlist-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      border: 1px solid rgba(75, 64, 96, 0.9);
+      background: rgba(26, 21, 32, 0.85);
+      color: #cbd5e1;
+    }
+    .coin-watchlist-chip.holding {
+      color: #86efac;
+      border-color: rgba(52, 211, 153, 0.25);
+      background: rgba(22, 78, 48, 0.18);
+    }
+    .coin-watchlist-chip.watching {
+      color: #c4b5fd;
+      border-color: rgba(167, 139, 250, 0.25);
+      background: rgba(76, 29, 149, 0.18);
+    }
+    .coin-watchlist-chip.pending {
+      color: #9ca3af;
+      border-color: rgba(107, 114, 128, 0.25);
+      background: rgba(31, 41, 55, 0.28);
+    }
+    .coin-watchlist-thresholds {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .coin-watchlist-threshold {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      color: #94a3b8;
+      background: rgba(30, 41, 59, 0.4);
+      border: 1px solid rgba(71, 85, 105, 0.35);
+    }
 
     /* ── Settings Toggle ── */
     .coin-toggle {
@@ -682,6 +754,14 @@
               <div class="flex justify-between">
                 <span class="text-gray-500">SSE 스트림</span>
                 <span id="sys-sse" class="text-gray-400">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">WS 감시</span>
+                <span id="sys-realtime" class="text-gray-400">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">자산/주문 동기화</span>
+                <span id="sys-private-sync" class="text-gray-400">--</span>
               </div>
               <div class="flex justify-between">
                 <span class="text-gray-500">업타임</span>
