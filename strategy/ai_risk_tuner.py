@@ -15,8 +15,9 @@ from core.database import AsyncSessionLocal
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType, Tier1Profile
-from trading.market_profile import is_us_market
+from trading.market_profile import is_crypto_market, is_us_market, market_scope, normalize_market
 from trading.models import AccountBalance
+from trading.quantity_policy import normalize_quantity
 
 
 class AIRiskTuner:
@@ -26,6 +27,25 @@ class AIRiskTuner:
     def _format_daily_trade_limit(limit: int) -> str:
         return "무제한" if int(limit or 0) == 0 else f"{int(limit)}회"
 
+    @staticmethod
+    def _market_defaults(market: str) -> dict[str, float | int]:
+        market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            return {
+                "max_daily_trades": settings.CRYPTO_MAX_DAILY_TRADES,
+                "max_single_order_krw": settings.CRYPTO_MAX_SINGLE_ORDER_KRW,
+                "min_buy_quantity": settings.CRYPTO_MIN_BUY_QUANTITY,
+                "max_position_pct": settings.CRYPTO_MAX_POSITION_PCT,
+                "min_cash_ratio": settings.CRYPTO_MIN_CASH_RATIO,
+            }
+        return {
+            "max_daily_trades": settings.MAX_DAILY_TRADES,
+            "max_single_order_krw": settings.MAX_SINGLE_ORDER_KRW,
+            "min_buy_quantity": settings.MIN_BUY_QUANTITY,
+            "max_position_pct": 25.0,
+            "min_cash_ratio": 0.05,
+        }
+
     async def compute_limits(
         self,
         market: str | None = None,
@@ -34,9 +54,8 @@ class AIRiskTuner:
         balance: AccountBalance | None = None,
     ) -> dict:
         """적정 한도 계산"""
-        from trading.market_profile import market_scope, normalize_market
-
         target = normalize_market(market or settings.primary_market_code)
+        defaults = self._market_defaults(target)
         timer = activity_logger.timer()
 
         try:
@@ -45,7 +64,7 @@ class AIRiskTuner:
                 balance = await account_manager.get_balance(target)
             if not balance.is_valid:
                 reason = balance.status_message or "계좌 잔고 조회 실패"
-                limits = self._blocked_limits(reason)
+                limits = self._blocked_limits(reason, target)
                 elapsed = activity_logger.elapsed_ms(timer)
                 logger.warning("[{}] AI 한도 결정 스킵: {}", target, reason)
                 await activity_logger.log(
@@ -110,8 +129,8 @@ class AIRiskTuner:
                 total_pnl_rate=balance.total_pnl_rate,
                 performance_summary=performance_summary,
                 risk_guideline=risk_guideline,
-                max_daily_trades=settings.MAX_DAILY_TRADES,
-                min_buy_quantity=settings.MIN_BUY_QUANTITY,
+                max_daily_trades=defaults["max_daily_trades"],
+                min_buy_quantity=defaults["min_buy_quantity"],
                 cash_interpretation_note=cash_interpretation_note,
             )
 
@@ -127,9 +146,9 @@ class AIRiskTuner:
             parsed = self._parse_json(result_text)
             if not parsed:
                 logger.warning("AI 한도 파싱 실패, 기본값 사용")
-                return self._default_limits()
+                return self._default_limits(target)
 
-            limits = self._clamp_limits(parsed)
+            limits = self._clamp_limits(parsed, target)
             elapsed = activity_logger.elapsed_ms(timer)
 
             await activity_logger.log(
@@ -148,46 +167,52 @@ class AIRiskTuner:
 
         except Exception as e:
             logger.error("AI 한도 결정 실패: {}", str(e))
-            return self._default_limits()
+            return self._default_limits(target)
 
-    def _clamp_limits(self, parsed: dict) -> dict:
+    def _clamp_limits(self, parsed: dict, market: str) -> dict:
         """AI 결정값 정규화 (최소 안전값만 적용, 상한선 없음)"""
+        defaults = self._market_defaults(market)
         return {
             "max_daily_trades": max(
-                int(parsed.get("max_daily_trades", settings.MAX_DAILY_TRADES)), 0
+                int(parsed.get("max_daily_trades", defaults["max_daily_trades"])), 0
             ),  # 0 = 무제한
             "max_single_order_krw": max(
-                int(parsed.get("max_single_order_krw", 0)), 0
+                int(parsed.get("max_single_order_krw", defaults["max_single_order_krw"])), 0
             ),  # 0 = 무제한
-            "min_buy_quantity": max(
-                int(parsed.get("min_buy_quantity", settings.MIN_BUY_QUANTITY)), 1
+            "min_buy_quantity": normalize_quantity(
+                parsed.get("min_buy_quantity", defaults["min_buy_quantity"]),
+                market,
             ),
             "max_position_pct": max(
-                float(parsed.get("max_position_pct", 25.0)), 5.0
+                float(parsed.get("max_position_pct", defaults["max_position_pct"])),
+                5.0,
             ),  # 상한선 없음
             "min_cash_ratio": max(
-                float(parsed.get("min_cash_ratio", 0.05)), 0.05
-            ),  # 최소 5%
+                float(parsed.get("min_cash_ratio", defaults["min_cash_ratio"])),
+                float(defaults["min_cash_ratio"]),
+            ),
             "reasoning": parsed.get("reasoning", ""),
         }
 
-    def _default_limits(self) -> dict:
+    def _default_limits(self, market: str) -> dict:
         """기본 한도값 (AI 실패 시)"""
+        defaults = self._market_defaults(market)
         return {
-            "max_daily_trades": settings.MAX_DAILY_TRADES,  # 0 = 무제한
-            "max_single_order_krw": settings.MAX_SINGLE_ORDER_KRW,  # 0 = 무제한
-            "min_buy_quantity": settings.MIN_BUY_QUANTITY,
-            "max_position_pct": 25.0,
-            "min_cash_ratio": 0.05,
+            "max_daily_trades": defaults["max_daily_trades"],  # 0 = 무제한
+            "max_single_order_krw": defaults["max_single_order_krw"],  # 0 = 무제한
+            "min_buy_quantity": defaults["min_buy_quantity"],
+            "max_position_pct": defaults["max_position_pct"],
+            "min_cash_ratio": defaults["min_cash_ratio"],
             "reasoning": "AI 한도 결정 실패, 기본값 사용",
         }
 
-    def _blocked_limits(self, reason: str) -> dict:
+    def _blocked_limits(self, reason: str, market: str) -> dict:
         """잔고 조회 실패 시 신규 매수를 사실상 차단하는 안전 한도"""
+        defaults = self._market_defaults(market)
         return {
             "max_daily_trades": 1,
             "max_single_order_krw": 1,
-            "min_buy_quantity": settings.MIN_BUY_QUANTITY,
+            "min_buy_quantity": defaults["min_buy_quantity"],
             "max_position_pct": 5.0,
             "min_cash_ratio": 1.0,
             "reasoning": f"계좌 잔고 조회 실패로 신규 매수를 차단했습니다: {reason}",

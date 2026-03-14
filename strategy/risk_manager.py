@@ -12,6 +12,7 @@ from trading.product_policy import (
     classification_from_metadata,
     is_product_trade_allowed,
 )
+from trading.quantity_policy import cap_quantity_for_amount, format_quantity, normalize_quantity
 
 
 class RiskManager:
@@ -105,7 +106,7 @@ class RiskManager:
             dynamic_limits: AI가 결정한 동적 한도 (있으면 기본값 대신 사용)
 
         Returns:
-            {"approved": bool, "reason": str, "adjusted_quantity": int | None}
+            {"approved": bool, "reason": str, "adjusted_quantity": float | None}
         """
         symbol = signal.symbol
         product_context = self._signal_product_context(signal)
@@ -163,7 +164,7 @@ class RiskManager:
 
         # 주문 금액 계산
         price = signal.suggested_price or 0
-        quantity = signal.suggested_quantity or 0
+        quantity = normalize_quantity(signal.suggested_quantity, market_code)
         if price <= 0 or quantity <= 0:
             result = {"approved": False, "reason": "가격 또는 수량이 유효하지 않습니다"}
             await self._log_result(
@@ -257,20 +258,25 @@ class RiskManager:
         requested_quantity = quantity
         adjustment_labels: list[str] = []
 
-        def _apply_quantity_cap(capped_qty: int, label: str) -> tuple[bool, dict | None]:
+        def _apply_quantity_cap(capped_qty: float, label: str) -> tuple[bool, dict | None]:
             nonlocal quantity, total_amount
             if capped_qty >= quantity:
                 return False, None
+            if capped_qty <= 0:
+                return True, {"approved": False, "reason": f"{label} 후 주문 가능 수량 없음"}
             if capped_qty < eff_min_qty:
                 return True, {"approved": False, "reason": f"{label} 후 최소 수량 미달"}
-            quantity = capped_qty
+            quantity = normalize_quantity(capped_qty, market_code)
             total_amount = unit_price_krw * quantity
             adjustment_labels.append(label)
             return True, None
 
         # 단일 주문 금액 한도 (0이면 AI 자율 → 스킵)
         if eff_max_order > 0 and total_amount > eff_max_order:
-            _, reject_result = _apply_quantity_cap(int(eff_max_order / unit_price_krw), "단일 주문 한도")
+            _, reject_result = _apply_quantity_cap(
+                cap_quantity_for_amount(eff_max_order, unit_price_krw, market_code),
+                "단일 주문 한도",
+            )
             if reject_result:
                 reject_result.update({
                     "broker_cash_krw": broker_cash_krw,
@@ -297,7 +303,10 @@ class RiskManager:
             return result
 
         if total_amount > cash_basis_krw:
-            _, reject_result = _apply_quantity_cap(int(cash_basis_krw / unit_price_krw), "현금 부족")
+            _, reject_result = _apply_quantity_cap(
+                cap_quantity_for_amount(cash_basis_krw, unit_price_krw, market_code),
+                "현금 부족",
+            )
             if reject_result:
                 reject_result.update({
                     "broker_cash_krw": broker_cash_krw,
@@ -325,7 +334,10 @@ class RiskManager:
                     symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
                 )
                 return result
-            _, reject_result = _apply_quantity_cap(int(max_spend / unit_price_krw), "현금 비중 유지")
+            _, reject_result = _apply_quantity_cap(
+                cap_quantity_for_amount(max_spend, unit_price_krw, market_code),
+                "현금 비중 유지",
+            )
             if reject_result:
                 reject_result.update({
                     "broker_cash_krw": broker_cash_krw,
@@ -343,7 +355,7 @@ class RiskManager:
             if combined_position_pct > eff_max_pos_pct:
                 remaining_amount = max((portfolio_budget * eff_max_pos_pct / 100) - current_position_value_krw, 0.0)
                 _, reject_result = _apply_quantity_cap(
-                    int(remaining_amount / unit_price_krw) if unit_price_krw > 0 else 0,
+                    cap_quantity_for_amount(remaining_amount, unit_price_krw, market_code),
                     "합산 비중 한도",
                 )
                 if reject_result:
@@ -369,7 +381,8 @@ class RiskManager:
         if quantity != requested_quantity:
             adjusted_quantity = quantity
             adjustment_reason = (
-                f"수량 조정 ({', '.join(adjustment_labels)}): {requested_quantity} → {quantity}"
+                f"수량 조정 ({', '.join(adjustment_labels)}): "
+                f"{format_quantity(requested_quantity, market_code)} → {format_quantity(quantity, market_code)}"
             )
         result = {
             "approved": True,

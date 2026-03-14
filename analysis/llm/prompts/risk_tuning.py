@@ -13,7 +13,7 @@ RISK_TUNING_SYSTEM = """당신은 주식 자동매매 시스템의 리스크 관
   - 소액(~10만원): 분산 의미 없음 → 집중 투자 (1~2종목, 높은 포지션 비중)
   - 중액(10만~100만원): 적정 분산 (3~5종목)
   - 대액(100만원~): 충분한 분산 + 리스크 관리 강화
-- min_buy_quantity는 1 이상이면 제한 불필요 (AI가 수량 자율 결정)
+- min_buy_quantity는 시장별 최소 주문 수량이다. 주식은 보통 정수, 코인은 소수점 가능.
 - 반드시 JSON 형식으로 답변"""
 
 RISK_APPETITE_GUIDELINES = {
@@ -58,7 +58,7 @@ RISK_TUNING_PROMPT = """## AI 한도 결정 요청
 
 ### 참고 설정
 - 일일 거래 한도 기본값: {max_daily_trades}회 (조정 가능)
-- 최소 매수 수량: {min_buy_quantity}주
+- 최소 매수 수량: {min_buy_quantity}
 
 ---
 
