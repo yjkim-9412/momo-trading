@@ -28,7 +28,7 @@ class EventMixin:
         trading_date = self._refresh_runtime_date(event_state, scope)
 
         # 데이트레이딩: 매수 마감 시간 이후 신규 매수 이벤트 무시
-        if settings.DAY_TRADING_ONLY:
+        if settings.DAY_TRADING_ONLY and settings.market_has_buy_cutoff(market_code):
             from datetime import time as _dt_time
             from util.time_util import now_kst
             from zoneinfo import ZoneInfo
@@ -183,7 +183,7 @@ class EventMixin:
                 symbol=symbol,
                 detail=event.data,
             )
-            if settings.TRADING_ENABLED:
+            if settings.is_trading_enabled_for_market(market_code):
                 try:
                     from trading.account_manager import account_manager
                     holdings = await account_manager.get_holdings(market_code)
@@ -235,7 +235,7 @@ class EventMixin:
                 symbol=symbol,
                 detail=event.data,
             )
-            if settings.TRADING_ENABLED:
+            if settings.is_trading_enabled_for_market(market_code):
                 try:
                     from trading.account_manager import account_manager
                     holdings = await account_manager.get_holdings(market_code)

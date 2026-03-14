@@ -382,7 +382,7 @@ class PortfolioMixin:
             and
             not is_restricted_product
             and tier1_confidence >= 0.80
-            and market_regime in ("THEME", "BULL")
+            and market_regime in ("THEME", "BULL", "BULL_RUN", "ALTSEASON", "ALT_SEASON")
             and recommendation == "BUY"
         )
 

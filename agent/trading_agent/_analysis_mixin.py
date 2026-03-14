@@ -58,6 +58,41 @@ from agent.trading_agent._types import _ENTRY_MODE_NEW
 class AnalysisMixin:
     """핵심 분석 파이프라인 Mixin: _analyze_and_trade, Tier1/2, 컨텍스트 빌더"""
 
+    @staticmethod
+    def _try_float(value) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _resolve_prompt_change_value(cls, price_data: dict, *, scope: str) -> float:
+        numeric = cls._try_float(price_data.get("change"))
+        if numeric is not None:
+            return numeric
+
+        if scope != "CRYPTO":
+            return 0.0
+
+        numeric = cls._try_float(price_data.get("signed_change_price"))
+        if numeric is not None:
+            return numeric
+
+        numeric = cls._try_float(price_data.get("change_price"))
+        if numeric is None:
+            logger.warning(
+                "코인 변화값 파싱 실패: change={}, change_price={}, direction={}",
+                price_data.get("change"),
+                price_data.get("change_price"),
+                price_data.get("change_direction"),
+            )
+            return 0.0
+
+        direction = str(price_data.get("change_direction") or price_data.get("change") or "").upper()
+        if direction == "FALL" and numeric > 0:
+            return -numeric
+        return numeric
+
     async def _analyze_and_trade(
         self, stock_info: dict, cycle_id: str,
         dynamic_limits: dict | None = None,
@@ -1003,19 +1038,25 @@ class AnalysisMixin:
 
         now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
 
-        close_time = now.replace(
-            hour=mkt_cfg["force_liquidation_hour"],
-            minute=mkt_cfg["force_liquidation_minute"],
-            second=0, microsecond=0,
-        )
-        minutes_left = max(0, int((close_time - now).total_seconds() / 60))
-        buy_cutoff_time = now.replace(
-            hour=mkt_cfg["buy_cutoff_hour"],
-            minute=mkt_cfg["buy_cutoff_minute"],
-            second=0,
-            microsecond=0,
-        )
-        minutes_until_buy_cutoff = max(0, int((buy_cutoff_time - now).total_seconds() / 60))
+        minutes_left: int | None = None
+        if settings.market_has_force_liquidation(target):
+            close_time = now.replace(
+                hour=mkt_cfg["force_liquidation_hour"],
+                minute=mkt_cfg["force_liquidation_minute"],
+                second=0,
+                microsecond=0,
+            )
+            minutes_left = max(0, int((close_time - now).total_seconds() / 60))
+
+        minutes_until_buy_cutoff: int | None = None
+        if settings.market_has_buy_cutoff(target):
+            buy_cutoff_time = now.replace(
+                hour=mkt_cfg["buy_cutoff_hour"],
+                minute=mkt_cfg["buy_cutoff_minute"],
+                second=0,
+                microsecond=0,
+            )
+            minutes_until_buy_cutoff = max(0, int((buy_cutoff_time - now).total_seconds() / 60))
         session = market_calendar.get_market_session(dt=now, market=target)
         timezone_label = now.tzname() or "LOCAL"
 
@@ -1034,8 +1075,10 @@ class AnalysisMixin:
 
         context = (
             f"현재 세션: {session} | 현지 시각({timezone_label}): {now.strftime('%H:%M')}\n"
-            f"신규 매수 마감까지: {minutes_until_buy_cutoff}분 | "
-            f"강제 청산까지: {minutes_left}분\n"
+            f"신규 매수 마감까지: "
+            f"{f'{minutes_until_buy_cutoff}분' if minutes_until_buy_cutoff is not None else '제한 없음'} | "
+            f"강제 청산까지: "
+            f"{f'{minutes_left}분' if minutes_left is not None else '없음'}\n"
             f"오늘 누적 손익: {daily_pnl_pct:+.2f}% | "
             f"매매 성적: {stats['wins']}승 {stats['losses']}패 "
             f"(총 {stats['total']}건)"
@@ -1138,7 +1181,7 @@ class AnalysisMixin:
             orderable_amount_context=orderable_amount_context,
         )
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
-        change_value = float(price_data.get("change") or 0)
+        change_value = self._resolve_prompt_change_value(price_data, scope=scope)
         change_text = f"{change_value:+,.2f}{'원' if currency == 'KRW' else currency}"
         prompt_template = get_stock_analysis_prompt(market_code)
         prompt = prompt_template.format(

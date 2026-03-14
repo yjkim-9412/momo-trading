@@ -15,11 +15,13 @@ from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from trading.enums import ActivityPhase, ActivityType, Tier1Profile
 from trading.market_profile import (
+    is_crypto_market,
     market_currency,
     market_scope,
     market_timezone,
     normalize_market,
     normalize_market_scope,
+    requires_mcp_connection,
 )
 from trading.mcp_client import mcp_client
 
@@ -46,7 +48,7 @@ class CycleMixin:
             return self._skip_result("cycle_already_running", scope, trading_date)
 
         if market_calendar.is_trading_hours(target):
-            if not mcp_client.is_connected:
+            if requires_mcp_connection(target) and not mcp_client.is_connected:
                 result = self._skip_result("mcp_unavailable", scope, trading_date, mode="TRADING")
                 result.update({
                     "scanned": 0,
@@ -117,7 +119,7 @@ class CycleMixin:
         with activity_logger.context(market_scope=scope, trading_date=trading_date):
             async with runtime.cycle_lock:
                 if market_calendar.is_trading_hours(target):
-                    if not mcp_client.is_connected:
+                    if requires_mcp_connection(target) and not mcp_client.is_connected:
                         from util.time_util import now_kst
 
                         self._set_cycle_runtime_state(
@@ -298,12 +300,21 @@ class CycleMixin:
 
             # 1. 시장 스캔 + 종목 선별 (통합 1회 LLM 호출)
             stage = "market_scan"
-            scan_result = await market_scanner.scan(
-                market=target,
-                cycle_id=cycle_id,
-                dynamic_limits=dynamic_limits,
-                account_snapshot=prefetched_snapshot,
-            )
+            if is_crypto_market(target):
+                from agent.crypto_scanner import crypto_scanner
+                scan_result = await crypto_scanner.scan(
+                    market=target,
+                    cycle_id=cycle_id,
+                    dynamic_limits=dynamic_limits,
+                    account_snapshot=prefetched_snapshot,
+                )
+            else:
+                scan_result = await market_scanner.scan(
+                    market=target,
+                    cycle_id=cycle_id,
+                    dynamic_limits=dynamic_limits,
+                    account_snapshot=prefetched_snapshot,
+                )
             candidates = scan_result.get("selected", [])
             results["scanned"] = len(candidates)
 
@@ -496,7 +507,7 @@ class CycleMixin:
                                 results["signals"] += 1
                             if r.get("executed"):
                                 results["executed"] += 1
-            if settings.AI_DYNAMIC_RESCAN_ENABLED and scheduled_budget_remaining is not None:
+            if settings.should_use_adaptive_rescan(target) and scheduled_budget_remaining is not None:
                 stage = "generate_schedule_hint"
                 schedule_hint = await self._generate_schedule_hint(
                     target,
@@ -987,11 +998,13 @@ class CycleMixin:
         return max(0.0, min(1.0, numeric))
 
     @staticmethod
-    def _minutes_until_market_buy_cutoff(market: str) -> int:
+    def _minutes_until_market_buy_cutoff(market: str) -> int | None:
         from util.time_util import now_kst
         from zoneinfo import ZoneInfo
 
         target = normalize_market(market)
+        if not settings.market_has_buy_cutoff(target):
+            return None
         now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
         mkt_cfg = settings.get_market_config(target)
         buy_cutoff_time = now.replace(
@@ -1038,7 +1051,11 @@ class CycleMixin:
                 "source": "fallback",
             }
 
-        if settings.DAY_TRADING_ONLY and minutes_until_buy_cutoff <= 0:
+        if (
+            settings.DAY_TRADING_ONLY
+            and minutes_until_buy_cutoff is not None
+            and minutes_until_buy_cutoff <= 0
+        ):
             return {
                 "action": "STOP_FOR_SESSION",
                 "next_run_in_minutes": None,
@@ -1059,7 +1076,9 @@ class CycleMixin:
         if results.get("executed", 0) > 0 or results.get("signals", 0) > 0:
             interval = 45
             reason = "유효 신호/체결 발생 → 후속 확인 우선"
-        elif state.market_regime in ("THEME", "BULL") and minutes_until_buy_cutoff > 60:
+        elif state.market_regime in ("THEME", "BULL") and (
+            minutes_until_buy_cutoff is None or minutes_until_buy_cutoff > 60
+        ):
             interval = 30
             reason = f"{state.market_regime} 국면 지속 → 짧은 후속 확인"
         elif results.get("scanned", 0) == 0 or results.get("analyzed", 0) == 0:
@@ -1122,7 +1141,9 @@ class CycleMixin:
             market_session=market_calendar.get_market_session(dt=market_now, market=target),
             market_regime=state.market_regime or "UNKNOWN",
             local_time=market_now.strftime("%H:%M"),
-            minutes_until_buy_cutoff=minutes_until_buy_cutoff,
+            minutes_until_buy_cutoff=(
+                minutes_until_buy_cutoff if minutes_until_buy_cutoff is not None else "N/A"
+            ),
             scanned=int(results.get("scanned", 0) or 0),
             analyzed=int(results.get("analyzed", 0) or 0),
             signals=int(results.get("signals", 0) or 0),

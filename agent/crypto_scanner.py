@@ -24,6 +24,7 @@ from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType, Tier1Profile
 from trading.market_profile import market_scope, normalize_market
+from trading.models import MCPResponse
 
 # 크립토 전용 스캔 시스템 프롬프트
 CRYPTO_SCAN_SYSTEM = """당신은 암호화폐(코인) 시장 전문 스크리너입니다.
@@ -192,28 +193,37 @@ class CryptoScanner:
             (
                 account_snapshot,
                 overview_data,
-                volume_rank_data,
-                surge_data,
                 performance_summary,
             ) = await asyncio.gather(
                 account_manager.get_account_snapshot(target),
                 _safe_call(bithumb_client.get_market_overview),
-                _safe_call(bithumb_client.get_volume_rank),
-                _safe_call(bithumb_client.get_surge_data),
                 self._get_performance_summary(target),
             )
         else:
             (
                 overview_data,
-                volume_rank_data,
-                surge_data,
                 performance_summary,
             ) = await asyncio.gather(
                 _safe_call(bithumb_client.get_market_overview),
-                _safe_call(bithumb_client.get_volume_rank),
-                _safe_call(bithumb_client.get_surge_data),
                 self._get_performance_summary(target),
             )
+        if overview_data is None:
+            overview_data = MCPResponse(success=False, error="market overview unavailable")
+
+        volume_rank_data, surge_data = await asyncio.gather(
+            _safe_call(
+                bithumb_client.get_volume_rank,
+                market=target,
+                overview_data=overview_data,
+                limit=settings.CRYPTO_SCAN_LIMIT,
+            ),
+            _safe_call(
+                bithumb_client.get_surge_data,
+                market=target,
+                overview_data=overview_data,
+                limit=settings.CRYPTO_SCAN_LIMIT,
+            ),
+        )
 
         balance, holdings = account_snapshot
         available_cash = balance.effective_cash
@@ -226,9 +236,22 @@ class CryptoScanner:
         logger.info("크립토 데이터 수집 완료: {}ms", data_elapsed)
 
         # --- 2. 데이터 정리: 거래대금 상위 + 급등/급락 ---
+        overview_all_coins = self._extract_coins(overview_data, limit=10_000)
+        if not overview_all_coins:
+            overview_all_coins = await self._build_watchlist_fallback_coins(
+                bithumb_client,
+                watchlist=settings.crypto_watchlist_symbols,
+                holdings=holdings,
+            )
+            if overview_all_coins:
+                logger.warning(
+                    "크립토 overview 조회 실패 → watchlist/보유 코인 기반 degraded 스캔 사용: {}개",
+                    len(overview_all_coins),
+                )
+
         volume_coins = self._extract_coins(volume_rank_data, limit=settings.CRYPTO_SCAN_LIMIT)
         surge_coins = self._extract_coins(surge_data, limit=settings.CRYPTO_SCAN_LIMIT)
-        overview_coins = self._extract_coins(overview_data, limit=settings.CRYPTO_SCAN_LIMIT)
+        overview_coins = overview_all_coins[: settings.CRYPTO_SCAN_LIMIT]
 
         # 급등/급락 분리: change_rate 기준
         drop_coins = [c for c in overview_coins if float(c.get("change_rate", 0)) < 0]
@@ -248,6 +271,32 @@ class CryptoScanner:
                 key=lambda c: float(c.get("volume", c.get("acc_trade_value_24h", 0))),
                 reverse=True,
             )[:15]
+
+        if not volume_coins and not surge_coins and not drop_coins:
+            overview_error = ""
+            if hasattr(overview_data, "error"):
+                overview_error = str(overview_data.error or "")
+            logger.error("크립토 스캔 시장 데이터 부족: {}", overview_error or "overview/보조 입력 모두 비어있음")
+            await activity_logger.log(
+                ActivityType.SCAN,
+                ActivityPhase.ERROR,
+                "❌ 크립토 스캔 실패: 시장 데이터 unavailable",
+                cycle_id=cycle_id,
+                detail={
+                    "reason": "market_data_unavailable",
+                    "overview_error": overview_error,
+                    "watchlist_size": len(settings.crypto_watchlist_symbols),
+                    "holding_count": len(holdings),
+                },
+                execution_time_ms=data_elapsed,
+            )
+            return {
+                "selected": [],
+                "market_summary": "시장 데이터 unavailable",
+                "market_regime": "",
+                "available_cash": available_cash,
+                "scan_source": "crypto_overview",
+            }
 
         # --- 3. 워치리스트 병합 ---
         watchlist = settings.crypto_watchlist_symbols
@@ -448,6 +497,50 @@ class CryptoScanner:
                 f"{i}. {name}({symbol}) {price}원 {change_rate}% 24h거래대금:{volume}"
             )
         return "\n".join(lines)
+
+    async def _build_watchlist_fallback_coins(
+        self,
+        bithumb_client: Any,
+        *,
+        watchlist: list[str],
+        holdings: list[Any],
+    ) -> list[dict]:
+        """overview 실패 시 watchlist/보유 코인 현재가로 최소 스캔 입력 구성"""
+        fallback_symbols: list[str] = []
+        for holding in holdings:
+            symbol = ""
+            if isinstance(holding, dict):
+                symbol = str(holding.get("symbol", "") or "").upper()
+            else:
+                symbol = str(getattr(holding, "symbol", "") or "").upper()
+            if symbol and symbol not in fallback_symbols:
+                fallback_symbols.append(symbol)
+        for symbol in watchlist:
+            sym = str(symbol or "").upper()
+            if sym and sym not in fallback_symbols:
+                fallback_symbols.append(sym)
+        if not fallback_symbols:
+            return []
+
+        responses = await asyncio.gather(*[
+            _safe_call(bithumb_client.get_current_price, symbol, market="BITHUMB")
+            for symbol in fallback_symbols
+        ])
+        coins: list[dict] = []
+        for symbol, resp in zip(fallback_symbols, responses, strict=False):
+            if not hasattr(resp, "success") or not resp.success or not resp.data:
+                continue
+            data = resp.data
+            coins.append({
+                "symbol": symbol,
+                "name": data.get("name") or symbol,
+                "market": "BITHUMB",
+                "price": float(data.get("price", 0) or 0),
+                "change_rate": float(data.get("change_rate", 0) or 0),
+                "volume": float(data.get("trade_value", data.get("volume", 0)) or 0),
+                "trade_value": float(data.get("trade_value", data.get("volume", 0)) or 0),
+            })
+        return coins
 
     @staticmethod
     def _format_holdings(holdings: Any) -> str:

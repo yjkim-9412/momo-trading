@@ -23,13 +23,20 @@ class CodexCLIProvider:
     _session_locks: dict[tuple[str, str], asyncio.Lock] = {}
     cumulative_usage: dict[str, Any] = empty_usage_snapshot(LLMProvider.CODEX_CLI)
 
-    def __init__(self, tier: LLMTier = LLMTier.TIER1):
+    def __init__(
+        self,
+        tier: LLMTier = LLMTier.TIER1,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ):
         self._tier = tier
         self._codex_path: str | None = None
-        self._model = settings.get_llm_model(LLMProvider.CODEX_CLI, tier)
-        self._reasoning_effort = settings.get_llm_reasoning_effort(
-            LLMProvider.CODEX_CLI,
-            tier,
+        self._model = model if model is not None else settings.get_llm_model(LLMProvider.CODEX_CLI, tier)
+        self._reasoning_effort = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else settings.get_llm_reasoning_effort(LLMProvider.CODEX_CLI, tier)
         )
         self._resolved_model = f"codex:{self._model}" if self._model else "codex"
 
