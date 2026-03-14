@@ -480,6 +480,14 @@ async def trigger_coin_cycle():
         result = await trading_agent.run_cycle(market="BITHUMB")
         if result.get("skipped"):
             logger.info("수동 코인 스캔 스킵: {}", result.get("reason", "skipped"))
+            return
+        try:
+            from services.watchlist_sync import reconcile_market_watchlist
+
+            synced_symbols = await reconcile_market_watchlist("BITHUMB")
+            logger.info("수동 코인 스캔 후 실시간 감시 갱신: {}종목", len(synced_symbols))
+        except Exception as e:
+            logger.warning("수동 코인 스캔 후 실시간 감시 갱신 실패: {}", str(e))
 
     task = asyncio.create_task(_run_crypto_cycle())
     task.add_done_callback(lambda t: (

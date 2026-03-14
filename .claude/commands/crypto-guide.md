@@ -133,6 +133,8 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`까지 함께 본다.
 - 코인 활동 피드는 `CoinActivityLog.detail`와 `execution_time_ms`를 그대로 노출해 LLM system prompt / prompt / response를 인라인으로 점검한다.
 - 코인 어드민 수동 스캔 버튼은 HTML inline handler를 쓰지 않고 단일 JS 바인딩만 사용한다. 버튼 상태는 `agent/state`를 기준으로 `요청 중 → 시작 대기 → 진행 중 → 완료/스킵` 흐름을 표시한다.
+- 수동 코인 스캔(`/api/v1/admin-coin/agent/trigger`)은 `run_cycle()` 완료 후 `reconcile_market_watchlist("BITHUMB")`를 다시 호출해 최근 선정 종목이 즉시 코인 WebSocket desired set에 반영되도록 유지한다.
+- 크립토 스캔 결과의 `monitoring` 필드는 `null`을 포함할 수 있으므로 `_apply_scan_thresholds()`에서는 `None`/빈값을 float 캐스팅하지 말고 무시해야 한다.
 - 코인 SSE는 `coin_sse_manager`(독립 인스턴스)로 브로드캐스트. `activity_logger`가 CRYPTO scope 자동 분기.
 
 ## 빗썸 WebSocket API

@@ -1106,12 +1106,20 @@ class AnalysisMixin:
                 continue
 
             kwargs = {}
-            if "surge_pct" in monitoring:
-                kwargs["surge_pct"] = float(monitoring["surge_pct"])
-            if "drop_pct" in monitoring:
-                kwargs["drop_pct"] = float(monitoring["drop_pct"])
-            if "volume_spike_ratio" in monitoring:
-                kwargs["volume_spike_ratio"] = float(monitoring["volume_spike_ratio"])
+            for key in ("surge_pct", "drop_pct", "volume_spike_ratio"):
+                raw_value = monitoring.get(key)
+                if raw_value in (None, ""):
+                    continue
+                try:
+                    kwargs[key] = float(raw_value)
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "[{}:{}] 스캔 모니터링 임계값 무시: {}={!r}",
+                        market_code,
+                        symbol,
+                        key,
+                        raw_value,
+                    )
 
             if kwargs:
                 event_detector.set_thresholds(symbol, market=market_code, **kwargs)
