@@ -711,7 +711,10 @@ async def get_agent_state():
     from agent.trading_agent import trading_agent
 
     result = {}
-    for scope in ("KRX", "US"):
+    scopes = ["KRX", "US"]
+    if settings.CRYPTO_ENABLED:
+        scopes.append("CRYPTO")
+    for scope in scopes:
         state = trading_agent._market_states.get(scope)
         if not state:
             result[scope] = {

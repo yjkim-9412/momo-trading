@@ -12,6 +12,7 @@ from api.routes import (
     backtest,
     feedback,
     admin,
+    admin_coin,
 )
 
 api_router = APIRouter(prefix="/api/v1")
@@ -26,3 +27,4 @@ api_router.include_router(dashboard.router)
 api_router.include_router(backtest.router)
 api_router.include_router(feedback.router)
 api_router.include_router(admin.router)
+api_router.include_router(admin_coin.router)
