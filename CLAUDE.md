@@ -92,18 +92,23 @@ Mixin 파일은 서로를 임포트하지 않으며, 상호 호출은 `self.*`�
 - 코인 장은 `CRYPTO` scope로 주식(KRX/US)과 완전 격리 운영된다. `MarketState`는 `normalize_market_scope("BITHUMB")` → `"CRYPTO"` 기준으로 자동 생성되므로, 독립 `cycle_lock`, `session_ids`, `trading_date`를 갖는다.
 - 코인 환경변수는 주식과 완전 분리한다. `CRYPTO_TRADING_ENABLED`, `CRYPTO_AUTONOMY_MODE`, `CRYPTO_MAX_DAILY_TRADES` 등은 주식의 `TRADING_ENABLED`, `AUTONOMY_MODE`와 독립이다. 코인 설정을 주식 설정에 섞지 말 것.
 - 빗썸 API 인증은 JWT Bearer (PyJWT + HS256). KIS의 OAuth2 토큰과 완전 다른 체계이므로 `BithumbClient`에서 자체 관리한다. 빗썸 인증 로직을 KIS 경로에 섞지 말 것.
-- 빗썸 rate limit은 public 10 req/s, private 5 req/s. KIS의 8 req/s + 해외 1 req/s와 독립된 `BithumbClient` 내부 semaphore로 관리한다. 두 브로커의 rate limiter를 공유하지 말 것.
+- 빗썸 rate limit 공식 한도는 Public **150 req/s**, Private **140 req/s**, 주문(생성/취소) **10 req/s**. 코드(`BithumbClient`)는 burst 방지를 위해 보수적으로 Public 10, Private 5 semaphore를 설정한다. 필요 시 상향 가능하나 두 브로커의 rate limiter를 공유하지 말 것.
 - 빗썸 캔들 응답은 newest-first일 수 있다. KIS 해외 일봉과 동일한 방어로 `BithumbClient`에서 oldest-first 정렬한다. 분석 파이프라인의 이중 정렬 방어는 코인에도 적용된다.
 - 코인 수량은 소수점이다 (`OrderRequest.quantity = float`). 주식은 항상 정수만 전달하므로 하위호환. `Decimal`은 `BithumbClient` 내부 계산에서만 사용하고, API 경계에서 float로 변환한다.
 - 코인은 24/7 시장이므로 `buy_cutoff`, `force_liquidation`, `장 시작/마감` 개념이 없다. `market_calendar.is_trading_hours("BITHUMB")`는 항상 True를 반환한다. 코인에 시간 기반 매수 차단을 넣지 말 것.
 - 코인 시장 국면은 `BULL_RUN`/`BEAR_MARKET`/`CONSOLIDATION`/`ALTSEASON`이다. 주식의 `BULL`/`BEAR`/`SIDEWAYS`/`THEME`와 다르지만, `risk_manager.CRYPTO_RR_FLOOR`에서 두 체계 모두 매핑한다.
 - 코인 Tier2 스트레스 테스트는 -10%/-7% (주식의 -5%/-3%보다 넓다). 코인 변동성 기준을 주식 수준으로 좁히지 말 것.
-- `/admin-coin` 페이지는 주식 `/admin`과 완전 별도 SPA이다. API prefix는 `/api/v1/coin/*`, SSE는 독립 `coin_sse_manager`를 사용한다. 주식 SSE와 코인 SSE를 공유하지 말 것.
+- `/admin-coin` 페이지는 주식 `/admin`과 완전 별도 SPA이다. API prefix는 `/api/v1/admin-coin/*`, SSE는 독립 `coin_sse_manager`를 사용한다. 주식 SSE와 코인 SSE를 공유하지 말 것.
+- 코인 DB는 주식과 완전 분리된 10개 `coin_*` 테이블을 사용한다. 주식 테이블과 FK가 없으므로 코인 데이터가 주식 쿼리에 영향을 주지 않는다. 코인 활동 로그는 `CoinActivityLog`, 추천은 `CoinRecommendation` 테이블에 저장한다.
+- 코인 활동 로그는 `activity_logger`가 `market_scope == "CRYPTO"`일 때 자동으로 `CoinActivityLog` 테이블과 `coin_sse_manager`로 분기한다. 주식 `sse_manager`와 코인 `coin_sse_manager`를 혼용하지 말 것.
+- 보유 코인 현재가는 `BithumbClient._fetch_coin_prices()`가 벌크 ticker 조회(1 API call)로 해결한다. `get_account_balance()`와 `get_holdings()` 모두 현재가 기반 평가. 조회 실패 시 `avg_buy_price` 폴백.
+- 코인 LLM Provider는 주식과 독립 설정 가능 (`CRYPTO_LLM_PROVIDER`). Tier1은 SCAN/ANALYSIS 프로필별 모델·effort 분리. Claude effort와 Codex reasoning effort 모두 코인 전용 환경변수로 제어.
 - 코인 구현 수정 시 반드시 같이 확인할 테스트:
   - `is_crypto_market()` 정규화 (기존 KRX/US 회귀 포함)
   - 빗썸 캔들 oldest-first 정렬
   - 빗썸 rate limit 동작
   - `CRYPTO_*` 환경변수 독립성 (주식 설정 영향 없음)
+  - 코인 DB 테이블 FK 정합성 (coin_assets ↔ coin_orders/holdings/analysis_results)
 
 ## 테스트
 

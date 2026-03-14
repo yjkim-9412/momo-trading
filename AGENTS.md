@@ -31,7 +31,7 @@ KIS Open API 구현, 디버깅, 새 API 연동 시 반드시 `kis-api-ref` 스�
 | 기술적 분석 | pandas + pandas-ta |
 | 실시간 통신 | WebSocket (KIS), SSE (Admin) |
 | 스케줄러 | APScheduler (장 시작/안전 앵커는 cron, 장중 재스캔은 adaptive one-shot) |
-| 증권사 API | KIS REST API 직접 호출 |
+| 증권사 API | KIS REST API (주식) + Bithumb REST API (코인) |
 | LLM | Claude Code CLI / Codex CLI (2-Tier) |
 | 로깅 | loguru |
 | 테스트 | pytest + pytest-asyncio + unittest |
@@ -136,13 +136,16 @@ WebSocket → EventDetector → EventBus:
 - 코인 장은 `CRYPTO` scope로 주식과 완전 격리. `MarketState`는 `normalize_market_scope("BITHUMB")` → `"CRYPTO"` 기준 자동 생성.
 - 환경변수는 주식과 완전 분리 (`CRYPTO_TRADING_ENABLED`, `CRYPTO_AUTONOMY_MODE` 등).
 - 빗썸 인증은 JWT Bearer (PyJWT + HS256). KIS OAuth2와 다른 체계.
-- 빗썸 rate limit: public 10/s, private 5/s. KIS와 독립 semaphore.
+- 빗썸 rate limit: 공식 Public 150/s, Private 140/s, 주문 10/s. 코드는 보수적 10/5 semaphore.
 - 캔들 정렬: newest-first → oldest-first 재정렬 (미국장과 동일 방어).
 - 수량 소수점: `OrderRequest.quantity = float`. 주식은 정수만 전달.
 - 24/7 시장: buy cutoff / force liquidation 없음.
 - R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게).
-- `/admin-coin` 별도 SPA, API prefix `/api/v1/coin/*`, 독립 SSE.
-- 코인 수정 시 확인할 테스트: 프로필 정규화, 캔들 정렬, rate limit, 환경변수 독립성.
+- `/admin-coin` 별도 SPA, API prefix `/api/v1/admin-coin/*`, 독립 `coin_sse_manager`.
+- DB 완전 분리: 10개 `coin_*` 테이블, 활동 로그 → `CoinActivityLog`, 추천 → `CoinRecommendation`.
+- 보유 코인 현재가: `_fetch_coin_prices()` 벌크 ticker 조회, 실패 시 avg_buy_price 폴백.
+- LLM Provider 독립: `CRYPTO_LLM_PROVIDER`, Tier1 SCAN/ANALYSIS 프로필별 모델·effort 분리.
+- 코인 수정 시 확인할 테스트: 프로필 정규화, 캔들 정렬, rate limit, 환경변수 독립성, DB FK 정합성.
 
 ## 미국장 구현 회고
 

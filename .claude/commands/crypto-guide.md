@@ -32,21 +32,47 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 
 ## 핵심 파일 맵
 
+### 인프라 & 인터페이스
 | 파일 | 역할 |
 |------|------|
 | `trading/broker_base.py` | BrokerClient / MarketDataProvider / RealtimeProvider Protocol 정의 |
 | `trading/bithumb_client.py` | 빗썸 REST API 클라이언트 (BrokerClient 구현체, JWT 인증) |
 | `agent/scanner_base.py` | MarketScannerProtocol 정의 |
 | `agent/crypto_scanner.py` | 코인 시장 스캐너 (24h 거래대금/등락률 기반) |
+| `analysis/llm/llm_factory.py` | 코인 scope LLM provider 라우팅 및 Codex 장애 fallback |
 | `trading/market_profile.py` | `is_crypto_market()`, `MARKET_SCOPE_CRYPTO`, BITHUMB 프로필 |
 | `core/config.py` | `CRYPTO_*`, `BITHUMB_*` 환경변수 (주식과 완전 독립) |
+
+### 분석 & 리스크
+| 파일 | 역할 |
+|------|------|
 | `scheduler/market_calendar.py` | 24/7 세션 (`CRYPTO_ACTIVE`), 휴장 없음 |
 | `strategy/risk_manager.py` | `CRYPTO_RR_FLOOR` (주식보다 넓은 R:R) |
 | `trading/product_policy.py` | 크립토 → Spot only 조기 리턴 |
 | `analysis/llm/prompts/market_scan.py` | 크립토 스캔 프롬프트 |
 | `analysis/llm/prompts/stock_analysis.py` | 크립토 Tier1 분석 프롬프트 |
 | `analysis/llm/prompts/final_review.py` | 크립토 Tier2 리뷰 프롬프트 |
-| `api/routes/admin_coin.py` | `/admin-coin` 전용 API (18개 엔드포인트) |
+
+### 코인 전용 DB 모델 (주식 테이블과 완전 분리)
+| 파일 | 테이블 | 주식 대응 |
+|------|--------|----------|
+| `models/coin_asset.py` | `coin_assets` | `stocks` |
+| `models/coin_order.py` | `coin_orders` | `orders` |
+| `models/coin_broker_order.py` | `coin_broker_orders` | `broker_orders` |
+| `models/coin_trade_result.py` | `coin_trade_results` | `trade_results` |
+| `models/coin_holding.py` | `coin_holdings` | `portfolio_holdings` |
+| `models/coin_activity_log.py` | `coin_activity_logs` | `agent_activity_logs` |
+| `models/coin_daily_report.py` | `coin_daily_reports` | `daily_reports` |
+| `models/coin_trading_rule.py` | `coin_trading_rules` | `trading_rules` |
+| `models/coin_analysis_result.py` | `coin_analysis_results` | `analysis_results` |
+| `models/coin_recommendation.py` | `coin_recommendations` | `recommendations` |
+
+### API & 운영
+| 파일 | 역할 |
+|------|------|
+| `api/routes/admin_coin.py` | `/admin-coin` 전용 API (`/api/v1/admin-coin/*`, `/system/status`, `/agent/state`, 활동/LLM 상세) |
+| `start-coin.sh` | 코인 전용 실행 스크립트 (Docker/MCP 불필요) |
+| `.env.example-coin` | 코인 환경변수 예제 (5만원~적극적 프로필) |
 | `docs/crypto-architecture.md` | Mermaid 다이어그램 6종 |
 
 ## 환경변수 분리 구조
@@ -55,11 +81,18 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 
 | 주식 (KIS) | 코인 (Bithumb) | 역할 |
 |------------|---------------|------|
+| 주식 (KIS) | 코인 (Bithumb) | 역할 |
+|------------|---------------|------|
 | `KIS_APP_KEY` | `BITHUMB_API_KEY` | API 인증 |
 | `TRADING_ENABLED` | `CRYPTO_TRADING_ENABLED` | 주문 실행 허용 |
 | `AUTONOMY_MODE` | `CRYPTO_AUTONOMY_MODE` | 자율/반자율 모드 |
-| `LLM_PROVIDER` | `CRYPTO_LLM_PROVIDER` | LLM 프로바이더 (CLAUDE_CODE / CODEX_CLI) |
+| `LLM_PROVIDER` | `CRYPTO_LLM_PROVIDER` | LLM 프로바이더 |
+| `CLAUDE_CODE_MODEL_TIER1` | `CRYPTO_LLM_MODEL_TIER1_SCAN` / `_ANALYSIS` | Claude 모델 (스캔/분석 분리) |
+| `CLAUDE_CODE_MODEL_TIER2` | `CRYPTO_LLM_MODEL_TIER2` | Claude 검토 모델 |
+| — (하드코딩 medium/high) | `CRYPTO_CLAUDE_EFFORT_TIER1_SCAN` / `_ANALYSIS` / `_TIER2` | Claude effort |
 | `CODEX_MODEL` | `CRYPTO_CODEX_MODEL` | Codex 모델 |
+| `CODEX_REASONING_EFFORT_TIER1_SCAN` | `CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN` | Codex 스캔 추론 |
+| `CODEX_REASONING_EFFORT_TIER1_ANALYSIS` | `CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS` | Codex 분석 추론 |
 | `MAX_DAILY_TRADES` | `CRYPTO_MAX_DAILY_TRADES` | 일일 거래 한도 |
 | `MIN_CASH_RATIO` | `CRYPTO_MIN_CASH_RATIO` | 최소 현금 비중 |
 | `MAX_SINGLE_ORDER_KRW` | `CRYPTO_MAX_SINGLE_ORDER_KRW` | 1회 주문 한도 |
@@ -74,13 +107,69 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 
 ## 코인 구현 주의사항
 
-- 빗썸 rate limit: public 10 req/s, private 5 req/s. `BithumbClient` 내부 semaphore로 관리.
+- 빗썸 rate limit: 공식 한도 Public **150 req/s**, Private **140 req/s**, 주문(생성/취소) **10 req/s**. 코드(`BithumbClient`)는 보수적으로 Public 10, Private 5 semaphore 설정. 필요 시 상향 가능.
 - 소수점 수량: `OrderRequest.quantity`가 `float`. 주식은 정수만 전달하므로 하위호환.
 - 캔들 정렬: 빗썸은 newest-first → `BithumbClient`에서 oldest-first로 재정렬 (미국장과 동일 방어).
-- JWT 인증: `PyJWT` 라이브러리 사용. `Api-Key` + `Api-Sign` (HS256 JWT) 헤더.
-- 시장 국면: `BULL_RUN` / `BEAR_MARKET` / `CONSOLIDATION` / `ALTSEASON` (주식의 BULL/BEAR/SIDEWAYS/THEME와 별도).
+- JWT 인증: `PyJWT` (HS256). `Authorization: Bearer {jwt_token}` 헤더. Content-Type: `application/json; charset=utf-8`.
+- 시장 국면: `BULL_RUN` / `BEAR_MARKET` / `CONSOLIDATION` / `ALTSEASON` / `ALT_SEASON` (주식의 BULL/BEAR/SIDEWAYS/THEME와 별도). `risk_manager.CRYPTO_RR_FLOOR`에 양쪽 변형 모두 매핑됨.
 - R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게).
 - Product Policy: 크립토는 항상 `COMMON` (Spot only), 레버리지/인버스 분류 Skip.
+- 코인 스캔은 `get_market_overview()` 1회 조회 결과를 `get_volume_rank(..., overview_data=...)` / `get_surge_data(..., overview_data=...)`에 재사용한다. overview 실패 시 watchlist/보유 코인 현재가로 degraded 스캔을 시도한다.
+- `BithumbClient.get_current_price()` / overview ticker 정규화에서 공통 `change` 필드는 숫자 변화량으로 맞춘다. 원본 방향 문자열은 `change_direction`, 부호 있는 변화량은 `signed_change_price`로 별도 보존한다.
+- `BithumbClient._public_get()`는 HTTP status, content-type, body preview를 함께 로그에 남긴다. `Expecting value`만 보이면 upstream HTML/빈 본문/5xx 가능성을 먼저 확인할 것.
+- 코인 scope에서 `CRYPTO_LLM_PROVIDER=CODEX_CLI`이고 Codex 인증/세션 갱신이 실패하면 `analysis/llm/llm_factory.py`가 `CLAUDE_CODE` fallback을 1회 시도한다.
+- 주문 체결 확인: `POST /v1/orders` 접수 후 `GET /v1/order?uuid=...` 개별 조회로 상태를 추적한다.
+- 보유 코인 현재가: `_fetch_coin_prices(symbols)` 헬퍼로 벌크 ticker 조회 (1 API call). `get_account_balance()`와 `get_holdings()` 모두 현재가 기반 평가. 조회 실패 시 `avg_buy_price` 폴백.
+- 코인 DB는 주식 테이블과 완전 분리 (10개 `coin_*` 테이블). FK는 코인 도메인 내부만 참조.
+- 코인 활동 로그 → `CoinActivityLog`, 코인 추천 → `CoinRecommendation`. `admin_coin.py`는 주식 Repository가 아닌 직접 쿼리 사용.
+- 코인 어드민 상태 패널은 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
+- 코인 활동 피드는 `CoinActivityLog.detail`와 `execution_time_ms`를 그대로 노출해 LLM system prompt / prompt / response를 인라인으로 점검한다.
+- 코인 SSE는 `coin_sse_manager`(독립 인스턴스)로 브로드캐스트. `activity_logger`가 CRYPTO scope 자동 분기.
+
+## 빗썸 API 요청 제한 (v2.1.0)
+
+| 구분 | 공식 한도 | 코드 설정 (보수적) | 비고 |
+|------|----------|------------------|------|
+| Public API | 150 req/s | 10 req/s (semaphore) | 시세, 캔들, 호가 |
+| Private API | 140 req/s | 5 req/s (semaphore) | 잔고, 입출금 |
+| 주문 (생성/취소) | 10 req/s | 별도 제한 없음 | 초과 시 일시 제한 |
+
+- 초과 시: API 사용 일시 제한 → 대기 후 재요청
+- 과도한 트래픽 시 별도 공지 없이 제한값 조정 가능
+- 요청 간격을 균등 분산하면 제한 가능성 감소
+
+## 빗썸 JWT 인증 구조
+
+```
+Authorization: Bearer {jwt_token}
+Content-Type: application/json; charset=utf-8
+```
+
+**JWT Payload:**
+| 필드 | 타입 | 필수 | 설명 |
+|------|------|------|------|
+| `access_key` | String | O | API Key |
+| `nonce` | String | O | UUID v4 |
+| `timestamp` | Number | O | 밀리초 단위 |
+| `query_hash` | String | 파라미터 있을 때 | SHA-512 해시 of query string |
+| `query_hash_alg` | String | query_hash 있을 때 | `"SHA512"` |
+
+서명: **HS256** (Secret Key로 서명)
+
+## 빗썸 주요 에러 코드
+
+| HTTP | 코드 | 설명 |
+|------|------|------|
+| 400 | `invalid_parameter` | 잘못된 파라미터 |
+| 400 | `invalid_price` | 주문가격 단위 오류 |
+| 400 | `cross_trading` | 기존 주문과 체결 가능성으로 취소 |
+| 401 | `jwt_verification` | JWT 토큰 검증 실패 |
+| 401 | `expired_jwt` | JWT 만료 |
+| 401 | `NotAllowIP` | 허용되지 않는 IP |
+| 401 | `out_of_scope` | API 권한 부족 |
+| 404 | `order_not_found` | 주문 정보 없음 |
+| 422 | `order_not_ready` | 주문 처리 중, 재시도 필요 |
+| 500 | `server_error` | 서버 오류, 재시도 |
 
 ## 실행 절차
 
@@ -98,7 +187,9 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - **스케줄**: `scheduler/market_calendar.py`, `scheduler/scheduler.py`
 - **환경변수/설정**: `core/config.py` → `CRYPTO_*`, `BITHUMB_*`
 - **인터페이스/프로토콜**: `trading/broker_base.py`, `agent/scanner_base.py`
+- **DB/모델/테이블**: `models/coin_*.py` (10개 코인 전용 테이블, 주식과 완전 분리)
 - **API/라우트**: `api/routes/admin_coin.py`
+- **실행/스크립트**: `start-coin.sh` (Docker 불필요, 코인 전용)
 - **아키텍처**: `docs/crypto-architecture.md`
 
 ### Step 2: 관련 파일 조회
