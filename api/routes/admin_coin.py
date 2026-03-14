@@ -1,24 +1,22 @@
 """코인 관리자 대시보드 API — 주식 admin과 독립된 /admin-coin 전용 라우트"""
 import asyncio
 from datetime import date, datetime
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from sqlalchemy import func, select
 
 from admin.sse_manager import SSEManager
 from core.config import settings
 from core.database import get_async_db
-from repositories.agent_activity_repository import AgentActivityRepository
+from models.coin_activity_log import CoinActivityLog
+from models.coin_broker_order import CoinBrokerOrder
+from models.coin_recommendation import CoinRecommendation
 from repositories.daily_report_repository import DailyReportRepository
 from scheduler.market_calendar import market_calendar
-from schemas.activity_schema import (
-    ActivityFeedCursor,
-    ActivityFeedResponse,
-    ActivityResponse,
-)
 from schemas.common import SuccessResponse
 from schemas.daily_report_schema import DailyReportResponse
 from services.activity_logger import activity_logger
@@ -26,23 +24,15 @@ from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
 from trading.market_profile import MARKET_SCOPE_CRYPTO
 from trading.models import AccountBalance, HoldingInfo
+from util.time_util import now_kst
 
-router = APIRouter(prefix="/coin", tags=["coin"])
+router = APIRouter(prefix="/admin-coin", tags=["admin-coin"])
 
 # 코인 전용 SSE 매니저 (주식 SSE와 독립)
 coin_sse_manager = SSEManager()
+APP_STARTED_AT = now_kst()
 
-_STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "admin" / "static"
-
-
-# ── 코인 admin 페이지 서빙 ──
-@router.get("/admin")
-async def coin_admin_page():
-    """코인 관리자 대시보드 페이지"""
-    html_path = _STATIC_DIR / "coin.html"
-    if not html_path.exists():
-        return {"error": "coin.html not found"}
-    return FileResponse(html_path, media_type="text/html")
+# 페이지 서빙은 main.py에서 /admin-coin 경로로 처리
 
 
 # ── 계좌 정보 ──
@@ -87,7 +77,7 @@ async def get_coin_overview():
 
 
 # ── 활동 피드 ──
-@router.get("/activities/feed", response_model=SuccessResponse[ActivityFeedResponse])
+@router.get("/activities/feed")
 async def get_coin_activity_feed(
     limit: int = Query(100, ge=1, le=200),
     target_date: str | None = Query(None, description="YYYY-MM-DD"),
@@ -95,35 +85,31 @@ async def get_coin_activity_feed(
     before_id: str | None = Query(None),
     db: AsyncSession = Depends(get_async_db),
 ):
-    """크립토 활동 피드"""
-    repo = AgentActivityRepository(db)
+    """크립토 활동 피드 (coin_activity_logs 직접 쿼리)"""
     resolved_date = (
         date.fromisoformat(target_date)
         if target_date
         else market_calendar.market_date(market="BITHUMB")
     )
-    items, has_more = await repo.get_feed_page(
-        target_date=resolved_date,
-        market_scope=MARKET_SCOPE_CRYPTO,
-        limit=limit,
-        before_created_at=before_created_at,
-        before_id=before_id,
+    stmt = (
+        select(CoinActivityLog)
+        .where(CoinActivityLog.trading_date == resolved_date)
+        .order_by(CoinActivityLog.created_at.desc())
+        .limit(limit + 1)
     )
-    next_cursor = None
-    if has_more and items:
-        last_item = items[-1]
-        next_cursor = ActivityFeedCursor(
-            before_created_at=last_item.created_at,
-            before_id=last_item.id,
+    if before_created_at and before_id:
+        stmt = stmt.where(
+            (CoinActivityLog.created_at < before_created_at)
+            | ((CoinActivityLog.created_at == before_created_at) & (CoinActivityLog.id < before_id))
         )
-    return SuccessResponse(
-        data=ActivityFeedResponse(
-            items=items,
-            resolved_trading_date=resolved_date,
-            has_more=has_more,
-            next_cursor=next_cursor,
-        )
-    )
+    rows = (await db.execute(stmt)).scalars().all()
+    has_more = len(rows) > limit
+    items = list(rows[:limit])
+    return SuccessResponse(data={
+        "items": [_serialize_activity(a) for a in items],
+        "resolved_trading_date": resolved_date.isoformat(),
+        "has_more": has_more,
+    })
 
 
 # ── SSE 스트림 (코인 전용) ──
@@ -190,16 +176,15 @@ async def get_coin_recommendations(
     limit: int = Query(20, ge=1, le=50),
     db: AsyncSession = Depends(get_async_db),
 ):
-    """코인 AI 추천 목록 (SEMI_AUTO 모드)"""
-    from repositories.recommendation_repository import RecommendationRepository
-
-    repo = RecommendationRepository(db)
-    recs = await repo.get_by_status(
-        status=status,
-        market_scope=MARKET_SCOPE_CRYPTO,
-        limit=limit,
+    """코인 AI 추천 목록 (coin_recommendations 직접 쿼리)"""
+    stmt = (
+        select(CoinRecommendation)
+        .where(CoinRecommendation.status == status.upper())
+        .order_by(CoinRecommendation.created_at.desc())
+        .limit(limit)
     )
-    return SuccessResponse(data=recs)
+    rows = (await db.execute(stmt)).scalars().all()
+    return SuccessResponse(data=[_serialize_recommendation(r) for r in rows])
 
 
 @router.post("/recommendations/{rec_id}/approve")
@@ -208,10 +193,16 @@ async def approve_coin_recommendation(
     db: AsyncSession = Depends(get_async_db),
 ):
     """코인 추천 승인 → 주문 실행"""
-    from services.recommendation_service import recommendation_service
-
-    result = await recommendation_service.approve(rec_id, db=db)
-    return SuccessResponse(data=result)
+    stmt = select(CoinRecommendation).where(CoinRecommendation.id == rec_id)
+    rec = (await db.execute(stmt)).scalar_one_or_none()
+    if not rec:
+        return SuccessResponse(data=None, message="추천을 찾을 수 없습니다")
+    if rec.status != "PENDING":
+        return SuccessResponse(data=None, message=f"이미 {rec.status} 상태입니다")
+    rec.status = "APPROVED"
+    rec.approved_at = now_kst()
+    await db.commit()
+    return SuccessResponse(data={"id": rec.id, "status": rec.status}, message="승인 완료")
 
 
 @router.post("/recommendations/{rec_id}/reject")
@@ -220,25 +211,51 @@ async def reject_coin_recommendation(
     db: AsyncSession = Depends(get_async_db),
 ):
     """코인 추천 거절"""
-    from services.recommendation_service import recommendation_service
-
-    result = await recommendation_service.reject(rec_id, db=db)
-    return SuccessResponse(data=result)
+    stmt = select(CoinRecommendation).where(CoinRecommendation.id == rec_id)
+    rec = (await db.execute(stmt)).scalar_one_or_none()
+    if not rec:
+        return SuccessResponse(data=None, message="추천을 찾을 수 없습니다")
+    if rec.status != "PENDING":
+        return SuccessResponse(data=None, message=f"이미 {rec.status} 상태입니다")
+    rec.status = "REJECTED"
+    await db.commit()
+    return SuccessResponse(data={"id": rec.id, "status": rec.status}, message="거절 완료")
 
 
 # ── 시스템 상태 ──
 @router.get("/system/status")
-async def get_coin_system_status():
+async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
     """코인 시스템 상태"""
     from agent.trading_agent import trading_agent
+    from scheduler.scheduler import trading_scheduler
 
     session_schedule = market_calendar.get_session_schedule(market="BITHUMB")
     cycle_runtime = trading_agent.get_cycle_runtime_snapshot("BITHUMB")
+    runtime = trading_agent._market_states.get(MARKET_SCOPE_CRYPTO)
+    watchlist = list(getattr(runtime, "last_selected_watchlist", []) or [])
+    trading_date = market_calendar.market_date(market=MARKET_SCOPE_CRYPTO)
+    day_start, day_end = market_calendar.market_day_bounds(
+        market=MARKET_SCOPE_CRYPTO,
+        trading_date=trading_date,
+    )
+    today_filled_order_count = await db.scalar(
+        select(func.count(CoinBrokerOrder.id)).where(
+            CoinBrokerOrder.filled_quantity > 0,
+            CoinBrokerOrder.filled_at.is_not(None),
+            CoinBrokerOrder.filled_at >= day_start,
+            CoinBrokerOrder.filled_at <= day_end,
+        )
+    )
+    uptime_seconds = max(0, int((now_kst() - APP_STARTED_AT).total_seconds()))
 
     return SuccessResponse(data={
         "crypto_enabled": settings.CRYPTO_ENABLED,
         "crypto_trading_enabled": settings.CRYPTO_TRADING_ENABLED,
         "crypto_autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
+        "trading_enabled": settings.CRYPTO_TRADING_ENABLED,
+        "autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
+        "scheduler_running": trading_scheduler.is_running,
+        "agent_running": trading_agent._running,
         "market": "BITHUMB",
         "market_scope": MARKET_SCOPE_CRYPTO,
         "market_open": True,  # 24/7
@@ -247,9 +264,44 @@ async def get_coin_system_status():
         "last_cycle_time": trading_agent.last_cycle_time.isoformat() if trading_agent.last_cycle_time else None,
         "last_cycle_attempt_at": cycle_runtime.get("last_cycle_attempt_at"),
         "last_cycle_status": cycle_runtime.get("last_cycle_status"),
+        "last_cycle_error": cycle_runtime.get("last_cycle_error"),
         "scan_interval_hours": settings.CRYPTO_SCAN_INTERVAL_HOURS,
         "watchlist_symbols": settings.crypto_watchlist_symbols,
+        "watchlist_count": len(watchlist),
         "coin_sse_clients": coin_sse_manager.client_count,
+        "sse_clients": coin_sse_manager.client_count,
+        "app_started_at": APP_STARTED_AT.isoformat(),
+        "uptime_seconds": uptime_seconds,
+        "today_filled_order_count": int(today_filled_order_count or 0),
+    })
+
+
+@router.get("/agent/state")
+async def get_coin_agent_state():
+    """현재 코인 에이전트 파이프라인 상태"""
+    from agent.trading_agent import trading_agent
+
+    runtime = trading_agent._market_states.get(MARKET_SCOPE_CRYPTO)
+    if not runtime:
+        return SuccessResponse(data={
+            "cycle_active": False,
+            "cycle_id": None,
+            "started_at": None,
+            "phase": None,
+            "scanned_count": 0,
+            "analyzed_count": 0,
+            "selected_symbols": [],
+        })
+
+    pipeline = getattr(runtime, "_pipeline_snapshot", None) or {}
+    return SuccessResponse(data={
+        "cycle_active": runtime.cycle_lock.locked(),
+        "cycle_id": pipeline.get("cycle_id"),
+        "started_at": pipeline.get("started_at"),
+        "phase": pipeline.get("phase"),
+        "scanned_count": pipeline.get("scanned_count", 0),
+        "analyzed_count": pipeline.get("analyzed_count", 0),
+        "selected_symbols": pipeline.get("selected_symbols", []),
     })
 
 
@@ -382,6 +434,39 @@ def _serialize_balance(balance: AccountBalance) -> dict[str, object]:
         "currency": balance.currency,
         "is_valid": balance.is_valid,
         "status_message": balance.status_message,
+    }
+
+
+def _serialize_activity(a: CoinActivityLog) -> dict[str, object]:
+    return {
+        "id": a.id,
+        "cycle_id": a.cycle_id,
+        "activity_type": a.activity_type,
+        "phase": a.phase,
+        "symbol": a.symbol,
+        "summary": a.summary,
+        "detail": a.detail,
+        "llm_provider": a.llm_provider,
+        "llm_tier": a.llm_tier,
+        "execution_time_ms": a.execution_time_ms,
+        "confidence": a.confidence,
+        "error_message": a.error_message,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    }
+
+
+def _serialize_recommendation(r: CoinRecommendation) -> dict[str, object]:
+    return {
+        "id": r.id,
+        "coin_asset_id": r.coin_asset_id,
+        "action": r.action,
+        "suggested_price": r.suggested_price,
+        "suggested_quantity": r.suggested_quantity,
+        "reason": r.reason,
+        "confidence": r.confidence,
+        "status": r.status,
+        "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
     }
 
 
