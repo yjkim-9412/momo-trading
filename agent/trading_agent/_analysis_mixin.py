@@ -11,8 +11,14 @@ from agent.decision_maker import decision_maker
 from analysis.chart_analyzer import ChartAnalysisResult, chart_analyzer
 from analysis.feedback.context_builder import FeedbackContextBuilder
 from analysis.llm.llm_factory import llm_factory
-from analysis.llm.prompts.final_review import FINAL_REVIEW_PROMPT, FINAL_REVIEW_SYSTEM
-from analysis.llm.prompts.stock_analysis import STOCK_ANALYSIS_PROMPT, STOCK_ANALYSIS_SYSTEM
+from analysis.llm.prompts.final_review import (
+    FINAL_REVIEW_PROMPT, FINAL_REVIEW_SYSTEM,
+    get_final_review_prompt, get_final_review_system,
+)
+from analysis.llm.prompts.stock_analysis import (
+    STOCK_ANALYSIS_PROMPT, STOCK_ANALYSIS_SYSTEM,
+    get_stock_analysis_prompt, get_stock_analysis_system,
+)
 from core.config import settings
 from core.database import AsyncSessionLocal
 from core.events import Event, EventType, event_bus
@@ -1134,7 +1140,8 @@ class AnalysisMixin:
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
         change_value = float(price_data.get("change") or 0)
         change_text = f"{change_value:+,.2f}{'원' if currency == 'KRW' else currency}"
-        prompt = STOCK_ANALYSIS_PROMPT.format(
+        prompt_template = get_stock_analysis_prompt(market_code)
+        prompt = prompt_template.format(
             stock_name=name,
             symbol=symbol,
             market=market_code,
@@ -1160,7 +1167,7 @@ class AnalysisMixin:
         try:
             result_text, provider = await llm_factory.generate_tier1(
                 prompt,
-                system_prompt=STOCK_ANALYSIS_SYSTEM,
+                system_prompt=get_stock_analysis_system(market_code),
                 profile=Tier1Profile.ANALYSIS,
                 scope=scope,
                 phase="cycle",
@@ -1240,7 +1247,8 @@ class AnalysisMixin:
             else settings.MAX_HOLD_DAYS_STABLE
         )
 
-        prompt = FINAL_REVIEW_PROMPT.format(
+        review_prompt_template = get_final_review_prompt(market_code)
+        prompt = review_prompt_template.format(
             tier1_analysis=json.dumps(tier1_prompt_payload, ensure_ascii=False, indent=2),
             stock_name=name,
             symbol=symbol,
@@ -1271,7 +1279,7 @@ class AnalysisMixin:
         try:
             result_text, provider = await llm_factory.generate_tier2(
                 prompt,
-                system_prompt=FINAL_REVIEW_SYSTEM,
+                system_prompt=get_final_review_system(market_code),
                 scope=scope,
                 phase="cycle",
                 symbol=symbol,
