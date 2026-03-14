@@ -1,13 +1,15 @@
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from agent.trading_agent import trading_agent
 from agent.trading_agent._state_mixin import StateMixin
 from agent.trading_agent._types import MarketState
 from api.routes import admin_coin
-from api.routes.admin_coin import get_coin_activity_feed, get_coin_watchlist
+from api.routes.admin_coin import get_coin_activity_feed, get_coin_system_status, get_coin_watchlist
+from realtime.coin_monitor import coin_realtime_monitor
+from scheduler.scheduler import trading_scheduler
 
 
 class _ScalarResult:
@@ -70,6 +72,74 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["scan_source"], "DISCOVERY")
         self.assertEqual(item["trade_value"], 45678.0)
         self.assertEqual(item["reason"], "시장 기준점")
+
+    async def test_get_coin_system_status_exposes_discovery_cache_metadata(self):
+        runtime = MarketState(scope="CRYPTO", last_selected_watchlist=[{"symbol": "BTC"}])
+        db = AsyncMock()
+        db.scalar.return_value = 0
+
+        with patch.object(trading_agent, "_market_states", {"CRYPTO": runtime}), \
+                patch.object(
+                    trading_agent,
+                    "get_cycle_runtime_snapshot",
+                    return_value={
+                        "last_cycle_attempt_at": "2026-03-14T01:08:33+00:00",
+                        "last_cycle_status": "COMPLETE",
+                        "last_cycle_error": None,
+                    },
+                ), \
+                patch.object(trading_agent, "_running", True), \
+                patch.object(trading_agent, "_last_cycle_time", None), \
+                patch.object(
+                    admin_coin.market_calendar,
+                    "get_session_schedule",
+                    return_value={"current_session": "CRYPTO_ACTIVE", "sessions": []},
+                ), \
+                patch.object(
+                    admin_coin.market_calendar,
+                    "market_day_bounds",
+                    return_value=(
+                        datetime(2026, 3, 14, tzinfo=timezone.utc),
+                        datetime(2026, 3, 15, tzinfo=timezone.utc),
+                    ),
+                ), \
+                patch.object(type(admin_coin.coin_sse_manager), "client_count", new_callable=PropertyMock, return_value=1), \
+                patch(
+                    "realtime.coin_stream_manager.coin_stream_manager.stream_status",
+                    return_value={"running": True, "connected": True},
+                ), \
+                patch(
+                    "realtime.coin_stream_manager.coin_stream_manager.private_sync_status",
+                    return_value={"running": True, "connected": True},
+                ), \
+                patch.object(
+                    type(coin_realtime_monitor),
+                    "is_running",
+                    new_callable=PropertyMock,
+                    return_value=True,
+                ), \
+                patch.object(
+                    type(trading_scheduler),
+                    "is_running",
+                    new_callable=PropertyMock,
+                    return_value=True,
+                ), \
+                patch(
+                    "trading.bithumb_client.bithumb_client.get_discovery_cache_status",
+                    return_value={
+                        "source": "stale_cache",
+                        "symbol_count": 30,
+                        "refreshed_at": "2026-03-14T00:00:00+00:00",
+                        "age_seconds": 120,
+                        "last_error": "dns failure",
+                    },
+                ):
+            response = await get_coin_system_status(db=db)
+
+        self.assertTrue(response.data["crypto_dynamic_discovery_enabled"])
+        self.assertEqual(response.data["discovery_cache"]["source"], "stale_cache")
+        self.assertEqual(response.data["discovery_cache"]["symbol_count"], 30)
+        self.assertEqual(response.data["watchlist_count"], 1)
 
     async def test_get_coin_activity_feed_returns_next_cursor_when_more_rows_exist(self):
         resolved_date = date(2026, 3, 14)

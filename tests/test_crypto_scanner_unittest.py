@@ -23,11 +23,12 @@ def _balance() -> AccountBalance:
 
 
 @pytest.mark.asyncio
-async def test_scan_reuses_single_overview_payload_for_ranked_views():
+async def test_scan_reuses_selective_ticker_payload_for_ranked_views():
     scanner = CryptoScanner()
-    overview = MCPResponse(
+    discovery = MCPResponse(
         success=True,
         data={
+            "cache_source": "live",
             "items": [
                 {
                     "symbol": "BTC",
@@ -50,10 +51,12 @@ async def test_scan_reuses_single_overview_payload_for_ranked_views():
             ]
         },
     )
+    overview = MCPResponse(success=True, data={"items": discovery.data["items"]})
     volume_rank = MCPResponse(success=True, data={"items": overview.data["items"]})
     surge_data = MCPResponse(success=True, data={"items": overview.data["items"]})
     client = SimpleNamespace(
-        get_market_overview=AsyncMock(return_value=overview),
+        get_discovery_universe=AsyncMock(return_value=discovery),
+        get_ticker_snapshots=AsyncMock(return_value=overview),
         get_volume_rank=AsyncMock(return_value=volume_rank),
         get_surge_data=AsyncMock(return_value=surge_data),
         get_current_price=AsyncMock(),
@@ -78,9 +81,13 @@ async def test_scan_reuses_single_overview_payload_for_ranked_views():
             account_snapshot=(_balance(), []),
         )
 
-    client.get_market_overview.assert_awaited_once()
-    assert client.get_volume_rank.await_args.kwargs["overview_data"] is overview
-    assert client.get_surge_data.await_args.kwargs["overview_data"] is overview
+    client.get_discovery_universe.assert_awaited_once()
+    client.get_ticker_snapshots.assert_awaited_once()
+    ranked_items = client.get_volume_rank.await_args.kwargs["overview_data"].data["items"]
+    assert [item["symbol"] for item in ranked_items] == ["BTC", "ETH"]
+    assert all(item["scan_source"] == "DISCOVERY" for item in ranked_items)
+    surge_items = client.get_surge_data.await_args.kwargs["overview_data"].data["items"]
+    assert [item["symbol"] for item in surge_items] == ["BTC", "ETH"]
     assert result["provider"] == "TEST"
 
 
@@ -89,7 +96,8 @@ async def test_scan_returns_market_data_unavailable_without_llm_call():
     scanner = CryptoScanner()
     failure = MCPResponse(success=False, error="non_json_response")
     client = SimpleNamespace(
-        get_market_overview=AsyncMock(return_value=failure),
+        get_discovery_universe=AsyncMock(return_value=failure),
+        get_ticker_snapshots=AsyncMock(return_value=failure),
         get_volume_rank=AsyncMock(return_value=failure),
         get_surge_data=AsyncMock(return_value=failure),
         get_current_price=AsyncMock(return_value=MCPResponse(success=False, error="ticker unavailable")),
@@ -162,11 +170,13 @@ async def test_scan_enriches_selected_candidates_with_discovery_source():
             "trade_value": 1.0,
         }
     )
+    discovery = MCPResponse(success=True, data={"items": items, "cache_source": "live"})
     overview = MCPResponse(success=True, data={"items": items})
     volume_rank = MCPResponse(success=True, data={"items": items[:15]})
     surge_data = MCPResponse(success=True, data={"items": items[:15]})
     client = SimpleNamespace(
-        get_market_overview=AsyncMock(return_value=overview),
+        get_discovery_universe=AsyncMock(return_value=discovery),
+        get_ticker_snapshots=AsyncMock(return_value=overview),
         get_volume_rank=AsyncMock(return_value=volume_rank),
         get_surge_data=AsyncMock(return_value=surge_data),
         get_current_price=AsyncMock(),
@@ -201,21 +211,13 @@ async def test_scan_enriches_selected_candidates_with_discovery_source():
     assert selected["P00"]["scan_source"] == "DISCOVERY"
     assert selected["DOGE"]["scan_source"] == "WATCHLIST"
     assert result["selected_count_by_source"] == {"DISCOVERY": 1, "WATCHLIST": 1}
+    assert result["discovery_cache_source"] == "live"
 
 
 @pytest.mark.asyncio
 async def test_scan_uses_watchlist_only_when_discovery_disabled():
     scanner = CryptoScanner()
     overview_items = [
-        {
-            "symbol": "SOL",
-            "name": "솔라나",
-            "market": "BITHUMB",
-            "price": 220000,
-            "change_rate": 9.0,
-            "volume": 9000.0,
-            "trade_value": 9000.0,
-        },
         {
             "symbol": "BTC",
             "name": "비트코인",
@@ -228,7 +230,8 @@ async def test_scan_uses_watchlist_only_when_discovery_disabled():
     ]
     overview = MCPResponse(success=True, data={"items": overview_items})
     client = SimpleNamespace(
-        get_market_overview=AsyncMock(return_value=overview),
+        get_discovery_universe=AsyncMock(),
+        get_ticker_snapshots=AsyncMock(return_value=overview),
         get_volume_rank=AsyncMock(return_value=MCPResponse(success=True, data={"items": overview_items})),
         get_surge_data=AsyncMock(return_value=MCPResponse(success=True, data={"items": overview_items})),
         get_current_price=AsyncMock(),
@@ -260,12 +263,76 @@ async def test_scan_uses_watchlist_only_when_discovery_disabled():
         )
 
     prompt = generate_tier1.await_args.args[0]
+    client.get_discovery_universe.assert_not_called()
     assert "비트코인(BTC)" in prompt
     assert "솔라나(SOL)" not in prompt
     assert "보유 코인 없음" in prompt
     assert "P(P)" not in prompt
     assert result["market_regime"] == "CONSOLIDATION"
     assert result["selected"][0]["scan_source"] == "WATCHLIST"
+
+
+@pytest.mark.asyncio
+async def test_scan_uses_stale_discovery_cache_without_dropping_to_fallback():
+    scanner = CryptoScanner()
+    discovery_items = [
+        {
+            "symbol": "BTC",
+            "name": "비트코인",
+            "market": "BITHUMB",
+            "price": 150000000,
+            "change_rate": 1.0,
+            "volume": 1000.0,
+            "trade_value": 1000000.0,
+        }
+    ]
+    client = SimpleNamespace(
+        get_discovery_universe=AsyncMock(
+            return_value=MCPResponse(
+                success=True,
+                data={
+                    "items": discovery_items,
+                    "count": 1,
+                    "cache_source": "stale_cache",
+                    "last_error": "dns failure",
+                },
+            )
+        ),
+        get_ticker_snapshots=AsyncMock(return_value=MCPResponse(success=False, error="subset failure")),
+        get_volume_rank=AsyncMock(return_value=MCPResponse(success=True, data={"items": discovery_items})),
+        get_surge_data=AsyncMock(return_value=MCPResponse(success=True, data={"items": discovery_items})),
+        get_current_price=AsyncMock(
+            return_value=MCPResponse(
+                success=True,
+                data={"name": "도지코인", "price": 500, "change_rate": 0.5, "trade_value": 1000},
+            )
+        ),
+    )
+
+    with patch("agent.crypto_scanner._get_bithumb_client", return_value=client), patch.object(
+        scanner,
+        "_get_performance_summary",
+        AsyncMock(return_value="매매 이력 없음"),
+    ), patch(
+        "agent.crypto_scanner.llm_factory.generate_tier1",
+        AsyncMock(
+            return_value=(
+                '{"selected":[{"symbol":"BTC","name":"비트코인","strategy_type":"STABLE_SHORT","reason":"stale cache 유지"}],"market_regime":"CONSOLIDATION","market_analysis":"cache path"}',
+                "TEST",
+            )
+        ),
+    ), patch("agent.crypto_scanner.activity_logger.log", AsyncMock()), patch(
+        "agent.crypto_scanner.settings.CRYPTO_WATCHLIST_SYMBOLS",
+        "DOGE",
+    ):
+        result = await scanner.scan(
+            market="BITHUMB",
+            cycle_id="cycle-1",
+            account_snapshot=(_balance(), []),
+        )
+
+    assert result["discovery_cache_source"] == "stale_cache"
+    assert result["selected"][0]["scan_source"] == "DISCOVERY"
 
 
 @pytest.mark.asyncio
@@ -289,3 +356,26 @@ async def test_build_watchlist_fallback_coins_tags_holding_and_watchlist_sources
     by_symbol = {item["symbol"]: item for item in coins}
     assert by_symbol["XRP"]["scan_source"] == "HOLDING_FALLBACK"
     assert by_symbol["BTC"]["scan_source"] == "WATCHLIST_FALLBACK"
+
+
+@pytest.mark.asyncio
+async def test_build_watchlist_fallback_coins_allows_custom_scan_sources():
+    scanner = CryptoScanner()
+    client = SimpleNamespace(
+        get_current_price=AsyncMock(
+            return_value=MCPResponse(
+                success=True,
+                data={"name": "비트코인", "price": 150000000, "change_rate": 2.0, "trade_value": 9000},
+            )
+        )
+    )
+
+    coins = await scanner._build_watchlist_fallback_coins(
+        client,
+        watchlist=["BTC"],
+        holdings=[],
+        watchlist_scan_source="WATCHLIST",
+        include_holdings=False,
+    )
+
+    assert coins[0]["scan_source"] == "WATCHLIST"

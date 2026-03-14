@@ -1,5 +1,6 @@
 import base64
 import json
+import time
 import httpx
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -229,3 +230,94 @@ async def test_get_tradable_krw_symbols_uses_stale_cache_when_market_catalog_fai
     assert source == "stale_cache"
     assert warning_mock.call_count == 1
     assert "캐시 사용" in str(warning_mock.call_args.args[0])
+
+
+@pytest.mark.asyncio
+async def test_get_ticker_snapshots_normalizes_multiple_symbols():
+    client = BithumbClient()
+    raw_items = [
+        {
+            "market": "KRW-BTC",
+            "trade_price": "145000000",
+            "signed_change_rate": "0.0125",
+            "acc_trade_volume_24h": "100",
+            "acc_trade_price_24h": "1000",
+        },
+        {
+            "market": "KRW-ETH",
+            "trade_price": "5000000",
+            "signed_change_rate": "-0.034",
+            "acc_trade_volume_24h": "200",
+            "acc_trade_price_24h": "2000",
+        },
+    ]
+
+    with patch.object(
+        client,
+        "_public_get",
+        AsyncMock(return_value=MCPResponse(success=True, data={"items": raw_items})),
+    ):
+        response = await client.get_ticker_snapshots(["BTC", "ETH", "BTC"])
+
+    assert response.success is True
+    assert response.data["count"] == 2
+    assert response.data["symbols"] == ["BTC", "ETH"]
+    assert [item["symbol"] for item in response.data["items"]] == ["BTC", "ETH"]
+
+
+@pytest.mark.asyncio
+async def test_get_discovery_universe_returns_fresh_cache_without_live_refresh():
+    client = BithumbClient()
+    client._discovery_universe_cache = [{"symbol": "BTC", "trade_value": 1000.0}]
+    client._discovery_universe_cached_at = time.monotonic()
+    client._discovery_universe_cached_at_epoch = time.time()
+
+    with patch.object(client, "get_market_overview", AsyncMock()) as overview_mock:
+        response = await client.get_discovery_universe()
+
+    overview_mock.assert_not_awaited()
+    assert response.success is True
+    assert response.data["cache_source"] == "cache"
+    assert response.data["items"][0]["symbol"] == "BTC"
+
+
+@pytest.mark.asyncio
+async def test_get_discovery_universe_refreshes_live_and_updates_cache():
+    client = BithumbClient()
+    overview = MCPResponse(
+        success=True,
+        data={
+            "items": [
+                {"symbol": "ETH", "trade_value": 200.0},
+                {"symbol": "BTC", "trade_value": 300.0},
+            ]
+        },
+    )
+
+    with patch.object(client, "get_market_overview", AsyncMock(return_value=overview)):
+        response = await client.get_discovery_universe(force_refresh=True)
+
+    assert response.success is True
+    assert response.data["cache_source"] == "live"
+    assert [item["symbol"] for item in response.data["items"]] == ["BTC", "ETH"]
+    assert [item["symbol"] for item in client._discovery_universe_cache] == ["BTC", "ETH"]
+
+
+@pytest.mark.asyncio
+async def test_get_discovery_universe_uses_stale_cache_when_live_refresh_fails():
+    client = BithumbClient()
+    client._discovery_universe_cache = [{"symbol": "BTC", "trade_value": 1000.0}]
+    client._discovery_universe_cached_at = 0.0
+    client._discovery_universe_cached_at_epoch = time.time() - 10_000
+
+    with patch.object(
+        client,
+        "get_market_overview",
+        AsyncMock(return_value=MCPResponse(success=False, error="dns failure")),
+    ), patch("trading.bithumb_client.logger.warning") as warning_mock:
+        response = await client.get_discovery_universe()
+
+    assert response.success is True
+    assert response.data["cache_source"] == "stale_cache"
+    assert response.data["last_error"] == "dns failure"
+    assert warning_mock.call_count == 1
