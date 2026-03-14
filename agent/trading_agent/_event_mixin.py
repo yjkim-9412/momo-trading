@@ -9,7 +9,7 @@ from realtime.event_detector import event_detector
 from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from trading.enums import ActivityPhase, ActivityType
-from trading.market_profile import market_scope, market_timezone, normalize_market
+from trading.market_profile import is_crypto_market, market_scope, market_timezone, normalize_market
 from trading.mcp_client import mcp_client
 
 
@@ -270,9 +270,15 @@ class EventMixin:
     async def _ensure_realtime_subscription(self, symbol: str, market: str | None = None) -> None:
         """매수 후 WebSocket 실시간 구독 확인/추가"""
         try:
-            from realtime.stream_manager import stream_manager
             market_code = normalize_market(market or settings.primary_market_code)
-            await stream_manager.ensure_symbol(market_scope(market_code), symbol, market_code)
+            if is_crypto_market(market_code):
+                from realtime.coin_stream_manager import coin_stream_manager
+
+                await coin_stream_manager.ensure_symbol(market_scope(market_code), symbol, market_code)
+            else:
+                from realtime.stream_manager import stream_manager
+
+                await stream_manager.ensure_symbol(market_scope(market_code), symbol, market_code)
             logger.debug("매수 종목 WebSocket 구독 추가: {} ({})", symbol, market_code)
         except Exception as e:
             logger.warning("WebSocket 구독 추가 실패 ({}): {}", symbol, str(e))

@@ -651,15 +651,11 @@ class TradingScheduler:
     async def _seed_startup_holdings_watchlist(self, market: str) -> None:
         """서버 기동 직후 보유종목은 즉시 desired watchlist에 복구"""
         try:
-            from realtime.stream_manager import stream_manager
-            from trading.account_manager import account_manager
+            from services.watchlist_sync import reconcile_market_watchlist
 
-            holdings = await account_manager.get_holdings(market)
-            symbols = [(h.symbol, h.market) for h in holdings if h.symbol]
-            if not symbols:
-                return
-            await stream_manager.replace_market_subscriptions(market, symbols)
-            logger.info("[{}] 서버 기동 보유종목 감시 복원: {}종목", market, len(symbols))
+            symbols = await reconcile_market_watchlist(market)
+            if symbols:
+                logger.info("[{}] 서버 기동 보유종목 감시 복원: {}종목", market, len(symbols))
         except Exception as e:
             logger.warning("[{}] 서버 기동 보유종목 감시 복원 실패: {}", market, str(e))
 

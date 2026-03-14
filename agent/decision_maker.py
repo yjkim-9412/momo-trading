@@ -322,6 +322,120 @@ class DecisionMaker:
             )
 
     @staticmethod
+    def _matched_order_from_broker_record(
+        record: BrokerOrder | CoinBrokerOrder | None,
+        market: str,
+    ) -> dict | None:
+        market_code = normalize_market(market)
+        if record is None:
+            return None
+
+        if is_crypto_market(market_code) and isinstance(record, CoinBrokerOrder):
+            quantity = float(record.quantity or 0.0)
+            filled_quantity = float(record.filled_quantity or 0.0)
+            remaining_quantity = max(quantity - filled_quantity, 0.0)
+            return {
+                "order_id": record.bithumb_order_id,
+                "market": market_code,
+                "symbol": record.symbol,
+                "name": record.coin_name,
+                "status": record.status,
+                "order_qty": quantity,
+                "filled_qty": filled_quantity,
+                "filled_quantity": filled_quantity,
+                "remaining_qty": remaining_quantity,
+                "order_price": float(record.requested_price or 0.0),
+                "filled_price": float(record.filled_price or 0.0),
+                "currency": record.currency or "KRW",
+                "exchange_rate_to_krw": 1.0,
+            }
+
+        if isinstance(record, BrokerOrder):
+            quantity = float(record.quantity or 0.0)
+            filled_quantity = float(record.filled_quantity or 0.0)
+            remaining_quantity = max(quantity - filled_quantity, 0.0)
+            return {
+                "order_id": record.kis_order_id,
+                "market": market_code,
+                "symbol": record.symbol,
+                "name": record.stock_name,
+                "status": record.status,
+                "order_qty": quantity,
+                "filled_qty": filled_quantity,
+                "filled_quantity": filled_quantity,
+                "remaining_qty": remaining_quantity,
+                "order_price": float(record.requested_price or 0.0),
+                "filled_price": float(record.filled_price or 0.0),
+                "currency": record.currency or "KRW",
+                "exchange_rate_to_krw": float(record.exchange_rate_to_krw or 1.0),
+            }
+        return None
+
+    async def sync_coin_ws_order(self, order_data: dict | None) -> None:
+        """Private MyOrder 수신 시 coin broker ledger를 즉시 동기화."""
+        payload = order_data or {}
+        order_id = str(payload.get("order_id") or "").strip()
+        symbol = str(payload.get("symbol") or "").upper().strip()
+        market_code = normalize_market(payload.get("market") or "BITHUMB")
+        if not order_id or not symbol or not is_crypto_market(market_code):
+            return
+
+        existing = await self._load_broker_order(order_id, market_code)
+        prev_status = str(getattr(existing, "status", "") or "")
+        prev_filled_qty = float(getattr(existing, "filled_quantity", 0.0) or 0.0)
+
+        status = str(payload.get("status") or payload.get("state") or "SUBMITTED").upper()
+        quantity = self._order_quantity(
+            payload.get("order_qty") or payload.get("volume"),
+            market_code,
+        )
+        if quantity <= 0:
+            return
+
+        filled_qty = self._order_quantity(
+            payload.get("filled_qty") or payload.get("filled_quantity"),
+            market_code,
+        )
+        filled_price = float(payload.get("filled_price") or payload.get("order_price") or 0.0)
+        detail_text = json.dumps(payload, ensure_ascii=False, default=str)
+
+        await self._upsert_broker_order(
+            cycle_id=getattr(existing, "cycle_id", None),
+            order_id=order_id,
+            symbol=symbol,
+            stock_name=str(payload.get("name") or getattr(existing, "coin_name", "") or symbol),
+            market=market_code,
+            side=str(payload.get("side") or getattr(existing, "side", "") or "").upper(),
+            status=status,
+            quantity=quantity,
+            requested_price=float(payload.get("order_price") or getattr(existing, "requested_price", 0.0) or 0.0),
+            requested_price_krw=float(payload.get("order_price") or getattr(existing, "requested_price", 0.0) or 0.0),
+            currency=str(payload.get("currency") or getattr(existing, "currency", "KRW") or "KRW"),
+            exchange_rate_to_krw=float(payload.get("exchange_rate_to_krw") or 1.0),
+            strategy_type=str(getattr(existing, "strategy_type", "") or ""),
+            filled_quantity=filled_qty,
+            filled_price=filled_price,
+            filled_price_krw=filled_price,
+            status_detail=detail_text,
+            error_message="",
+            submitted_at=payload.get("submitted_at"),
+            filled_at=payload.get("filled_at") if status in {"FILLED", "PARTIAL"} else None,
+        )
+
+        if status != prev_status or filled_qty > prev_filled_qty:
+            from trading.account_manager import account_manager
+
+            account_manager.invalidate_cache()
+            logger.info(
+                "[CoinWS] 주문 상태 동기화: {} {} {} → {} (filled={})",
+                symbol,
+                order_id,
+                prev_status or "NEW",
+                status,
+                self._quantity_text(filled_qty, market_code),
+            )
+
+    @staticmethod
     def _extract_broker_order_payload(activity: AgentActivityLog) -> dict | None:
         if not activity.detail:
             return None
@@ -675,7 +789,19 @@ class DecisionMaker:
                 exchange_rate = await mcp_client._get_exchange_rate_to_krw(market_code)
 
             matched_order: dict | None = None
+            broker_record = await self._load_broker_order(order_id, market_code)
+            broker_snapshot = self._matched_order_from_broker_record(broker_record, market_code)
+            if broker_snapshot is not None:
+                broker_filled_qty = self._order_quantity(
+                    broker_snapshot.get("filled_qty") or broker_snapshot.get("filled_quantity"),
+                    market_code,
+                )
+                if broker_filled_qty > 0:
+                    matched_order = broker_snapshot
+
             for delay_seconds in _OVERSEAS_CONFIRM_DELAYS_SECONDS:
+                if matched_order is not None:
+                    break
                 await asyncio.sleep(delay_seconds)
 
                 if is_crypto_market(market_code):

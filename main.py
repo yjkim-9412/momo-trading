@@ -52,6 +52,16 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("주식 시장 비활성 — 실시간 모니터 건너뜀")
 
+    # 코인 실시간 모니터 시작 (코인 시장 활성 시에만)
+    if settings.has_crypto_markets:
+        from realtime.coin_monitor import coin_realtime_monitor
+        try:
+            await coin_realtime_monitor.start()
+        except Exception as e:
+            logger.warning("코인 실시간 모니터 시작 실패: {}", str(e))
+    else:
+        logger.info("코인 시장 비활성 — 코인 실시간 모니터 건너뜀")
+
     # AI Trading Agent 시작
     from agent.trading_agent import trading_agent
     try:
@@ -86,6 +96,12 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         await mcp_client.disconnect()
+    if settings.has_crypto_markets:
+        try:
+            from realtime.coin_monitor import coin_realtime_monitor
+            await coin_realtime_monitor.stop()
+        except Exception:
+            pass
     await event_bus.stop()
     logger.info("애플리케이션 종료")
 

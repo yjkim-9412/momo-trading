@@ -1,7 +1,7 @@
 """시장별 실시간 감시 종목 동기화."""
 from loguru import logger
 
-from trading.market_profile import normalize_market
+from trading.market_profile import is_crypto_market, normalize_market
 
 
 def _normalize_selected_watchlist(
@@ -46,7 +46,6 @@ async def reconcile_market_watchlist(
 ) -> list[tuple[str, str]]:
     """최근 선정 종목과 보유 종목을 합쳐 scope별 desired 구독을 재계산."""
     from agent.trading_agent import trading_agent
-    from realtime.stream_manager import stream_manager
     from trading.account_manager import account_manager
 
     market_code = normalize_market(market)
@@ -81,7 +80,16 @@ async def reconcile_market_watchlist(
         seen.add(key)
         desired_symbols.append((symbol, holding_market))
 
-    desired_symbols = desired_symbols[:41]
-    await stream_manager.replace_market_subscriptions(market_code, desired_symbols)
-    logger.info("[{}] 실시간 감시 종목 동기화: {}종목", market_code, len(desired_symbols))
-    return desired_symbols
+    if is_crypto_market(market_code):
+        from realtime.coin_stream_manager import coin_stream_manager
+
+        synced_symbols = desired_symbols
+        await coin_stream_manager.replace_market_subscriptions(market_code, synced_symbols)
+    else:
+        from realtime.stream_manager import stream_manager
+
+        synced_symbols = desired_symbols[:41]
+        await stream_manager.replace_market_subscriptions(market_code, synced_symbols)
+
+    logger.info("[{}] 실시간 감시 종목 동기화: {}종목", market_code, len(synced_symbols))
+    return synced_symbols
