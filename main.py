@@ -31,20 +31,26 @@ async def lifespan(app: FastAPI):
     # 이벤트 버스 시작
     await event_bus.start()
 
-    # MCP 클라이언트 연결 (실패해도 서버는 기동)
-    try:
-        await mcp_client.connect()
-        tools = await mcp_client.list_tools()
-        logger.info("MCP 도구 목록 ({}개): {}", len(tools), [t.get("name") for t in tools])
-    except Exception as e:
-        logger.warning("MCP 서버 연결 실패 (나중에 재시도): {}", str(e))
+    # MCP 클라이언트 연결 (주식 시장 활성 시에만, 실패해도 서버는 기동)
+    if settings.has_stock_markets:
+        try:
+            await mcp_client.connect()
+            tools = await mcp_client.list_tools()
+            logger.info("MCP 도구 목록 ({}개): {}", len(tools), [t.get("name") for t in tools])
+        except Exception as e:
+            logger.warning("MCP 서버 연결 실패 (나중에 재시도): {}", str(e))
+    else:
+        logger.info("주식 시장 비활성 — MCP 클라이언트 연결 건너뜀")
 
-    # 실시간 모니터 시작 (WebSocket, 실패해도 서버 기동)
-    from realtime.monitor import realtime_monitor
-    try:
-        await realtime_monitor.start()
-    except Exception as e:
-        logger.warning("실시간 모니터 시작 실패: {}", str(e))
+    # 실시간 모니터 시작 (주식 시장 활성 시에만, 실패해도 서버 기동)
+    if settings.has_stock_markets:
+        from realtime.monitor import realtime_monitor
+        try:
+            await realtime_monitor.start()
+        except Exception as e:
+            logger.warning("실시간 모니터 시작 실패: {}", str(e))
+    else:
+        logger.info("주식 시장 비활성 — 실시간 모니터 건너뜀")
 
     # AI Trading Agent 시작
     from agent.trading_agent import trading_agent
@@ -73,11 +79,13 @@ async def lifespan(app: FastAPI):
         await trading_agent.stop()
     except Exception:
         pass
-    try:
-        await realtime_monitor.stop()
-    except Exception:
-        pass
-    await mcp_client.disconnect()
+    if settings.has_stock_markets:
+        try:
+            from realtime.monitor import realtime_monitor
+            await realtime_monitor.stop()
+        except Exception:
+            pass
+        await mcp_client.disconnect()
     await event_bus.stop()
     logger.info("애플리케이션 종료")
 
@@ -111,8 +119,19 @@ app.mount("/admin/static", StaticFiles(directory=str(ADMIN_STATIC)), name="admin
 @app.get("/admin")
 @app.get("/admin/")
 async def admin_dashboard():
-    """관리자 대시보드 UI"""
+    """관리자 대시보드 UI (주식)"""
     return FileResponse(str(ADMIN_STATIC / "index.html"))
+
+
+@app.get("/admin-coin")
+@app.get("/admin-coin/")
+async def coin_admin_dashboard():
+    """코인 관리자 대시보드 UI"""
+    coin_html = ADMIN_STATIC / "coin.html"
+    if not coin_html.exists():
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse("<h1>coin.html not found</h1><p>프론트엔드 구현 필요</p>", status_code=404)
+    return FileResponse(str(coin_html))
 
 
 # ── 예외 핸들러 ──

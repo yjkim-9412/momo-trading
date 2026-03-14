@@ -30,6 +30,7 @@ class RiskManager:
         "BEAR_MARKET": 1.5,
         "CONSOLIDATION": 1.5,
         "ALTSEASON": 2.0,
+        "ALT_SEASON": 2.0,  # 프롬프트 변형 호환
         # 주식 regime 호환
         "BULL": 2.0,
         "BEAR": 1.5,

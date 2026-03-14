@@ -217,6 +217,13 @@ class Settings(BaseSettings):
         return seen
 
     @property
+    def has_stock_markets(self) -> bool:
+        """KRX 또는 US 시장이 활성화되어 있는지 확인 (코인 전용 모드 판별)"""
+        from trading.market_profile import is_crypto_market
+
+        return any(not is_crypto_market(m) for m in self.enabled_market_groups)
+
+    @property
     def primary_market_code(self) -> str:
         """대표 시장 코드"""
         from trading.market_profile import normalize_market
@@ -268,6 +275,61 @@ class Settings(BaseSettings):
             "force_liquidation_minute": self.FORCE_LIQUIDATION_MINUTE,
         }
 
+    def market_has_buy_cutoff(self, market: str) -> bool:
+        """시장에 신규 매수 cutoff 개념이 존재하는지 반환"""
+        mkt_cfg = self.get_market_config(market)
+        return (
+            mkt_cfg["buy_cutoff_hour"] is not None
+            and mkt_cfg["buy_cutoff_minute"] is not None
+        )
+
+    def market_has_force_liquidation(self, market: str) -> bool:
+        """시장에 강제 청산 cutoff 개념이 존재하는지 반환"""
+        mkt_cfg = self.get_market_config(market)
+        return (
+            mkt_cfg["force_liquidation_hour"] is not None
+            and mkt_cfg["force_liquidation_minute"] is not None
+        )
+
+    def is_trading_enabled_for_market(self, market: str) -> bool:
+        """시장별 실주문 허용 여부 반환"""
+        from trading.market_profile import is_crypto_market, is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        if is_crypto_market(norm):
+            return bool(self.CRYPTO_TRADING_ENABLED)
+        if is_us_market(norm):
+            return bool(self.TRADING_ENABLED and self.US_TRADING_ENABLED)
+        return bool(self.TRADING_ENABLED)
+
+    def autonomy_mode_for_market(self, market: str) -> str:
+        """시장별 autonomy mode 반환"""
+        from trading.market_profile import is_crypto_market, normalize_market
+
+        norm = normalize_market(market)
+        if is_crypto_market(norm):
+            return (self.CRYPTO_AUTONOMY_MODE or self.AUTONOMY_MODE or "SEMI_AUTO").upper()
+        return (self.AUTONOMY_MODE or "SEMI_AUTO").upper()
+
+    def recommendation_expire_minutes_for_market(self, market: str) -> int:
+        """시장별 추천 만료 시간 반환"""
+        from trading.market_profile import is_crypto_market, normalize_market
+
+        norm = normalize_market(market)
+        if is_crypto_market(norm):
+            return max(
+                1,
+                int(self.CRYPTO_RECOMMENDATION_EXPIRE_MIN or self.RECOMMENDATION_EXPIRE_MIN or 30),
+            )
+        return max(1, int(self.RECOMMENDATION_EXPIRE_MIN or 60))
+
+    def should_use_adaptive_rescan(self, market: str) -> bool:
+        """시장별 adaptive rescan 사용 여부"""
+        from trading.market_profile import is_crypto_market, normalize_market
+
+        norm = normalize_market(market)
+        return bool(self.AI_DYNAMIC_RESCAN_ENABLED and not is_crypto_market(norm))
+
     @property
     def crypto_watchlist_symbols(self) -> list[str]:
         """크립토 스캔용 감시 코인 목록"""
@@ -285,27 +347,49 @@ class Settings(BaseSettings):
             logger.warning("알 수 없는 CRYPTO_LLM_PROVIDER={} → 주식 설정 사용", raw)
             return self.llm_provider
 
+    def llm_provider_for_scope(self, scope: str | None = None) -> LLMProvider:
+        """scope 기준 provider 반환"""
+        from trading.market_profile import normalize_market_scope
+
+        if scope and normalize_market_scope(scope) == "CRYPTO":
+            return self.crypto_llm_provider
+        return self.llm_provider
+
     def get_crypto_llm_model(
         self,
         tier: LLMTier,
         profile: Tier1Profile | None = None,
     ) -> str:
         """크립토 전용 LLM 모델 반환 (SCAN/ANALYSIS 프로필 분리, 비어있으면 주식 설정)"""
-        provider = self.crypto_llm_provider
-        if tier == LLMTier.TIER1:
-            if profile == Tier1Profile.SCAN:
+        return self.get_crypto_llm_model_for_provider(
+            self.crypto_llm_provider,
+            tier,
+            profile,
+        )
+
+    def get_crypto_llm_model_for_provider(
+        self,
+        provider: LLMProvider,
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str:
+        """크립토 scope에서 특정 provider가 사용할 모델 반환"""
+        if provider == LLMProvider.CLAUDE_CODE:
+            if tier == LLMTier.TIER1:
+                if profile == Tier1Profile.SCAN:
+                    return (
+                        self.CRYPTO_LLM_MODEL_TIER1_SCAN
+                        or self.CRYPTO_LLM_MODEL_TIER1_ANALYSIS
+                        or self.get_llm_model(provider, tier)
+                    )
                 return (
-                    self.CRYPTO_LLM_MODEL_TIER1_SCAN
-                    or self.CRYPTO_LLM_MODEL_TIER1_ANALYSIS
+                    self.CRYPTO_LLM_MODEL_TIER1_ANALYSIS
+                    or self.CRYPTO_LLM_MODEL_TIER1_SCAN
                     or self.get_llm_model(provider, tier)
                 )
-            # ANALYSIS 또는 None
-            return (
-                self.CRYPTO_LLM_MODEL_TIER1_ANALYSIS
-                or self.CRYPTO_LLM_MODEL_TIER1_SCAN
-                or self.get_llm_model(provider, tier)
-            )
-        return self.CRYPTO_LLM_MODEL_TIER2 or self.get_llm_model(provider, tier)
+            return self.CRYPTO_LLM_MODEL_TIER2 or self.get_llm_model(provider, tier)
+
+        return self.CRYPTO_CODEX_MODEL or self.get_llm_model(provider, tier)
 
     def get_crypto_codex_model(self) -> str:
         """코인 전용 Codex 모델 (비어있으면 주식 CODEX_MODEL 사용)"""
@@ -317,15 +401,26 @@ class Settings(BaseSettings):
         profile: Tier1Profile | None = None,
     ) -> str | None:
         """코인 전용 추론 강도 (Claude/Codex 모두 지원, 비어있으면 주식 설정)"""
-        provider = self.crypto_llm_provider
+        return self.get_crypto_llm_reasoning_effort_for_provider(
+            self.crypto_llm_provider,
+            tier,
+            profile,
+        )
 
+    def get_crypto_llm_reasoning_effort_for_provider(
+        self,
+        provider: LLMProvider,
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str | None:
+        """크립토 scope에서 특정 provider가 사용할 추론 강도 반환"""
         if provider == LLMProvider.CLAUDE_CODE:
-            # Claude Code: 코인 전용 effort → 주식 기본값 (medium/high) 폴백
             if tier == LLMTier.TIER1:
-                if profile == Tier1Profile.SCAN:
-                    raw = self.CRYPTO_CLAUDE_EFFORT_TIER1_SCAN
-                else:
-                    raw = self.CRYPTO_CLAUDE_EFFORT_TIER1_ANALYSIS
+                raw = (
+                    self.CRYPTO_CLAUDE_EFFORT_TIER1_SCAN
+                    if profile == Tier1Profile.SCAN
+                    else self.CRYPTO_CLAUDE_EFFORT_TIER1_ANALYSIS
+                )
                 default = "medium"
             else:
                 raw = self.CRYPTO_CLAUDE_EFFORT_TIER2
@@ -333,18 +428,74 @@ class Settings(BaseSettings):
             normalized = (raw or "").strip().lower()
             return normalized if normalized else default
 
-        # Codex CLI: 코인 전용 → 주식 설정 폴백
         if tier == LLMTier.TIER1:
-            if profile == Tier1Profile.SCAN:
-                raw = self.CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN
-            else:
-                raw = self.CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS
+            raw = (
+                self.CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN
+                if profile == Tier1Profile.SCAN
+                else self.CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS
+            )
         else:
             raw = self.CRYPTO_CODEX_REASONING_EFFORT_TIER2
 
         normalized = (raw or "").strip().lower()
         if normalized and normalized in VALID_CODEX_REASONING_EFFORTS:
             return normalized
+        return self.get_llm_reasoning_effort(provider, tier, profile)
+
+    def get_llm_model_for_scope(
+        self,
+        scope: str | None,
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str:
+        """scope 기준 모델명 반환"""
+        return self.get_llm_model_for_scope_provider(
+            scope,
+            self.llm_provider_for_scope(scope),
+            tier,
+            profile,
+        )
+
+    def get_llm_model_for_scope_provider(
+        self,
+        scope: str | None,
+        provider: LLMProvider,
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str:
+        """scope와 provider 기준 모델명 반환"""
+        from trading.market_profile import normalize_market_scope
+
+        if scope and normalize_market_scope(scope) == "CRYPTO":
+            return self.get_crypto_llm_model_for_provider(provider, tier, profile)
+        return self.get_llm_model(provider, tier)
+
+    def get_llm_reasoning_effort_for_scope(
+        self,
+        scope: str | None,
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str | None:
+        """scope 기준 reasoning effort 반환"""
+        return self.get_llm_reasoning_effort_for_scope_provider(
+            scope,
+            self.llm_provider_for_scope(scope),
+            tier,
+            profile,
+        )
+
+    def get_llm_reasoning_effort_for_scope_provider(
+        self,
+        scope: str | None,
+        provider: LLMProvider,
+        tier: LLMTier,
+        profile: Tier1Profile | None = None,
+    ) -> str | None:
+        """scope와 provider 기준 reasoning effort 반환"""
+        from trading.market_profile import normalize_market_scope
+
+        if scope and normalize_market_scope(scope) == "CRYPTO":
+            return self.get_crypto_llm_reasoning_effort_for_provider(provider, tier, profile)
         return self.get_llm_reasoning_effort(provider, tier, profile)
 
     @property
@@ -472,7 +623,7 @@ class Settings(BaseSettings):
 
         self._validate_codex_reasoning_efforts()
 
-        if not self.KIS_APP_KEY and not self.KIS_PAPER_APP_KEY:
+        if self.has_stock_markets and not self.KIS_APP_KEY and not self.KIS_PAPER_APP_KEY:
             logger.warning(
                 "KIS API 키 미설정: KIS_APP_KEY, KIS_PAPER_APP_KEY 모두 비어있음. "
                 "실매매/모의투자 모두 불가합니다."
