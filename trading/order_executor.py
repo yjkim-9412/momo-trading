@@ -2,6 +2,7 @@
 from loguru import logger
 
 from core.config import settings
+from trading.market_profile import is_crypto_market, normalize_market
 from trading.mcp_client import mcp_client
 from trading.models import OrderRequest, OrderResult
 
@@ -13,6 +14,10 @@ class OrderExecutor:
         """주문 실행"""
         if not settings.TRADING_ENABLED:
             return OrderResult(success=False, message="매매가 비활성화되어 있습니다")
+
+        market_code = normalize_market(request.market.value)
+        if is_crypto_market(market_code):
+            return await self._execute_crypto(request, market_code)
 
         response = await mcp_client.place_order(
             symbol=request.symbol,
@@ -41,9 +46,50 @@ class OrderExecutor:
             filled_price_krw=float(data.get("filled_price_krw", 0)),
         )
 
+    async def _execute_crypto(self, request: OrderRequest, market_code: str) -> OrderResult:
+        """크립토 주문 실행 (빗썸)"""
+        from trading.bithumb_client import bithumb_client
+
+        response = await bithumb_client.place_order(
+            symbol=request.symbol,
+            side=request.side.value,
+            quantity=request.quantity,
+            price=request.price,
+            market=market_code,
+        )
+
+        if not response.success:
+            logger.error("크립토 주문 실행 실패: {} {}", request.symbol, response.error)
+            return OrderResult(success=False, message=response.error or "크립토 주문 실패")
+
+        data = response.data or {}
+        logger.info(
+            "크립토 주문 실행: {} {} x{} @ {}",
+            request.symbol, request.side.value, request.quantity, request.price,
+        )
+        return OrderResult(
+            success=True,
+            order_id=data.get("order_id"),
+            message="크립토 주문 실행 완료",
+            filled_quantity=float(data.get("executed_volume", 0)),
+            filled_price=float(data.get("price", 0)),
+            currency="KRW",
+            filled_price_krw=float(data.get("price", 0)),
+        )
+
     async def cancel(self, order_id: str, market: str = "KRX") -> OrderResult:
         """주문 취소"""
-        if market in ("KOSPI", "KOSDAQ", "KRX"):
+        market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            from trading.bithumb_client import bithumb_client
+
+            response = await bithumb_client.cancel_order(order_id, market=market_code)
+            if not response.success:
+                return OrderResult(success=False, message=response.error or "크립토 취소 실패")
+            logger.info("크립토 주문 취소: {}", order_id)
+            return OrderResult(success=True, message="크립토 주문 취소 완료")
+
+        if market_code in ("KOSPI", "KOSDAQ", "KRX"):
             response = await mcp_client.call_tool("cancel_domestic_order", {
                 "order_id": order_id,
             })

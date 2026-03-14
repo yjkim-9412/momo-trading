@@ -9,7 +9,7 @@ from loguru import logger
 from core.config import settings
 from scheduler.market_calendar import market_calendar
 from trading.mcp_client import mcp_client
-from trading.market_profile import is_us_market, market_currency, normalize_market
+from trading.market_profile import is_crypto_market, is_us_market, market_currency, normalize_market
 from trading.models import AccountBalance, AccountOverview, HoldingInfo, PendingOrderInfo
 
 _INTRADAY_SNAPSHOT_TTL_SECONDS = 2.0
@@ -441,6 +441,9 @@ class AccountManager:
         return (current - cached_at) <= _INTRADAY_SNAPSHOT_TTL_SECONDS
 
     async def _fetch_account_snapshot(self, market_code: str) -> tuple[AccountBalance, list[HoldingInfo]]:
+        if is_crypto_market(market_code):
+            return await self._fetch_crypto_snapshot(market_code)
+
         response = await mcp_client.get_account_balance(market=market_code)
         if not response.success:
             logger.warning("계좌 조회 실패: {}", response.error)
@@ -457,6 +460,67 @@ class AccountManager:
             self._balance_cache[market_code] = balance
             self._holdings_cache[market_code] = holdings
             self._snapshot_cached_at[market_code] = time.monotonic()
+        return balance, holdings
+
+    async def _fetch_crypto_snapshot(self, market_code: str) -> tuple[AccountBalance, list[HoldingInfo]]:
+        """크립토 계좌 스냅샷: bithumb_client 잔고 + 보유 조회."""
+        from trading.bithumb_client import bithumb_client
+
+        balance_resp = await bithumb_client.get_account_balance(market=market_code)
+        if not balance_resp.success:
+            logger.warning("[{}] 크립토 잔고 조회 실패: {}", market_code, balance_resp.error)
+            return self._empty_balance(market_code, status_message=balance_resp.error or ""), []
+
+        bal_data = balance_resp.data or {}
+        logger.debug("[{}] 크립토 잔고 응답: {}", market_code, str(bal_data)[:500])
+
+        holdings_resp = await bithumb_client.get_holdings(market=market_code)
+        raw_holdings = (holdings_resp.data or {}).get("holdings", []) if holdings_resp.success else []
+
+        holdings: list[HoldingInfo] = []
+        for item in raw_holdings:
+            qty = self._to_float(item.get("quantity", 0))
+            if qty <= 0:
+                continue
+            holdings.append(HoldingInfo(
+                symbol=item.get("symbol", ""),
+                name=item.get("name", item.get("symbol", "")),
+                market=market_code,
+                currency="KRW",
+                quantity=qty,
+                avg_buy_price=self._to_float(item.get("avg_buy_price", 0)),
+                current_price=self._to_float(item.get("current_price", 0)),
+                pnl=self._to_float(item.get("pnl", 0)),
+                pnl_rate=self._to_float(item.get("pnl_rate", 0)),
+                exchange_rate_to_krw=1.0,
+            ))
+
+        total_asset = self._to_float(bal_data.get("total_asset", 0))
+        cash = self._to_float(bal_data.get("cash", 0))
+        stock_value = self._to_float(bal_data.get("stock_value", 0))
+
+        balance = AccountBalance(
+            total_asset=total_asset,
+            cash=cash,
+            stock_value=stock_value,
+            total_pnl=self._to_float(bal_data.get("total_pnl", 0)),
+            total_pnl_rate=self._to_float(bal_data.get("total_pnl_rate", 0)),
+            raw_total_pnl=self._to_float(bal_data.get("total_pnl", 0)),
+            raw_total_pnl_rate=self._to_float(bal_data.get("total_pnl_rate", 0)),
+            pnl_source="BROKER_SUMMARY",
+            market=market_code,
+            currency="KRW",
+            exchange_rate_to_krw=1.0,
+            raw_cash=cash,
+            effective_cash=cash,
+            cash_source="BROKER",
+            status_message="",
+            is_valid=True,
+        )
+
+        self._balance_cache[market_code] = balance
+        self._holdings_cache[market_code] = holdings
+        self._snapshot_cached_at[market_code] = time.monotonic()
         return balance, holdings
 
     async def get_account_snapshot(self, market: str | None = None) -> tuple[AccountBalance, list[HoldingInfo]]:

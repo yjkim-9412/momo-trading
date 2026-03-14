@@ -163,6 +163,11 @@ def is_crypto_market(market: str | Market | None) -> bool:
     return get_market_profile(market).region == "CRYPTO"
 
 
+def requires_mcp_connection(market: str | Market | None) -> bool:
+    """장중 트레이딩 진입 전에 KIS MCP 연결이 필요한 시장 여부."""
+    return not is_crypto_market(market)
+
+
 def normalize_market_scope(scope_or_market: str | Market | None, default: str = MARKET_SCOPE_KRX) -> str:
     """시장 scope를 KRX/US/CRYPTO 중 하나로 정규화"""
     raw = str(scope_or_market or default).strip().upper()

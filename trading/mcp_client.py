@@ -10,6 +10,7 @@ from loguru import logger
 
 from core.config import settings
 from trading.market_profile import (
+    is_crypto_market,
     is_domestic_market,
     kis_exchange_code,
     market_currency,
@@ -999,6 +1000,10 @@ class MCPClient:
     async def get_current_price(self, symbol: str, market: str = "KRX") -> MCPResponse:
         """현재가 조회 (KIS 원본 키 → 정규화)"""
         market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            from trading.bithumb_client import bithumb_client
+
+            return await bithumb_client.get_current_price(symbol, market=market_code)
         if is_domestic_market(market_code):
             resp = await self.call_tool("inquery-stock-price", {"symbol": symbol})
         else:
@@ -1059,6 +1064,10 @@ class MCPClient:
     async def get_account_balance(self, market: str = "KRX") -> MCPResponse:
         """계좌 잔고 조회"""
         market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            from trading.bithumb_client import bithumb_client
+
+            return await bithumb_client.get_account_balance(market=market_code)
         if is_domestic_market(market_code):
             return await self.call_tool("inquery-balance")
         from trading.kis_api import get_overseas_balance, get_overseas_present_balance
@@ -1243,6 +1252,17 @@ class MCPClient:
         start_date = (datetime.now() - timedelta(days=count * 2)).strftime("%Y%m%d")
         market_code = normalize_market(market)
 
+        if is_crypto_market(market_code):
+            from trading.bithumb_client import bithumb_client
+
+            resp = await bithumb_client.get_daily_price(
+                symbol, market=market_code, period=period, count=count,
+            )
+            if resp.success and resp.data:
+                # bithumb_client는 "candles" 키로 반환 → "prices"로도 매핑
+                resp.data["prices"] = resp.data.get("candles", [])
+            return resp
+
         if is_domestic_market(market_code):
             resp = await self.call_tool("inquery-stock-info", {
                 "symbol": symbol, "start_date": start_date, "end_date": end_date,
@@ -1288,12 +1308,19 @@ class MCPClient:
         return resp
 
     async def place_order(
-        self, symbol: str, side: str, quantity: int,
+        self, symbol: str, side: str, quantity: float,
         price: float | None = None, market: str = "KRX"
     ) -> MCPResponse:
         """주문 실행 (KIS 원본 키 → 정규화)"""
         order_type = "buy" if side == "BUY" else "sell"
         market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            from trading.bithumb_client import bithumb_client
+
+            return await bithumb_client.place_order(
+                symbol=symbol, side=side, quantity=quantity,
+                price=price, market=market_code,
+            )
         if is_domestic_market(market_code):
             resp = await self.call_tool("order-stock", {
                 "symbol": symbol,
@@ -1353,6 +1380,15 @@ class MCPClient:
             }
         return resp
 
+    async def get_order(self, order_id: str, market: str = "KRX") -> MCPResponse:
+        """단건 주문 조회"""
+        market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            from trading.bithumb_client import bithumb_client
+
+            return await bithumb_client.get_order(order_id=order_id, market=market_code)
+        return MCPResponse(success=False, error=f"단건 주문 조회 미지원 시장: {market_code}")
+
     async def get_volume_rank(self, market: str = "KRX") -> MCPResponse:
         """거래량 상위 종목 조회"""
         from trading.kis_api import get_volume_rank
@@ -1411,6 +1447,29 @@ class MCPClient:
         from trading.kis_api import get_minute_chart
 
         market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            from trading.bithumb_client import bithumb_client
+
+            resp = await bithumb_client.get_minute_price(
+                symbol, market=market_code, interval=int(period), count=60,
+            )
+            if resp.success and resp.data:
+                # bithumb_client는 "candles" 키로 반환 → "prices"로도 매핑
+                candles = resp.data.get("candles", [])
+                prices = [
+                    {
+                        "time": c.get("date", ""),
+                        "open": c.get("open", 0),
+                        "high": c.get("high", 0),
+                        "low": c.get("low", 0),
+                        "close": c.get("close", 0),
+                        "volume": c.get("volume", 0),
+                    }
+                    for c in candles
+                ]
+                resp.data["prices"] = prices
+            return resp
+
         if not is_domestic_market(market_code):
             from trading.kis_api import get_overseas_minute_chart
 
@@ -1514,6 +1573,10 @@ class MCPClient:
 
         today = datetime.now().strftime("%Y%m%d")
         market_code = normalize_market(market)
+
+        if is_crypto_market(market_code):
+            # 빗썸은 별도 미체결 내역 API가 없으므로 빈 리스트 반환
+            return MCPResponse(success=True, data={"output": []})
 
         if is_domestic_market(market_code):
             return await self.call_tool("inquery-order-list", {

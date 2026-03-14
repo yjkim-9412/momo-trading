@@ -183,6 +183,14 @@ class BithumbClient:
     # 저수준 HTTP 호출
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _response_preview(text: str, limit: int = 200) -> str:
+        """응답 본문 일부를 한 줄로 축약"""
+        compact = " ".join((text or "").split())
+        if len(compact) <= limit:
+            return compact
+        return compact[:limit] + "..."
+
     async def _public_get(self, path: str, params: dict[str, Any] | None = None) -> MCPResponse:
         """Public GET 요청 (인증 불필요)."""
         async with self._public_semaphore:
@@ -190,10 +198,55 @@ class BithumbClient:
             try:
                 client = await self._ensure_client()
                 resp = await client.get(path, params=params)
-                data = resp.json()
+                content_type = resp.headers.get("content-type", "")
+                body_preview = self._response_preview(resp.text)
+                if resp.status_code >= 400:
+                    error = (
+                        f"HTTP {resp.status_code} | content-type={content_type or '-'}"
+                        f" | body={body_preview or '<empty>'}"
+                    )
+                    logger.error(
+                        "빗썸 public GET 오류 [{}]: params={} {}",
+                        path,
+                        params or {},
+                        error,
+                    )
+                    return MCPResponse(
+                        success=False,
+                        error=error,
+                        data={
+                            "status_code": resp.status_code,
+                            "content_type": content_type or None,
+                            "body_preview": body_preview or None,
+                        },
+                    )
+                try:
+                    data = resp.json()
+                except ValueError as exc:
+                    error = (
+                        f"non_json_response: HTTP {resp.status_code}"
+                        f" | content-type={content_type or '-'}"
+                        f" | body={body_preview or '<empty>'}"
+                    )
+                    logger.error(
+                        "빗썸 public GET 오류 [{}]: params={} {} ({})",
+                        path,
+                        params or {},
+                        error,
+                        exc,
+                    )
+                    return MCPResponse(
+                        success=False,
+                        error=error,
+                        data={
+                            "status_code": resp.status_code,
+                            "content_type": content_type or None,
+                            "body_preview": body_preview or None,
+                        },
+                    )
                 return self._parse_response(data)
             except Exception as e:
-                logger.error("빗썸 public GET 오류 [{}]: {}", path, e)
+                logger.error("빗썸 public GET 오류 [{}]: params={} {}", path, params or {}, e)
                 return MCPResponse(success=False, error=str(e))
 
     async def _private_request(
@@ -288,6 +341,15 @@ class BithumbClient:
     @staticmethod
     def _normalize_ticker(raw: dict[str, Any]) -> dict[str, Any]:
         """빗썸 ticker 객체를 프로젝트 표준 dict로 변환."""
+        change_direction = str(raw.get("change", "") or "").upper()
+        change_price = _to_float(raw.get("change_price"))
+        signed_change_price = _to_float(raw.get("signed_change_price"))
+        if signed_change_price == 0.0 and change_price > 0:
+            if change_direction == "FALL":
+                signed_change_price = -change_price
+            else:
+                signed_change_price = change_price
+
         return {
             "market": raw.get("market", ""),
             "symbol": _symbol_from_market_code(raw.get("market", "")),
@@ -296,8 +358,10 @@ class BithumbClient:
             "high_price": _to_float(raw.get("high_price")),
             "low_price": _to_float(raw.get("low_price")),
             "prev_closing_price": _to_float(raw.get("prev_closing_price")),
-            "change": raw.get("change", ""),
-            "change_price": _to_float(raw.get("change_price")),
+            "change": signed_change_price,
+            "change_direction": change_direction,
+            "change_price": change_price,
+            "signed_change_price": signed_change_price,
             "change_rate": _to_float(raw.get("signed_change_rate")),
             "volume": _to_float(raw.get("acc_trade_volume_24h")),
             "trade_value": _to_float(raw.get("acc_trade_price_24h")),
@@ -306,6 +370,27 @@ class BithumbClient:
             "lowest_52_week_price": _to_float(raw.get("lowest_52_week_price")),
             "timestamp": raw.get("timestamp"),
         }
+
+    # ===================================================================
+    # 내부 헬퍼
+    # ===================================================================
+
+    async def _fetch_coin_prices(self, symbols: list[str]) -> dict[str, float]:
+        """여러 코인의 현재가를 벌크 조회 → {symbol: price} dict"""
+        if not symbols:
+            return {}
+        market_codes = ",".join(_to_market_code(s) for s in symbols)
+        resp = await self._public_get("/v1/ticker", params={"markets": market_codes})
+        if not resp.success or not resp.data:
+            return {}
+        prices: dict[str, float] = {}
+        for item in resp.data.get("items", []):
+            raw_market = str(item.get("market", ""))
+            symbol = _symbol_from_market_code(raw_market)
+            price = _to_float(item.get("trade_price"))
+            if symbol and price > 0:
+                prices[symbol] = price
+        return prices
 
     # ===================================================================
     # BrokerClient Protocol 구현
@@ -395,6 +480,10 @@ class BithumbClient:
 
         holdings: list[dict[str, Any]] = []
 
+        # 1단계: KRW 잔고 + 코인 보유량 파싱
+        coin_symbols: list[str] = []
+        coin_data: list[dict] = []
+
         for item in items:
             currency = str(item.get("currency", "")).upper()
             balance = _to_decimal(item.get("balance"))
@@ -410,20 +499,46 @@ class BithumbClient:
             if total_qty <= 0:
                 continue
 
-            # 코인 평가액 = 수량 * 평균매입가 (현재가 미포함 — 간이 계산)
-            coin_value = total_qty * avg_buy_price
+            coin_symbols.append(currency)
+            coin_data.append({
+                "currency": currency,
+                "balance": balance,
+                "locked": locked,
+                "total_qty": total_qty,
+                "avg_buy_price": avg_buy_price,
+            })
+
+        # 2단계: 벌크 현재가 조회
+        prices = await self._fetch_coin_prices(coin_symbols) if coin_symbols else {}
+
+        # 3단계: 현재가 기반 평가
+        total_pnl = Decimal("0")
+
+        for cd in coin_data:
+            sym = cd["currency"]
+            current_price = Decimal(str(prices.get(sym, 0)))
+            if current_price > 0:
+                coin_value = cd["total_qty"] * current_price
+            else:
+                coin_value = cd["total_qty"] * cd["avg_buy_price"]  # 현재가 조회 실패 시 폴백
+
             total_coin_value += coin_value
+            cost_basis = cd["total_qty"] * cd["avg_buy_price"]
+            total_pnl += coin_value - cost_basis
 
             holdings.append({
-                "currency": currency,
-                "balance": float(balance),
-                "locked": float(locked),
-                "avg_buy_price": float(avg_buy_price),
+                "currency": sym,
+                "balance": float(cd["balance"]),
+                "locked": float(cd["locked"]),
+                "avg_buy_price": float(cd["avg_buy_price"]),
+                "current_price": float(current_price),
                 "coin_value_krw": float(coin_value),
             })
 
         total_asset = krw_balance + krw_locked + total_coin_value
-        cash = krw_balance  # 주문 가능 원화
+        cash = krw_balance
+        cost_total = total_asset - total_pnl
+        pnl_rate = float(total_pnl / cost_total * 100) if cost_total > 0 else 0.0
 
         return MCPResponse(
             success=True,
@@ -432,8 +547,8 @@ class BithumbClient:
                 "cash": float(cash),
                 "locked_krw": float(krw_locked),
                 "stock_value": float(total_coin_value),
-                "total_pnl": 0.0,  # 실시간 PnL은 현재가 조회 필요
-                "total_pnl_rate": 0.0,
+                "total_pnl": float(total_pnl),
+                "total_pnl_rate": pnl_rate,
                 "market": "BITHUMB",
                 "currency": "KRW",
                 "holdings_count": len(holdings),
@@ -442,14 +557,16 @@ class BithumbClient:
         )
 
     async def get_holdings(self, market: str = "") -> MCPResponse:
-        """보유 종목 목록 — ``GET /v1/accounts`` 에서 코인만 추출."""
+        """보유 종목 목록 — ``GET /v1/accounts`` 에서 코인만 추출 + 벌크 현재가 조회."""
         resp = await self._private_request("GET", "/v1/accounts")
         if not resp.success or not resp.data:
             return resp
 
         items: list[dict[str, Any]] = resp.data.get("items", [])
-        holdings: list[dict[str, Any]] = []
 
+        # 1단계: 코인 보유량 파싱
+        coin_list: list[dict] = []
+        symbols: list[str] = []
         for item in items:
             currency = str(item.get("currency", "")).upper()
             if currency == "KRW":
@@ -462,19 +579,40 @@ class BithumbClient:
                 continue
 
             avg_buy_price = _to_decimal(item.get("avg_buy_price"))
+            symbols.append(currency)
+            coin_list.append({
+                "symbol": currency,
+                "balance": balance,
+                "locked": locked,
+                "total_qty": total_qty,
+                "avg_buy_price": avg_buy_price,
+            })
+
+        # 2단계: 벌크 현재가 조회
+        prices = await self._fetch_coin_prices(symbols) if symbols else {}
+
+        # 3단계: PnL 계산
+        holdings: list[dict[str, Any]] = []
+        for cd in coin_list:
+            sym = cd["symbol"]
+            qty = float(cd["total_qty"])
+            avg = float(cd["avg_buy_price"])
+            cur_price = prices.get(sym, 0.0)
+            pnl = (cur_price - avg) * qty if cur_price > 0 and avg > 0 else 0.0
+            pnl_rate = ((cur_price / avg) - 1) * 100 if avg > 0 and cur_price > 0 else 0.0
 
             holdings.append({
-                "symbol": currency,
-                "name": currency,
+                "symbol": sym,
+                "name": sym,
                 "market": "BITHUMB",
                 "currency": "KRW",
-                "quantity": float(total_qty),
-                "available_quantity": float(balance),
-                "locked_quantity": float(locked),
-                "avg_buy_price": float(avg_buy_price),
-                "current_price": 0.0,  # 별도 ticker 호출 필요
-                "pnl": 0.0,
-                "pnl_rate": 0.0,
+                "quantity": qty,
+                "available_quantity": float(cd["balance"]),
+                "locked_quantity": float(cd["locked"]),
+                "avg_buy_price": avg,
+                "current_price": cur_price,
+                "pnl": round(pnl, 2),
+                "pnl_rate": round(pnl_rate, 2),
                 "exchange_rate_to_krw": 1.0,
             })
 
@@ -541,7 +679,8 @@ class BithumbClient:
             data={
                 "order_id": data.get("uuid", ""),
                 "side": side.upper(),
-                "market": market_code,
+                "market": "BITHUMB",
+                "market_pair": market_code,
                 "ord_type": data.get("ord_type", ""),
                 "price": data.get("price", ""),
                 "state": data.get("state", ""),
@@ -552,6 +691,49 @@ class BithumbClient:
                 "created_at": data.get("created_at", ""),
             },
         )
+
+    @staticmethod
+    def _normalize_order_payload(data: dict[str, Any]) -> dict[str, Any]:
+        """빗썸 주문 응답을 공통 order dict로 정규화"""
+        market_pair = str(data.get("market", "") or "")
+        symbol = _symbol_from_market_code(market_pair) if market_pair else ""
+        order_price = _to_float(data.get("price"))
+        ord_type = str(data.get("ord_type", "") or "").lower()
+        filled_qty = _to_float(data.get("executed_volume"))
+        remaining_qty = _to_float(data.get("remaining_volume"))
+        order_qty = _to_float(data.get("volume"))
+        normalized_side = str(data.get("side", "") or "").lower()
+
+        return {
+            "order_id": data.get("uuid", ""),
+            "client_order_id": data.get("client_order_id", ""),
+            "market": "BITHUMB",
+            "market_pair": market_pair,
+            "symbol": symbol,
+            "name": symbol,
+            "side": "BUY" if normalized_side == "bid" else "SELL" if normalized_side == "ask" else normalized_side.upper(),
+            "status": str(data.get("state", "") or ""),
+            "state": str(data.get("state", "") or ""),
+            "ord_type": ord_type,
+            "order_price": order_price,
+            "price": order_price,
+            "order_qty": order_qty,
+            "volume": order_qty,
+            "filled_qty": filled_qty,
+            "filled_quantity": filled_qty,
+            "executed_volume": filled_qty,
+            "remaining_qty": remaining_qty,
+            "remaining_volume": remaining_qty,
+            "filled_price": order_price if ord_type == "limit" else 0.0,
+            "currency": "KRW",
+            "exchange_rate_to_krw": 1.0,
+            "paid_fee": _to_float(data.get("paid_fee")),
+            "reserved_fee": _to_float(data.get("reserved_fee")),
+            "remaining_fee": _to_float(data.get("remaining_fee")),
+            "locked": _to_float(data.get("locked")),
+            "trades_count": int(data.get("trades_count") or 0),
+            "created_at": data.get("created_at", ""),
+        }
 
     async def cancel_order(self, order_id: str, market: str = "", **kwargs: Any) -> MCPResponse:
         """주문 취소 — ``DELETE /v1/order?uuid={order_id}``"""
@@ -571,10 +753,28 @@ class BithumbClient:
                 "order_id": data.get("uuid", order_id),
                 "state": data.get("state", ""),
                 "side": data.get("side", ""),
-                "market": data.get("market", ""),
+                "market": "BITHUMB",
+                "market_pair": data.get("market", ""),
                 "remaining_volume": data.get("remaining_volume", ""),
                 "executed_volume": data.get("executed_volume", ""),
             },
+        )
+
+    async def get_order(self, order_id: str, market: str = "", **kwargs: Any) -> MCPResponse:
+        """개별 주문 조회 — ``GET /v1/order?uuid={order_id}``"""
+        resp = await self._private_request(
+            "GET",
+            "/v1/order",
+            params={"uuid": order_id},
+        )
+        if not resp.success:
+            logger.warning("빗썸 개별 주문 조회 실패 ({}): {}", order_id, resp.error)
+            return resp
+
+        data = resp.data or {}
+        return MCPResponse(
+            success=True,
+            data=self._normalize_order_payload(data),
         )
 
     async def get_orderable_amount(
@@ -676,10 +876,18 @@ class BithumbClient:
             data={"items": overview, "count": len(overview)},
         )
 
-    async def get_volume_rank(self, market: str = "", **kwargs: Any) -> MCPResponse:
+    async def get_volume_rank(
+        self,
+        market: str = "",
+        *,
+        overview_data: MCPResponse | dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> MCPResponse:
         """거래대금 상위 종목 — overview 데이터에서 trade_value 내림차순 정렬."""
         limit = int(kwargs.get("limit", 30))
-        overview = await self.get_market_overview(market)
+        overview = overview_data if overview_data is not None else await self.get_market_overview(market)
+        if isinstance(overview, dict):
+            overview = MCPResponse(success=True, data=overview)
         if not overview.success or not overview.data:
             return overview
 
@@ -692,10 +900,18 @@ class BithumbClient:
             data={"items": top, "count": len(top), "sort_by": "trade_value"},
         )
 
-    async def get_surge_data(self, market: str = "", **kwargs: Any) -> MCPResponse:
+    async def get_surge_data(
+        self,
+        market: str = "",
+        *,
+        overview_data: MCPResponse | dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> MCPResponse:
         """급등/급락 종목 — overview 데이터에서 change_rate 절대값 내림차순 정렬."""
         limit = int(kwargs.get("limit", 30))
-        overview = await self.get_market_overview(market)
+        overview = overview_data if overview_data is not None else await self.get_market_overview(market)
+        if isinstance(overview, dict):
+            overview = MCPResponse(success=True, data=overview)
         if not overview.success or not overview.data:
             return overview
 
