@@ -25,14 +25,31 @@ export function formatPrice(n) {
   return value.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
 }
 
+// ── KRW formatting for account/pending UI ──
+export function formatDetailedKRW(n) {
+  if (n == null || Number.isNaN(Number(n))) return '-';
+  var value = Number(n);
+  var rounded = Math.round(value);
+  var exact = rounded.toLocaleString() + '원';
+  if (Math.abs(rounded) < 10000) return exact;
+  return exact + ' (' + formatKRW(rounded) + ')';
+}
+
+export function formatPreciseKRWTitle(n) {
+  if (n == null || Number.isNaN(Number(n))) return '';
+  var value = Number(n);
+  return value.toLocaleString('ko-KR', { maximumFractionDigits: 6 }) + ' KRW';
+}
+
 // ── P&L with color ──
 export function formatPnl(pnl, rate) {
   var pnlVal = Number(pnl ?? 0);
   var rateVal = Number(rate ?? 0);
-  var sign = pnlVal >= 0 ? '+' : '';
+  var sign = pnlVal > 0 ? '+' : pnlVal < 0 ? '-' : '';
   var color = pnlVal > 0 ? 'text-green-400' : pnlVal < 0 ? 'text-red-400' : 'text-gray-400';
-  var pnlText = sign + formatKRW(pnlVal);
-  var rateText = sign + rateVal.toFixed(2) + '%';
+  var pnlText = sign + formatDetailedKRW(Math.abs(pnlVal));
+  var rateSign = rateVal > 0 ? '+' : rateVal < 0 ? '-' : '';
+  var rateText = rateSign + Math.abs(rateVal).toFixed(2) + '%';
   return '<span class="' + color + '">' + pnlText + ' / ' + rateText + '</span>';
 }
 
@@ -102,7 +119,7 @@ export function formatSignedKRW(value) {
   var amount = Number(value ?? 0);
   if (!Number.isFinite(amount)) return '-';
   var sign = amount > 0 ? '+' : amount < 0 ? '-' : '';
-  return sign + formatKRW(Math.abs(amount));
+  return sign + formatDetailedKRW(Math.abs(amount));
 }
 
 // ── Set inline status element ──

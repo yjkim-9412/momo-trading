@@ -177,6 +177,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - 공용 알림 분류기(`admin/static/js/shared/admin-toast.js`)는 코인 `TIER1_ANALYSIS COMPLETE`를 `summary` 키워드가 아니라 `detail.recommendation` 우선으로 해석한다. `HOLD/스킵/관망/보류/미승인` 문구 안에 `BUY/SELL` 단어가 있어도 알림을 띄우지 않게 유지한다.
 - 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`로 WS 감시 상태를 렌더링한다.
 - 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`까지 함께 본다.
+- 코인 계좌 잔고/보유 평가/미체결 주문 금액은 공용 `formatKRW()` 축약이 아니라 `coin-utils.js`의 계좌 전용 상세 포맷을 사용한다. 기본 표시는 `10,031원 (1만)` 형태이고, element `title`에는 raw KRW 값을 넣어 hover로 더 자세히 본다.
 - 코인 활동 피드는 `CoinActivityLog.detail`와 `execution_time_ms`를 그대로 노출해 LLM system prompt / prompt / response를 인라인으로 점검한다.
 - 코인 체크포인트 리포트 KPI(`total_cycles`, `total_analyses`, `activity_counts` 등)는 `period_started_at ~ period_ended_at` 전체를 exact aggregate로 계산한다. 최근 활동 로그는 prompt 크기 보호용 sample로만 사용하고 KPI와 섞지 않는다.
 - 코인 어드민 수동 스캔 버튼은 HTML inline handler를 쓰지 않고 단일 JS 바인딩만 사용한다. 버튼 상태는 `agent/state`를 기준으로 `요청 중 → 시작 대기 → 진행 중 → 완료/스킵` 흐름을 표시한다.
