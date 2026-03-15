@@ -1,6 +1,7 @@
 // ── coin-utils.js — Coin-specific formatting and utility functions ──
 
 import { formatKRW } from '../shared/admin-core.js';
+import { state } from './coin-state.js';
 
 // ── Coin quantity formatting (0-8 decimals) ──
 export function formatCoinQty(n) {
