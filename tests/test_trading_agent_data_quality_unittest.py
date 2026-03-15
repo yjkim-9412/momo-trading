@@ -108,12 +108,14 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn(f"BULL_RUN/ALTSEASON/THEME 국면: {CRYPTO_MOMENTUM_RR_FLOOR:.1f}:1 이상이면 적정", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn(f"BEAR_MARKET/CONSOLIDATION 국면: 최소 {CRYPTO_DEFENSIVE_RR_FLOOR:.1f}:1", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("24/7 시장이므로 시간 압박은 없습니다", CRYPTO_ANALYSIS_SYSTEM)
+        self.assertIn("지나치게 보수적인 HOLD보다 BUY를 우선 검토하세요", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("ADD_ON_PYRAMID", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("ADD_ON_AVERAGE_DOWN", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("5,000 KRW", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("수량이 아니라 KRW 투자금 기준", CRYPTO_ANALYSIS_PROMPT)
         self.assertIn("24h 거래대금: {trade_value_text}", CRYPTO_ANALYSIS_PROMPT)
         self.assertIn("거래대금이 약하거나 추격 매수 성격이 강하면", CRYPTO_ANALYSIS_PROMPT)
+        self.assertIn("HOLD라면 거래대금 부족, 추격 매수, 추세 불일치, RR 부족, 지지선 회복 미확인", CRYPTO_ANALYSIS_PROMPT)
         self.assertNotIn('"recommendation": "BUY/SELL/HOLD"', CRYPTO_ANALYSIS_PROMPT)
 
     def test_final_review_prompt_requires_market_currency_for_price_fields(self):
@@ -139,9 +141,11 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn(f"RR비율: {CRYPTO_MOMENTUM_RR_FLOOR:.1f}:1 이상이면 허용", CRYPTO_REVIEW_SYSTEM)
         self.assertIn(f"RR비율: 최소 {CRYPTO_DEFENSIVE_RR_FLOOR:.1f}:1", CRYPTO_REVIEW_SYSTEM)
         self.assertIn("시장가 금액 매수", CRYPTO_REVIEW_SYSTEM)
+        self.assertIn("막연한 불안감만으로 HOLD로 돌리지 말고 BUY를 우선 검토하세요", CRYPTO_REVIEW_SYSTEM)
         self.assertIn("suggested_amount_krw", CRYPTO_REVIEW_PROMPT)
         self.assertIn("24h 거래대금: {trade_value_text}", CRYPTO_REVIEW_PROMPT)
         self.assertIn("action: BUY 또는 HOLD만 사용하세요", CRYPTO_REVIEW_PROMPT)
+        self.assertIn("체크리스트 통과 시 HOLD보다 BUY를 우선 검토하세요", CRYPTO_REVIEW_PROMPT)
         self.assertIn('"action": "BUY/HOLD"', CRYPTO_REVIEW_PROMPT)
         self.assertNotIn('"action": "BUY/SELL/HOLD"', CRYPTO_REVIEW_PROMPT)
 
@@ -160,10 +164,12 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("수시간~2일", CRYPTO_MARKET_SCAN_SYSTEM)
         self.assertIn("THEME(섹터 장세)", CRYPTO_MARKET_SCAN_SYSTEM)
         self.assertIn("canonical 국면명만 사용", CRYPTO_MARKET_SCAN_SYSTEM)
+        self.assertIn("0개보다 1개 이상 선정을 우선하세요", CRYPTO_MARKET_SCAN_SYSTEM)
         self.assertIn("최소 주문금액은 5,000 KRW", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn("수량이 아니라 KRW 투자금 기준", CRYPTO_MARKET_SCAN_SYSTEM)
         self.assertIn("이번 스캔 선정 목표: {selection_target_range}개", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn("적합한 후보가 없으면 0개 허용", CRYPTO_MARKET_SCAN_PROMPT)
+        self.assertIn("조건을 충족하는 후보가 있으면 0개보다 1개 이상 선정을 우선", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn('"market_regime": "BULL_RUN/BEAR_MARKET/CONSOLIDATION/ALTSEASON/THEME"', CRYPTO_MARKET_SCAN_PROMPT)
 
     def test_crypto_primary_market_falls_back_to_bithumb_for_invalid_value(self):

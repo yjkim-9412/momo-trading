@@ -173,6 +173,7 @@ CRYPTO_MARKET_SCAN_SYSTEM = """당신은 암호화폐(코인) 시장 전문 스�
   - 공격형(AGGRESSIVE_SHORT): 알트코인, 거래대금 급증, 강한 모멘텀, 높은 변동성
   - BULL_RUN → 대형 + 리더 알트 혼합 / BEAR_MARKET → 대형 코인 위주 또는 0개 허용
   - ALTSEASON/THEME → 주도 알트·섹터 코인 AGGRESSIVE_SHORT 적극 선정
+  - 강세 국면(BULL_RUN/ALTSEASON/THEME)에서는 유동성·추세·실행 가능성이 확인된 후보가 있으면 0개보다 1개 이상 선정을 우선하세요
 
 **Step 3. 코인 시장 특성 반영**
   - 24/7 시장이므로 시간에 쫓겨 억지로 후보를 채우지 말고, 적합한 후보가 없으면 0개도 허용
@@ -188,6 +189,7 @@ CRYPTO_MARKET_SCAN_SYSTEM = """당신은 암호화폐(코인) 시장 전문 스�
 - 제공된 데이터만 사용 (추측 금지)
 - 투자 가용 금액 고려
 - 코인당 최대 KRW 한도 안에서 **5,000 KRW 이상 주문이 현실적으로 가능한 후보**만 남길 것
+- 강세 국면이어도 거래대금 둔화, 과열 추격, RR 부족, 5,000 KRW 주문 현실성 부족이면 제외할 것
 - 과거 손실 패턴 회피
 - canonical 국면명만 사용: `BULL_RUN`, `BEAR_MARKET`, `CONSOLIDATION`, `ALTSEASON`, `THEME`
 - **절대 규칙**: 반드시 위 데이터에 있는 코인만 선정
@@ -221,6 +223,7 @@ CRYPTO_MARKET_SCAN_PROMPT = """## 코인 시장 데이터
 
 위 데이터를 분석하여 시장 국면을 판단하고, **심층 분석할 코인을 {selection_target_range}개 범위에서** 직접 선정하세요.
 각 코인에 적합한 전략(STABLE_SHORT/AGGRESSIVE_SHORT)을 배정하세요.
+강세 국면(BULL_RUN/ALTSEASON/THEME)에서는 조건을 충족하는 후보가 있으면 0개보다 1개 이상 선정을 우선하되, 조건 미달이면 0개 허용을 유지하세요.
 
 JSON:
 ```json
