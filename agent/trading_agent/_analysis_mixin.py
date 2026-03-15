@@ -418,7 +418,7 @@ class AnalysisMixin:
         feedback_context = "매매 이력 없음"
         try:
             async with AsyncSessionLocal() as session:
-                builder = FeedbackContextBuilder(session)
+                builder = FeedbackContextBuilder(session, market_scope=scope)
                 rsi_val = indicators.get("rsi_14")
                 feedback_context = await builder.build_full_context(
                     strategy_type=strategy_type,
