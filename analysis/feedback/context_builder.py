@@ -18,8 +18,12 @@ class FeedbackContextBuilder:
     - 시장 국면별 성과 → 현재 시장에 적합한 판단 유도
     """
 
-    def __init__(self, session: AsyncSession):
-        self.tracker = PerformanceTracker(session)
+    def __init__(self, session: AsyncSession, market_scope: str | None = None):
+        if market_scope == "CRYPTO":
+            from models.coin_trade_result import CoinTradeResult
+            self.tracker = PerformanceTracker(session, model=CoinTradeResult)
+        else:
+            self.tracker = PerformanceTracker(session)
 
     async def build_strategy_context(self, strategy_type: str, market_scope: str | None = None) -> str:
         """전략별 성과 컨텍스트"""

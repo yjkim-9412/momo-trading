@@ -48,3 +48,21 @@ class CoinTradeResult(Base, TimestampMixin):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     entry_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     exit_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # ── TradeResult 호환 프로퍼티 (PerformanceTracker 공유용) ──
+
+    @property
+    def stock_symbol(self) -> str:
+        return self.symbol
+
+    @property
+    def stock_name(self) -> str:
+        return self.coin_name
+
+    @property
+    def hold_days(self) -> int:
+        return self.hold_hours
+
+    @property
+    def entry_pattern(self) -> str | None:
+        return None

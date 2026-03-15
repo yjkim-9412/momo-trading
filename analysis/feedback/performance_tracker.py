@@ -30,14 +30,21 @@ class PerformanceTracker:
     이 데이터는 AI 프롬프트에 포함되어 동일 패턴 반복 실수 방지에 활용.
     """
 
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, model=None):
         self.session = session
+        self.model = model or TradeResult
 
-    @staticmethod
-    def _apply_market_scope(stmt, market_scope: str | None):
+    def _apply_market_scope(self, stmt, market_scope: str | None):
         if not market_scope:
             return stmt
+        if self.model is not TradeResult:
+            return stmt
         return stmt.where(TradeResult.market.in_(markets_for_scope(market_scope)))
+
+    def _symbol_col(self):
+        if self.model is TradeResult:
+            return TradeResult.stock_symbol
+        return self.model.symbol
 
     async def get_strategy_stats(
         self,
@@ -46,10 +53,11 @@ class PerformanceTracker:
         market_scope: str | None = None,
     ) -> PerformanceStat:
         """전략별 성과 통계"""
+        M = self.model
         stmt = (
-            select(TradeResult)
-            .where(TradeResult.strategy_type == strategy_type)
-            .order_by(TradeResult.created_at.desc())
+            select(M)
+            .where(M.strategy_type == strategy_type)
+            .order_by(M.created_at.desc())
             .limit(limit)
         )
         stmt = self._apply_market_scope(stmt, market_scope)
@@ -64,10 +72,11 @@ class PerformanceTracker:
         market_scope: str | None = None,
     ) -> PerformanceStat:
         """종목별 성과 통계"""
+        M = self.model
         stmt = (
-            select(TradeResult)
-            .where(TradeResult.stock_symbol == symbol)
-            .order_by(TradeResult.created_at.desc())
+            select(M)
+            .where(self._symbol_col() == symbol)
+            .order_by(M.created_at.desc())
             .limit(limit)
         )
         stmt = self._apply_market_scope(stmt, market_scope)
@@ -82,10 +91,13 @@ class PerformanceTracker:
         market_scope: str | None = None,
     ) -> PerformanceStat:
         """차트 패턴별 성과 통계 (예: GOLDEN_CROSS, HAMMER 등)"""
+        M = self.model
+        if M is not TradeResult:
+            return PerformanceStat()
         stmt = (
-            select(TradeResult)
+            select(M)
             .where(TradeResult.entry_pattern == pattern)
-            .order_by(TradeResult.created_at.desc())
+            .order_by(M.created_at.desc())
             .limit(limit)
         )
         stmt = self._apply_market_scope(stmt, market_scope)
@@ -100,16 +112,17 @@ class PerformanceTracker:
         market_scope: str | None = None,
     ) -> PerformanceStat:
         """특정 RSI 구간 진입 시 성과"""
+        M = self.model
         stmt = (
-            select(TradeResult)
+            select(M)
             .where(
                 and_(
-                    TradeResult.entry_rsi >= rsi_low,
-                    TradeResult.entry_rsi < rsi_high,
-                    TradeResult.entry_rsi.isnot(None),
+                    M.entry_rsi >= rsi_low,
+                    M.entry_rsi < rsi_high,
+                    M.entry_rsi.isnot(None),
                 )
             )
-            .order_by(TradeResult.created_at.desc())
+            .order_by(M.created_at.desc())
             .limit(100)
         )
         stmt = self._apply_market_scope(stmt, market_scope)
@@ -123,10 +136,11 @@ class PerformanceTracker:
         market_scope: str | None = None,
     ) -> PerformanceStat:
         """시장 국면별 성과 (상승장/하락장/횡보장)"""
+        M = self.model
         stmt = (
-            select(TradeResult)
-            .where(TradeResult.market_regime == regime)
-            .order_by(TradeResult.created_at.desc())
+            select(M)
+            .where(M.market_regime == regime)
+            .order_by(M.created_at.desc())
             .limit(100)
         )
         stmt = self._apply_market_scope(stmt, market_scope)
@@ -138,12 +152,13 @@ class PerformanceTracker:
         self,
         limit: int = 10,
         market_scope: str | None = None,
-    ) -> list[TradeResult]:
+    ) -> list:
         """최근 손실 거래 목록 (AI에게 실패 사례로 제공)"""
+        M = self.model
         stmt = (
-            select(TradeResult)
-            .where(TradeResult.is_win == False)  # noqa: E712
-            .order_by(TradeResult.created_at.desc())
+            select(M)
+            .where(M.is_win == False)  # noqa: E712
+            .order_by(M.created_at.desc())
             .limit(limit)
         )
         stmt = self._apply_market_scope(stmt, market_scope)
@@ -154,12 +169,13 @@ class PerformanceTracker:
         self,
         limit: int = 5,
         market_scope: str | None = None,
-    ) -> list[TradeResult]:
+    ) -> list:
         """최근 성공 거래 목록 (AI에게 성공 패턴으로 제공)"""
+        M = self.model
         stmt = (
-            select(TradeResult)
-            .where(TradeResult.is_win == True)  # noqa: E712
-            .order_by(TradeResult.created_at.desc())
+            select(M)
+            .where(M.is_win == True)  # noqa: E712
+            .order_by(M.created_at.desc())
             .limit(limit)
         )
         stmt = self._apply_market_scope(stmt, market_scope)
@@ -168,9 +184,10 @@ class PerformanceTracker:
 
     async def get_consecutive_losses(self, market_scope: str | None = None) -> int:
         """최근 연속 손실 횟수"""
+        M = self.model
         stmt = (
-            select(TradeResult)
-            .order_by(TradeResult.created_at.desc())
+            select(M)
+            .order_by(M.created_at.desc())
             .limit(20)
         )
         stmt = self._apply_market_scope(stmt, market_scope)
@@ -186,7 +203,8 @@ class PerformanceTracker:
 
     async def get_overall_stats(self, market_scope: str | None = None) -> dict:
         """전체 요약 통계"""
-        stmt = select(TradeResult).order_by(TradeResult.created_at.desc()).limit(200)
+        M = self.model
+        stmt = select(M).order_by(M.created_at.desc()).limit(200)
         stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         trades = list(result.scalars().all())
