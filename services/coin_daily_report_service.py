@@ -5,7 +5,7 @@ import json
 from datetime import datetime, time
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 
 from analysis.feedback.trading_rules import trading_rule_engine
 from analysis.llm.llm_factory import llm_factory
@@ -26,6 +26,8 @@ from trading.enums import ActivityPhase, ActivityType, Tier1Profile
 from trading.market_profile import MARKET_SCOPE_CRYPTO
 from trading.risk_policy import normalize_crypto_regime
 from util.time_util import KST, ensure_kst, now_kst
+
+_RECENT_ACTIVITY_SAMPLE_LIMIT = 400
 
 
 class CoinReportGenerationError(RuntimeError):
@@ -178,6 +180,8 @@ class CoinDailyReportService:
                                     "feedback_for_next_cycle": parsed.get("feedback_for_next_cycle", {}) if parsed else {},
                                     "risk_alerts": parsed.get("risk_alerts", []) if parsed else [],
                                     "activity_counts": activity_snapshot["activity_counts"],
+                                    "total_activity_count": activity_snapshot["activity_count"],
+                                    "sampled_activity_count": activity_snapshot["sampled_activity_count"],
                                 },
                                 ensure_ascii=False,
                                 default=str,
@@ -211,6 +215,8 @@ class CoinDailyReportService:
                         "sell_count": activity_snapshot["sell_count"],
                         "total_pnl": activity_snapshot["total_pnl"],
                         "unrealized_pnl": account_snapshot["unrealized_pnl"],
+                        "activity_count": activity_snapshot["activity_count"],
+                        "sampled_activity_count": activity_snapshot["sampled_activity_count"],
                     },
                 )
                 logger.info(
@@ -350,14 +356,73 @@ class CoinDailyReportService:
         period_ended_at: datetime,
     ) -> dict[str, object]:
         async with AsyncSessionLocal() as session:
-            activity_rows = list(
+            period_filters = (
+                CoinActivityLog.created_at >= period_started_at,
+                CoinActivityLog.created_at <= period_ended_at,
+            )
+            aggregate_row = (
+                await session.execute(
+                    select(
+                        func.count(CoinActivityLog.id),
+                        func.coalesce(
+                            func.sum(
+                                case(
+                                    (
+                                        (CoinActivityLog.activity_type == "CYCLE")
+                                        & (CoinActivityLog.phase == "COMPLETE"),
+                                        1,
+                                    ),
+                                    else_=0,
+                                )
+                            ),
+                            0,
+                        ),
+                        func.coalesce(
+                            func.sum(
+                                case(
+                                    (
+                                        (CoinActivityLog.activity_type == "TIER1_ANALYSIS")
+                                        & (CoinActivityLog.phase == "COMPLETE"),
+                                        1,
+                                    ),
+                                    else_=0,
+                                )
+                            ),
+                            0,
+                        ),
+                        func.coalesce(
+                            func.sum(
+                                case(
+                                    (
+                                        (CoinActivityLog.activity_type == "DECISION")
+                                        & (CoinActivityLog.phase == "COMPLETE"),
+                                        1,
+                                    ),
+                                    else_=0,
+                                )
+                            ),
+                            0,
+                        ),
+                    ).where(*period_filters)
+                )
+            ).one()
+            activity_count_rows = (
+                await session.execute(
+                    select(
+                        CoinActivityLog.activity_type,
+                        func.count(CoinActivityLog.id),
+                    )
+                    .where(*period_filters)
+                    .group_by(CoinActivityLog.activity_type)
+                )
+            ).all()
+            recent_activity_rows = list(
                 (
                     await session.execute(
                         select(CoinActivityLog)
-                        .where(CoinActivityLog.created_at >= period_started_at)
-                        .where(CoinActivityLog.created_at <= period_ended_at)
+                        .where(*period_filters)
                         .order_by(CoinActivityLog.created_at.desc(), CoinActivityLog.id.desc())
-                        .limit(400)
+                        .limit(_RECENT_ACTIVITY_SAMPLE_LIMIT)
                     )
                 ).scalars().all()
             )
@@ -387,19 +452,16 @@ class CoinDailyReportService:
                 ).scalars().all()
             )
 
-        activity_counts: dict[str, int] = {}
-        total_cycles = 0
-        total_analyses = 0
-        total_recommendations = 0
-        for activity in activity_rows:
-            activity_type = str(activity.activity_type or "")
-            activity_counts[activity_type] = activity_counts.get(activity_type, 0) + 1
-            if activity_type == "CYCLE" and str(activity.phase or "") == "COMPLETE":
-                total_cycles += 1
-            if activity_type == "TIER1_ANALYSIS" and str(activity.phase or "") == "COMPLETE":
-                total_analyses += 1
-            if activity_type == "DECISION" and str(activity.phase or "") == "COMPLETE":
-                total_recommendations += 1
+        total_activity_count = int(aggregate_row[0] or 0)
+        total_cycles = int(aggregate_row[1] or 0)
+        total_analyses = int(aggregate_row[2] or 0)
+        total_recommendations = int(aggregate_row[3] or 0)
+        activity_counts = {
+            str(activity_type or ""): int(count or 0)
+            for activity_type, count in activity_count_rows
+            if str(activity_type or "")
+        }
+        sampled_activity_count = len(recent_activity_rows)
 
         buy_count = len(opened_trades)
         sell_count = len(completed_trades)
@@ -408,9 +470,15 @@ class CoinDailyReportService:
         loss_count = sum(1 for trade in completed_trades if not bool(trade.is_win))
 
         return {
-            "activity_count": len(activity_rows),
+            "activity_count": total_activity_count,
             "activity_counts": activity_counts,
-            "recent_activities": self._format_recent_activities(activity_rows),
+            "sampled_activity_count": sampled_activity_count,
+            "recent_activity_sample_limit": _RECENT_ACTIVITY_SAMPLE_LIMIT,
+            "recent_activities": self._format_recent_activities(
+                recent_activity_rows,
+                total_activity_count=total_activity_count,
+                sampled_activity_count=sampled_activity_count,
+            ),
             "trade_summary": self._format_trade_summary(opened_trades, completed_trades),
             "total_cycles": total_cycles,
             "total_analyses": total_analyses,
@@ -530,10 +598,26 @@ class CoinDailyReportService:
         return "\n".join(lines)
 
     @staticmethod
-    def _format_recent_activities(activities: list[CoinActivityLog]) -> str:
+    def _format_recent_activities(
+        activities: list[CoinActivityLog],
+        *,
+        total_activity_count: int,
+        sampled_activity_count: int,
+    ) -> str:
         if not activities:
-            return "활동 없음"
-        lines = []
+            if total_activity_count <= 0:
+                return "최근 활동 샘플: 활동 없음"
+            return (
+                f"최근 활동 샘플: 전체 {total_activity_count}건 중 최근 "
+                f"{sampled_activity_count}건을 확인했지만 표시할 로그가 없습니다."
+            )
+        lines = [
+            (
+                f"최근 활동 샘플: 전체 {total_activity_count}건 중 최근 "
+                f"{sampled_activity_count}건을 기준으로 하며, 아래에는 최신 "
+                f"{min(len(activities), 30)}건만 표시합니다."
+            )
+        ]
         for activity in activities[:30]:
             lines.append(
                 f"[{activity.activity_type}/{activity.phase}] {activity.summary}"

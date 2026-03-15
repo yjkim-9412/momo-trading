@@ -1,7 +1,7 @@
 import json
 import unittest
 from contextlib import nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -194,6 +194,60 @@ class CoinDailyReportServiceTest(unittest.IsolatedAsyncioTestCase):
             rows = list((await session.execute(select(CoinDailyReport))).scalars().all())
 
         self.assertEqual(rows, [])
+
+    async def test_load_activity_snapshot_uses_exact_period_counts_beyond_recent_sample_limit(self):
+        service = CoinDailyReportService()
+        period_started_at = datetime(2026, 3, 15, 0, 0, tzinfo=timezone.utc)
+        period_ended_at = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                for index in range(405):
+                    session.add(
+                        CoinActivityLog(
+                            activity_type="TIER1_ANALYSIS",
+                            phase="COMPLETE",
+                            summary=f"analysis-{index:03d}",
+                            created_at=period_started_at + timedelta(minutes=index),
+                        )
+                    )
+                session.add(
+                    CoinActivityLog(
+                        activity_type="CYCLE",
+                        phase="COMPLETE",
+                        summary="cycle-complete-1",
+                        created_at=period_started_at + timedelta(minutes=406),
+                    )
+                )
+                session.add(
+                    CoinActivityLog(
+                        activity_type="CYCLE",
+                        phase="COMPLETE",
+                        summary="cycle-complete-2",
+                        created_at=period_started_at + timedelta(minutes=407),
+                    )
+                )
+                session.add(
+                    CoinActivityLog(
+                        activity_type="SCHEDULE",
+                        phase="PROGRESS",
+                        summary="recovery scheduled",
+                        created_at=period_started_at + timedelta(minutes=408),
+                    )
+                )
+
+        with patch("services.coin_daily_report_service.AsyncSessionLocal", TestAsyncSessionLocal):
+            snapshot = await service._load_activity_snapshot(period_started_at, period_ended_at)
+
+        self.assertEqual(snapshot["activity_count"], 408)
+        self.assertEqual(snapshot["sampled_activity_count"], 400)
+        self.assertEqual(snapshot["total_cycles"], 2)
+        self.assertEqual(snapshot["total_analyses"], 405)
+        self.assertEqual(snapshot["total_recommendations"], 0)
+        self.assertEqual(snapshot["activity_counts"]["TIER1_ANALYSIS"], 405)
+        self.assertEqual(snapshot["activity_counts"]["CYCLE"], 2)
+        self.assertEqual(snapshot["activity_counts"]["SCHEDULE"], 1)
+        self.assertIn("전체 408건 중 최근 400건", snapshot["recent_activities"])
 
     async def test_generate_checkpoint_report_raises_with_ticker_batch_stage_when_overview_batch_fails(self):
         service = CoinDailyReportService()
