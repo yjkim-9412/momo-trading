@@ -267,6 +267,7 @@ async def get_coin_watchlist():
     from agent.trading_agent import trading_agent
     from realtime.coin_stream_manager import coin_stream_manager
     from realtime.event_detector import DEFAULT_THRESHOLDS, event_detector
+    from trading.bithumb_client import bithumb_client
 
     state = trading_agent._market_states.get(MARKET_SCOPE_CRYPTO)
     default_thresholds = asdict(DEFAULT_THRESHOLDS)
@@ -282,6 +283,23 @@ async def get_coin_watchlist():
         for h in holdings
         if getattr(h, "symbol", None)
     }
+    # 보유종목 ticker fallback: 스캔 미실행 시에도 시세 표시용
+    holding_symbols = [
+        str(h.symbol) for h in holdings if getattr(h, "symbol", None)
+    ]
+    holdings_ticker_map: dict[tuple[str, str], dict] = {}
+    if holding_symbols:
+        ticker_resp = await bithumb_client.get_ticker_snapshots(holding_symbols)
+        if ticker_resp.success and ticker_resp.data:
+            for item in ticker_resp.data.get("items", []):
+                sym = str(item.get("symbol", "")).upper()
+                if sym:
+                    holdings_ticker_map[(crypto_market, sym)] = {
+                        "price": item.get("price"),
+                        "change_rate": item.get("change_rate"),
+                        "volume": item.get("volume"),
+                        "trade_value": item.get("trade_value"),
+                    }
     selected_map: dict[tuple[str, str], dict] = {}
     all_symbols: dict[tuple[str, str], dict[str, bool]] = {}
 
@@ -341,14 +359,16 @@ async def get_coin_watchlist():
             if threshold_dict != default_thresholds:
                 threshold_data = threshold_dict
         meta = selected_map.get((market_code, symbol), {})
+        key = (market_code, symbol)
+        ht = holdings_ticker_map.get(key, {})
         symbols_list.append({
             "symbol": symbol,
             "market": market_code,
             "name": meta.get("name") or name_map.get((market_code, symbol), ""),
-            "price": meta.get("price"),
-            "change_rate": meta.get("change_rate"),
-            "volume": meta.get("volume"),
-            "trade_value": meta.get("trade_value"),
+            "price": meta.get("price") or ht.get("price"),
+            "change_rate": meta.get("change_rate") if meta.get("change_rate") is not None else ht.get("change_rate"),
+            "volume": meta.get("volume") or ht.get("volume"),
+            "trade_value": meta.get("trade_value") or ht.get("trade_value"),
             "strategy_type": meta.get("strategy_type", ""),
             "reason": meta.get("reason", ""),
             "scan_source": meta.get("scan_source", ""),

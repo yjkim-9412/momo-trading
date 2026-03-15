@@ -109,7 +109,10 @@ class Settings(BaseSettings):
     CRYPTO_CLAUDE_EFFORT_TIER2: str = ""  # 코인 최종검토 effort
     CRYPTO_CLAUDE_EFFORT_REPORT: str = ""  # 코인 체크포인트 리포트 effort (예: max)
     # Codex CLI 설정
-    CRYPTO_CODEX_MODEL: str = ""  # 코인 전용 Codex 모델, 비어있으면 CODEX_MODEL 사용
+    CRYPTO_CODEX_MODEL: str = ""  # 코인 Codex 기본 모델 (fallback), 비어있으면 CODEX_MODEL 사용
+    CRYPTO_CODEX_MODEL_TIER1_SCAN: str = ""  # 코인 스캔용 Codex 모델
+    CRYPTO_CODEX_MODEL_TIER1_ANALYSIS: str = ""  # 코인 분석용 Codex 모델
+    CRYPTO_CODEX_MODEL_TIER2: str = ""  # 코인 최종검토용 Codex 모델
     CRYPTO_CODEX_REASONING_EFFORT_REPORT: str = ""  # 코인 체크포인트 리포트 추론 강도
     CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN: str = ""  # 코인 스캔 추론 강도
     CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS: str = ""  # 코인 분석 추론 강도
@@ -459,11 +462,26 @@ class Settings(BaseSettings):
                 )
             return self.CRYPTO_LLM_MODEL_TIER2 or self.get_llm_model(provider, tier)
 
-        return self.CRYPTO_CODEX_MODEL or self.get_llm_model(provider, tier)
-
-    def get_crypto_codex_model(self) -> str:
-        """코인 전용 Codex 모델 (비어있으면 주식 CODEX_MODEL 사용)"""
-        return self.CRYPTO_CODEX_MODEL or self.CODEX_MODEL
+        # Codex: Claude와 동일하게 tier/profile별 모델 분리
+        if tier == LLMTier.TIER1:
+            if profile == Tier1Profile.SCAN:
+                return (
+                    self.CRYPTO_CODEX_MODEL_TIER1_SCAN
+                    or self.CRYPTO_CODEX_MODEL_TIER1_ANALYSIS
+                    or self.CRYPTO_CODEX_MODEL
+                    or self.get_llm_model(provider, tier)
+                )
+            return (
+                self.CRYPTO_CODEX_MODEL_TIER1_ANALYSIS
+                or self.CRYPTO_CODEX_MODEL_TIER1_SCAN
+                or self.CRYPTO_CODEX_MODEL
+                or self.get_llm_model(provider, tier)
+            )
+        return (
+            self.CRYPTO_CODEX_MODEL_TIER2
+            or self.CRYPTO_CODEX_MODEL
+            or self.get_llm_model(provider, tier)
+        )
 
     def get_crypto_llm_reasoning_effort(
         self,

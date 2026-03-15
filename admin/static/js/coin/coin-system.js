@@ -200,7 +200,7 @@ export async function loadSystemStatus() {
     );
     setInlineStatus('sys-uptime', uptime, '#d1d5db');
     setInlineStatus('sys-trades-today', todayTrades + '건', todayTrades > 0 ? '#fbbf24' : '#9ca3af');
-    if (typeof s.watchlist_count === 'number') {
+    if (typeof s.watchlist_count === 'number' && s.watchlist_count > 0) {
       setTextContent('watchlist-count', s.watchlist_count + '종목');
     }
 
