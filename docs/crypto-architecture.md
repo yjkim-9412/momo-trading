@@ -156,16 +156,16 @@ sequenceDiagram
 
 ```mermaid
 graph TB
-    subgraph "/admin (주식)"
-        SA[index.html<br/>주식 대시보드]
-        SAP[/api/v1/admin/*<br/>KRX/US 데이터]
-        SSE1[SSE: /admin/stream]
+    subgraph ADMIN_STOCK["admin — 주식"]
+        SA["index.html<br/>주식 대시보드"]
+        SAP["api/v1/admin/*<br/>KRX/US 데이터"]
+        SSE1["SSE: admin/stream"]
     end
 
-    subgraph "/admin-coin (코인)"
-        CA[coin.html<br/>코인 대시보드]
-        CAP[/api/v1/coin/*<br/>BITHUMB 데이터]
-        SSE2[SSE: /coin/stream]
+    subgraph ADMIN_COIN["admin-coin — 코인"]
+        CA["coin.html<br/>코인 대시보드"]
+        CAP["api/v1/coin/*<br/>BITHUMB 데이터"]
+        SSE2["SSE: coin/stream"]
     end
 
     subgraph "Shared Backend"

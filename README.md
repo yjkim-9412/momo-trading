@@ -21,12 +21,12 @@
 
 ```mermaid
 flowchart TD
-    MARKET["시장 전체\n수백 종목"]
-    SCOUT["1단계: 스카우터 AI\n유망한 후보 5~8개 선별"]
-    ANALYST["2단계: 분석가 AI\n차트 · 거래량 · 기술지표 정밀 분석\n'사라' 또는 '관망' 판단"]
-    GATE["코드 안전장치\n신뢰도 · 손익비 · 손절가 검증\n— AI가 아닌 코드가 판단"]
-    REVIEWER["3단계: 심사역 AI\n독립적으로 다시 검증\n진입가 · 목표가 · 손절가 확정"]
-    RISK["리스크 관리\n잔고 확인 · 한도 체크 · 비중 검증"]
+    MARKET["시장 전체<br/>수백 종목"]
+    SCOUT["1단계: 스카우터 AI<br/>유망한 후보 5~8개 선별"]
+    ANALYST["2단계: 분석가 AI<br/>차트 · 거래량 · 기술지표 정밀 분석<br/>'사라' 또는 '관망' 판단"]
+    GATE["코드 안전장치<br/>신뢰도 · 손익비 · 손절가 검증<br/>— AI가 아닌 코드가 판단"]
+    REVIEWER["3단계: 심사역 AI<br/>독립적으로 다시 검증<br/>진입가 · 목표가 · 손절가 확정"]
+    RISK["리스크 관리<br/>잔고 확인 · 한도 체크 · 비중 검증"]
     ORDER["주문 실행"]
     SKIP["매매 안 함"]
 
@@ -125,10 +125,10 @@ gantt
 ```mermaid
 flowchart LR
     TRADE["오늘 매매"]
-    REPORT["성적표 작성\nAI가 하루를 복기"]
-    LEARN["교훈 추출\n성공 · 실패 패턴 분석"]
-    RULES["규칙 생성\n코드가 자동 검증 후 저장"]
-    TOMORROW["내일 매매\n변경된 기준 적용"]
+    REPORT["성적표 작성<br/>AI가 하루를 복기"]
+    LEARN["교훈 추출<br/>성공 · 실패 패턴 분석"]
+    RULES["규칙 생성<br/>코드가 자동 검증 후 저장"]
+    TOMORROW["내일 매매<br/>변경된 기준 적용"]
 
     TRADE --> REPORT --> LEARN --> RULES --> TOMORROW
     TOMORROW -.->|반복| TRADE
@@ -176,8 +176,8 @@ flowchart TB
     end
 
     subgraph SHARED["공유 AI 엔진"]
-        AI["AI 분석 파이프라인\n3단계 면접관"]
-        CHART["차트 분석기\nRSI · MACD · 볼린저밴드"]
+        AI["AI 분석 파이프라인<br/>3단계 면접관"]
+        CHART["차트 분석기<br/>RSI · MACD · 볼린저밴드"]
         RISK["리스크 관리"]
         FB["피드백 학습"]
     end

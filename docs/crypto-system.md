@@ -16,10 +16,10 @@
 
 ```mermaid
 flowchart LR
-    APP["MOMO Trading\nFastAPI :9000"]
-    REST["Bithumb REST API\n주문 · 잔고 · 시세"]
-    PUBWS["Public WebSocket\n실시간 시세"]
-    PRIVWS["Private WebSocket\n주문 · 잔고 이벤트"]
+    APP["MOMO Trading<br/>FastAPI :9000"]
+    REST["Bithumb REST API<br/>주문 · 잔고 · 시세"]
+    PUBWS["Public WebSocket<br/>실시간 시세"]
+    PRIVWS["Private WebSocket<br/>주문 · 잔고 이벤트"]
 
     APP -->|JWT 인증| REST
     APP -->|구독| PUBWS
@@ -100,15 +100,15 @@ Tier2 최종 검토에서 적용하는 스트레스 테스트 범위가 주식�
 
 ```mermaid
 flowchart TD
-    AI["AI 분석 결과\nBUY + 신뢰도 + 금액"]
+    AI["AI 분석 결과<br/>BUY + 신뢰도 + 금액"]
     MODE{"운영 모드"}
 
-    AUTO["AUTONOMOUS\n자동 주문 실행"]
-    SEMI["SEMI_AUTO\n추천 저장 → 사용자 승인 대기"]
+    AUTO["AUTONOMOUS<br/>자동 주문 실행"]
+    SEMI["SEMI_AUTO<br/>추천 저장 → 사용자 승인 대기"]
 
-    ORDER["빗썸 시장가 주문\nord_type='price'\n금액 기준 (KRW)"]
-    TRACK["주문 추적\nPolling + WebSocket"]
-    LOG["결과 기록\ncoin_broker_orders"]
+    ORDER["빗썸 시장가 주문<br/>ord_type='price'<br/>금액 기준 (KRW)"]
+    TRACK["주문 추적<br/>Polling + WebSocket"]
+    LOG["결과 기록<br/>coin_broker_orders"]
 
     AI --> MODE
     MODE -->|AUTONOMOUS| AUTO --> ORDER

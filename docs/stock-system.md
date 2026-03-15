@@ -17,9 +17,9 @@ MCP Server는 Docker 컨테이너(`docker/kis-mcp/`)로 실행되며, SSE(Server
 
 ```mermaid
 flowchart LR
-    APP["MOMO Trading\nFastAPI :9000"]
-    MCP["KIS MCP Server\nDocker :3100"]
-    KIS["KIS Open API\n한국투자증권"]
+    APP["MOMO Trading<br/>FastAPI :9000"]
+    MCP["KIS MCP Server<br/>Docker :3100"]
+    KIS["KIS Open API<br/>한국투자증권"]
 
     APP -->|SSE 요청| MCP
     APP -->|REST 직접| KIS
@@ -144,10 +144,10 @@ KIS WebSocket으로 실시간 시세를 받아 이벤트를 감지합니다.
 
 ```mermaid
 flowchart LR
-    WS["KIS WebSocket\n실시간 시세"]
-    ED["EventDetector\n임계값 기반 감지"]
-    EB["EventBus\n이벤트 전파"]
-    AGENT["TradingAgent\n즉시 분석 + 매매"]
+    WS["KIS WebSocket<br/>실시간 시세"]
+    ED["EventDetector<br/>임계값 기반 감지"]
+    EB["EventBus<br/>이벤트 전파"]
+    AGENT["TradingAgent<br/>즉시 분석 + 매매"]
 
     WS --> ED --> EB --> AGENT
 ```
