@@ -77,6 +77,7 @@ async def test_admin_coin_reports_generate_uses_checkpoint_service_and_refreshes
         trigger_reason="manual_generate",
         market_regime="ALTSEASON",
         market_context="최근 회고 기반 다음 사이클 우선순위",
+        period_anchor_sources={"AUTO_SETTLEMENT"},
         raise_on_error=True,
     )
     refresh_rules.assert_awaited_once_with(market="CRYPTO", emit_activity=True)

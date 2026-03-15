@@ -2,6 +2,8 @@
 import asyncio
 from dataclasses import asdict
 from datetime import date, datetime
+from pathlib import Path
+import re
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -46,12 +48,44 @@ router = APIRouter(prefix="/admin-coin", tags=["admin-coin"])
 # 코인 전용 SSE 매니저 (주식 SSE와 독립)
 coin_sse_manager = SSEManager()
 APP_STARTED_AT = now_kst()
+ENV_FILE_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 # 페이지 서빙은 main.py에서 /admin-coin 경로로 처리
 
 
 def _crypto_market_code() -> str:
     return settings.crypto_primary_market_code
+
+
+def _format_env_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _persist_env_setting(key: str, value: object, *, env_file_path: Path | None = None) -> None:
+    """특정 설정 값을 .env 파일에 반영한다."""
+    key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    rendered = f"{key}={_format_env_value(value)}"
+    path = Path(env_file_path or ENV_FILE_PATH)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    updated_lines: list[str] = []
+    replaced = False
+    for line in lines:
+        if key_pattern.match(line) and not line.lstrip().startswith("#"):
+            if not replaced:
+                updated_lines.append(rendered)
+                replaced = True
+            continue
+        updated_lines.append(line)
+
+    if not replaced:
+        if updated_lines and updated_lines[-1] != "":
+            updated_lines.append("")
+        updated_lines.append(rendered)
+
+    path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
 
 
 # ── 계좌 정보 ──
@@ -434,6 +468,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "crypto_primary_market": crypto_market,
         "crypto_trading_enabled": settings.CRYPTO_TRADING_ENABLED,
         "crypto_autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
+        "crypto_timebox_hours": settings.crypto_timebox_hours,
         "crypto_dynamic_discovery_enabled": settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED,
         "trading_enabled": settings.CRYPTO_TRADING_ENABLED,
         "autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
@@ -450,6 +485,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "last_cycle_error": cycle_runtime.get("last_cycle_error"),
         "realtime_monitor_running": coin_realtime_monitor.is_running,
         "scan_interval_hours": settings.CRYPTO_SCAN_INTERVAL_HOURS,
+        "timebox_hours": settings.crypto_timebox_hours,
         "watchlist_symbols": settings.crypto_watchlist_symbols,
         "watchlist_count": len(watchlist),
         "discovery_cache": discovery_cache,
@@ -501,6 +537,7 @@ COIN_MUTABLE_SETTINGS = [
     "CRYPTO_AUTONOMY_MODE",
     "CRYPTO_RECOMMENDATION_EXPIRE_MIN",
     "CRYPTO_SCAN_INTERVAL_HOURS",
+    "CRYPTO_TIMEBOX_HOURS",
     "CRYPTO_MAX_POSITION_PCT",
     "CRYPTO_MIN_CASH_RATIO",
     "CRYPTO_MAX_SINGLE_ORDER_KRW",
@@ -512,6 +549,9 @@ async def get_coin_settings():
     """코인 런타임 설정 조회"""
     data = {}
     for key in COIN_MUTABLE_SETTINGS:
+        if key == "CRYPTO_TIMEBOX_HOURS":
+            data[key] = settings.crypto_timebox_hours
+            continue
         data[key] = getattr(settings, key, None)
     return SuccessResponse(data=data)
 
@@ -520,16 +560,31 @@ async def get_coin_settings():
 async def update_coin_settings(updates: dict):
     """코인 런타임 설정 변경"""
     changed = {}
+    rejected = {}
     for key, value in updates.items():
         if key not in COIN_MUTABLE_SETTINGS:
             continue
-        old = getattr(settings, key, None)
+        old = settings.crypto_timebox_hours if key == "CRYPTO_TIMEBOX_HOURS" else getattr(settings, key, None)
         if isinstance(old, bool):
             value = str(value).lower() in ("true", "1", "yes")
         elif isinstance(old, int):
             value = int(value)
         elif isinstance(old, float):
             value = float(value)
+
+        if key == "CRYPTO_TIMEBOX_HOURS" and value not in {12, 24}:
+            rejected[key] = {"attempted": value, "reason": "12 또는 24만 허용"}
+            logger.warning("코인 설정 변경 거부: {} = {}", key, value)
+            continue
+
+        if key == "CRYPTO_TIMEBOX_HOURS":
+            try:
+                _persist_env_setting(key, value)
+            except OSError as exc:
+                rejected[key] = {"attempted": value, "reason": f".env 저장 실패: {str(exc)[:120]}"}
+                logger.error("코인 설정 영속화 실패: {} = {} ({})", key, value, str(exc))
+                continue
+
         setattr(settings, key, value)
         changed[key] = {"old": old, "new": value}
         logger.info("코인 설정 변경: {} = {} → {}", key, old, value)
@@ -542,6 +597,10 @@ async def update_coin_settings(updates: dict):
             market_scope=MARKET_SCOPE_CRYPTO,
         )
 
+    if rejected and not changed:
+        return SuccessResponse(data=changed, message="코인 설정 변경이 거부되었습니다")
+    if rejected:
+        return SuccessResponse(data=changed, message=f"{len(changed)}개 코인 설정 변경, {len(rejected)}개 거부")
     return SuccessResponse(data=changed, message=f"{len(changed)}개 코인 설정 변경됨")
 
 
@@ -671,6 +730,11 @@ async def generate_coin_report():
             data=None,
             message="코인 사이클 실행 중이라 수동 리포트를 생성할 수 없습니다",
         )
+    if runtime.settlement_lock.locked():
+        return SuccessResponse(
+            data=None,
+            message="코인 정산 실행 중이라 수동 리포트를 생성할 수 없습니다",
+        )
 
     try:
         report = await coin_daily_report_service.generate_checkpoint_report(
@@ -679,6 +743,7 @@ async def generate_coin_report():
             trigger_reason="manual_generate",
             market_regime=runtime.market_regime,
             market_context=runtime.market_context,
+            period_anchor_sources={"AUTO_SETTLEMENT"},
             raise_on_error=True,
         )
     except CoinReportGenerationError as exc:

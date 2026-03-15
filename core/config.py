@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     CRYPTO_TRADING_ENABLED: bool = False
     CRYPTO_AUTONOMY_MODE: str = "SEMI_AUTO"  # SEMI_AUTO / AUTONOMOUS
     CRYPTO_RECOMMENDATION_EXPIRE_MIN: int = 30
+    CRYPTO_TIMEBOX_HOURS: int = 12
 
     # === Crypto 스캔 ===
     CRYPTO_SCAN_INTERVAL_HOURS: int = 4
@@ -262,6 +263,19 @@ class Settings(BaseSettings):
             self.CRYPTO_PRIMARY_MARKET,
         )
         return "BITHUMB"
+
+    @property
+    def crypto_timebox_hours(self) -> int:
+        """코인 최대 보유시간 설정을 12h/24h로 정규화한다."""
+        raw = int(self.CRYPTO_TIMEBOX_HOURS or 12)
+        if raw in {12, 24}:
+            return raw
+
+        logger.warning(
+            "CRYPTO_TIMEBOX_HOURS={}는 지원되지 않습니다. 12시간으로 고정합니다.",
+            self.CRYPTO_TIMEBOX_HOURS,
+        )
+        return 12
 
     @property
     def scan_markets(self) -> list[str]:

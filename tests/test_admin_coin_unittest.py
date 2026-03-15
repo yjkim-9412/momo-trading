@@ -1,6 +1,8 @@
 import asyncio
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, PropertyMock, patch
 
@@ -11,6 +13,7 @@ from api.routes import admin_coin
 from api.routes.admin_coin import (
     cancel_coin_order,
     get_coin_order,
+    get_coin_settings,
     _serialize_recommendation,
     generate_coin_report,
     get_coin_activity_feed,
@@ -20,6 +23,7 @@ from api.routes.admin_coin import (
     place_coin_order,
     preview_coin_order,
     trigger_coin_cycle,
+    update_coin_settings,
 )
 from realtime.coin_monitor import coin_realtime_monitor
 from scheduler.scheduler import trading_scheduler
@@ -152,6 +156,7 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
             trigger_reason="manual_generate",
             market_regime="BULL_RUN",
             market_context="최근 회고 문맥",
+            period_anchor_sources={"AUTO_SETTLEMENT"},
             raise_on_error=True,
         )
         refresh_rules.assert_awaited_once_with(
@@ -187,6 +192,36 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
         refresh_rules.assert_not_awaited()
         self.assertIsNone(response.data)
         self.assertIn("시장 개요 조회 실패", response.message)
+
+    async def test_get_coin_settings_includes_timebox_hours(self):
+        with patch.object(admin_coin.settings, "CRYPTO_TIMEBOX_HOURS", 24):
+            response = await get_coin_settings()
+
+        self.assertEqual(response.data["CRYPTO_TIMEBOX_HOURS"], 24)
+
+    async def test_update_coin_settings_accepts_only_12_or_24_for_timebox(self):
+        original = admin_coin.settings.CRYPTO_TIMEBOX_HOURS
+
+        try:
+            with TemporaryDirectory() as temp_dir:
+                env_file = Path(temp_dir) / ".env"
+                env_file.write_text("CRYPTO_ENABLED=true\nCRYPTO_TIMEBOX_HOURS=12\n", encoding="utf-8")
+                with patch.object(admin_coin, "ENV_FILE_PATH", env_file), \
+                        patch("api.routes.admin_coin.activity_logger.log", AsyncMock()):
+                    accepted = await update_coin_settings({"CRYPTO_TIMEBOX_HOURS": 24})
+                    persisted_after_accept = env_file.read_text(encoding="utf-8")
+                    rejected = await update_coin_settings({"CRYPTO_TIMEBOX_HOURS": 18})
+
+                self.assertIn("CRYPTO_TIMEBOX_HOURS=24", persisted_after_accept)
+                self.assertIn("CRYPTO_ENABLED=true", persisted_after_accept)
+                self.assertEqual(env_file.read_text(encoding="utf-8"), persisted_after_accept)
+
+            self.assertEqual(admin_coin.settings.CRYPTO_TIMEBOX_HOURS, 24)
+            self.assertEqual(accepted.data["CRYPTO_TIMEBOX_HOURS"]["new"], 24)
+            self.assertEqual(rejected.message, "코인 설정 변경이 거부되었습니다")
+            self.assertEqual(rejected.data, {})
+        finally:
+            admin_coin.settings.CRYPTO_TIMEBOX_HOURS = original
 
     async def test_preview_coin_order_wraps_service_result(self):
         preview = CoinOrderPreviewResponse(

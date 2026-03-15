@@ -1,7 +1,8 @@
-"""코인 체크포인트 회고 리포트 서비스"""
+"""코인 리포트/정산 리포트 서비스"""
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from datetime import datetime, time
 
 from loguru import logger
@@ -46,7 +47,7 @@ class CoinReportGenerationError(RuntimeError):
 
 
 class CoinDailyReportService:
-    """코인 자동 체크포인트 회고 리포트 생성기"""
+    """코인 정산/회고 리포트 생성기"""
 
     async def generate_checkpoint_report(
         self,
@@ -57,11 +58,13 @@ class CoinDailyReportService:
         applied_cycle_id: str | None = None,
         market_regime: str | None = None,
         market_context: str | None = None,
+        period_anchor_sources: Iterable[str] | None = None,
         raise_on_error: bool = False,
     ) -> CoinDailyReport | None:
-        """직전 구간 코인 회고 리포트를 생성한다."""
+        """직전 구간 코인 리포트를 생성한다."""
         period_ended_at = now_kst()
         report_date = period_ended_at.date()
+        source_label = self._report_source_label(report_source)
 
         with activity_logger.context(market_scope=MARKET_SCOPE_CRYPTO, trading_date=report_date):
             try:
@@ -72,14 +75,17 @@ class CoinDailyReportService:
                         if existing:
                             return existing
 
-                    previous_report = await repo.get_latest_before(period_ended_at)
+                    previous_report = await repo.get_latest_before(
+                        period_ended_at,
+                        report_sources=period_anchor_sources,
+                    )
                     period_started_at = self._resolve_period_start(previous_report, report_date)
 
                 await activity_logger.log(
                     ActivityType.REPORT,
                     ActivityPhase.START,
                     (
-                        f"📘 [CRYPTO] 체크포인트 회고 리포트 생성 시작 "
+                        f"📘 [CRYPTO] {source_label} 리포트 생성 시작 "
                         f"({report_source}, {period_started_at.strftime('%m/%d %H:%M')} ~ "
                         f"{period_ended_at.strftime('%m/%d %H:%M')})"
                     ),
@@ -200,7 +206,7 @@ class CoinDailyReportService:
                     ActivityType.REPORT,
                     ActivityPhase.COMPLETE,
                     (
-                        f"📘 [CRYPTO] 체크포인트 회고 리포트 생성 완료 "
+                        f"📘 [CRYPTO] {source_label} 리포트 생성 완료 "
                         f"({report_source}) | 실현 {activity_snapshot['total_pnl']:+,.0f}원 "
                         f"| 미실현 {account_snapshot['unrealized_pnl']:+,.0f}원"
                     ),
@@ -220,14 +226,17 @@ class CoinDailyReportService:
                     },
                 )
                 logger.info(
-                    "[CRYPTO] 체크포인트 회고 리포트 생성 완료: {} {}",
+                    "[CRYPTO] {} 리포트 생성 완료: {} {}",
+                    source_label,
                     report_source,
                     period_ended_at.isoformat(),
                 )
 
                 async with AsyncSessionLocal() as session:
                     repo = CoinDailyReportRepository(session)
-                    return await repo.get_by_applied_cycle_id(applied_cycle_id) if applied_cycle_id else await repo.get_latest()
+                    if applied_cycle_id:
+                        return await repo.get_by_applied_cycle_id(applied_cycle_id)
+                    return await repo.get_latest(report_sources=[report_source])
             except Exception as e:
                 error_detail = {
                     "report_source": report_source,
@@ -236,11 +245,11 @@ class CoinDailyReportService:
                 if isinstance(e, CoinReportGenerationError) and e.detail:
                     error_detail.update(e.detail)
 
-                logger.error("[CRYPTO] 체크포인트 회고 리포트 생성 실패: {}", str(e))
+                logger.error("[CRYPTO] {} 리포트 생성 실패: {}", source_label, str(e))
                 await activity_logger.log(
                     ActivityType.REPORT,
                     ActivityPhase.ERROR,
-                    f"❌ [CRYPTO] 체크포인트 회고 리포트 생성 실패: {str(e)[:120]}",
+                    f"❌ [CRYPTO] {source_label} 리포트 생성 실패: {str(e)[:120]}",
                     cycle_id=applied_cycle_id,
                     detail=error_detail,
                     error_message=str(e),
@@ -254,6 +263,17 @@ class CoinDailyReportService:
         if previous_report and previous_report.period_ended_at:
             return ensure_kst(previous_report.period_ended_at)
         return datetime.combine(report_date, time.min, tzinfo=KST)
+
+    @staticmethod
+    def _report_source_label(report_source: str) -> str:
+        source = str(report_source or "").upper()
+        if source == "AUTO_SETTLEMENT":
+            return "자동 정산"
+        if source == "MANUAL":
+            return "수동"
+        if source == "AUTO_PRE_CYCLE":
+            return "자동 회고"
+        return "코인"
 
     async def _load_account_snapshot(self, market: str) -> dict[str, object]:
         total_asset = 0.0
@@ -525,7 +545,7 @@ class CoinDailyReportService:
         return CRYPTO_CYCLE_REVIEW_PROMPT.format(
             period_started_at=period_started_at.strftime("%Y-%m-%d %H:%M KST"),
             period_ended_at=period_ended_at.strftime("%Y-%m-%d %H:%M KST"),
-            report_source_label="자동 회고" if report_source == "AUTO_PRE_CYCLE" else "수동 생성",
+            report_source_label=self._report_source_label(report_source),
             applied_cycle_label=applied_cycle_id or "즉시 반영",
             market_regime=resolved_regime,
             market_context=resolved_context,

@@ -452,16 +452,16 @@ class TradingScheduler:
                     misfire_grace_time=300,
                 )
 
-                # 일일 리뷰 — 매일 00:00 KST
+                # 타임박스 정산 스윕 (기본 30분)
                 self.scheduler.add_job(
-                    self._post_market,
-                    "cron",
+                    self._crypto_settlement_sweep,
+                    "interval",
                     args=[market],
-                    hour=0, minute=0,
+                    minutes=30,
                     timezone=tz,
-                    id=f"post_market_{label}",
-                    name=f"크립토 일일 리뷰 ({label})",
-                    misfire_grace_time=3600,
+                    id=f"crypto_settlement_{label}",
+                    name=f"크립토 타임박스 정산 ({label})",
+                    misfire_grace_time=300,
                 )
                 continue
 
@@ -1068,6 +1068,339 @@ class TradingScheduler:
         except Exception as e:
             logger.warning("[{}] 보유종목 점검 오류: {}", market, str(e))
 
+    async def _load_due_crypto_timebox_trades(self, deadline: datetime) -> list[object]:
+        """타임박스 만료된 미청산 코인 매수 기록을 로드한다."""
+        from sqlalchemy import select
+
+        from core.database import AsyncSessionLocal
+        from models.coin_trade_result import CoinTradeResult
+
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    select(CoinTradeResult)
+                    .where(CoinTradeResult.side == "BUY")
+                    .where(CoinTradeResult.exit_at.is_(None))
+                    .where(CoinTradeResult.entry_at.is_not(None))
+                    .where(CoinTradeResult.entry_at <= deadline)
+                    .order_by(CoinTradeResult.entry_at.asc(), CoinTradeResult.created_at.asc())
+                )
+            ).scalars().all()
+        return list(rows)
+
+    async def _is_coin_trade_settled(self, trade_result_id: str) -> bool:
+        """매도 확인 후 코인 trade_result가 청산 완료되었는지 확인한다."""
+        from sqlalchemy import select
+
+        from core.database import AsyncSessionLocal
+        from models.coin_trade_result import CoinTradeResult
+
+        async with AsyncSessionLocal() as session:
+            row = await session.scalar(
+                select(CoinTradeResult)
+                .where(CoinTradeResult.id == trade_result_id)
+                .limit(1)
+            )
+        return bool(row and row.exit_at is not None)
+
+    @staticmethod
+    def _build_crypto_settlement_context(open_trade, holding, exit_reason: str) -> dict[str, object]:
+        """타임박스 정산용 최소 분석 컨텍스트를 구성한다."""
+        return {
+            "stock_name": str(getattr(holding, "name", "") or getattr(open_trade, "coin_name", "") or getattr(open_trade, "symbol", "")),
+            "strategy_type": str(getattr(open_trade, "strategy_type", "") or "TIMEBOX"),
+            "market_regime": str(getattr(open_trade, "market_regime", "") or ""),
+            "ai_confidence": float(getattr(open_trade, "ai_confidence", 0.0) or 0.0),
+            "ai_target_price": getattr(open_trade, "ai_target_price", None),
+            "ai_stop_loss_price": getattr(open_trade, "ai_stop_loss_price", None),
+            "analysis_source": "TIMEBOX_SETTLEMENT",
+            "event_type": exit_reason,
+            "currency": "KRW",
+        }
+
+    async def _crypto_settlement_sweep(self, market: str) -> None:
+        """코인 타임박스 만료 포지션을 청산하고 정산 리포트를 생성한다."""
+        from agent.decision_maker import decision_maker
+        from agent.trading_agent import trading_agent
+        from realtime.event_detector import event_detector
+        from scheduler.market_calendar import market_calendar
+        from services.activity_logger import activity_logger
+        from services.coin_daily_report_service import (
+            CoinReportGenerationError,
+            coin_daily_report_service,
+        )
+        from trading.account_manager import account_manager
+        from trading.market_profile import market_scope
+        from trading.mcp_client import mcp_client as _mcp
+        from util.time_util import ensure_kst, now_kst
+
+        scope = market_scope(market)
+        runtime = trading_agent.get_runtime(scope)
+        trading_date = market_calendar.market_date(market=scope)
+
+        if not settings.CRYPTO_ENABLED:
+            logger.debug("[{}] 타임박스 정산 스킵 — CRYPTO_ENABLED=false", market)
+            return
+        if runtime.cycle_lock.locked():
+            logger.debug("[{}] 타임박스 정산 스킵 — 코인 사이클 실행 중", market)
+            return
+        if runtime.settlement_lock.locked():
+            logger.debug("[{}] 타임박스 정산 스킵 — 기존 정산 스윕 진행 중", market)
+            return
+
+        with activity_logger.context(market_scope=scope, trading_date=trading_date):
+            async with runtime.settlement_lock:
+                try:
+                    if runtime.cycle_lock.locked():
+                        logger.debug("[{}] 타임박스 정산 취소 — 코인 사이클이 먼저 시작됨", market)
+                        return
+
+                    now = now_kst()
+                    timebox_hours = settings.crypto_timebox_hours
+                    exit_reason = f"TIMEBOX_{timebox_hours}H"
+                    deadline = now - timedelta(hours=timebox_hours)
+                    due_trades = await self._load_due_crypto_timebox_trades(deadline)
+                    if not due_trades:
+                        return
+
+                    holdings = await account_manager.get_holdings(market)
+                    if not holdings:
+                        logger.info("[{}] 타임박스 만료 trade_result는 있으나 실제 보유 코인이 없음", market)
+                        return
+
+                    holdings_map = {
+                        str(holding.symbol or "").upper(): holding
+                        for holding in holdings
+                        if getattr(holding, "symbol", None) and getattr(holding, "quantity", 0) > 0
+                    }
+                    pending_orders = await account_manager.get_pending_orders(market)
+                    pending_sell_symbols = {
+                        str(order.symbol or "").upper()
+                        for order in pending_orders
+                        if str(order.side or "") == "매도"
+                    }
+
+                    candidates: list[tuple[object, object]] = []
+                    for open_trade in due_trades:
+                        symbol = str(getattr(open_trade, "symbol", "") or "").upper()
+                        if not symbol or symbol in pending_sell_symbols:
+                            continue
+                        holding = holdings_map.get(symbol)
+                        if holding is None:
+                            continue
+                        candidates.append((open_trade, holding))
+
+                    if not candidates:
+                        return
+
+                    if not settings.is_trading_enabled_for_market(market):
+                        await self._log_schedule(
+                            market,
+                            ActivityPhase.PROGRESS,
+                            f"⚠️ [{market}] 타임박스 만료 {len(candidates)}건 있으나 trading disabled로 정산 스킵",
+                        )
+                        return
+
+                    settlement_cycle_id = activity_logger.start_cycle()
+                    await activity_logger.log(
+                        ActivityType.CYCLE,
+                        ActivityPhase.START,
+                        f"⏱️ [{market}] 타임박스 정산 시작 — 만료 {len(candidates)}건 | 기준 {timebox_hours}시간",
+                        cycle_id=settlement_cycle_id,
+                        detail={
+                            "market": market,
+                            "timebox_hours": timebox_hours,
+                            "candidate_count": len(candidates),
+                        },
+                    )
+
+                    settled_symbols: list[str] = []
+                    failed_symbols: list[str] = []
+
+                    for open_trade, holding in candidates:
+                        symbol = str(getattr(holding, "symbol", "") or "").upper()
+                        entry_at = ensure_kst(getattr(open_trade, "entry_at", None))
+                        hold_hours = (
+                            max(0, int((now - entry_at).total_seconds() // 3600))
+                            if entry_at
+                            else timebox_hours
+                        )
+                        current_price = float(
+                            getattr(holding, "current_price", 0.0)
+                            or getattr(open_trade, "entry_price", 0.0)
+                            or 0.0
+                        )
+                        requested_amount_krw = max(current_price * float(getattr(holding, "quantity", 0.0) or 0.0), 0.0)
+
+                        await activity_logger.log(
+                            ActivityType.ORDER,
+                            ActivityPhase.PROGRESS,
+                            f"⏱️ [{symbol}] 타임박스 만료 {hold_hours}시간 → 자동 청산 시도",
+                            cycle_id=settlement_cycle_id,
+                            symbol=symbol,
+                            detail={
+                                "market": market,
+                                "exit_reason": exit_reason,
+                                "hold_hours": hold_hours,
+                                "entry_at": entry_at.isoformat() if entry_at else None,
+                                "quantity": float(getattr(holding, "quantity", 0.0) or 0.0),
+                            },
+                        )
+
+                        try:
+                            response = await _mcp.place_order(
+                                symbol=symbol,
+                                side="SELL",
+                                quantity=float(getattr(holding, "quantity", 0.0) or 0.0),
+                                price=None,
+                                market=market,
+                            )
+                        except Exception as exc:
+                            failed_symbols.append(symbol)
+                            logger.error("[{}] 타임박스 청산 주문 오류 ({}): {}", market, symbol, str(exc))
+                            await activity_logger.log(
+                                ActivityType.ORDER,
+                                ActivityPhase.ERROR,
+                                f"❌ [{symbol}] 타임박스 청산 주문 오류: {str(exc)[:100]}",
+                                cycle_id=settlement_cycle_id,
+                                symbol=symbol,
+                                error_message=str(exc),
+                            )
+                            continue
+
+                        if not response.success:
+                            failed_symbols.append(symbol)
+                            error_message = str(response.error or "알 수 없는 오류")
+                            logger.error("[{}] 타임박스 청산 실패 ({}): {}", market, symbol, error_message)
+                            await activity_logger.log(
+                                ActivityType.ORDER,
+                                ActivityPhase.ERROR,
+                                f"❌ [{symbol}] 타임박스 청산 실패: {error_message[:100]}",
+                                cycle_id=settlement_cycle_id,
+                                symbol=symbol,
+                                error_message=error_message,
+                            )
+                            continue
+
+                        order_id = str((response.data or {}).get("order_id") or "")
+                        if not order_id:
+                            failed_symbols.append(symbol)
+                            await activity_logger.log(
+                                ActivityType.ORDER,
+                                ActivityPhase.ERROR,
+                                f"❌ [{symbol}] 타임박스 청산 실패: 주문번호 누락",
+                                cycle_id=settlement_cycle_id,
+                                symbol=symbol,
+                                error_message="order_id_missing",
+                            )
+                            continue
+
+                        await decision_maker.confirm_and_record(
+                            symbol=symbol,
+                            market=market,
+                            side="SELL",
+                            order_id=order_id,
+                            quantity=float(getattr(holding, "quantity", 0.0) or 0.0),
+                            expected_price=current_price,
+                            requested_amount_krw=requested_amount_krw,
+                            analysis_context=self._build_crypto_settlement_context(open_trade, holding, exit_reason),
+                            cycle_id=settlement_cycle_id,
+                            exit_reason=exit_reason,
+                        )
+
+                        if await self._is_coin_trade_settled(str(getattr(open_trade, "id", ""))):
+                            settled_symbols.append(symbol)
+                            event_detector.remove_levels(symbol, market=market)
+                        else:
+                            failed_symbols.append(symbol)
+                            await activity_logger.log(
+                                ActivityType.ORDER,
+                                ActivityPhase.ERROR,
+                                f"❌ [{symbol}] 타임박스 청산 주문은 접수됐지만 체결 확인이 완료되지 않았습니다",
+                                cycle_id=settlement_cycle_id,
+                                symbol=symbol,
+                                error_message="settlement_confirmation_missing",
+                            )
+
+                    if not settled_symbols:
+                        await activity_logger.log(
+                            ActivityType.CYCLE,
+                            ActivityPhase.SKIP,
+                            f"⏱️ [{market}] 타임박스 정산 종료 — 실제 청산 확정 없음",
+                            cycle_id=settlement_cycle_id,
+                            detail={
+                                "market": market,
+                                "timebox_hours": timebox_hours,
+                                "failed_symbols": failed_symbols,
+                            },
+                        )
+                        return
+
+                    account_manager.invalidate_cache()
+                    overview = await account_manager.get_account_overview(market)
+                    if not overview.balance.is_valid:
+                        message = overview.balance.status_message or "계좌 overview 재동기화 실패"
+                        await activity_logger.log(
+                            ActivityType.REPORT,
+                            ActivityPhase.ERROR,
+                            f"❌ [{market}] 타임박스 정산 후 overview 재동기화 실패: {message[:100]}",
+                            cycle_id=settlement_cycle_id,
+                            error_message=message,
+                        )
+                        return
+
+                    report = None
+                    try:
+                        report = await coin_daily_report_service.generate_checkpoint_report(
+                            market=market,
+                            report_source="AUTO_SETTLEMENT",
+                            trigger_reason=exit_reason,
+                            applied_cycle_id=settlement_cycle_id,
+                            market_regime=runtime.market_regime,
+                            market_context=runtime.market_context,
+                            period_anchor_sources={"AUTO_SETTLEMENT"},
+                            raise_on_error=True,
+                        )
+                    except CoinReportGenerationError as exc:
+                        logger.warning("[{}] 자동 정산 리포트 생성 실패: {}", market, exc.user_message)
+                    except Exception as exc:
+                        logger.error("[{}] 자동 정산 리포트 생성 오류: {}", market, str(exc))
+
+                    if report is not None:
+                        await trading_agent.refresh_runtime_trading_rules(
+                            market=market,
+                            cycle_id=settlement_cycle_id,
+                            emit_activity=True,
+                        )
+
+                    await self._log_schedule(
+                        market,
+                        ActivityPhase.PROGRESS,
+                        f"✅ [{market}] 타임박스 정산 완료: {len(settled_symbols)}건 청산"
+                        f"{' | 자동 정산 리포트 생성' if report is not None else ''}",
+                    )
+                    await activity_logger.log(
+                        ActivityType.CYCLE,
+                        ActivityPhase.COMPLETE,
+                        f"✅ [{market}] 타임박스 정산 완료: {len(settled_symbols)}건 청산",
+                        cycle_id=settlement_cycle_id,
+                        detail={
+                            "market": market,
+                            "timebox_hours": timebox_hours,
+                            "exit_reason": exit_reason,
+                            "settled_symbols": settled_symbols,
+                            "failed_symbols": failed_symbols,
+                            "report_generated": report is not None,
+                        },
+                    )
+                except Exception as exc:
+                    logger.error("[{}] 타임박스 정산 스윕 오류: {}", market, str(exc))
+                    await self._log_schedule(
+                        market,
+                        ActivityPhase.ERROR,
+                        f"❌ [{market}] 타임박스 정산 오류: {str(exc)[:100]}",
+                    )
+
     async def _post_market(self, market: str) -> None:
         """장 마감 성과 리뷰"""
         from agent.trading_agent import trading_agent
@@ -1110,6 +1443,12 @@ class TradingScheduler:
         """특정 시장의 장외 리뷰가 아직 안 되었으면 실행"""
         from scheduler.market_calendar import market_calendar
         from agent.trading_agent import trading_agent
+        from trading.market_profile import is_crypto_market
+
+        if is_crypto_market(market):
+            logger.debug("[{}] 코인 시장은 startup 장마감 리뷰를 사용하지 않음", market)
+            return
+
         market_now = self._market_now(market)
         if not market_calendar.is_trading_day(market, market_now):
             return

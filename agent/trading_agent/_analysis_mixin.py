@@ -1226,7 +1226,12 @@ class AnalysisMixin:
             f"(총 {stats['total']}건)"
         )
 
-        if not settings.DAY_TRADING_ONLY:
+        if scope == "CRYPTO":
+            context += (
+                f"\n코인 운영: 포지션별 최대 {settings.crypto_timebox_hours}시간 보유 | "
+                f"만료 시 자동 청산·정산 | 스캔 전 자동 리포트 없음"
+            )
+        elif not settings.DAY_TRADING_ONLY:
             context += (
                 f"\n모드: 스윙 (STABLE {settings.MAX_HOLD_DAYS_STABLE}일, "
                 f"AGGRESSIVE {settings.MAX_HOLD_DAYS_AGGRESSIVE}일)"
@@ -1255,7 +1260,12 @@ class AnalysisMixin:
         if not report:
             return ""
 
-        source_label = "자동 회고" if report.report_source == "AUTO_PRE_CYCLE" else "수동 생성"
+        source_map = {
+            "AUTO_PRE_CYCLE": "자동 회고",
+            "AUTO_SETTLEMENT": "자동 정산",
+            "MANUAL": "수동 리포트",
+        }
+        source_label = source_map.get(str(report.report_source or "").upper(), "코인 리포트")
         ended_at = ensure_kst(report.period_ended_at or report.created_at)
         lines = [f"- 기준 시각: {ended_at.strftime('%m/%d %H:%M')} KST ({source_label})"]
         if report.market_summary:
@@ -1263,7 +1273,12 @@ class AnalysisMixin:
         if report.lessons_learned:
             lines.append(f"- 학습 포인트: {str(report.lessons_learned)[:180]}")
         if report.next_day_plan:
-            lines.append(f"- 다음 사이클 계획: {str(report.next_day_plan)[:180]}")
+            next_plan_label = (
+                "다음 정산 윈도우 포인트"
+                if str(report.report_source or "").upper() == "AUTO_SETTLEMENT"
+                else "다음 사이클 계획"
+            )
+            lines.append(f"- {next_plan_label}: {str(report.next_day_plan)[:180]}")
         return "\n".join(lines)
 
     # ── 임계값 적용 ──
@@ -1379,6 +1394,7 @@ class AnalysisMixin:
             symbol=symbol,
             market=market_code,
             currency=currency,
+            timebox_hours=settings.crypto_timebox_hours if scope == "CRYPTO" else "",
             current_price_text=current_price_text,
             change_text=change_text,
             change_rate=float(price_data.get("change_rate") or 0),
@@ -1484,11 +1500,15 @@ class AnalysisMixin:
             if suggestions:
                 tuning_suggestions = "\n".join(f"- {s}" for s in suggestions)
 
-        max_hold_days = (
-            settings.MAX_HOLD_DAYS_AGGRESSIVE
-            if strategy_type == "AGGRESSIVE_SHORT"
-            else settings.MAX_HOLD_DAYS_STABLE
-        )
+        if scope == "CRYPTO":
+            max_hold_window = f"{settings.crypto_timebox_hours}시간 (만료 시 자동 청산)"
+        else:
+            max_hold_days = (
+                settings.MAX_HOLD_DAYS_AGGRESSIVE
+                if strategy_type == "AGGRESSIVE_SHORT"
+                else settings.MAX_HOLD_DAYS_STABLE
+            )
+            max_hold_window = f"{max_hold_days}일"
 
         review_prompt_template = get_final_review_prompt(market_code)
         prompt = review_prompt_template.format(
@@ -1512,7 +1532,7 @@ class AnalysisMixin:
             position_pct=account_context["projected_combined_position_pct"] or 0,
             stop_loss_pct=getattr(strategy, "stop_loss_pct", None) or -3,
             take_profit_pct=getattr(strategy, "take_profit_pct", None) or 5,
-            max_hold_days=max_hold_days,
+            max_hold_window=max_hold_window,
             max_position_pct=account_context["max_position_pct"],
             feedback_context=feedback_context or "매매 이력 없음",
             tuning_suggestions=tuning_suggestions,

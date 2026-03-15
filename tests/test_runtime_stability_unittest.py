@@ -77,7 +77,7 @@ class TradingAgentBrokerAvailabilityTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result, expected)
 
-    async def test_prepare_crypto_cycle_feedback_generates_report_for_scheduled_auto_only(self):
+    async def test_prepare_crypto_cycle_feedback_skips_auto_report_for_scheduled_auto(self):
         agent = TradingAgent()
         runtime = agent.get_runtime("CRYPTO")
 
@@ -97,14 +97,7 @@ class TradingAgentBrokerAvailabilityTest(unittest.IsolatedAsyncioTestCase):
                 trigger_reason="adaptive_rescan",
             )
 
-        generate_report.assert_awaited_once_with(
-            market="BITHUMB",
-            report_source="AUTO_PRE_CYCLE",
-            trigger_reason="adaptive_rescan",
-            applied_cycle_id="cycle-auto",
-            market_regime="",
-            market_context="",
-        )
+        generate_report.assert_not_awaited()
         refresh_rules.assert_awaited_once_with(
             market="BITHUMB",
             cycle_id="cycle-auto",
@@ -141,7 +134,11 @@ class TradingAgentBrokerAvailabilityTest(unittest.IsolatedAsyncioTestCase):
             emit_activity=True,
         )
         self.assertTrue(
-            any(call.args[:2] == ("REPORT", "SKIP") for call in log_activity.await_args_list)
+            any(
+                call.args[:2] == ("REPORT", "SKIP")
+                and "최신 정산 리포트 기준 규칙만 재적용" in call.args[2]
+                for call in log_activity.await_args_list
+            )
         )
 
 

@@ -104,17 +104,19 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertNotIn('"recommendation": "BUY/SELL/HOLD"', STOCK_ANALYSIS_PROMPT)
 
     def test_crypto_analysis_prompt_uses_coin_specific_short_term_rules(self):
-        self.assertIn("수시간~2일", CRYPTO_ANALYSIS_SYSTEM)
+        self.assertIn("timebox(12h/24h)", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn(f"BULL_RUN/ALTSEASON/THEME 국면: {CRYPTO_MOMENTUM_RR_FLOOR:.1f}:1 이상이면 적정", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn(f"BEAR_MARKET/CONSOLIDATION 국면: 최소 {CRYPTO_DEFENSIVE_RR_FLOOR:.1f}:1", CRYPTO_ANALYSIS_SYSTEM)
-        self.assertIn("24/7 시장이므로 시간 압박은 없습니다", CRYPTO_ANALYSIS_SYSTEM)
+        self.assertIn("timebox 만료 시 자동 청산", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("지나치게 보수적인 HOLD보다 BUY를 우선 검토하세요", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("ADD_ON_PYRAMID", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("ADD_ON_AVERAGE_DOWN", CRYPTO_ANALYSIS_SYSTEM)
         self.assertIn("5,000 KRW", CRYPTO_ANALYSIS_SYSTEM)
+        self.assertIn("현재 타임박스: {timebox_hours}시간", CRYPTO_ANALYSIS_PROMPT)
         self.assertIn("수량이 아니라 KRW 투자금 기준", CRYPTO_ANALYSIS_PROMPT)
         self.assertIn("24h 거래대금: {trade_value_text}", CRYPTO_ANALYSIS_PROMPT)
         self.assertIn("거래대금이 약하거나 추격 매수 성격이 강하면", CRYPTO_ANALYSIS_PROMPT)
+        self.assertIn("timebox 안에 끝낼 수 없는 느린 추세면", CRYPTO_ANALYSIS_PROMPT)
         self.assertIn("HOLD라면 거래대금 부족, 추격 매수, 추세 불일치, RR 부족, 지지선 회복 미확인", CRYPTO_ANALYSIS_PROMPT)
         self.assertNotIn('"recommendation": "BUY/SELL/HOLD"', CRYPTO_ANALYSIS_PROMPT)
 
@@ -141,9 +143,12 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn(f"RR비율: {CRYPTO_MOMENTUM_RR_FLOOR:.1f}:1 이상이면 허용", CRYPTO_REVIEW_SYSTEM)
         self.assertIn(f"RR비율: 최소 {CRYPTO_DEFENSIVE_RR_FLOOR:.1f}:1", CRYPTO_REVIEW_SYSTEM)
         self.assertIn("시장가 금액 매수", CRYPTO_REVIEW_SYSTEM)
+        self.assertIn("timebox 만료 시 자동 청산", CRYPTO_REVIEW_SYSTEM)
         self.assertIn("막연한 불안감만으로 HOLD로 돌리지 말고 BUY를 우선 검토하세요", CRYPTO_REVIEW_SYSTEM)
         self.assertIn("suggested_amount_krw", CRYPTO_REVIEW_PROMPT)
         self.assertIn("24h 거래대금: {trade_value_text}", CRYPTO_REVIEW_PROMPT)
+        self.assertIn("최대 보유: {max_hold_window}", CRYPTO_REVIEW_PROMPT)
+        self.assertIn("이 진입이 {max_hold_window} 안에 끝날 구조인가", CRYPTO_REVIEW_PROMPT)
         self.assertIn("action: BUY 또는 HOLD만 사용하세요", CRYPTO_REVIEW_PROMPT)
         self.assertIn("체크리스트 통과 시 HOLD보다 BUY를 우선 검토하세요", CRYPTO_REVIEW_PROMPT)
         self.assertIn('"action": "BUY/HOLD"', CRYPTO_REVIEW_PROMPT)
@@ -161,15 +166,18 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("장후반(15:00 ET~매수 마감)", US_MARKET_SCAN_SYSTEM)
 
     def test_crypto_market_scan_prompt_uses_canonical_regimes_and_can_return_zero(self):
-        self.assertIn("수시간~2일", CRYPTO_MARKET_SCAN_SYSTEM)
+        self.assertIn("12h/24h timebox", CRYPTO_MARKET_SCAN_SYSTEM)
         self.assertIn("THEME(섹터 장세)", CRYPTO_MARKET_SCAN_SYSTEM)
         self.assertIn("canonical 국면명만 사용", CRYPTO_MARKET_SCAN_SYSTEM)
         self.assertIn("0개보다 1개 이상 선정을 우선하세요", CRYPTO_MARKET_SCAN_SYSTEM)
+        self.assertIn("timebox 만료 시 자동 청산", CRYPTO_MARKET_SCAN_SYSTEM)
         self.assertIn("최소 주문금액은 5,000 KRW", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn("수량이 아니라 KRW 투자금 기준", CRYPTO_MARKET_SCAN_SYSTEM)
+        self.assertIn("현재 운영 타임박스: {timebox_hours}시간", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn("이번 스캔 선정 목표: {selection_target_range}개", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn("적합한 후보가 없으면 0개 허용", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn("조건을 충족하는 후보가 있으면 0개보다 1개 이상 선정을 우선", CRYPTO_MARKET_SCAN_PROMPT)
+        self.assertIn("{timebox_hours}시간 안에 끝낼 수 있는지", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn('"market_regime": "BULL_RUN/BEAR_MARKET/CONSOLIDATION/ALTSEASON/THEME"', CRYPTO_MARKET_SCAN_PROMPT)
 
     def test_crypto_primary_market_falls_back_to_bithumb_for_invalid_value(self):
@@ -183,10 +191,10 @@ class TradingAgentDataQualityTest(unittest.TestCase):
     def test_daily_plan_prompt_limits_action_items_to_top_changes(self):
         self.assertIn("action_items는 가장 중요한 3~5개만 제안하세요", DAILY_PLAN_PROMPT)
 
-    def test_crypto_cycle_review_prompt_targets_next_cycle_feedback(self):
-        self.assertIn("다음 코인 사이클", CRYPTO_CYCLE_REVIEW_SYSTEM)
-        self.assertIn("직전 자동 운영 구간", CRYPTO_CYCLE_REVIEW_PROMPT)
-        self.assertIn("다음 적용 사이클", CRYPTO_CYCLE_REVIEW_PROMPT)
+    def test_crypto_cycle_review_prompt_targets_next_settlement_window_feedback(self):
+        self.assertIn("다음 정산 윈도우", CRYPTO_CYCLE_REVIEW_SYSTEM)
+        self.assertIn("직전 자동 정산 구간", CRYPTO_CYCLE_REVIEW_PROMPT)
+        self.assertIn("다음 적용 윈도우", CRYPTO_CYCLE_REVIEW_PROMPT)
         self.assertIn('"next_cycle_plan"', CRYPTO_CYCLE_REVIEW_PROMPT)
         self.assertIn("ALL / BULL_RUN / BEAR_MARKET / CONSOLIDATION / ALTSEASON / THEME", CRYPTO_CYCLE_REVIEW_SYSTEM)
 

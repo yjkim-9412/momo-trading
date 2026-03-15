@@ -13,10 +13,12 @@ class DynamicRescanSchedulerSetupTest(unittest.TestCase):
     def setUp(self):
         self._original_markets = settings.ENABLED_MARKETS
         self._original_dynamic = settings.AI_DYNAMIC_RESCAN_ENABLED
+        self._original_crypto_enabled = settings.CRYPTO_ENABLED
 
     def tearDown(self):
         settings.ENABLED_MARKETS = self._original_markets
         settings.AI_DYNAMIC_RESCAN_ENABLED = self._original_dynamic
+        settings.CRYPTO_ENABLED = self._original_crypto_enabled
 
     def test_setup_jobs_omits_fixed_intraday_cron_when_dynamic_mode_enabled(self):
         settings.ENABLED_MARKETS = "KRX"
@@ -38,6 +40,17 @@ class DynamicRescanSchedulerSetupTest(unittest.TestCase):
 
         job_ids = {job.id for job in scheduler.scheduler.get_jobs()}
         self.assertIn("intraday_rescan_KRX", job_ids)
+
+    def test_setup_jobs_registers_crypto_settlement_sweep_instead_of_post_market_review(self):
+        settings.ENABLED_MARKETS = "BITHUMB"
+        settings.CRYPTO_ENABLED = True
+        scheduler = TradingScheduler()
+
+        scheduler._setup_jobs()
+
+        job_ids = {job.id for job in scheduler.scheduler.get_jobs()}
+        self.assertIn("crypto_settlement_BITHUMB", job_ids)
+        self.assertNotIn("post_market_BITHUMB", job_ids)
 
 
 class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
