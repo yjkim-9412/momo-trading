@@ -10,6 +10,13 @@ KIS Open API 구현, 디버깅, 새 API 연동 시 반드시 `kis-api-ref` 스�
 - 스킬: `.codex/skills/kis-api-ref/`
 - LLM용 샘플은 `examples_llm/` 폴더에, 사용자용 통합 예제는 `examples_user/` 폴더에 위치
 
+## 빗썸 API 참조
+
+빗썸 API 구현, 디버깅, 새 API 연동 시 `bithumb-api-ref` 스킬을 사용하여 로컬 레퍼런스를 참조할 것.
+
+- 스킬: `.codex/skills/bithumb-api-ref/`
+- 로컬 레퍼런스: `docs/bithumb-api/` (PUBLIC 9개 + PRIVATE 25개 = 34개 엔드포인트)
+
 ## 코인(빗썸) 시스템 가이드
 
 코인 관련 개발·디버깅 시 `crypto-guide` 스킬을 사용하여 코인 시스템 구조를 참조할 것.
@@ -79,18 +86,6 @@ Scheduler (고정 오픈 스캔 + adaptive 장중 재스캔)
 | AggressiveShortStrategy | `strategy/aggressive_short.py` | `evaluate()` |
 | RiskManager | `strategy/risk_manager.py` | `check()` |
 
-### 스케줄 구조
-
-- `장 시작 스캔`은 시장별 고정 cron으로 유지한다.
-- `장중 재스캔`은 더 이상 `11:00/13:00` 고정 cron이 아니다.
-  - `run_cycle()` 종료 후 `schedule_hint`를 생성한다.
-  - 스케줄러는 시장별 `adaptive_rescan_*` one-shot job 하나만 유지한다.
-- `보유종목 점검`, `강제 청산`, `장마감 리뷰`, `포트폴리오 정산`, `일봉 데이터 수집`은 고정 스케줄로 유지한다.
-- scheduled 재스캔 예산은 `오픈 스캔 제외` 기준으로 `AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION`만큼만 사용한다.
-- `cycle_already_running`, `buy_cutoff`, `mcp_unavailable`, 휴장일 같은 skip는 scheduled 예산을 차감하지 않는다.
-- WebSocket 실시간 이벤트 기반 분석은 scheduled 재스캔 예산과 별개다.
-- 롤백이 필요하면 `.env`에서 `AI_DYNAMIC_RESCAN_ENABLED=false`로 두면 기존 고정 `11:00/13:00` 재스캔 구조로 복귀한다.
-
 ### 2-Tier LLM 시스템
 
 | Tier | 용도 | Claude Code | Codex CLI |
@@ -114,14 +109,6 @@ WebSocket → EventDetector → EventBus:
 
 장후 리뷰 → 성공/실패 패턴 추출 → 트레이딩 규칙 자동 생성 → 다음 날 적용
 
-## 분리된 장 구조
-
-- 운영 장은 `KRX`, `US`, `CRYPTO` 세 runtime scope로 분리한다.
-- `market_scope` 는 스케줄, 리포트, 리스크, LLM 세션, 실시간 구독을 나누는 기준이다.
-- 실제 주문/시세용 `market` 코드는 `KRX`, `NASDAQ`, `NYSE`, `AMEX`, `BITHUMB` 같은 거래소 코드를 그대로 유지한다.
-- 미국장은 거래소 단위로 주문하지만, 장중 런타임과 장후 리뷰는 `US` scope로 묶어 처리한다.
-- 코인은 `BITHUMB` 거래소 코드를 사용하며, `CRYPTO` scope로 묶어 24/7 운영한다.
-
 ### 인터페이스 추상화
 
 | Protocol | 파일 | 역할 |
@@ -131,39 +118,6 @@ WebSocket → EventDetector → EventBus:
 | `RealtimeProvider` | `trading/broker_base.py` | WebSocket 실시간 시세 |
 | `MarketScannerProtocol` | `agent/scanner_base.py` | 시장 스캔 결과 반환 |
 
-## 코인(빗썸) 구현 회고
-
-- 코인 장은 `CRYPTO` scope로 주식과 완전 격리. `MarketState`는 `normalize_market_scope("BITHUMB")` → `"CRYPTO"` 기준 자동 생성.
-- 환경변수는 주식과 완전 분리 (`CRYPTO_TRADING_ENABLED`, `CRYPTO_AUTONOMY_MODE` 등).
-- 빗썸 인증은 JWT Bearer (PyJWT + HS256). KIS OAuth2와 다른 체계.
-- 빗썸 rate limit: 공식 Public 150/s, Private 140/s, 주문 10/s. 코드는 보수적 10/5 semaphore.
-- 캔들 정렬: newest-first → oldest-first 재정렬 (미국장과 동일 방어).
-- 수량 소수점: `OrderRequest.quantity = float`. 주식은 정수만 전달.
-- 24/7 시장: buy cutoff / force liquidation 없음.
-- R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게).
-- `/admin-coin` 별도 SPA, API prefix `/api/v1/admin-coin/*`, 독립 `coin_sse_manager`.
-- DB 완전 분리: 10개 `coin_*` 테이블, 활동 로그 → `CoinActivityLog`, 추천 → `CoinRecommendation`.
-- 보유 코인 현재가: `_fetch_coin_prices()` 벌크 ticker 조회, 실패 시 avg_buy_price 폴백.
-- LLM Provider 독립: `CRYPTO_LLM_PROVIDER`, Tier1 SCAN/ANALYSIS 프로필별 모델·effort 분리.
-- 코인 수정 시 확인할 테스트: 프로필 정규화, 캔들 정렬, rate limit, 환경변수 독립성, DB FK 정합성.
-
-## 미국장 구현 회고
-
-- 미국 프리마켓은 `US_PREMARKET_ENABLED=true`일 때 정식 장중 세션으로 취급한다. 스케줄 기준은 `03:50 ET` 준비, `04:05 ET` 오픈 스캔이며, 그 이후 장중 재스캔은 고정 `11:00/13:00 ET`가 아니라 adaptive one-shot으로 이어진다. 미국장 스케줄은 `scheduler/scheduler.py`의 프로필 계산과 `schedule_hint` 흐름을 기준으로 유지하고, `09:35 ET` 같은 정규장 하드코딩을 다시 넣지 말 것.
-- 미국장 API 장애의 1차 원인은 `프리마켓 미지원`이 아니라 `해외 시세 burst 호출`이었다. 종목 병렬 분석과 종목 내부 `현재가 + 일봉 + 분봉` 동시 호출이 겹치면 KIS가 `초당 거래건수를 초과하였습니다.`를 반환할 수 있다. 해외 현재가/일봉/분봉은 반드시 공통 limiter 또는 직렬화 경로를 타게 유지할 것.
-- 미국장 API 장애의 2차 원인은 `시계열 역순 응답`이었다. KIS 해외 `dailyprice`, `inquire-time-itemchartprice` 응답은 최신순일 수 있고, 지표 계산기는 `oldest -> newest`를 가정한다. 해외 시세는 `trading/mcp_client.py`에서 먼저 `date/time` 오름차순 정렬하고, `agent/trading_agent/`의 DataFrame 단계에서도 다시 정렬하는 이중 방어를 유지할 것.
-- 미국 단기매매에서는 `실시간 현재가`와 같은 가격 축을 쓰는 것이 우선이다. 해외 일봉은 `trading/kis_api.py`에서 `MODP="0"`을 사용해 비수정주가 기준으로 가져오고, 수정주가 기준 일봉과 실시간 현재가를 혼용하지 말 것. 장기 백테스트처럼 수정주가가 꼭 필요한 경우가 아니라면 단기 AI 분석 경로에서는 `MODP="1"`로 되돌리지 않는다.
-- 미국장 Tier2 가격 필드는 반드시 시장 통화 기준이다. 미국 종목에서 `entry_price`, `target_price`, `stop_loss_price`, `take_profit_price`에 원화 값을 넣지 말 것. Tier2가 원화처럼 보이는 값을 반환하면 시장 통화로 정규화하고, 주문 직전에는 실시간 현재가 대비 지정가 괴리 sanity guard를 통과한 값만 브로커로 보낼 것.
-- `KIS_ACCOUNT_TYPE=VIRTUAL` 기준으로 미국 `US_PRE`/`US_AFTER` 주문은 KIS가 `모의투자 장시작전 입니다.` 등으로 거절할 수 있다. 모의계좌에서 미국 프리마켓/애프터마켓은 분석 세션으로는 유지하되, 자동주문은 실패 반복 대신 추천 fallback으로 전환하는 현재 동작을 유지할 것.
-- 일봉 기반 절대 레벨과 실시간 현재가가 크게 어긋나면 LLM이 이상한 것이 아니라 입력 데이터 축이 충돌한 것이다. 미국장 분석 전 `latest_daily_close`, `latest_minute_close`와 현재가를 비교하는 정합성 가드를 유지하고, 큰 괴리가 나면 `HOLD` 유도가 아니라 분석 자체를 차단하고 로그에 원인 값을 남길 것.
-- 일봉 여러 개를 누적해서 만든 숫자 `VWAP`는 미국 단기매매 판단에 쓰지 않는다. intraday VWAP 맥락은 분봉 기반 분석에서만 사용하고, 일봉 지표 목록에 다시 넣지 말 것.
-- 운영 중 미국장 로그를 볼 때 `데이터 부족으로 분석 스킵 (현재가·일봉 조회 실패)`가 여러 종목에서 동시 발생하면 우선 거래소 미지원이 아니라 rate limit/burst를 의심할 것. `데이터 정합성 차단`이 나오면 프리마켓 자체보다 가격 축 또는 시계열 정렬 문제를 먼저 확인할 것.
-- 미국장 구현이나 수정 시 아래 테스트 축을 같이 유지한다.
-  - 해외 일봉 `MODP=0` 검증
-  - 해외 일봉/분봉 `oldest -> newest` 정렬 검증
-  - 해외 quote 직렬화 및 rate limit 재시도 검증
-  - 실시간 현재가 대비 일봉/분봉 앵커 정합성 차단 검증
-
 ## 코드 컨벤션
 
 - Python 3.11+, async/await 기반
@@ -172,28 +126,11 @@ WebSocket → EventDetector → EventBus:
 - loguru 로깅 (logger.info/warning/error)
 - 테스트: `pytest` + `pytest-asyncio` + `unittest` 혼용, `tests/` 디렉토리
 
-## 테스트 실행 규칙
+## 공통 운영 지침
 
-- 테스트는 항상 저장소 루트(`/mnt/c/Users/KYJ/projects/momo-trading`)에서 실행할 것.
-- **OS/셸에 맞는 가상환경 Python을 직접 호출할 것.** bare `pytest`, `python -m pytest`, `python3 -m pytest` 사용 금지.
-- 이 저장소는 환경이 분리돼 있을 수 있다:
-  - WSL / Linux / macOS (bash, zsh): `venv/`
-  - Windows (PowerShell, cmd): `.venv\\Scripts\\`
-- WSL / Linux / macOS 실행 규칙:
-  - 기본 전체 실행: `venv/bin/python -m pytest tests/ -v`
-  - 파일 단위 실행: `venv/bin/python -m pytest tests/test_admin_coin_unittest.py -v`
-  - 키워드 실행: `venv/bin/python -m pytest tests/ -k watchlist -v`
-  - 세션 시작 확인: `test -x venv/bin/python && venv/bin/python --version`
-- Windows 실행 규칙:
-  - 기본 전체 실행: `.venv\\Scripts\\python.exe -m pytest tests\\ -v`
-  - 파일 단위 실행: `.venv\\Scripts\\python.exe -m pytest tests\\test_admin_coin_unittest.py -v`
-  - 세션 시작 확인: `if exist .venv\\Scripts\\python.exe .venv\\Scripts\\python.exe --version`
-- 가상환경이 없으면 OS에 맞게 생성/복구:
-  - WSL / Linux / macOS: `python3 -m venv venv && venv/bin/pip install -r requirements.txt`
-  - Windows: `py -m venv .venv && .venv\\Scripts\\pip.exe install -r requirements.txt`
-- bash 세션에서는 `.venv/bin/python`을 가정하지 말 것. 이 저장소의 `.venv`는 Windows 레이아웃일 수 있다.
-- Windows 세션에서는 `venv/bin/python`을 사용하지 말 것.
-- 테스트가 실패해도 system Python으로 재시도하지 말고, 먼저 현재 세션이 어느 OS/셸인지와 해당 가상환경 경로를 확인할 것.
+분리된 장 구조, 스케줄 구조, 미국장/코인 구현 회고, 테스트 실행 규칙은 아래 문서에 정의되어 있다. 반드시 참조할 것.
+
+- `docs/shared-guidelines.md`
 
 ## 주요 디렉토리
 

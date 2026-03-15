@@ -1,12 +1,13 @@
+---
+name: bithumb-api-ref
+description: 빗썸 거래소 API 레퍼런스 조회. 빗썸 REST API(PUBLIC 9개 + PRIVATE 25개), WebSocket API(PUBLIC 3개 + PRIVATE 2개), JWT 인증, rate limit, 에러 코드 참조 시 사용.
+---
+
 # Bithumb API 레퍼런스 조회
 
 빗썸 거래소 API 참조가 필요할 때 로컬 레퍼런스를 조회한다. REST API(PUBLIC 9개 + PRIVATE 25개)와 WebSocket API(PUBLIC 3개 + PRIVATE 2개)를 포함한다.
 
 **공식 문서:** https://apidocs.bithumb.com/v2.1.0/reference/
-
-## 사용자 인자
-
-$ARGUMENTS — 검색할 API 기능 키워드 (예: 주문, 시세, 캔들, 출금, ticker, orderbook 등)
 
 ## 레퍼런스 구조
 
@@ -136,30 +137,10 @@ Content-Type: application/json; charset=utf-8
 | 422 | `order_not_ready` | 주문 처리 중, 재시도 필요 |
 | 500 | `server_error` | 서버 오류, 재시도 |
 
-## 실행 절차
+## 조회 절차
 
-사용자 인자 "$ARGUMENTS"에 대해 아래 순서로 조회:
+키워드에 대해 아래 순서로 조회:
 
-### Step 1: 인덱스에서 키워드 검색
-
-`docs/bithumb-api/README.md`를 읽어서 "$ARGUMENTS"와 매칭되는 엔드포인트를 찾는다.
-한글·영문 키워드 모두 매칭 대상이다.
-
-### Step 2: 매칭된 엔드포인트 상세 조회
-
-매칭된 엔드포인트의 상세 파일을 읽는다:
-```
-docs/bithumb-api/{public|private|websocket}/{엔드포인트}.md
-```
-
-WebSocket 관련 키워드(websocket, 웹소켓, 실시간, realtime, stream, ticker, trade, orderbook, myOrder, myAsset)는 `websocket/` 폴더에서 조회한다.
-
-여러 개가 매칭되면 가장 관련도 높은 1~3개를 선택한다.
-
-### Step 3: 결과 정리
-
-조회한 내용을 바탕으로:
-- API URL, HTTP 메서드, 인증 요구사항 정리
-- 요청 파라미터 & 응답 스키마 설명
-- 코드 예제 (Python, JavaScript, Java)
-- 현재 프로젝트(MOMO Trading) 코드와의 연관성 안내
+1. `docs/bithumb-api/README.md`를 읽어서 매칭되는 엔드포인트를 찾는다
+2. 매칭된 엔드포인트 상세 파일(`docs/bithumb-api/{public|private|websocket}/`)을 읽는다
+3. API URL, 인증, 요청/응답 스키마, 프로젝트 코드와의 연관성을 정리한다
