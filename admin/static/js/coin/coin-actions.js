@@ -3,7 +3,7 @@
 // Security note: all dynamic content is escaped via escapeHtml()
 // before DOM insertion. This mirrors the original coin-app.js exactly.
 
-import { fetchJSON } from '../shared/admin-core.js';
+import { refreshIcons, fetchJSON } from '../shared/admin-core.js';
 import * as Toast from '../shared/admin-toast.js';
 import { state, API, registerSyncAgentSnapshot } from './coin-state.js';
 import { setStatusText, truncateText } from './coin-utils.js';
