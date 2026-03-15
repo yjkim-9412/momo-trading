@@ -9,6 +9,7 @@ from trading.market_profile import is_crypto_market, is_us_market
 from trading.risk_policy import (
     CRYPTO_DEFAULT_RR_FLOOR,
     DEFAULT_RR_FLOOR,
+    resolve_crypto_rr_floor,
     resolve_rr_floor as resolve_shared_rr_floor,
 )
 from trading.product_policy import (
@@ -272,7 +273,11 @@ class RiskManager:
             if risk > 0:
                 rr_ratio = reward / risk
                 if _is_crypto:
-                    min_rr = self.CRYPTO_RR_FLOOR.get(market_regime, 1.5)
+                    min_rr = resolve_crypto_rr_floor(
+                        market_regime,
+                        settings.crypto_trading_style_mode,
+                        rr_floor_overrides,
+                    )
                 else:
                     min_rr = self.resolve_rr_floor(market_regime, rr_floor_overrides)
                 if rr_ratio < min_rr:

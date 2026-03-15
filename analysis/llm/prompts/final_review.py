@@ -1,11 +1,14 @@
 """Tier 2: 최종 검토 — 체크리스트 검증 + 스트레스 테스트"""
 
+from core.config import settings
 from trading.market_profile import is_crypto_market, normalize_market
 from trading.risk_policy import (
     BULL_THEME_RR_FLOOR,
     CRYPTO_DEFENSIVE_RR_FLOOR,
     CRYPTO_MOMENTUM_RR_FLOOR,
     DEFENSIVE_RR_FLOOR,
+    get_crypto_rr_thresholds_for_mode,
+    normalize_crypto_trading_style_mode,
 )
 
 FINAL_REVIEW_SYSTEM = """당신은 최고 수준의 주식 투자 심사역(Risk Reviewer)입니다.
@@ -168,7 +171,7 @@ FINAL_REVIEW_PROMPT = (
 # 크립토 Tier 2 프롬프트
 # ---------------------------------------------------------------------------
 
-CRYPTO_REVIEW_SYSTEM = """당신은 최고 수준의 암호화폐(코인) 투자 심사역(Risk Reviewer)입니다.
+CRYPTO_REVIEW_SYSTEM_TEMPLATE = """당신은 최고 수준의 암호화폐(코인) 투자 심사역(Risk Reviewer)입니다.
 Tier 1 AI가 수행한 코인 분석을 **독립적으로 검증**하고, 최종 매매 결정을 내립니다.
 
 ## 핵심 역할
@@ -200,6 +203,7 @@ Tier 1 AI가 수행한 코인 분석을 **독립적으로 검증**하고, 최종
 - timebox 안에 목표가 도달 근거가 약하면 BUY가 아니라 HOLD 또는 REJECT 쪽으로 판단하세요
 - 강세 국면에서는 체크리스트를 통과한 BUY 아이디어를 완전히 버리기보다 `suggested_amount_krw`를 보수적으로 줄여 승인하는 선택지도 우선 검토하세요
 - Spot(현물) 거래만 — 레버리지/인버스 상품 없음
+__CRYPTO_STYLE_GUIDANCE__
 
 ## 거부(REJECT) 기준
 - BULL_RUN/ALTSEASON/THEME 국면: RR비율 __CRYPTO_MOMENTUM_RR__:1 미만 → REJECT
@@ -213,13 +217,34 @@ Tier 1 AI가 수행한 코인 분석을 **독립적으로 검증**하고, 최종
 - falling knife 성격이면 승인하지 말고 HOLD로 돌리세요
 
 반드시 한국어로 답변"""
-CRYPTO_REVIEW_SYSTEM = (
-    CRYPTO_REVIEW_SYSTEM
-    .replace("__CRYPTO_MOMENTUM_RR__", f"{CRYPTO_MOMENTUM_RR_FLOOR:.1f}")
-    .replace("__CRYPTO_DEFENSIVE_RR__", f"{CRYPTO_DEFENSIVE_RR_FLOOR:.1f}")
-)
 
-CRYPTO_REVIEW_PROMPT = """## 최종 검토 요청
+
+def _crypto_review_style_guidance(trading_style_mode: str | None) -> str:
+    mode = normalize_crypto_trading_style_mode(trading_style_mode)
+    if mode == "AGGRESSIVE":
+        return (
+            "- 공격적 모드: 강세 국면에서는 RR이 기준 이상이고 거래대금 유지·분봉 재확인이 있으면 "
+            "막연한 경계심보다 BUY 승인을 우선 검토하세요\n"
+            "- 공격적 모드: 조건은 맞지만 확신이 낮을 때는 HOLD보다 `suggested_amount_krw`를 줄여 승인하는 선택지를 우선 보세요"
+        )
+    return (
+        "- 보수적 모드: 분봉 중립, 거래량 정체, 저항 바로 아래 추격은 BUY보다 HOLD 또는 REJECT를 우선하세요"
+    )
+
+
+def get_crypto_review_system(trading_style_mode: str | None = None) -> str:
+    momentum_rr_floor, defensive_rr_floor = get_crypto_rr_thresholds_for_mode(trading_style_mode)
+    return (
+        CRYPTO_REVIEW_SYSTEM_TEMPLATE
+        .replace("__CRYPTO_MOMENTUM_RR__", f"{momentum_rr_floor:.1f}")
+        .replace("__CRYPTO_DEFENSIVE_RR__", f"{defensive_rr_floor:.1f}")
+        .replace("__CRYPTO_STYLE_GUIDANCE__", _crypto_review_style_guidance(trading_style_mode))
+    )
+
+
+CRYPTO_REVIEW_SYSTEM = get_crypto_review_system("CONSERVATIVE")
+
+CRYPTO_REVIEW_PROMPT_TEMPLATE = """## 최종 검토 요청
 
 ### 시장 전체 상황
 {market_context}
@@ -329,28 +354,35 @@ JSON 형식으로 답변:
   "risk_warnings": ["위 분석에서 도출한 리스크"]
 }}
 ```"""
-CRYPTO_REVIEW_PROMPT = (
-    CRYPTO_REVIEW_PROMPT
-    .replace("__CRYPTO_MOMENTUM_RR__", f"{CRYPTO_MOMENTUM_RR_FLOOR:.1f}")
-    .replace("__CRYPTO_DEFENSIVE_RR__", f"{CRYPTO_DEFENSIVE_RR_FLOOR:.1f}")
-)
+
+
+def get_crypto_review_prompt(trading_style_mode: str | None = None) -> str:
+    momentum_rr_floor, defensive_rr_floor = get_crypto_rr_thresholds_for_mode(trading_style_mode)
+    return (
+        CRYPTO_REVIEW_PROMPT_TEMPLATE
+        .replace("__CRYPTO_MOMENTUM_RR__", f"{momentum_rr_floor:.1f}")
+        .replace("__CRYPTO_DEFENSIVE_RR__", f"{defensive_rr_floor:.1f}")
+    )
+
+
+CRYPTO_REVIEW_PROMPT = get_crypto_review_prompt("CONSERVATIVE")
 
 
 # ---------------------------------------------------------------------------
 # Dispatch 함수
 # ---------------------------------------------------------------------------
 
-def get_final_review_system(market: str) -> str:
+def get_final_review_system(market: str, trading_style_mode: str | None = None) -> str:
     """시장별 Tier2 시스템 프롬프트 반환"""
     market_code = normalize_market(market)
     if is_crypto_market(market_code):
-        return CRYPTO_REVIEW_SYSTEM
+        return get_crypto_review_system(trading_style_mode or settings.crypto_trading_style_mode)
     return FINAL_REVIEW_SYSTEM
 
 
-def get_final_review_prompt(market: str) -> str:
+def get_final_review_prompt(market: str, trading_style_mode: str | None = None) -> str:
     """시장별 Tier2 사용자 프롬프트 템플릿 반환"""
     market_code = normalize_market(market)
     if is_crypto_market(market_code):
-        return CRYPTO_REVIEW_PROMPT
+        return get_crypto_review_prompt(trading_style_mode or settings.crypto_trading_style_mode)
     return FINAL_REVIEW_PROMPT

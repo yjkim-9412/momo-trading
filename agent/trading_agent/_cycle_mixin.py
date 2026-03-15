@@ -316,7 +316,7 @@ class CycleMixin:
                     from strategy.ai_risk_tuner import ai_risk_tuner
                     dynamic_limits = await ai_risk_tuner.compute_limits(
                         market=target,
-                        risk_appetite=settings.RISK_APPETITE,
+                        risk_appetite=settings.risk_appetite_for_market(target),
                         cycle_id=cycle_id,
                         balance=prefetched_balance,
                     )

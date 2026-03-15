@@ -15,6 +15,8 @@ from analysis.llm.prompts.final_review import (
     CRYPTO_REVIEW_SYSTEM,
     FINAL_REVIEW_PROMPT,
     FINAL_REVIEW_SYSTEM,
+    get_crypto_review_prompt,
+    get_crypto_review_system,
 )
 from analysis.llm.prompts.market_scan import (
     CRYPTO_MARKET_SCAN_PROMPT,
@@ -22,16 +24,19 @@ from analysis.llm.prompts.market_scan import (
     MARKET_SCAN_PROMPT,
     US_MARKET_SCAN_PROMPT,
     US_MARKET_SCAN_SYSTEM,
+    get_crypto_market_scan_system,
 )
 from analysis.llm.prompts.stock_analysis import (
     CRYPTO_ANALYSIS_PROMPT,
     CRYPTO_ANALYSIS_SYSTEM,
     STOCK_ANALYSIS_PROMPT,
     STOCK_ANALYSIS_SYSTEM,
+    get_crypto_analysis_system,
 )
 from core.config import settings
 from trading.risk_policy import (
     BULL_THEME_RR_FLOOR,
+    CRYPTO_AGGRESSIVE_MOMENTUM_RR_FLOOR,
     CRYPTO_DEFENSIVE_RR_FLOOR,
     CRYPTO_MOMENTUM_RR_FLOOR,
     DEFENSIVE_RR_FLOOR,
@@ -180,6 +185,37 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("{timebox_hours}시간 안에 끝낼 수 있는지", CRYPTO_MARKET_SCAN_PROMPT)
         self.assertIn('"market_regime": "BULL_RUN/BEAR_MARKET/CONSOLIDATION/ALTSEASON/THEME"', CRYPTO_MARKET_SCAN_PROMPT)
 
+    def test_crypto_prompt_helpers_reflect_aggressive_mode(self):
+        aggressive_analysis_system = get_crypto_analysis_system("AGGRESSIVE")
+        aggressive_review_prompt = get_crypto_review_prompt("AGGRESSIVE")
+        aggressive_review_system = get_crypto_review_system("AGGRESSIVE")
+        aggressive_scan_system = get_crypto_market_scan_system("AGGRESSIVE")
+
+        self.assertIn(
+            f"BULL_RUN/ALTSEASON/THEME 국면: {CRYPTO_AGGRESSIVE_MOMENTUM_RR_FLOOR:.1f}:1 이상이면 적정",
+            aggressive_analysis_system,
+        )
+        self.assertIn("과열 자체만으로 HOLD로 돌리지 마세요", aggressive_analysis_system)
+        self.assertIn(
+            f"RR비율: {CRYPTO_AGGRESSIVE_MOMENTUM_RR_FLOOR:.1f}:1 이상이면 허용",
+            aggressive_review_system,
+        )
+        self.assertIn(
+            f"BULL_RUN/ALTSEASON/THEME: {CRYPTO_AGGRESSIVE_MOMENTUM_RR_FLOOR:.1f}:1 이상",
+            aggressive_review_prompt,
+        )
+        self.assertIn("suggested_amount_krw", CRYPTO_REVIEW_PROMPT)
+        self.assertIn("1~2개는 적극 선정", aggressive_scan_system)
+
+    def test_crypto_trading_style_mode_falls_back_to_conservative(self):
+        original = settings.CRYPTO_TRADING_STYLE_MODE
+        try:
+            settings.CRYPTO_TRADING_STYLE_MODE = "invalid"
+            self.assertEqual(settings.crypto_trading_style_mode, "CONSERVATIVE")
+            self.assertEqual(settings.risk_appetite_for_market("BITHUMB"), "CONSERVATIVE")
+        finally:
+            settings.CRYPTO_TRADING_STYLE_MODE = original
+
     def test_crypto_primary_market_falls_back_to_bithumb_for_invalid_value(self):
         original = settings.CRYPTO_PRIMARY_MARKET
         try:
@@ -290,7 +326,7 @@ class TradingAgentCryptoFallbackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["market"], "BITHUMB")
         self.assertEqual(
             generate_tier1.await_args.kwargs["system_prompt"],
-            CRYPTO_ANALYSIS_SYSTEM,
+            get_crypto_analysis_system(settings.crypto_trading_style_mode),
         )
 
 

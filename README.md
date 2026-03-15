@@ -161,6 +161,12 @@ AI가 조정할 수 있는 항목:
 | **데이터베이스** | 주식 전용 테이블 | 코인 전용 테이블 (완전 분리) |
 | **환경 설정** | `TRADING_*` 변수 | `CRYPTO_*` 변수 (독립) |
 
+### 코인 매매 성향 모드
+
+- `보수적 (CONSERVATIVE)` : 기본값. 강세장에서도 `RR 2.0`을 우선하고, 늦은 추격 진입과 애매한 돌파는 엄격하게 걸러냅니다.
+- `공격적 (AGGRESSIVE)` : 소액 단기매매용. 강세장에서는 `RR 1.6`까지 허용하고, 거래대금이 유지되는 돌파는 BUY를 더 적극적으로 검토합니다.
+- 설정 위치 : `/admin-coin` 또는 `CRYPTO_TRADING_STYLE_MODE`
+
 ```mermaid
 flowchart TB
     subgraph STOCK["주식 시스템 (KRX)"]

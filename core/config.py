@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     CRYPTO_PRIMARY_MARKET: str = "BITHUMB"
     CRYPTO_TRADING_ENABLED: bool = False
     CRYPTO_AUTONOMY_MODE: str = "SEMI_AUTO"  # SEMI_AUTO / AUTONOMOUS
+    CRYPTO_TRADING_STYLE_MODE: str = "CONSERVATIVE"  # CONSERVATIVE / AGGRESSIVE
     CRYPTO_RECOMMENDATION_EXPIRE_MIN: int = 30
     CRYPTO_TIMEBOX_HOURS: int = 12
 
@@ -278,6 +279,19 @@ class Settings(BaseSettings):
         return 12
 
     @property
+    def crypto_trading_style_mode(self) -> str:
+        """코인 매매 성향 모드를 정규화한다."""
+        raw = (self.CRYPTO_TRADING_STYLE_MODE or "CONSERVATIVE").strip().upper()
+        if raw in {"CONSERVATIVE", "AGGRESSIVE"}:
+            return raw
+
+        logger.warning(
+            "CRYPTO_TRADING_STYLE_MODE={}는 지원되지 않습니다. CONSERVATIVE로 고정합니다.",
+            self.CRYPTO_TRADING_STYLE_MODE,
+        )
+        return "CONSERVATIVE"
+
+    @property
     def scan_markets(self) -> list[str]:
         """시장 스캔 대상 목록"""
         return self.scan_markets_for(self.primary_market_code)
@@ -357,6 +371,15 @@ class Settings(BaseSettings):
         if is_crypto_market(norm):
             return (self.CRYPTO_AUTONOMY_MODE or self.AUTONOMY_MODE or "SEMI_AUTO").upper()
         return (self.AUTONOMY_MODE or "SEMI_AUTO").upper()
+
+    def risk_appetite_for_market(self, market: str) -> str:
+        """시장별 AI risk tuning 성향 반환"""
+        from trading.market_profile import is_crypto_market, normalize_market
+
+        norm = normalize_market(market)
+        if is_crypto_market(norm):
+            return self.crypto_trading_style_mode
+        return (self.RISK_APPETITE or "MODERATE").upper()
 
     def recommendation_expire_minutes_for_market(self, market: str) -> int:
         """시장별 추천 만료 시간 반환"""

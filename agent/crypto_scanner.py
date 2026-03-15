@@ -24,7 +24,7 @@ from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType, Tier1Profile
 from trading.market_profile import is_crypto_market, market_scope, normalize_market
-from trading.risk_policy import normalize_crypto_regime
+from trading.risk_policy import get_crypto_trading_style_profile, normalize_crypto_regime
 from trading.models import MCPResponse
 
 # 선정 목표 범위 (24/7 시장이므로 고정)
@@ -374,10 +374,13 @@ class CryptoScanner:
         from util.time_util import now_kst
 
         now = now_kst()
+        trading_style_profile = get_crypto_trading_style_profile(settings.crypto_trading_style_mode)
 
         prompt = get_market_scan_prompt(target).format(
             current_time=now.strftime("%H:%M"),
             timebox_hours=settings.crypto_timebox_hours,
+            trading_style_mode_label=trading_style_profile["label"],
+            trading_style_summary=trading_style_profile["summary"],
             available_cash=available_cash,
             max_per_stock=max_per_coin,
             holding_count=len(holdings),
@@ -393,7 +396,10 @@ class CryptoScanner:
         try:
             result_text, provider = await llm_factory.generate_tier1(
                 prompt,
-                system_prompt=get_market_scan_system(target),
+                system_prompt=get_market_scan_system(
+                    target,
+                    trading_style_mode=settings.crypto_trading_style_mode,
+                ),
                 profile=Tier1Profile.SCAN,
                 scope=market_scope(target),
                 phase="cycle",

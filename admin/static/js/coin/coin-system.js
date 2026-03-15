@@ -8,7 +8,8 @@ import * as Monitor from '../shared/admin-monitor.js';
 import { state, API } from './coin-state.js';
 import {
   formatDuration, formatTimeAgo, formatDateTime, truncateText, formatPrice,
-  formatCoinScanSource, formatTimeboxHours, setInlineStatus, setStatusText, setTextContent,
+  formatCoinScanSource, formatTimeboxHours, formatTradingStyleMode,
+  setInlineStatus, setStatusText, setTextContent,
 } from './coin-utils.js';
 
 // Late-bound references for functions defined in other coin modules.
@@ -101,6 +102,15 @@ function resolveTimeboxHours(status) {
   if (Number.isFinite(selectedValue) && selectedValue > 0) return selectedValue;
 
   return null;
+}
+
+function resolveTradingStyleMode(status) {
+  var statusValue = String(status && (status.trading_style_mode ?? status.crypto_trading_style_mode) || '').toUpperCase();
+  if (statusValue) return statusValue;
+
+  var settingsSelect = document.getElementById('set-trading-style');
+  var selectedValue = String(settingsSelect && settingsSelect.value || '').toUpperCase();
+  return selectedValue || null;
 }
 
 // -- Load system status --
@@ -197,14 +207,17 @@ export async function loadSystemStatus() {
     var sessionLabel = getSessionLabel(s.market_session);
     var connectivityMeta = describeConnectivity(connectivity, 88);
     var timeboxHours = resolveTimeboxHours(s);
+    var tradingStyleMode = resolveTradingStyleMode(s);
+    var tradingStyleLabel = formatTradingStyleMode(tradingStyleMode);
     var timeboxSuffix = timeboxHours ? ' · 정산 ' + formatTimeboxHours(timeboxHours) : '';
+    var tradingStyleSuffix = tradingStyleMode ? ' · 성향 ' + tradingStyleLabel : '';
     if (s.last_cycle_error) {
       setStatusText('마지막 사이클 오류 · ' + truncateText(s.last_cycle_error, 88), '#f87171');
     } else if (!connectivityMeta.ok) {
       setStatusText(connectivityMeta.statusText, connectivityMeta.color);
     } else {
       var cycleState = s.last_cycle_status ? ' · 마지막 ' + s.last_cycle_status : '';
-      setStatusText(sessionLabel + ' · 스캔 ' + (s.scheduler_running ? '동작' : '중지') + timeboxSuffix + cycleState, '#9ca3af');
+      setStatusText(sessionLabel + ' · 스캔 ' + (s.scheduler_running ? '동작' : '중지') + timeboxSuffix + tradingStyleSuffix + cycleState, '#9ca3af');
     }
 
     if (_updateScanTimeline) _updateScanTimeline();
@@ -253,6 +266,7 @@ export function renderScanScheduleSummary(status) {
   var connectivityMeta = describeConnectivity(connectivity, 30);
   var timeboxHours = resolveTimeboxHours(status);
   var timeboxLabel = timeboxHours ? formatTimeboxHours(timeboxHours) : '--';
+  var tradingStyleLabel = formatTradingStyleMode(resolveTradingStyleMode(status));
 
   container.innerHTML = `
   <div class="text-xs text-gray-300 space-y-2">
@@ -267,6 +281,10 @@ export function renderScanScheduleSummary(status) {
     <div class="flex justify-between gap-3">
       <span class="text-gray-500">정산 기준</span>
       <span class="text-gray-300">${escapeHtml(timeboxLabel)}</span>
+    </div>
+    <div class="flex justify-between gap-3">
+      <span class="text-gray-500">매매 성향</span>
+      <span class="text-gray-300">${escapeHtml(tradingStyleLabel)}</span>
     </div>
     <div class="flex justify-between gap-3">
       <span class="text-gray-500">최근 상태</span>

@@ -193,11 +193,13 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(response.data)
         self.assertIn("시장 개요 조회 실패", response.message)
 
-    async def test_get_coin_settings_includes_timebox_hours(self):
-        with patch.object(admin_coin.settings, "CRYPTO_TIMEBOX_HOURS", 24):
+    async def test_get_coin_settings_includes_timebox_and_trading_style_mode(self):
+        with patch.object(admin_coin.settings, "CRYPTO_TIMEBOX_HOURS", 24), \
+                patch.object(admin_coin.settings, "CRYPTO_TRADING_STYLE_MODE", "AGGRESSIVE"):
             response = await get_coin_settings()
 
         self.assertEqual(response.data["CRYPTO_TIMEBOX_HOURS"], 24)
+        self.assertEqual(response.data["CRYPTO_TRADING_STYLE_MODE"], "AGGRESSIVE")
 
     async def test_update_coin_settings_accepts_only_12_or_24_for_timebox(self):
         original = admin_coin.settings.CRYPTO_TIMEBOX_HOURS
@@ -222,6 +224,33 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rejected.data, {})
         finally:
             admin_coin.settings.CRYPTO_TIMEBOX_HOURS = original
+
+    async def test_update_coin_settings_accepts_only_known_trading_style_modes(self):
+        original = admin_coin.settings.CRYPTO_TRADING_STYLE_MODE
+
+        try:
+            with TemporaryDirectory() as temp_dir:
+                env_file = Path(temp_dir) / ".env"
+                env_file.write_text(
+                    "CRYPTO_ENABLED=true\nCRYPTO_TRADING_STYLE_MODE=CONSERVATIVE\n",
+                    encoding="utf-8",
+                )
+                with patch.object(admin_coin, "ENV_FILE_PATH", env_file), \
+                        patch("api.routes.admin_coin.activity_logger.log", AsyncMock()):
+                    accepted = await update_coin_settings({"CRYPTO_TRADING_STYLE_MODE": "AGGRESSIVE"})
+                    persisted_after_accept = env_file.read_text(encoding="utf-8")
+                    rejected = await update_coin_settings({"CRYPTO_TRADING_STYLE_MODE": "FAST"})
+
+                self.assertIn("CRYPTO_TRADING_STYLE_MODE=AGGRESSIVE", persisted_after_accept)
+                self.assertIn("CRYPTO_ENABLED=true", persisted_after_accept)
+                self.assertEqual(env_file.read_text(encoding="utf-8"), persisted_after_accept)
+
+            self.assertEqual(admin_coin.settings.CRYPTO_TRADING_STYLE_MODE, "AGGRESSIVE")
+            self.assertEqual(accepted.data["CRYPTO_TRADING_STYLE_MODE"]["new"], "AGGRESSIVE")
+            self.assertEqual(rejected.message, "코인 설정 변경이 거부되었습니다")
+            self.assertEqual(rejected.data, {})
+        finally:
+            admin_coin.settings.CRYPTO_TRADING_STYLE_MODE = original
 
     async def test_preview_coin_order_wraps_service_result(self):
         preview = CoinOrderPreviewResponse(
@@ -371,6 +400,7 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
         db.scalar.return_value = 0
 
         with patch.object(trading_agent, "_market_states", {"CRYPTO": runtime}), \
+                patch.object(admin_coin.settings, "CRYPTO_TRADING_STYLE_MODE", "AGGRESSIVE"), \
                 patch.object(
                     trading_agent,
                     "get_cycle_runtime_snapshot",
@@ -466,6 +496,8 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
             response = await get_coin_system_status(db=db)
 
         self.assertTrue(response.data["crypto_dynamic_discovery_enabled"])
+        self.assertEqual(response.data["crypto_trading_style_mode"], "AGGRESSIVE")
+        self.assertEqual(response.data["trading_style_mode"], "AGGRESSIVE")
         self.assertEqual(response.data["discovery_cache"]["source"], "stale_cache")
         self.assertEqual(response.data["discovery_cache"]["symbol_count"], 30)
         self.assertEqual(response.data["watchlist_count"], 1)
