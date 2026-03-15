@@ -158,6 +158,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 코인 어드민 상태/중앙 모니터는 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
 - 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`를 사용해 WS 감시 상태를 렌더링한다.
 - 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`를 함께 사용한다.
+- 코인 계좌 잔고/보유 평가/미체결 주문 금액은 공용 `formatKRW()` 축약이 아니라 `coin-utils.js`의 계좌 전용 상세 포맷을 사용한다. 기본 표시는 `10,031원 (1만)` 형태이고, element `title`에는 raw KRW 값을 넣어 hover로 더 자세히 본다.
 - 코인 활동 피드는 `CoinActivityLog.detail`와 `execution_time_ms`를 그대로 노출해 LLM system prompt / prompt / response를 인라인으로 점검하고, `/api/v1/admin-coin/activities/feed`는 stock admin과 동일하게 `resolved_trading_date`, `has_more`, `next_cursor(before_created_at,before_id)`를 반환한다.
 - 코인 체크포인트 리포트 KPI(`total_cycles`, `total_analyses`, `activity_counts` 등)는 `period_started_at ~ period_ended_at` 전체를 exact aggregate로 계산한다. 최근 활동 로그는 prompt 크기 보호용 sample로만 사용하고 KPI와 섞지 않는다.
 - 코인 어드민 수동 스캔 버튼은 HTML inline handler를 쓰지 않고 단일 JS 바인딩만 사용한다. 버튼 상태는 `agent/state`를 기준으로 `요청 중 → 시작 대기 → 진행 중 → 완료/스킵` 흐름을 표시한다.

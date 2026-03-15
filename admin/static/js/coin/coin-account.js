@@ -3,11 +3,12 @@
 // Security note: all dynamic content is escaped via escapeHtml()
 // before DOM insertion. This mirrors the original coin-app.js exactly.
 
-import { escapeHtml, formatKRW, formatTime, fetchJSON } from '../shared/admin-core.js';
+import { escapeHtml, formatTime, fetchJSON } from '../shared/admin-core.js';
 import { API } from './coin-state.js';
 // state accessed indirectly via API
 import {
   formatCoinQty, formatPrice, formatPnl, truncateText,
+  formatDetailedKRW, formatPreciseKRWTitle,
   setInlineStatus, setTextContent, updateMetricValue,
 } from './coin-utils.js';
 
@@ -41,10 +42,14 @@ export function renderBalance(b) {
   var totalPnl = Number(b.total_pnl ?? 0);
   var totalPnlRate = Number(b.total_pnl_rate ?? 0);
 
-  updateMetricValue('total-asset', 'total-asset-delta', totalAsset, formatKRW(totalAsset));
-  updateMetricValue('cash-balance', 'cash-balance-delta', cash, formatKRW(cash));
-  updateMetricValue('coin-eval', 'coin-eval-delta', coinValue, formatKRW(coinValue));
-  updateMetricValue('locked-krw', 'locked-krw-delta', lockedKrw, formatKRW(lockedKrw));
+  updateMetricValue('total-asset', 'total-asset-delta', totalAsset, formatDetailedKRW(totalAsset));
+  updateMetricValue('cash-balance', 'cash-balance-delta', cash, formatDetailedKRW(cash));
+  updateMetricValue('coin-eval', 'coin-eval-delta', coinValue, formatDetailedKRW(coinValue));
+  updateMetricValue('locked-krw', 'locked-krw-delta', lockedKrw, formatDetailedKRW(lockedKrw));
+  _setValueTitle('total-asset', totalAsset);
+  _setValueTitle('cash-balance', cash);
+  _setValueTitle('coin-eval', coinValue);
+  _setValueTitle('locked-krw', lockedKrw);
 
   var pnlEl = document.getElementById('total-pnl');
   if (pnlEl) {
@@ -74,11 +79,15 @@ export function renderHoldings(holdings) {
     var pnlVal = Number(h.pnl ?? 0);
     var pnlRate = Number(h.pnl_rate ?? 0);
     var pnlColor = pnlVal > 0 ? '#34d399' : pnlVal < 0 ? '#f87171' : '#9ca3af';
-    var pnlSign = pnlVal >= 0 ? '+' : '';
+    var pnlSign = pnlVal > 0 ? '+' : pnlVal < 0 ? '-' : '';
     var qty = formatCoinQty(h.quantity);
     var avgP = formatPrice(h.avg_buy_price);
     var curP = formatPrice(h.current_price);
-    var evalAmt = formatKRW(h.current_price * h.quantity);
+    var evalValue = Number(h.current_price || 0) * Number(h.quantity || 0);
+    var evalAmt = formatDetailedKRW(evalValue);
+    var evalTitle = escapeHtml(formatPreciseKRWTitle(evalValue));
+    var pnlText = pnlSign + formatDetailedKRW(Math.abs(pnlVal));
+    var pnlTitle = escapeHtml(formatPreciseKRWTitle(pnlVal));
     var name = h.name || h.symbol || '';
     var symbol = h.symbol || '';
 
@@ -89,15 +98,15 @@ export function renderHoldings(holdings) {
           <div style="color:#e2e8f0; font-weight:500; font-size:13px;">${escapeHtml(name)}</div>
           <div style="color:#6b7280; font-size:11px;">${escapeHtml(symbol)} · ${qty}</div>
         </div>
-        <span style="color:${pnlColor}; font-weight:500; font-size:13px;">${pnlSign}${pnlRate.toFixed(2)}%</span>
+        <span style="color:${pnlColor}; font-weight:500; font-size:13px;">${pnlSign}${Math.abs(pnlRate).toFixed(2)}%</span>
       </div>
       <div style="display:flex; justify-content:space-between; color:#9ca3af; font-size:11px; margin-top:4px;">
         <span>평단 ${avgP}</span>
         <span>현재 ${curP}</span>
       </div>
       <div style="display:flex; justify-content:space-between; color:#6b7280; font-size:11px; margin-top:2px;">
-        <span>평가 ${evalAmt}</span>
-        <span style="color:${pnlColor};">${pnlSign}${formatKRW(pnlVal)}</span>
+        <span title="${evalTitle}">평가 ${evalAmt}</span>
+        <span style="color:${pnlColor};" title="${pnlTitle}">${pnlText}</span>
       </div>
     </div>
   `;
@@ -139,6 +148,7 @@ export function renderPendingOrders(orders) {
 
   if (!orders || !orders.length) {
     countEl.textContent = '0건';
+    countEl.title = '';
     container.innerHTML = '<div style="color:#6b7280; font-size:13px; padding:12px; text-align:center;">미체결 주문 없음</div>';
     return;
   }
@@ -146,7 +156,8 @@ export function renderPendingOrders(orders) {
   var totalAmount = orders.reduce(function (sum, order) {
     return sum + (Number(order.order_price || 0) * Number(order.remaining_qty || 0));
   }, 0);
-  countEl.textContent = orders.length + '건 (' + formatKRW(totalAmount) + ')';
+  countEl.textContent = orders.length + '건 (' + formatDetailedKRW(totalAmount) + ')';
+  countEl.title = formatPreciseKRWTitle(totalAmount);
 
   container.innerHTML = orders.map(function (order) {
     var isBuy = order.side === '매수';
@@ -156,6 +167,7 @@ export function renderPendingOrders(orders) {
     var remainingQty = formatCoinQty(order.remaining_qty);
     var orderQty = formatCoinQty(order.order_qty);
     var filledQty = formatCoinQty(order.filled_qty);
+    var remainingValue = Number(order.order_price || 0) * Number(order.remaining_qty || 0);
     var statusDetail = order.status_detail
       ? `<div class="text-[10px] text-gray-500 truncate" title="${escapeHtml(order.status_detail)}">${escapeHtml(order.status_detail)}</div>`
       : '';
@@ -177,7 +189,7 @@ export function renderPendingOrders(orders) {
       </div>
       <div class="flex justify-between items-center gap-2 text-[11px] text-gray-400 mt-1">
         <span>미체결 ${remainingQty} / 주문 ${orderQty}</span>
-        <span>${formatKRW(Number(order.order_price || 0) * Number(order.remaining_qty || 0))}</span>
+        <span title="${escapeHtml(formatPreciseKRWTitle(remainingValue))}">${formatDetailedKRW(remainingValue)}</span>
       </div>
       <div class="flex justify-between items-center gap-2 text-[11px] text-gray-500 mt-1">
         <span>체결 ${filledQty}</span>
@@ -187,4 +199,9 @@ export function renderPendingOrders(orders) {
     </div>
   `;
   }).join('');
+}
+
+function _setValueTitle(id, numericValue) {
+  var el = document.getElementById(id);
+  if (el) el.title = formatPreciseKRWTitle(numericValue);
 }
