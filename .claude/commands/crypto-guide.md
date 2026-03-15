@@ -141,6 +141,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - Public WS는 `ticker`, `trade`, `orderbook`; Private WS는 `myOrder`, `myAsset`를 사용한다.
 - 코인 미체결 주문의 source of truth 는 빗썸 REST placeholder 가 아니라 `coin_broker_orders` 원장이다. `AccountManager.get_pending_orders("BITHUMB")` 는 `SUBMITTED` / `OPEN` / `PARTIAL` 상태를 DB에서 읽어 코인 어드민 overview 로 반환한다.
 - `myAsset` payload 는 총자산/손익을 직접 주지 않고 `balance` / `locked` 변경만 주므로, 코인 어드민의 `총 자산`, `KRW 현금`, `코인 평가`, `잠금 KRW` 는 WS 이벤트를 트리거로 `/api/v1/admin-coin/account/overview` 를 재조회해 확정한다.
+- `CoinRealtimeMonitor.start()`는 서버 재기동 직후 현재 보유 코인을 desired 감시에 먼저 복원한 뒤 WebSocket 런타임을 올린다. 이후 order/asset update 및 holdings check 경로가 desired 감시를 self-heal 한다.
 - 시장 국면 canonical 값: `BULL_RUN` / `BEAR_MARKET` / `CONSOLIDATION` / `ALTSEASON` / `THEME`
 - legacy alias는 `normalize_crypto_regime()`에서 `BEAR -> BEAR_MARKET`, `SIDEWAYS -> CONSOLIDATION`, `ALT_SEASON -> ALTSEASON`으로 정규화한다
 - R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게).
@@ -175,6 +176,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - 빗썸 `ord_type="price"` 시장가 매수의 체결가는 `executed_funds / executed_volume`으로 평균 체결단가를 계산한다. REST/WS payload의 `price`를 체결단가로 그대로 신뢰하지 말 것.
 - 코인 수동 주문 API 에러는 `validation`, `funds`, `auth`, `order_state`, `upstream` 으로 표준화하고, `broker_error_code`/`broker_error_message`를 함께 반환한다.
 - 코인 어드민 상태 패널은 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
+- `/api/v1/admin-coin/system/status`는 `holding_watch_restore_at`, `holding_watch_restore_error`, `holding_watch_symbol_count`로 마지막 보유종목 감시 복원 상태를 함께 노출한다.
 - 공용 알림 분류기(`admin/static/js/shared/admin-toast.js`)는 코인 `TIER1_ANALYSIS COMPLETE`를 `summary` 키워드가 아니라 `detail.recommendation` 우선으로 해석한다. `HOLD/스킵/관망/보류/미승인` 문구 안에 `BUY/SELL` 단어가 있어도 알림을 띄우지 않게 유지한다.
 - 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`로 WS 감시 상태를 렌더링한다.
 - 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`까지 함께 본다.

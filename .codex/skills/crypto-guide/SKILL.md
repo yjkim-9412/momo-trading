@@ -113,6 +113,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - Public WS는 `ticker`, `trade`, `orderbook`으로 가격/거래량/호가 이벤트를 만들고, Private WS는 `myOrder`, `myAsset`로 주문/자산 동기화를 수행한다
 - 코인 미체결 주문의 source of truth 는 빗썸 REST placeholder 가 아니라 `coin_broker_orders` 원장이다. `AccountManager.get_pending_orders("BITHUMB")` 는 `SUBMITTED` / `OPEN` / `PARTIAL` 상태를 DB에서 읽어 코인 어드민 overview 로 반환한다.
 - `myAsset` payload 는 총자산/손익을 직접 주지 않고 `balance` / `locked` 변경만 주므로, 코인 어드민의 `총 자산`, `KRW 현금`, `코인 평가`, `잠금 KRW` 는 WS 이벤트를 트리거로 `/api/v1/admin-coin/account/overview` 를 재조회해 확정한다.
+- `CoinRealtimeMonitor.start()`는 서버 재기동 직후 현재 보유 코인을 desired 감시에 먼저 복원한 뒤 WebSocket 런타임을 올린다. 이후 order/asset update 및 holdings check 경로가 desired 감시를 self-heal 한다.
 - 소수점 수량: `OrderRequest.quantity = float` (주식은 정수만 전달)
 - 코인 소수점 수량은 `trading/quantity_policy.py`를 기준으로 end-to-end 8자리 floor 정책을 유지한다. 포지션 스냅샷, 계좌 컨텍스트, 리스크 캡, Tier2 제안 수량, 빗썸 주문 payload는 코인만 fractional 을 보존하고 주식 API/스키마는 그대로 둔다.
 - 코인 BUY 계약은 **수량 중심이 아니라 KRW 금액 중심**이다. `TradeSignal.suggested_amount_krw`가 authoritative 하고, `suggested_quantity`는 `entry_price` 기준 추정 수량이다.
@@ -161,6 +162,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 코인 어드민 중앙 라이브 워크스페이스는 주식 어드민과 동일한 `Agent Monitor → grouped symbol cards → 중요도 기반 toast/브라우저 알림/탭 강조 → SSE reconnect banner` 흐름을 사용한다.
 - 공용 알림 분류기(`admin/static/js/shared/admin-toast.js`)는 코인 `TIER1_ANALYSIS COMPLETE`를 `summary` 키워드가 아니라 `detail.recommendation` 우선으로 해석한다. `HOLD/스킵/관망/보류/미승인` 문구 안에 `BUY/SELL` 단어가 있어도 알림을 띄우지 않게 유지한다.
 - 코인 어드민 상태/중앙 모니터는 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
+- `/api/v1/admin-coin/system/status`는 `holding_watch_restore_at`, `holding_watch_restore_error`, `holding_watch_symbol_count`로 마지막 보유종목 감시 복원 상태를 함께 노출한다.
 - 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`를 사용해 WS 감시 상태를 렌더링한다.
 - 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`를 함께 사용한다.
 - 코인 계좌 잔고/보유 평가/미체결 주문 금액은 공용 `formatKRW()` 축약이 아니라 `coin-utils.js`의 계좌 전용 상세 포맷을 사용한다. 기본 표시는 `10,031원 (1만)` 형태이고, element `title`에는 raw KRW 값을 넣어 hover로 더 자세히 본다.

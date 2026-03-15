@@ -411,6 +411,24 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
                     return_value=True,
                 ), \
                 patch.object(
+                    type(coin_realtime_monitor),
+                    "last_holding_watch_restore_at",
+                    new_callable=PropertyMock,
+                    return_value=datetime(2026, 3, 14, 1, 5, tzinfo=timezone.utc),
+                ), \
+                patch.object(
+                    type(coin_realtime_monitor),
+                    "last_holding_watch_restore_error",
+                    new_callable=PropertyMock,
+                    return_value=None,
+                ), \
+                patch.object(
+                    type(coin_realtime_monitor),
+                    "last_holding_watch_symbol_count",
+                    new_callable=PropertyMock,
+                    return_value=2,
+                ), \
+                patch.object(
                     type(trading_scheduler),
                     "is_running",
                     new_callable=PropertyMock,
@@ -451,6 +469,9 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data["discovery_cache"]["source"], "stale_cache")
         self.assertEqual(response.data["discovery_cache"]["symbol_count"], 30)
         self.assertEqual(response.data["watchlist_count"], 1)
+        self.assertEqual(response.data["holding_watch_symbol_count"], 2)
+        self.assertEqual(response.data["holding_watch_restore_at"], "2026-03-14T01:05:00+00:00")
+        self.assertIsNone(response.data["holding_watch_restore_error"])
         self.assertFalse(response.data["bithumb_connectivity"]["dns_api_ok"])
         self.assertFalse(response.data["bithumb_connectivity"]["market_catalog_ok"])
         self.assertFalse(response.data["bithumb_connectivity"]["ticker_probe_ok"])

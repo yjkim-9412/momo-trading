@@ -51,6 +51,7 @@ CLAUDE.md와 AGENTS.md에서 공유하는 운영 규칙. 양쪽 지침 파일이
 - 코인 수량은 소수점이다 (`OrderRequest.quantity = float`). 주식은 항상 정수만 전달하므로 하위호환. `Decimal`은 `BithumbClient` 내부 계산에서만 사용하고, API 경계에서 float로 변환한다.
 - 코인은 24/7 시장이므로 주식식 `buy_cutoff`, `장 시작/마감`, 장종료 일괄 `force_liquidation` 개념을 그대로 쓰지 않는다. `market_calendar.is_trading_hours("BITHUMB")`는 항상 True를 반환한다.
 - 대신 코인 포지션은 `CRYPTO_TIMEBOX_HOURS` 기준 rolling timebox 정산을 사용한다. timebox 만료 청산은 장마감 개념이 아니라 포지션별 최대 보유시간 리스크 정책으로 유지할 것.
+- 코인 보유종목 실시간 감시 복원은 스케줄러 startup 훅에만 의존하지 않는다. `CoinRealtimeMonitor.start()`에서 현재 보유종목을 먼저 desired set에 복원하고, 이후 order/asset update 및 holdings check에서 self-heal 되도록 유지할 것.
 - 코인 시장 국면은 `BULL_RUN`/`BEAR_MARKET`/`CONSOLIDATION`/`ALTSEASON`이다. 주식의 `BULL`/`BEAR`/`SIDEWAYS`/`THEME`와 다르지만, `risk_manager.CRYPTO_RR_FLOOR`에서 두 체계 모두 매핑한다.
 - 코인 Tier2 스트레스 테스트는 -10%/-7% (주식의 -5%/-3%보다 넓다). 코인 변동성 기준을 주식 수준으로 좁히지 말 것.
 - `/admin-coin` 페이지는 주식 `/admin`과 완전 별도 SPA이다. API prefix는 `/api/v1/admin-coin/*`, SSE는 독립 `coin_sse_manager`를 사용한다. 주식 SSE와 코인 SSE를 공유하지 말 것.

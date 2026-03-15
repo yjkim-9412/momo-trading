@@ -71,6 +71,13 @@ flowchart LR
 - 스케줄러는 `30분`마다 정산 스윕을 실행해 `entry_at + timebox`를 넘긴 포지션만 자동 매도합니다.
 - 이 정산은 `AUTONOMOUS/SEMI_AUTO`와 무관한 리스크 정책이며, `CRYPTO_TRADING_ENABLED=true`일 때만 실제 주문이 나갑니다.
 
+### 보유종목 실시간 감시 복원
+
+- 서버가 재기동되면 `CoinRealtimeMonitor.start()`가 먼저 현재 빗썸 실보유 코인을 다시 조회해 desired 감시 목록에 복원합니다.
+- 이 복원은 스케줄러와 별도로 동작하므로 `SCHEDULER_ENABLED=false`여도 코인 보유종목 실시간 감시는 복원됩니다.
+- 이후 주문/자산 WebSocket 이벤트와 주기적 holdings check가 들어올 때마다 desired 감시 목록을 다시 맞추는 self-heal 경로를 유지합니다.
+- `/api/v1/admin-coin/system/status`는 마지막 복원 시각, 에러, 복원 종목 수를 함께 노출합니다.
+
 ### 자동 리포트
 
 자동 리포트는 더 이상 스캔 직전에 생성되지 않습니다. 실제 타임박스 청산이 1건 이상 성공하고 계좌 재동기화가 끝난 뒤에만 생성됩니다:
