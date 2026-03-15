@@ -48,6 +48,14 @@ Mixin 파일은 서로를 임포트하지 않으며, 상호 호출은 `self.*`�
 - 환경변수 예제: `.env.example-coin`
 - **코인 관련 코드 변경(파일 추가/삭제, 인터페이스 변경, 환경변수 추가 등) 시 반드시 `/crypto-guide` 스킬(`.claude/commands/crypto-guide.md`)도 함께 업데이트할 것.**
 
+## Admin JS 코딩 컨벤션
+
+`admin/static/js/` 하위 파일을 **생성·수정·리팩토링**할 때 반드시 `/js-convention` 스킬을 참조할 것.
+
+- 스킬 사용법: `/js-convention` (ES 모듈 패턴, 상태 관리, DOM 보안, 네이밍 규칙)
+- 적용 대상: `admin/static/js/shared/*.js`, `admin/static/js/app/*.js`, `admin/static/js/coin/*.js`
+- **JS 파일 수정 시 이 스킬의 import 순서, export 패턴, 순환 의존성 방지 규칙을 준수할 것.**
+
 ## 공통 운영 지침
 
 분리된 장 구조, 스케줄 구조, 미국장/코인 구현 회고, 테스트 실행 규칙은 아래 문서에 정의되어 있다. 반드시 참조할 것.
