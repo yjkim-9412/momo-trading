@@ -1,5 +1,7 @@
 # Crypto (Bithumb) Domain Architecture
 
+> **개발자 대상 코드 레벨 아키텍처 문서입니다.** 일반 개요는 [README](../README.md), 사용자 관점 상세는 [코인 시스템 상세](crypto-system.md)를 참조하세요.
+
 ## 1. 도메인 구조
 
 ```mermaid

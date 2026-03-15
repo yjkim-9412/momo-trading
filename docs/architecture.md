@@ -1,5 +1,7 @@
 # MOMO Trading — 시스템 아키텍처
 
+> **개발자 대상 기술 아키텍처 문서입니다.** 일반 개요는 [README](../README.md), 도메인별 상세는 [주식 시스템](stock-system.md) · [코인 시스템](crypto-system.md)을 참조하세요.
+
 > 이 문서는 단기매매 자동화 시스템의 전체 구조를 Mermaid 다이어그램으로 설명합니다.
 > 주식 용어를 최소화하고, 개선된 계약 정렬(RR 단일 기준, Tier1 BUY/HOLD 계약, confidence 정의) 반영 상태 기준입니다.
 

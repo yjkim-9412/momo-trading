@@ -1,304 +1,251 @@
 # MOMO Trading
 
-AI 기반 한국 주식(KRX) 자동 매매 시스템.
+> AI가 시장을 스캔하고, 분석하고, 주문까지 — 한국 주식(KRX)과 암호화폐(빗썸)를 자동으로 매매하는 트레이딩 봇
 
-LLM 다단계 분석(스크리닝 → 기술적 분석 → 최종 검토)과 실시간 WebSocket 이벤트 감지를 결합하여, 장중 자율 매매부터 스윙 오버나이트 보유까지 지원합니다.
+---
+
+## MOMO는 이런 시스템입니다
+
+- **3명의 AI가 팀을 이루어 매매합니다** — 스카우터가 수백 종목을 훑고, 분석가가 정밀 검토하고, 심사역이 독립적으로 다시 검증합니다. 사람이 아닌 코드가 최종 안전장치 역할을 합니다.
+- **주식과 코인, 두 개의 독립 시스템** — 한국투자증권(KIS) API로 주식을, 빗썸 API로 암호화폐를 각각 매매합니다. 설정, 잔고, 데이터가 완전히 분리되어 서로 영향을 주지 않습니다.
+- **매일 스스로 학습합니다** — 하루가 끝나면 AI가 성적표를 작성하고, 성공/실패 패턴을 분석하여 다음 날 매매 규칙을 자동으로 조정합니다.
+- **반자동 또는 완전자동** — 모든 매매를 사람이 승인하는 반자동(SEMI_AUTO) 모드와, AI가 스스로 판단하는 완전자동(AUTONOMOUS) 모드를 선택할 수 있습니다.
+
+---
+
+## 어떻게 동작하나요?
+
+### 3단계 AI 판단 과정
+
+하나의 종목이 실제로 매수되기까지 3단계의 AI 면접과 코드 레벨 안전장치를 통과해야 합니다.
+
+```mermaid
+flowchart TD
+    MARKET["시장 전체\n수백 종목"]
+    SCOUT["1단계: 스카우터 AI\n유망한 후보 5~8개 선별"]
+    ANALYST["2단계: 분석가 AI\n차트 · 거래량 · 기술지표 정밀 분석\n'사라' 또는 '관망' 판단"]
+    GATE["코드 안전장치\n신뢰도 · 손익비 · 손절가 검증\n— AI가 아닌 코드가 판단"]
+    REVIEWER["3단계: 심사역 AI\n독립적으로 다시 검증\n진입가 · 목표가 · 손절가 확정"]
+    RISK["리스크 관리\n잔고 확인 · 한도 체크 · 비중 검증"]
+    ORDER["주문 실행"]
+    SKIP["매매 안 함"]
+
+    MARKET --> SCOUT
+    SCOUT --> ANALYST
+    ANALYST -->|관망| SKIP
+    ANALYST -->|사라| GATE
+    GATE -->|미통과| SKIP
+    GATE -->|통과| REVIEWER
+    REVIEWER -->|거부| SKIP
+    REVIEWER -->|승인| RISK
+    RISK -->|미통과| SKIP
+    RISK -->|통과| ORDER
+
+    style SKIP fill:#f8d7da,stroke:#721c24,color:#721c24
+    style ORDER fill:#d4edda,stroke:#155724
+    style GATE fill:#fff3cd,stroke:#856404
+```
+
+> **핵심**: AI가 아무리 "사라"고 해도, 코드 레벨 안전장치(신뢰도 부족, 손익비 미달, 손절가 미설정)에서 자동 차단됩니다.
+
+---
+
+### 하루 일과 — 주식 vs 코인
+
+주식은 장 시간에만 매매하지만, 코인은 24시간 쉬지 않고 돌아갑니다.
+
+#### 주식 (KRX) — 평일 09:00~15:30
+
+```mermaid
+gantt
+    title 주식 하루 일정 (KST)
+    dateFormat HH:mm
+    axisFormat %H:%M
+
+    section 장전
+    사전 준비 — 어제 메모 확인    :prep, 08:50, 10m
+
+    section 장중
+    스캔 + 매매              :scan1, 09:05, 25m
+    보유종목 점검              :check1, 09:30, 60m
+    재스캔 + 매매             :scan2, 11:00, 25m
+    보유종목 점검              :check2, 11:30, 90m
+    재스캔 + 매매             :scan3, 13:00, 25m
+    보유종목 점검              :check3, 13:30, 60m
+    매수 마감 — 오늘 쇼핑 끝   :crit, cutoff, 14:30, 5m
+
+    section 장마감
+    강제 청산 — 문 닫기 전 정리   :crit, liq, 15:10, 10m
+    성적표 작성 — 하루 일기      :review, 15:40, 20m
+    포트폴리오 정산             :sync, 16:00, 10m
+```
+
+#### 코인 (빗썸) — 24시간 365일
+
+```mermaid
+gantt
+    title 코인 24시간 스케줄 (KST)
+    dateFormat HH:mm
+    axisFormat %H:%M
+
+    section 스캔 사이클
+    스캔 + 매매 1   :crit, s1, 00:00, 30m
+    스캔 + 매매 2   :crit, s2, 04:00, 30m
+    스캔 + 매매 3   :crit, s3, 08:00, 30m
+    스캔 + 매매 4   :crit, s4, 12:00, 30m
+    스캔 + 매매 5   :crit, s5, 16:00, 30m
+    스캔 + 매매 6   :crit, s6, 20:00, 30m
+
+    section 보유 점검
+    보유종목 점검 1   :active, c1, 02:00, 15m
+    보유종목 점검 2   :active, c2, 06:00, 15m
+    보유종목 점검 3   :active, c3, 10:00, 15m
+    보유종목 점검 4   :active, c4, 14:00, 15m
+    보유종목 점검 5   :active, c5, 18:00, 15m
+    보유종목 점검 6   :active, c6, 22:00, 15m
+```
+
+#### 시간대별 하는 일
+
+| 시간 | 무슨 일 | 비유 |
+|------|---------|------|
+| **사전 준비** | 어제 성적표 피드백 로드, 규칙 세팅 | 출근해서 어제 메모 확인 |
+| **스캔 + 매매** | AI 3단계 면접관 전체 가동 | 후보 뽑고 → 분석 → 검증 → 주문 |
+| **보유종목 점검** | 이미 산 종목의 상태 확인 (손절/익절) | 가지고 있는 물건 가격 체크 |
+| **매수 마감** | 더 이상 새로 사지 않음 (주식만) | "오늘 쇼핑 끝" |
+| **강제 청산** | 당일 매매분 전량 매도 (주식만) | "가게 문 닫기 전에 정리" |
+| **성적표** | AI가 오늘 결과 복기 → 내일 규칙 생성 | 하루 끝나고 일기 쓰기 |
+
+---
+
+### 매일 학습하는 AI
+
+매매가 끝나면 AI가 성적표를 작성하고, 다음 날 더 나은 기준으로 돌아옵니다.
+
+```mermaid
+flowchart LR
+    TRADE["오늘 매매"]
+    REPORT["성적표 작성\nAI가 하루를 복기"]
+    LEARN["교훈 추출\n성공 · 실패 패턴 분석"]
+    RULES["규칙 생성\n코드가 자동 검증 후 저장"]
+    TOMORROW["내일 매매\n변경된 기준 적용"]
+
+    TRADE --> REPORT --> LEARN --> RULES --> TOMORROW
+    TOMORROW -.->|반복| TRADE
+```
+
+AI가 조정할 수 있는 항목:
+
+| 항목 | 의미 | 예시 |
+|------|------|------|
+| 최소 신뢰도 | "몇 % 이상 확신해야 사는가" | "75% 이상만 사자" |
+| 손절 기준 | "얼마나 떨어지면 파는가" | "3% 떨어지면 팔자" |
+| 익절 기준 | "얼마나 오르면 파는가" | "5% 올랐으면 팔자" |
+| 손익비 | "위험 대비 기대 수익 비율" | "최소 1.2배 벌어야 함" |
+
+> 단, AI가 제안한 규칙도 코드가 허용 범위 안에서만 적용됩니다. 극단적인 값은 자동으로 보정됩니다.
+
+---
+
+## 주식 vs 코인 — 두 개의 독립 시스템
+
+|  | 주식 (KRX) | 코인 (빗썸) |
+|---|---|---|
+| **시장 시간** | 평일 09:00~15:30 | 24시간 365일 |
+| **증권사** | 한국투자증권 (KIS API) | 빗썸 (Bithumb API) |
+| **스캔 주기** | 장 시작 + 장중 재스캔 | 4시간마다 |
+| **전략** | 보수적 단타 + 공격적 모멘텀 | 코인 전용 전략 |
+| **AI 분석** | 동일한 3단계 파이프라인 | 동일 (코인 전용 프롬프트) |
+| **실시간 감지** | WebSocket 급등/급락/거래량 | WebSocket 가격/주문/잔고 |
+| **관리자 화면** | `/admin` | `/admin-coin` |
+| **데이터베이스** | 주식 전용 테이블 | 코인 전용 테이블 (완전 분리) |
+| **환경 설정** | `TRADING_*` 변수 | `CRYPTO_*` 변수 (독립) |
+
+```mermaid
+flowchart TB
+    subgraph STOCK["주식 시스템 (KRX)"]
+        S1["한국투자증권 API"]
+        S2["평일 09:00~15:30"]
+        S3["/admin 대시보드"]
+    end
+
+    subgraph CRYPTO["코인 시스템 (빗썸)"]
+        C1["빗썸 API"]
+        C2["24시간 365일"]
+        C3["/admin-coin 대시보드"]
+    end
+
+    subgraph SHARED["공유 AI 엔진"]
+        AI["AI 분석 파이프라인\n3단계 면접관"]
+        CHART["차트 분석기\nRSI · MACD · 볼린저밴드"]
+        RISK["리스크 관리"]
+        FB["피드백 학습"]
+    end
+
+    STOCK --> SHARED
+    CRYPTO --> SHARED
+
+    style STOCK fill:#fee2e2,stroke:#ef4444
+    style CRYPTO fill:#fef3c7,stroke:#f59e0b
+    style SHARED fill:#ede9fe,stroke:#6366f1
+```
+
+> 주식과 코인은 AI 엔진과 인프라를 공유하지만, **설정 · 잔고 · 데이터 · 관리자 화면이 완전히 분리**되어 있어 서로 영향을 주지 않습니다.
+
+---
 
 ## 주요 기능
 
-- **AI 에이전트 파이프라인** — 시장 스캔 → LLM 스크리닝 → 5단계 CoT 분석 → 8항목 체크리스트 최종 검토 → 자동 주문
-- **2-Tier LLM 라우팅** — Tier1/Tier2에 대해 선택한 로컬 CLI provider(Claude Code 또는 Codex)로 스캔·분석·최종 검토를 수행
-- **듀얼 전략** — STABLE_SHORT(대형주 보수적) + AGGRESSIVE_SHORT(모멘텀 공격적), 시장 국면별 파라미터 자동 조정
-- **실시간 이벤트 트레이딩** — KIS WebSocket → 거래량 급증 / 급등 / 급락 감지 → 즉시 분석 및 매매
-- **스윙 모드** — 오버나이트 보유, 종목별 HOLD/SELL 판단, 갭 리스크 체크
-- **피드백 학습** — 일일 성과 분석 → 성공/실패 패턴 추출 → 트레이딩 규칙 자동 생성·적용
-- **Admin 대시보드** — SSE 실시간 활동 피드, 보유종목·미체결 현황, 설정 변경, 수동 사이클 트리거
-- **백테스팅** — 과거 데이터 기반 전략 시뮬레이션
-
-## 기술 스택
-
-| 구분 | 기술 |
+| 기능 | 설명 |
 |------|------|
-| **Web Framework** | FastAPI (async) |
-| **ORM** | SQLAlchemy 2.0 (async) |
-| **DB Migration** | Alembic |
-| **Validation** | Pydantic v2 |
-| **기술적 분석** | pandas + pandas-ta |
-| **실시간 통신** | WebSocket (KIS), SSE (Admin) |
-| **스케줄러** | APScheduler (KRX 장 시간 기준 cron) |
-| **증권사 API** | KIS MCP Server (Docker) + KIS REST API 직접 호출 |
-| **LLM** | Claude Code CLI / Codex CLI |
-| **로깅** | loguru |
-| **테스트** | pytest + pytest-asyncio |
+| **AI 자동 매매** | 반자동(승인 필요) 또는 완전자동 선택 가능 |
+| **실시간 이벤트 감지** | 거래량 폭증, 급등/급락 발생 시 즉시 분석 및 대응 |
+| **리스크 관리** | 손절/익절 자동 설정, 일일 거래 한도, 최소 현금 비중 |
+| **피드백 학습** | 매일 성과 분석 → 성공/실패 패턴 추출 → 규칙 자동 개선 |
+| **관리자 대시보드** | 실시간 활동 모니터링, 보유종목 현황, 수동 개입 가능 |
+| **듀얼 전략** | 보수적(대형주) + 공격적(모멘텀) 전략, 시장 국면별 자동 조정 |
+| **백테스팅** | 과거 데이터 기반 전략 시뮬레이션 |
+| **2-Tier LLM** | Claude Code 또는 Codex CLI를 Tier1(빠른 스캔)/Tier2(정밀 검토)로 활용 |
 
-## 아키텍처
-
-### 요청 흐름
-
-```mermaid
-graph LR
-    A["API Routes"] --> B["Services"] --> C["Repositories\n(AsyncBaseRepository[T])"] --> D["SQLAlchemy Models"]
-    A <-.-> S["schemas/\n(Pydantic)"]
-    B <-.-> Dep["dependencies/\n(Annotated[Type, Depends(factory)])"]
-```
-
-### 에이전트 파이프라인 (장중)
-
-```mermaid
-graph TD
-    SCH["Scheduler\n(APScheduler, KST cron)"] --> TA["TradingAgent.run_cycle()"]
-    TA --> MS["MarketScanner.scan()\n거래량순위 · 등락률순위"]
-    MS --> SS["StockScreener.screen()\nLLM Tier1: 후보 필터링"]
-    SS --> PAR
-
-    subgraph PAR ["병렬 _analyze_and_trade() — Semaphore(3), asyncio.gather"]
-        direction TB
-        MCP1["MCP: 현재가 + 일봉 + 분봉\n(gather)"]
-        MCP1 --> CA["ChartAnalyzer\n(pandas-ta 지표)"]
-        CA --> T1["LLM Tier1: 종목 분석\n(CoT 5단계)"]
-        T1 --> T2["LLM Tier2: 최종 검토\n(체크리스트 + 스트레스테스트)"]
-        T2 --> SE["Strategy.evaluate()\nRiskManager.check()"]
-        SE --> DM["DecisionMaker.execute()\nMCP: 주문 실행"]
-    end
-```
-
-### 실시간 경로
-
-```mermaid
-graph LR
-    WS["KIS WebSocket"] --> RM["RealtimeMonitor"] --> ED["EventDetector"]
-    ED --> EB["EventBus\n(asyncio pub/sub)"]
-    EB --> TA["TradingAgent\n._on_market_event()"]
-    TA --> AN["즉시 분석 + 매매\n(단일 종목 파이프라인)"]
-```
-
-### 일일 스케줄 (KST)
-
-| 시간 | 작업 |
-|------|------|
-| 08:50 | 프리마켓 — 전일 피드백 로드, 오버나이트 포지션 확인 |
-| 09:05 | 장 시작 — 풀 스캔 → AI 종목 선정 → WebSocket 구독 |
-| 11:00, 13:00 | 장중 재스캔 — 신규 기회 탐색 |
-| 09:30~14:30 | 30분 간격 — 보유종목 손절/익절 체크 |
-| 14:30 | 매수 마감 (데이트레이딩 모드만) |
-| 15:10 | 청산 — 데이트레이딩: 전량 매도 / 스윙: 종목별 HOLD/SELL 판단 |
-| 15:40 | 장 마감 리뷰 — 성과 분석, AI 피드백 학습, 일일 리포트 생성 |
-| 16:00 | 포트폴리오 동기화 — KIS ↔ DB 잔고 대사 |
-| 16:30 | 시장 데이터 수집 — 일봉 OHLCV 저장 |
-
-## 프로젝트 구조
-
-```
-momo-trading/
-├── main.py                     # FastAPI 앱 진입점
-├── core/                       # 설정, DB, 이벤트버스, 로깅
-├── models/                     # SQLAlchemy ORM 모델
-├── repositories/               # AsyncBaseRepository[T] CRUD
-├── services/                   # 비즈니스 로직
-├── schemas/                    # Pydantic DTO
-├── api/routes/                 # REST API 엔드포인트
-├── dependencies/               # DI 팩토리 + Type Alias
-├── exceptions/                 # ServiceException + ErrorCode
-│
-├── agent/                      # AI 트레이딩 에이전트
-│   ├── trading_agent.py        # 메인 오케스트레이터
-│   ├── market_scanner.py       # 시장 스캔 + LLM 스크리닝
-│   ├── chart_analyzer.py       # pandas-ta 기술적 분석
-│   └── decision_maker.py       # 매매 실행 로직
-│
-├── strategy/                   # 전략 엔진
-│   ├── stable_short.py         # 보수적 단타 (대형주, 5일)
-│   ├── aggressive_short.py     # 공격적 모멘텀 (3일)
-│   ├── risk_manager.py         # 리스크 관리
-│   └── holding_policy.py       # 오버나이트 보유 정책
-│
-├── analysis/                   # AI 분석
-│   ├── llm/                    # LLM 팩토리 + 프롬프트
-│   └── feedback/               # 성과 추적 + 학습 규칙
-│
-├── trading/                    # 증권사 연동
-│   ├── mcp_client.py           # KIS MCP SSE 클라이언트
-│   ├── kis_api.py              # KIS REST API 직접 호출
-│   └── account_manager.py      # 잔고/보유/주문 조회
-│
-├── realtime/                   # 실시간 모니터링
-│   ├── monitor.py              # KIS WebSocket 리스너
-│   └── event_detector.py       # 이벤트 감지 (급등/급락/거래량)
-│
-├── scheduler/                  # APScheduler 잡 관리
-├── admin/static/               # Admin 대시보드 (HTML/JS)
-├── backtesting/                # 백테스팅 엔진
-├── docker/kis-mcp/             # KIS MCP Docker 설정
-├── alembic/                    # DB 마이그레이션
-└── tests/                      # pytest 테스트
-```
+---
 
 ## 시작하기
-
-### 사전 요구사항
-
-- Python 3.12+
-- [KIS Developers](https://apiportal.koreainvestment.com/) 계정 및 API 키
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) 또는 Codex CLI (LLM 분석용)
-- Docker & Docker Compose (KIS MCP 서버 실행용)
-
-### 1. 저장소 클론 및 환경 설정
 
 ```bash
 git clone https://github.com/jjunmo/momo-trading.git
 cd momo-trading
-
-# 가상환경
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# 의존성 설치
-pip install -r requirements.txt
-
-# 환경 변수 설정
-cp .env.example .env
+cp .env.example .env          # 환경 변수 편집 (KIS API 키, LLM 설정)
+docker compose up              # http://localhost:9000/admin
 ```
 
-### 2. `.env` 설정
+> 처음에는 반드시 `TRADING_ENABLED=false` + `KIS_ACCOUNT_TYPE=VIRTUAL`(모의 투자)로 시작하세요.
 
-`.env` 파일을 열고 KIS API 키와 사용할 LLM provider를 입력합니다.
+상세 설정 방법, 코인 전용 설정, 로컬 개발 환경 구성은 **[설치 가이드](docs/setup-guide.md)**를 참조하세요.
 
-```bash
-# === 필수: KIS API 인증 ===
-KIS_APP_KEY=your_app_key              # 실전 투자 앱 키
-KIS_APP_SECRET=your_app_secret        # 실전 투자 앱 시크릿
-KIS_PAPER_APP_KEY=your_paper_key      # 모의 투자 앱 키
-KIS_PAPER_APP_SECRET=your_paper_secret # 모의 투자 앱 시크릿
-KIS_ACCT_STOCK=your_account_number    # 실전 계좌번호(권장: 10자리 전체 / 호환: CANO 8자리)
-KIS_PAPER_STOCK=your_paper_account    # 모의 계좌번호(권장: 10자리 전체 / 호환: CANO 8자리)
-KIS_PROD_TYPE=                        # 2자리 상품코드 override (8자리 CANO만 입력하면 필수)
-KIS_ACCOUNT_TYPE=VIRTUAL              # VIRTUAL(모의) 또는 REAL(실전)
+---
 
-# === LLM Provider 선택 ===
-LLM_PROVIDER=CLAUDE_CODE              # CLAUDE_CODE 또는 CODEX_CLI
+## 상세 문서
 
-# Claude Code CLI
-CLAUDE_CODE_MODEL=sonnet
-CLAUDE_CODE_MODEL_TIER1=haiku
-CLAUDE_CODE_MODEL_TIER2=sonnet
+| 문서 | 설명 |
+|------|------|
+| **[설치 가이드](docs/setup-guide.md)** | 환경 설정, Docker/로컬 실행, 첫 실행 체크리스트 |
+| **[주식 시스템 상세](docs/stock-system.md)** | KIS 연동, 전략 파라미터, 실시간 이벤트, 프로젝트 구조 |
+| **[코인 시스템 상세](docs/crypto-system.md)** | 빗썸 연동, 24/7 운영, 시장 국면, DB 구조 |
+| **[시스템 아키텍처](docs/architecture.md)** | 전체 파이프라인, 검증 게이트, 피드백 루프 (개발자용) |
+| **[코인 아키텍처](docs/crypto-architecture.md)** | 도메인 구조, 프로토콜, 거래 플로우 (개발자용) |
+| **[LLM 아키텍처](docs/llm-architecture.md)** | AI 엔진 구조, Claude/Codex 연동 (개발자용) |
+| **[트레이딩 에이전트](docs/trading-agent-architecture.md)** | 매매 파이프라인, 스케줄러, 피드백 (개발자용) |
 
-# Codex CLI
-CODEX_MODEL=gpt-5.4
-# CODEX_MODEL_TIER1=gpt-5.4
-# CODEX_MODEL_TIER2=gpt-5.4
-CODEX_REASONING_EFFORT=
-# CODEX_REASONING_EFFORT_TIER1=
-# CODEX_REASONING_EFFORT_TIER1_SCAN=low
-# CODEX_REASONING_EFFORT_TIER1_ANALYSIS=medium
-CODEX_REASONING_EFFORT_TIER2=xhigh
-
-# 참고:
-# - 앱과 kis-mcp 컨테이너는 같은 규칙으로 계좌번호를 해석합니다.
-# - 10자리 전체 계좌번호를 넣으면 내부에서 CANO(앞 8자리) + 상품코드(뒤 2자리)로 자동 분리합니다.
-# - 8자리 CANO만 넣을 수도 있지만, 그 경우 KIS_PROD_TYPE 2자리를 반드시 함께 설정해야 합니다.
-# - KIS_PROD_TYPE 를 명시하면 10자리 계좌번호 뒤 2자리 대신 해당 값을 우선 사용합니다.
-
-# === 거래 안전 설정 ===
-TRADING_ENABLED=false                 # true로 변경 시 실제 매매 실행
-DAY_TRADING_ONLY=false                # true=당일 청산, false=스윙(오버나이트)
-AUTONOMY_MODE=SEMI_AUTO               # SEMI_AUTO=승인 필요, AUTONOMOUS=자동 매매
-
-# === 리스크 관리 ===
-RISK_APPETITE=MODERATE                # CONSERVATIVE / MODERATE / AGGRESSIVE
-MIN_CASH_RATIO=0.05                   # 최소 현금 비중 (5%)
-MAX_DAILY_TRADES=30                   # 일일 최대 거래 횟수
-# MAX_SINGLE_ORDER_KRW=5000000       # 1회 주문 한도 (미설정 시 AI 자율)
-```
-
-> 전체 설정 항목은 `.env.example`을 참조하세요.
-
-> Codex를 사용할 경우 `codex login`이 선행되어 있어야 하며, Claude를 사용할 경우 `claude` CLI가 PATH에 있어야 합니다.
-
-> `Tier1`은 호출 성격에 따라 기본값이 다릅니다. 시장 스캔·스크리닝·뉴스는 `low`, 종목 1차 분석·AI 한도 결정은 `medium`을 사용합니다. `CODEX_REASONING_EFFORT_TIER1_SCAN` / `CODEX_REASONING_EFFORT_TIER1_ANALYSIS`가 우선이며, 비어 있으면 `CODEX_REASONING_EFFORT_TIER1` → `CODEX_REASONING_EFFORT` → 프로필 기본값 순으로 해석합니다.
-
-> `Tier2` 최종 검토는 기본적으로 `xhigh`를 사용합니다. 지원값은 `minimal`, `low`, `medium`, `high`, `xhigh`입니다.
-
-### 3. 실행
-
-#### Docker (권장)
-
-```bash
-docker compose up
-# App: http://localhost:9000
-# KIS MCP: http://localhost:3100
-# Admin 대시보드: http://localhost:9000/admin
-```
-
-#### 로컬 개발
-
-```bash
-# KIS MCP 서버를 별도로 실행해야 합니다
-docker compose up kis-mcp
-
-# 다른 터미널에서
-alembic upgrade head          # DB 마이그레이션
-uvicorn main:app --reload     # http://localhost:8000
-```
-
-### 4. 첫 실행 체크리스트
-
-1. `TRADING_ENABLED=false` 상태에서 시작 (건조 실행)
-2. `KIS_ACCOUNT_TYPE=VIRTUAL`로 모의 투자 먼저 테스트
-3. Admin 대시보드(`/admin`)에서 에이전트 활동 모니터링
-4. 수동 사이클 트리거로 동작 확인 후 `SCHEDULER_ENABLED=true`
-
-## 트레이딩 전략
-
-### STABLE_SHORT (보수적)
-
-| 항목 | 값 |
-|------|-----|
-| 대상 | 대형주, ETF, 저변동성 |
-| 보유 기간 | 1~5일 |
-| 손절 | -2~-3% (시장 국면별) |
-| 익절 | +3~+6% (시장 국면별) |
-| 최소 신뢰도 | 0.5 |
-
-### AGGRESSIVE_SHORT (공격적)
-
-| 항목 | 값 |
-|------|-----|
-| 대상 | 모멘텀 급등, 거래량 폭증 |
-| 보유 기간 | 수시간~3일 |
-| 손절 | -3~-5% (시장 국면별) |
-| 익절 | +6~+12% (시장 국면별) |
-| 최소 신뢰도 | 0.55 |
-
-전략 파라미터는 시장 국면(BULL/THEME/BEAR)에 따라 자동 조정됩니다.
-
-## Admin 대시보드
-
-`http://localhost:9000/admin`에서 실시간 모니터링 가능합니다.
-
-- **실시간 피드** — SSE 기반 에이전트 활동 스트림 (매수/매도/분석/에러)
-- **보유종목 카드** — 현재 포지션, 수익률, 미실현 손익
-- **미체결 주문** — 대기 중인 주문 현황
-- **일일 리포트** — 승률, 손익, Sharpe ratio, AI 학습 내용
-- **설정 패널** — 런타임 설정 변경 (재시작 불필요)
-- **수동 트리거** — 장 외 시간에도 사이클 실행 가능
-
-## 테스트
-
-```bash
-pytest tests/ -v
-pytest tests/api/test_health.py -v    # 단일 파일
-```
-
-인메모리 SQLite(`sqlite+aiosqlite://`)로 실행되며, KIS API 호출 없이 독립 테스트 가능합니다.
+---
 
 ## 면책 조항
 
-이 프로젝트는 **교육 및 연구 목적**으로 제작되었습니다.
-
-- 이 소프트웨어를 사용한 투자 손실에 대해 개발자는 어떠한 책임도 지지 않습니다.
-- 실전 투자 전 반드시 모의 투자(`KIS_ACCOUNT_TYPE=VIRTUAL`)로 충분히 테스트하세요.
-- 자동 매매 시스템은 예상치 못한 시장 상황에서 손실을 발생시킬 수 있습니다.
-- KIS API 사용 시 [한국투자증권 API 이용약관](https://apiportal.koreainvestment.com/)을 준수하세요.
+> **이 프로젝트는 교육 및 연구 목적으로 제작되었습니다.**
+>
+> - 이 소프트웨어를 사용한 투자 손실에 대해 개발자는 어떠한 책임도 지지 않습니다.
+> - 실전 투자 전 반드시 모의 투자(`KIS_ACCOUNT_TYPE=VIRTUAL`)로 충분히 테스트하세요.
+> - 자동 매매 시스템은 예상치 못한 시장 상황에서 손실을 발생시킬 수 있습니다.
+> - 각 증권사 API 이용약관을 준수하세요.
 
 ## License
 
