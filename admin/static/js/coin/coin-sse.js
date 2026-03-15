@@ -135,6 +135,7 @@ export function connectSSE() {
 
       if (msg.type === 'account_changed') {
         if (_scheduleAccountOverviewRefresh) _scheduleAccountOverviewRefresh();
+        if (_loadSystemStatus) setTimeout(_loadSystemStatus, 500);
       }
     } catch (err) {
       console.error('[coin-sse] parse error', err);

@@ -177,6 +177,17 @@ export async function loadSystemStatus() {
       privateLabel,
       privateSync.connected ? '#34d399' : (privateSync.last_error ? '#f87171' : '#9ca3af')
     );
+    var restoreAt = s.holding_watch_restore_at;
+    var restoreError = truncateText(s.holding_watch_restore_error || '', 28);
+    var restoreCount = Number(s.holding_watch_symbol_count || 0);
+    var restoreLabel = restoreError
+      ? '오류 · ' + restoreError
+      : (restoreAt ? '확인 · ' + restoreCount + '종목 · ' + formatTimeAgo(restoreAt) : '대기');
+    setInlineStatus(
+      'sys-holding-restore',
+      restoreLabel,
+      restoreError ? '#f87171' : (restoreAt ? '#34d399' : '#9ca3af')
+    );
     setInlineStatus('sys-uptime', uptime, '#d1d5db');
     setInlineStatus('sys-trades-today', todayTrades + '건', todayTrades > 0 ? '#fbbf24' : '#9ca3af');
     if (typeof s.watchlist_count === 'number') {

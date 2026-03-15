@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 from loguru import logger
 
 from agent.decision_maker import decision_maker
+from core.config import settings
 from realtime.coin_stream_manager import coin_stream_manager
 from realtime.event_detector import event_detector
 from trading.account_manager import account_manager
 from trading.bithumb_websocket import bithumb_websocket
+from util.time_util import now_kst
 
 
 class CoinRealtimeMonitor:
@@ -25,6 +28,9 @@ class CoinRealtimeMonitor:
         self._running = False
         self._account_change_task: asyncio.Task | None = None
         self._pending_account_change: dict[str, object] = self._empty_pending()
+        self._last_holding_watch_restore_at: datetime | None = None
+        self._last_holding_watch_restore_error: str | None = None
+        self._last_holding_watch_symbol_count: int = 0
 
     async def start(self) -> None:
         if self._running:
@@ -33,6 +39,7 @@ class CoinRealtimeMonitor:
         bithumb_websocket.set_on_public(self._on_price_update)
         bithumb_websocket.set_on_order(self._on_order_update)
         bithumb_websocket.set_on_asset(self._on_asset_update)
+        await self._restore_holding_watchlist(reason="startup")
         await coin_stream_manager.start()
         self._running = True
         logger.info("코인 실시간 모니터 시작")
@@ -106,9 +113,35 @@ class CoinRealtimeMonitor:
         if self._account_change_task is None or self._account_change_task.done():
             self._account_change_task = asyncio.create_task(self._flush_account_change())
 
+    @staticmethod
+    def _truncate_restore_error(message: str | None, limit: int = 160) -> str | None:
+        if not message:
+            return None
+        normalized = " ".join(str(message).split())
+        return normalized[:limit]
+
+    async def _restore_holding_watchlist(self, *, reason: str) -> None:
+        """현재 보유 코인을 desired 감시에 다시 맞춘다."""
+        from services.watchlist_sync import reconcile_market_watchlist
+
+        market = settings.crypto_primary_market_code
+        try:
+            account_manager.invalidate_cache()
+            symbols = await reconcile_market_watchlist(market)
+            self._last_holding_watch_restore_at = now_kst()
+            self._last_holding_watch_restore_error = None
+            self._last_holding_watch_symbol_count = len(symbols)
+            logger.info("[CoinWS] 보유종목 감시 복원 완료 ({}): {}종목", reason, len(symbols))
+        except Exception as e:
+            self._last_holding_watch_restore_at = now_kst()
+            self._last_holding_watch_restore_error = self._truncate_restore_error(str(e))
+            self._last_holding_watch_symbol_count = 0
+            logger.warning("[CoinWS] 보유종목 감시 복원 실패 ({}): {}", reason, str(e))
+
     async def _flush_account_change(self) -> None:
         try:
             await asyncio.sleep(self._ACCOUNT_CHANGE_DEBOUNCE_SECONDS)
+            await self._restore_holding_watchlist(reason="account_changed")
             payload = self._build_account_change_payload()
             if payload is None:
                 return
@@ -149,6 +182,18 @@ class CoinRealtimeMonitor:
     @property
     def is_connected(self) -> bool:
         return coin_stream_manager.stream_status().get("connected", False)
+
+    @property
+    def last_holding_watch_restore_at(self) -> datetime | None:
+        return self._last_holding_watch_restore_at
+
+    @property
+    def last_holding_watch_restore_error(self) -> str | None:
+        return self._last_holding_watch_restore_error
+
+    @property
+    def last_holding_watch_symbol_count(self) -> int:
+        return self._last_holding_watch_symbol_count
 
 
 coin_realtime_monitor = CoinRealtimeMonitor()

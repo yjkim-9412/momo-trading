@@ -484,6 +484,13 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "last_cycle_status": cycle_runtime.get("last_cycle_status"),
         "last_cycle_error": cycle_runtime.get("last_cycle_error"),
         "realtime_monitor_running": coin_realtime_monitor.is_running,
+        "holding_watch_restore_at": (
+            coin_realtime_monitor.last_holding_watch_restore_at.isoformat()
+            if coin_realtime_monitor.last_holding_watch_restore_at
+            else None
+        ),
+        "holding_watch_restore_error": coin_realtime_monitor.last_holding_watch_restore_error,
+        "holding_watch_symbol_count": coin_realtime_monitor.last_holding_watch_symbol_count,
         "scan_interval_hours": settings.CRYPTO_SCAN_INTERVAL_HOURS,
         "timebox_hours": settings.crypto_timebox_hours,
         "watchlist_symbols": settings.crypto_watchlist_symbols,
