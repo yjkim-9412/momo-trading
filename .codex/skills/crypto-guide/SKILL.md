@@ -98,7 +98,10 @@ CRYPTO_CLAUDE_EFFORT_TIER1_SCAN         # Claude 스캔 effort
 CRYPTO_CLAUDE_EFFORT_TIER1_ANALYSIS     # Claude 분석 effort
 CRYPTO_CLAUDE_EFFORT_TIER2              # Claude 검토 effort
 CRYPTO_CLAUDE_EFFORT_REPORT             # 코인 자동 정산/수동 리포트 effort (예: max)
-CRYPTO_CODEX_MODEL                      # Codex 모델
+CRYPTO_CODEX_MODEL                      # Codex 기본 모델 (fallback)
+CRYPTO_CODEX_MODEL_TIER1_SCAN           # Codex 스캔 모델
+CRYPTO_CODEX_MODEL_TIER1_ANALYSIS       # Codex 분석 모델
+CRYPTO_CODEX_MODEL_TIER2                # Codex 최종검토 모델
 CRYPTO_CODEX_REASONING_EFFORT_REPORT    # 코인 자동 정산/수동 리포트 추론 (기본 xhigh)
 CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN      # Codex 스캔 추론
 CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS  # Codex 분석 추론

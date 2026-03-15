@@ -578,6 +578,35 @@ class DecisionMaker:
             filled_qty=filled_qty,
             detail=payload,
         )
+
+        # SELL 체결 시 trade_result 종료 처리
+        if side == "SELL" and status == "FILLED" and filled_qty > 0:
+            try:
+                await self._record_trade_result(
+                    symbol=symbol,
+                    market=market_code,
+                    side=side,
+                    order_id=order_id,
+                    filled_qty=filled_qty,
+                    filled_price=filled_price,
+                    currency=str(
+                        payload.get("currency")
+                        or getattr(existing, "currency", "KRW")
+                        or "KRW"
+                    ),
+                    exchange_rate_to_krw=float(
+                        payload.get("exchange_rate_to_krw") or 1.0
+                    ),
+                    exit_reason="WS_FILL",
+                    cycle_id=(
+                        getattr(record, "cycle_id", None)
+                        if record is not None
+                        else getattr(existing, "cycle_id", None)
+                    ),
+                )
+            except Exception as e:
+                logger.error("[CoinWS] SELL trade_result 기록 실패 ({}): {}", symbol, str(e))
+
         return {
             "reason": "order_update",
             "symbol": symbol,

@@ -113,7 +113,9 @@ def test_crypto_scope_provider_specific_model_and_effort():
         _env_file=None,
         CRYPTO_LLM_PROVIDER=LLMProvider.CODEX_CLI.value,
         CRYPTO_LLM_MODEL_TIER1_SCAN="claude-crypto-scan",
-        CRYPTO_CODEX_MODEL="codex-crypto",
+        CRYPTO_CODEX_MODEL_TIER1_SCAN="codex-crypto-scan",
+        CRYPTO_CODEX_MODEL_TIER1_ANALYSIS="codex-crypto-analysis",
+        CRYPTO_CODEX_MODEL_TIER2="codex-crypto-tier2",
         CRYPTO_CLAUDE_EFFORT_TIER1_SCAN="high",
         CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN="minimal",
     )
@@ -124,11 +126,22 @@ def test_crypto_scope_provider_specific_model_and_effort():
         LLMTier.TIER1,
         Tier1Profile.SCAN,
     )
-    codex_model = settings.get_llm_model_for_scope_provider(
+    codex_scan = settings.get_llm_model_for_scope_provider(
         "CRYPTO",
         LLMProvider.CODEX_CLI,
         LLMTier.TIER1,
         Tier1Profile.SCAN,
+    )
+    codex_analysis = settings.get_llm_model_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CODEX_CLI,
+        LLMTier.TIER1,
+        Tier1Profile.ANALYSIS,
+    )
+    codex_tier2 = settings.get_llm_model_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CODEX_CLI,
+        LLMTier.TIER2,
     )
     claude_effort = settings.get_llm_reasoning_effort_for_scope_provider(
         "CRYPTO",
@@ -144,9 +157,58 @@ def test_crypto_scope_provider_specific_model_and_effort():
     )
 
     assert claude_model == "claude-crypto-scan"
-    assert codex_model == "codex-crypto"
+    assert codex_scan == "codex-crypto-scan"
+    assert codex_analysis == "codex-crypto-analysis"
+    assert codex_tier2 == "codex-crypto-tier2"
     assert claude_effort == "high"
     assert codex_effort == "minimal"
+
+
+def test_crypto_codex_model_tier_fallback():
+    """Codex 코인 모델 fallback 체인: tier별 → 기본 → 주식 tier별 → 주식 기본"""
+    # tier별 미설정 → CRYPTO_CODEX_MODEL fallback
+    s1 = Settings(_env_file=None, CRYPTO_CODEX_MODEL="codex-base")
+    assert s1.get_crypto_llm_model_for_provider(
+        LLMProvider.CODEX_CLI, LLMTier.TIER1, Tier1Profile.SCAN,
+    ) == "codex-base"
+    assert s1.get_crypto_llm_model_for_provider(
+        LLMProvider.CODEX_CLI, LLMTier.TIER1, Tier1Profile.ANALYSIS,
+    ) == "codex-base"
+    assert s1.get_crypto_llm_model_for_provider(
+        LLMProvider.CODEX_CLI, LLMTier.TIER2,
+    ) == "codex-base"
+
+    # 모두 미설정 → 주식 CODEX_MODEL_TIER1 / CODEX_MODEL fallback
+    s2 = Settings(
+        _env_file=None,
+        CODEX_MODEL="codex-stock",
+        CODEX_MODEL_TIER1="codex-stock-t1",
+        CODEX_MODEL_TIER2="codex-stock-t2",
+    )
+    assert s2.get_crypto_llm_model_for_provider(
+        LLMProvider.CODEX_CLI, LLMTier.TIER1, Tier1Profile.SCAN,
+    ) == "codex-stock-t1"
+    assert s2.get_crypto_llm_model_for_provider(
+        LLMProvider.CODEX_CLI, LLMTier.TIER2,
+    ) == "codex-stock-t2"
+
+    # scan만 설정 → analysis는 scan fallback
+    s3 = Settings(
+        _env_file=None,
+        CRYPTO_CODEX_MODEL_TIER1_SCAN="codex-scan-only",
+    )
+    assert s3.get_crypto_llm_model_for_provider(
+        LLMProvider.CODEX_CLI, LLMTier.TIER1, Tier1Profile.ANALYSIS,
+    ) == "codex-scan-only"
+
+    # analysis만 설정 → scan은 analysis fallback
+    s4 = Settings(
+        _env_file=None,
+        CRYPTO_CODEX_MODEL_TIER1_ANALYSIS="codex-analysis-only",
+    )
+    assert s4.get_crypto_llm_model_for_provider(
+        LLMProvider.CODEX_CLI, LLMTier.TIER1, Tier1Profile.SCAN,
+    ) == "codex-analysis-only"
 
 
 def test_report_phase_defaults_codex_to_xhigh():
