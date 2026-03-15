@@ -49,6 +49,9 @@ class CycleMixin:
         if runtime.cycle_lock.locked():
             return self._skip_result("cycle_already_running", scope, trading_date)
 
+        if is_crypto_market(target) and runtime.settlement_lock.locked():
+            return self._skip_result("settlement_already_running", scope, trading_date)
+
         if market_calendar.is_trading_hours(target):
             if requires_mcp_connection(target) and not mcp_client.is_connected:
                 result = self._skip_result("mcp_unavailable", scope, trading_date, mode="TRADING")
@@ -119,6 +122,10 @@ class CycleMixin:
         if runtime.cycle_lock.locked():
             logger.warning("[{}] 사이클 이미 실행 중 — 중복 트리거 무시", scope)
             return self._skip_result("cycle_already_running", scope, trading_date)
+
+        if is_crypto_market(target) and runtime.settlement_lock.locked():
+            logger.warning("[{}] 타임박스 정산 실행 중 — 사이클 중복 트리거 무시", scope)
+            return self._skip_result("settlement_already_running", scope, trading_date)
 
         with activity_logger.context(market_scope=scope, trading_date=trading_date):
             async with runtime.cycle_lock:
@@ -633,31 +640,18 @@ class CycleMixin:
         trigger_source: str,
         trigger_reason: str | None,
     ) -> None:
-        """코인 사이클 시작 전에 회고 리포트와 활성 규칙을 준비한다."""
-        from services.coin_daily_report_service import coin_daily_report_service
-
-        if trigger_source == "SCHEDULED_AUTO":
-            report = await coin_daily_report_service.generate_checkpoint_report(
-                market=market,
-                report_source="AUTO_PRE_CYCLE",
-                trigger_reason=trigger_reason,
-                applied_cycle_id=cycle_id,
-                market_regime=state.market_regime,
-                market_context=state.market_context,
-            )
-            if report is None:
-                await activity_logger.log(
-                    ActivityType.REPORT,
-                    ActivityPhase.SKIP,
-                    "📘 [CRYPTO] 자동 코인 사이클은 새 회고 리포트를 건너뛰고 기존 회고/규칙을 유지합니다",
-                    cycle_id=cycle_id,
-                )
-        elif trigger_source == "MANUAL_API":
+        """코인 사이클 시작 전에 최신 정산 리포트 기준 규칙만 재적용한다."""
+        if trigger_source in {"SCHEDULED_AUTO", "MANUAL_API"}:
             await activity_logger.log(
                 ActivityType.REPORT,
                 ActivityPhase.SKIP,
-                "📘 [CRYPTO] 수동 코인 사이클은 새 회고 리포트를 만들지 않고 기존 회고를 참조합니다",
+                "📘 [CRYPTO] 코인 사이클 시작 시 자동 리포트는 생성하지 않고 최신 정산 리포트 기준 규칙만 재적용합니다",
                 cycle_id=cycle_id,
+                detail={
+                    "trigger_source": trigger_source,
+                    "trigger_reason": trigger_reason,
+                    "market": market,
+                },
             )
 
         await self.refresh_runtime_trading_rules(

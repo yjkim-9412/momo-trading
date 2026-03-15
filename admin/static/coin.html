@@ -872,6 +872,15 @@
                 <option value="12">12시간</option>
               </select>
             </div>
+            <div>
+              <label class="text-sm block mb-1">타임박스 정산</label>
+              <select id="set-timebox" onchange="updateSetting('CRYPTO_TIMEBOX_HOURS', Number(this.value))"
+                class="w-full bg-dark-700 border border-[#3d3350] rounded px-2 py-1.5 text-sm text-gray-200">
+                <option value="12">12시간</option>
+                <option value="24">24시간</option>
+              </select>
+              <div class="mt-1 text-[11px] text-gray-500">포지션 최대 보유시간 기준</div>
+            </div>
           </div>
         </div>
 

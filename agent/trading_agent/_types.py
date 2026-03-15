@@ -44,6 +44,7 @@ class MarketState:
     rr_floor_overrides: dict[str, float] = field(default_factory=dict)
     cycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     after_hours_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    settlement_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     cash_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     strategies: dict[str, object] = field(default_factory=_default_strategies)
     last_completed_review_date: date | None = None

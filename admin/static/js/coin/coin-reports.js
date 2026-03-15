@@ -13,7 +13,8 @@ import * as Feed from '../shared/admin-feed.js';
 import { state, API, setActivityCount } from './coin-state.js';
 import {
   formatSignedKRW, formatDateTime, truncateText,
-  safeJsonParse, getReportSourceLabel, resolveReportTimestamp,
+  safeJsonParse, getReportHeadline, getReportOriginLabel,
+  getReportSourceLabel, getReportTriggerReasonLabel, resolveReportTimestamp,
   setReportCaches, getSelectedCachedReport, setStatusText,
 } from './coin-utils.js';
 
@@ -61,7 +62,7 @@ export function renderLatestReport(report) {
   var pnl = Number(report.total_pnl ?? 0);
   var pnlColor = pnl >= 0 ? '#34d399' : '#f87171';
   var summary = truncateText(report.market_summary || report.performance_review || report.lessons_learned || '요약 없음', 120);
-  var reportSource = getReportSourceLabel(report.report_source);
+  var reportSource = getReportOriginLabel(report.report_source, report.trigger_reason);
   var reportTs = resolveReportTimestamp(report);
   var reportTsText = reportTs ? formatDateTime(reportTs) : '--';
 
@@ -83,8 +84,9 @@ export function renderLatestReport(report) {
   var row2 = document.createElement('div');
   row2.className = 'flex items-center justify-between gap-2 text-[10px]';
   var srcSpan = document.createElement('span');
-  srcSpan.className = 'text-blue-300';
+  srcSpan.className = 'text-blue-300 truncate';
   srcSpan.textContent = reportSource;
+  srcSpan.title = reportSource;
   var tsSpan = document.createElement('span');
   tsSpan.className = 'text-gray-500';
   tsSpan.textContent = reportTsText;
@@ -152,7 +154,7 @@ export function renderReportList() {
     var reportId = String(report.id || '');
     var ts = resolveReportTimestamp(report);
     var title = ts ? formatDateTime(ts).replace(/\.\s*/g, '/') : String(report.report_date || '--');
-    var source = getReportSourceLabel(report.report_source);
+    var source = getReportOriginLabel(report.report_source, report.trigger_reason);
     var pnl = formatSignedKRW(report.total_pnl);
     var active = state.currentView === 'report'
       && state.currentReportSelection.mode === 'id'
@@ -181,8 +183,9 @@ export function renderReportList() {
     var bottomRow = document.createElement('div');
     bottomRow.className = 'mt-1 flex items-center justify-between gap-2 text-[10px]';
     var srcSpan = document.createElement('span');
-    srcSpan.className = 'text-blue-300';
+    srcSpan.className = 'text-blue-300 truncate';
     srcSpan.textContent = source;
+    srcSpan.title = source;
     var regimeSpan = document.createElement('span');
     regimeSpan.className = 'text-gray-500';
     regimeSpan.textContent = String(report.market_regime || '');
@@ -272,6 +275,8 @@ export function createReportCard(report) {
     : [];
 
   var reportSource = getReportSourceLabel(report.report_source);
+  var triggerReason = getReportTriggerReasonLabel(report.trigger_reason);
+  var reportHeadline = getReportHeadline(report.report_source);
   var periodStarted = report.period_started_at ? formatDateTime(report.period_started_at) : '--';
   var periodEnded = report.period_ended_at ? formatDateTime(report.period_ended_at) : '--';
   var totalPnl = Number(report.total_pnl ?? 0);
@@ -320,7 +325,7 @@ export function createReportCard(report) {
   var feedbackHtml = feedbackEntries.length
     ? '<div class="mt-3">'
         + '<div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1">'
-        + '<i data-lucide="target" class="w-4 h-4"></i> 다음 사이클 피드백'
+        + '<i data-lucide="target" class="w-4 h-4"></i> 다음 운영 피드백'
         + '</div>'
         + '<div class="grid grid-cols-1 md:grid-cols-2 gap-2">'
         + feedbackEntries.map(function (entry) {
@@ -340,7 +345,7 @@ export function createReportCard(report) {
   + '<div>'
   + '<div class="flex items-center gap-2 text-lg font-bold text-white">'
   + '<i data-lucide="clipboard-list" class="w-5 h-5 text-coin-purple"></i>'
-  + ' 코인 체크포인트 리포트'
+  + ' ' + escapeHtml(reportHeadline)
   + '</div>'
   + '<div class="mt-1 text-xs text-gray-500">'
   + escapeHtml(periodStarted) + ' ~ ' + escapeHtml(periodEnded)
@@ -348,6 +353,9 @@ export function createReportCard(report) {
   + '</div>'
   + '<div class="flex flex-wrap items-center gap-2 text-xs">'
   + '<span class="px-2 py-1 rounded-full bg-blue-900/30 text-blue-300">' + escapeHtml(reportSource) + '</span>'
+  + (triggerReason
+    ? '<span class="px-2 py-1 rounded-full bg-violet-900/20 text-violet-200">' + escapeHtml(triggerReason) + '</span>'
+    : '')
   + '<span class="px-2 py-1 rounded-full bg-dark-900 text-gray-300">' + escapeHtml(String(report.market_regime || 'UNKNOWN')) + '</span>'
   + '<span class="px-2 py-1 rounded-full bg-dark-900 text-gray-500">' + escapeHtml(String(report.report_date || '--')) + '</span>'
   + '</div>'
@@ -380,7 +388,7 @@ export function createReportCard(report) {
     cardHtml += '<div class="mb-3"><div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="book-open" class="w-4 h-4"></i> 학습 포인트</div><div class="text-sm text-gray-400 bg-dark-900 rounded p-3 whitespace-pre-wrap">' + escapeHtml(report.lessons_learned) + '</div></div>';
   }
   if (report.next_day_plan) {
-    cardHtml += '<div class="mb-3"><div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="compass" class="w-4 h-4"></i> 다음 사이클 계획</div><div class="text-sm text-gray-400 bg-dark-900 rounded p-3 whitespace-pre-wrap">' + escapeHtml(report.next_day_plan) + '</div></div>';
+    cardHtml += '<div class="mb-3"><div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="compass" class="w-4 h-4"></i> 다음 운영 계획</div><div class="text-sm text-gray-400 bg-dark-900 rounded p-3 whitespace-pre-wrap">' + escapeHtml(report.next_day_plan) + '</div></div>';
   }
   if (topPicks.length) {
     cardHtml += '<div class="mb-3"><div class="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-1"><i data-lucide="crosshair" class="w-4 h-4"></i> 관심 코인</div><div class="flex flex-wrap gap-2">'
@@ -505,6 +513,7 @@ export function renderSettings(settings) {
   if (settings.CRYPTO_ENABLED != null && el('set-auto-scan')) el('set-auto-scan').checked = !!settings.CRYPTO_ENABLED;
   if (settings.CRYPTO_AUTONOMY_MODE && el('set-mode')) el('set-mode').value = settings.CRYPTO_AUTONOMY_MODE;
   if (settings.CRYPTO_SCAN_INTERVAL_HOURS != null && el('set-risk')) el('set-risk').value = String(settings.CRYPTO_SCAN_INTERVAL_HOURS);
+  if (settings.CRYPTO_TIMEBOX_HOURS != null && el('set-timebox')) el('set-timebox').value = String(settings.CRYPTO_TIMEBOX_HOURS);
 }
 
 export async function updateSetting(key, value) {

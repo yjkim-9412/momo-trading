@@ -377,6 +377,7 @@ class CryptoScanner:
 
         prompt = get_market_scan_prompt(target).format(
             current_time=now.strftime("%H:%M"),
+            timebox_hours=settings.crypto_timebox_hours,
             available_cash=available_cash,
             max_per_stock=max_per_coin,
             holding_count=len(holdings),

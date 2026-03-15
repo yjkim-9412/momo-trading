@@ -96,6 +96,13 @@ export function formatDuration(seconds) {
   return s + '초';
 }
 
+// ── Timebox label ──
+export function formatTimeboxHours(hours) {
+  var value = Number(hours);
+  if (!Number.isFinite(value) || value <= 0) return '--';
+  return value + '시간';
+}
+
 // ── Truncate with ellipsis ──
 export function truncateText(text, limit) {
   if (!text) return '';
@@ -159,8 +166,35 @@ export function safeJsonParse(value, fallback) {
 // ── Report source label ──
 export function getReportSourceLabel(source) {
   if (source === 'AUTO_PRE_CYCLE') return '자동 회고';
-  if (source === 'MANUAL') return '수동 생성';
+  if (source === 'AUTO_SETTLEMENT') return '자동 정산';
+  if (source === 'MANUAL') return '수동 리포트';
   return '리포트';
+}
+
+// ── Report trigger label ──
+export function getReportTriggerReasonLabel(triggerReason) {
+  var reason = String(triggerReason || '').toUpperCase();
+  if (reason === 'TIMEBOX_12H') return '12시간 타임박스';
+  if (reason === 'TIMEBOX_24H') return '24시간 타임박스';
+  if (reason === 'MANUAL_GENERATE') return '수동 실행';
+  return '';
+}
+
+// ── Report source + trigger label ──
+export function getReportOriginLabel(source, triggerReason) {
+  var sourceLabel = getReportSourceLabel(source);
+  var triggerLabel = getReportTriggerReasonLabel(triggerReason);
+  if (source === 'MANUAL') return sourceLabel;
+  if (!triggerLabel || triggerLabel === sourceLabel) return sourceLabel;
+  return sourceLabel + ' · ' + triggerLabel;
+}
+
+// ── Report headline ──
+export function getReportHeadline(source) {
+  if (source === 'AUTO_SETTLEMENT') return '코인 자동 정산 리포트';
+  if (source === 'MANUAL') return '코인 수동 리포트';
+  if (source === 'AUTO_PRE_CYCLE') return '코인 자동 회고 리포트';
+  return '코인 리포트';
 }
 
 // ── Extract report timestamp ──

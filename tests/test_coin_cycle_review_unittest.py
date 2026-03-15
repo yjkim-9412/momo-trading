@@ -6,7 +6,7 @@ from agent.trading_agent._types import MarketState
 
 
 class CryptoCycleFeedbackPreparationTest(unittest.IsolatedAsyncioTestCase):
-    async def test_prepare_crypto_cycle_feedback_generates_report_for_scheduled_auto(self):
+    async def test_prepare_crypto_cycle_feedback_skips_auto_report_for_scheduled_auto(self):
         agent = TradingAgent()
         state = MarketState(
             scope="CRYPTO",
@@ -33,15 +33,10 @@ class CryptoCycleFeedbackPreparationTest(unittest.IsolatedAsyncioTestCase):
                 trigger_reason="scheduled_rescan",
             )
 
-        generate_report.assert_awaited_once_with(
-            market="BITHUMB",
-            report_source="AUTO_PRE_CYCLE",
-            trigger_reason="scheduled_rescan",
-            applied_cycle_id="cycle-auto",
-            market_regime="ALTSEASON",
-            market_context="직전 회고 기반 모멘텀 우위",
-        )
-        log_activity.assert_not_awaited()
+        generate_report.assert_not_awaited()
+        log_activity.assert_awaited_once()
+        self.assertEqual(log_activity.await_args.args[:2], ("REPORT", "SKIP"))
+        self.assertIn("최신 정산 리포트 기준 규칙만 재적용", log_activity.await_args.args[2])
         refresh_rules.assert_awaited_once_with(
             market="BITHUMB",
             cycle_id="cycle-auto",
@@ -79,9 +74,9 @@ class CryptoCycleFeedbackPreparationTest(unittest.IsolatedAsyncioTestCase):
         )
         log_activity.assert_awaited_once()
         self.assertEqual(log_activity.await_args.args[:2], ("REPORT", "SKIP"))
-        self.assertIn("기존 회고를 참조", log_activity.await_args.args[2])
+        self.assertIn("최신 정산 리포트 기준 규칙만 재적용", log_activity.await_args.args[2])
 
-    async def test_prepare_crypto_cycle_feedback_keeps_existing_rules_when_auto_report_is_skipped(self):
+    async def test_prepare_crypto_cycle_feedback_always_refreshes_rules_without_report_generation(self):
         agent = TradingAgent()
         state = MarketState(scope="CRYPTO")
 
@@ -104,11 +99,11 @@ class CryptoCycleFeedbackPreparationTest(unittest.IsolatedAsyncioTestCase):
                 trigger_reason="scheduled_rescan",
             )
 
-        generate_report.assert_awaited_once()
+        generate_report.assert_not_awaited()
         refresh_rules.assert_awaited_once_with(
             market="BITHUMB",
             cycle_id="cycle-skip",
             emit_activity=True,
         )
         self.assertEqual(log_activity.await_args.args[:2], ("REPORT", "SKIP"))
-        self.assertIn("기존 회고/규칙을 유지", log_activity.await_args.args[2])
+        self.assertIn("최신 정산 리포트 기준 규칙만 재적용", log_activity.await_args.args[2])

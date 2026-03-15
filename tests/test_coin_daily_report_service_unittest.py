@@ -1,7 +1,7 @@
 import json
 import unittest
 from contextlib import nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -25,7 +25,7 @@ class CoinDailyReportServiceTest(unittest.IsolatedAsyncioTestCase):
                 await session.execute(delete(CoinActivityLog))
                 await session.execute(delete(CoinDailyReport))
 
-    async def test_generate_checkpoint_report_persists_and_deduplicates_cycle_id(self):
+    async def test_generate_checkpoint_report_persists_and_deduplicates_auto_settlement_cycle_id(self):
         service = CoinDailyReportService()
         fixed_now = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
         llm_payload = {
@@ -105,21 +105,23 @@ class CoinDailyReportServiceTest(unittest.IsolatedAsyncioTestCase):
                 ) as generate_rules:
             first = await service.generate_checkpoint_report(
                 market="BITHUMB",
-                report_source="AUTO_PRE_CYCLE",
-                trigger_reason="adaptive_rescan",
+                report_source="AUTO_SETTLEMENT",
+                trigger_reason="TIMEBOX_12H",
                 applied_cycle_id="cycle-1",
+                period_anchor_sources={"AUTO_SETTLEMENT"},
             )
             second = await service.generate_checkpoint_report(
                 market="BITHUMB",
-                report_source="AUTO_PRE_CYCLE",
-                trigger_reason="adaptive_rescan",
+                report_source="AUTO_SETTLEMENT",
+                trigger_reason="TIMEBOX_12H",
                 applied_cycle_id="cycle-1",
+                period_anchor_sources={"AUTO_SETTLEMENT"},
             )
 
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
         self.assertEqual(first.id, second.id)
-        self.assertEqual(first.report_source, "AUTO_PRE_CYCLE")
+        self.assertEqual(first.report_source, "AUTO_SETTLEMENT")
         self.assertEqual(first.applied_cycle_id, "cycle-1")
         self.assertEqual(first.market_regime, "BULL_RUN")
         self.assertEqual(first.period_ended_at.replace(tzinfo=timezone.utc), fixed_now)
@@ -131,8 +133,102 @@ class CoinDailyReportServiceTest(unittest.IsolatedAsyncioTestCase):
             rows = list((await session.execute(select(CoinDailyReport))).scalars().all())
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].report_source, "AUTO_PRE_CYCLE")
-        self.assertEqual(rows[0].trigger_reason, "adaptive_rescan")
+        self.assertEqual(rows[0].report_source, "AUTO_SETTLEMENT")
+        self.assertEqual(rows[0].trigger_reason, "TIMEBOX_12H")
+
+    async def test_manual_report_can_anchor_only_from_last_auto_settlement(self):
+        service = CoinDailyReportService()
+        fixed_now = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+        llm_payload = {
+            "market_regime": "BULL_RUN",
+            "market_summary": "시장 요약",
+            "performance_review": "성과 요약",
+            "lessons_learned": "학습 포인트",
+            "next_cycle_plan": "다음 운영 포인트",
+            "top_picks": ["BTC"],
+            "trade_evaluation": {},
+            "success_patterns": [],
+            "failure_patterns": [],
+            "feedback_for_next_cycle": {},
+            "risk_alerts": [],
+            "action_items": [],
+        }
+        balance = SimpleNamespace(total_asset=1_200_000.0, cash=400_000.0)
+        holdings = []
+        overview = SimpleNamespace(
+            success=True,
+            data={"items": [{"symbol": "BTC", "trade_value": 5_000_000.0, "change_rate": 2.5}]},
+        )
+
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                session.add_all(
+                    [
+                        CoinDailyReport(
+                            id="auto-settlement-1",
+                            report_date=date(2026, 3, 15),
+                            report_source="AUTO_SETTLEMENT",
+                            trigger_reason="TIMEBOX_12H",
+                            period_started_at=datetime(2026, 3, 15, 0, 0, tzinfo=timezone.utc),
+                            period_ended_at=datetime(2026, 3, 15, 4, 0, tzinfo=timezone.utc),
+                            total_cycles=1,
+                            total_analyses=1,
+                            total_recommendations=0,
+                            total_orders=0,
+                            win_count=0,
+                            loss_count=0,
+                            total_pnl=0.0,
+                        ),
+                        CoinDailyReport(
+                            id="manual-1",
+                            report_date=date(2026, 3, 15),
+                            report_source="MANUAL",
+                            trigger_reason="manual_generate",
+                            period_started_at=datetime(2026, 3, 15, 4, 0, tzinfo=timezone.utc),
+                            period_ended_at=datetime(2026, 3, 15, 8, 0, tzinfo=timezone.utc),
+                            total_cycles=1,
+                            total_analyses=1,
+                            total_recommendations=0,
+                            total_orders=0,
+                            win_count=0,
+                            loss_count=0,
+                            total_pnl=0.0,
+                        ),
+                    ]
+                )
+
+        with patch("services.coin_daily_report_service.AsyncSessionLocal", TestAsyncSessionLocal), \
+                patch("services.coin_daily_report_service.now_kst", return_value=fixed_now), \
+                patch("services.coin_daily_report_service.activity_logger.context", return_value=nullcontext()), \
+                patch("services.coin_daily_report_service.activity_logger.log", AsyncMock()), \
+                patch(
+                    "services.coin_daily_report_service.account_manager.get_account_snapshot",
+                    AsyncMock(return_value=(balance, holdings)),
+                ), \
+                patch(
+                    "services.coin_daily_report_service.bithumb_client.get_market_overview",
+                    AsyncMock(return_value=overview),
+                ), \
+                patch(
+                    "services.coin_daily_report_service.llm_factory.generate_tier1",
+                    AsyncMock(return_value=(json.dumps(llm_payload, ensure_ascii=False), "TEST")),
+                ), \
+                patch(
+                    "services.coin_daily_report_service.trading_rule_engine.generate_rules_from_review",
+                    AsyncMock(),
+                ):
+            report = await service.generate_checkpoint_report(
+                market="BITHUMB",
+                report_source="MANUAL",
+                trigger_reason="manual_generate",
+                period_anchor_sources={"AUTO_SETTLEMENT"},
+            )
+
+        self.assertIsNotNone(report)
+        self.assertEqual(
+            report.period_started_at.replace(tzinfo=timezone.utc),
+            datetime(2026, 3, 15, 4, 0, tzinfo=timezone.utc),
+        )
 
     async def test_generate_checkpoint_report_raises_and_does_not_persist_when_market_overview_fails(self):
         service = CoinDailyReportService()

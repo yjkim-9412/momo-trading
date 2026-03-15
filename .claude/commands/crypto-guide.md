@@ -46,7 +46,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 | `analysis/llm/llm_factory.py` | 코인 scope LLM provider 라우팅 및 Codex 장애 fallback |
 | `analysis/feedback/trading_rules.py` | 코인 회고 기반 `coin_trading_rules` 생성/로드 |
 | `services/coin_order_service.py` | 코인 수동 주문 preview/place/get/cancel helper + 브로커 에러 표준화 |
-| `services/coin_daily_report_service.py` | 코인 체크포인트 회고 리포트 생성 |
+| `services/coin_daily_report_service.py` | 코인 자동 정산/수동 리포트 생성 |
 | `repositories/coin_daily_report_repository.py` | 코인 체크포인트 리포트 latest/list/applied_cycle 조회 |
 | `trading/market_profile.py` | `is_crypto_market()`, `MARKET_SCOPE_CRYPTO`, BITHUMB 프로필 |
 | `trading/risk_policy.py` | 코인 canonical regime alias 정규화, shared RR floor 상수 |
@@ -61,7 +61,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 | `analysis/llm/prompts/market_scan.py` | 크립토 스캔 프롬프트 |
 | `analysis/llm/prompts/stock_analysis.py` | 크립토 Tier1 분석 프롬프트 |
 | `analysis/llm/prompts/final_review.py` | 크립토 Tier2 리뷰 프롬프트 |
-| `analysis/llm/prompts/crypto_cycle_review.py` | 코인 체크포인트 회고 프롬프트 |
+| `analysis/llm/prompts/crypto_cycle_review.py` | 코인 자동 정산 회고 프롬프트 |
 | `strategy/signal.py` | 코인 BUY `suggested_amount_krw` 포함 공통 시그널 계약 |
 | `agent/decision_maker.py` | 코인 BUY 금액 주문 실행 (`price=None`, `quantity=<KRW amount>`) |
 
@@ -119,12 +119,13 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 ## 24/7 스케줄 구조
 
 코인은 장 시작/마감 개념이 없다:
-- **자동 체크포인트 회고 + 스캔**: `CRYPTO_SCAN_INTERVAL_HOURS` 간격 고정 cron (기본 4시간)
-  - scheduled 자동 사이클은 `체크포인트 회고 리포트 생성 → refresh_runtime_trading_rules() → CryptoScanner.scan()` 순서로 돈다.
+- **자동 스캔**: `CRYPTO_SCAN_INTERVAL_HOURS` 간격 고정 cron (기본 4시간)
+  - scheduled 자동 사이클은 `최신 자동 정산 리포트 기준 refresh_runtime_trading_rules() → CryptoScanner.scan()` 순서로 돈다.
 - **보유 점검**: `CRYPTO_HOLDINGS_CHECK_INTERVAL_HOURS` 간격 (기본 2시간)
+- **타임박스 정산**: `30분` 주기 sweep이 `entry_at + CRYPTO_TIMEBOX_HOURS`를 넘긴 포지션만 자동 청산한다.
 - **수동 사이클**: `/api/v1/admin-coin/agent/trigger` 는 새 리포트를 만들지 않고 최신 회고를 참조해서 실행한다.
-- **수동 리포트 생성**: `POST /api/v1/admin-coin/reports/generate` 는 현재 시점 기준 체크포인트 회고만 생성하고 규칙을 즉시 재적용한다.
-- **buy cutoff / 강제 청산**: 없음 (24/7)
+- **수동 리포트 생성**: `POST /api/v1/admin-coin/reports/generate` 는 현재 시점 기준 정산 윈도우 스냅샷만 생성하고 규칙을 즉시 재적용한다.
+- **주식식 buy cutoff / 장종료 강제 청산**: 없음 (24/7). 대신 rolling timebox 정산 사용.
 
 ## 코인 구현 주의사항
 
@@ -144,12 +145,12 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - legacy alias는 `normalize_crypto_regime()`에서 `BEAR -> BEAR_MARKET`, `SIDEWAYS -> CONSOLIDATION`, `ALT_SEASON -> ALTSEASON`으로 정규화한다
 - R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게).
 - 코인 기본 시장 fallback은 주식 `PRIMARY_MARKET`를 공유하지 않는다. 코인 경로는 `CRYPTO_PRIMARY_MARKET`를 우선 사용하고, 값이 비어 있거나 잘못되면 `BITHUMB`로 고정한다.
-- 코인 프롬프트 스택(`market_scan.py`, `stock_analysis.py`, `final_review.py`)은 `빗썸 KRW 현물`, `수시간~2일`, `BUY/HOLD 전용`, `24h 거래대금 기반 유동성 확인`을 공통 계약으로 유지한다.
+- 코인 프롬프트 스택(`market_scan.py`, `stock_analysis.py`, `final_review.py`)은 `빗썸 KRW 현물`, `12h/24h timebox`, `BUY/HOLD 전용`, `24h 거래대금 기반 유동성 확인`을 공통 계약으로 유지한다.
 - 코인 프롬프트 스택은 `BUY 판단은 KRW 투자금 기준`, `Tier2 BUY는 suggested_amount_krw 필수`, `suggested_quantity는 추정치` 계약을 함께 유지한다.
-- 코인 체크포인트 회고 프롬프트는 `analysis/llm/prompts/crypto_cycle_review.py`를 사용하며, 표현도 `직전 구간` / `다음 코인 사이클` 기준으로 유지한다.
+- 코인 자동 정산 회고 프롬프트는 `analysis/llm/prompts/crypto_cycle_review.py`를 사용하며, 표현도 `직전 정산 구간` / `다음 정산 윈도우` 기준으로 유지한다.
 - Product Policy: 크립토는 항상 `COMMON` (Spot only), 레버리지/인버스 분류 Skip.
 - manual 코인 사이클은 새 리포트를 만들지 않는다. `_build_trading_context()`가 최신 `coin_daily_reports`를 읽어 `최근 회고 참고` 블록을 붙인다.
-- `coin_daily_reports`는 체크포인트 이력 저장소다. `report_source`, `trigger_reason`, `applied_cycle_id`, `period_started_at`, `period_ended_at`를 함께 저장하고 `period_ended_at` 기준 latest/list를 조회한다.
+- `coin_daily_reports`는 자동 정산/수동 리포트 이력 저장소다. `report_source`, `trigger_reason`, `applied_cycle_id`, `period_started_at`, `period_ended_at`를 함께 저장하고 `period_ended_at` 기준 latest/list를 조회한다.
 - 코인 회고 규칙은 공유 `trading_rules`가 아니라 `coin_trading_rules`에 저장되고, `refresh_runtime_trading_rules()`가 현재 CRYPTO runtime에 즉시 적용한다.
 - 코인 스캔은 `CRYPTO_DYNAMIC_DISCOVERY_ENABLED=true`일 때 `get_discovery_universe()`로 저빈도 broad refresh를 수행하고, `CRYPTO_DISCOVERY_UNIVERSE_SIZE` 상위 유동성 코인을 메모리 캐시에 유지한다.
 - broad refresh 기본 주기는 `CRYPTO_DISCOVERY_REFRESH_MINUTES=360`이며, 평소 스캔은 cached universe 심볼과 `CRYPTO_WATCHLIST_SYMBOLS`만 `get_ticker_snapshots()`로 selective 조회한다.
@@ -161,7 +162,7 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - `BithumbClient._public_get()`는 HTTP status, content-type, body preview를 함께 로그에 남긴다. `Expecting value`만 보이면 upstream HTML/빈 본문/5xx 가능성을 먼저 확인할 것.
 - `start-coin.sh`는 서버 기동 전에 venv Python 기준 `socket.getaddrinfo(api.bithumb.com/ws-api.bithumb.com)`와 `httpx` public probe(`/v1/market/all`, `/v1/ticker?markets=KRW-BTC,KRW-ETH`)를 확인한다. `curl`만 성공하고 Python이 실패하는 상태는 정상으로 보지 않는다.
 - 코인 scope에서 `CRYPTO_LLM_PROVIDER=CODEX_CLI`이고 Codex 인증/세션 갱신이 실패하면 `analysis/llm/llm_factory.py`가 `CLAUDE_CODE` fallback을 1회 시도한다.
-- 코인 체크포인트 회고 리포트는 LLM `phase="report"`를 사용한다. Codex는 기본 `xhigh`, Claude는 `CRYPTO_CLAUDE_EFFORT_REPORT=max` 같은 report 전용 override를 줄 수 있다.
+- 코인 자동 정산/수동 리포트는 LLM `phase="report"`를 사용한다. Codex는 기본 `xhigh`, Claude는 `CRYPTO_CLAUDE_EFFORT_REPORT=max` 같은 report 전용 override를 줄 수 있다.
 - 주문 체결 확인: `POST /v1/orders` 접수 후 `GET /v1/order?uuid=...` 개별 조회로 상태를 추적한다.
 - 보유 코인 현재가: `_fetch_coin_prices(symbols)` 헬퍼로 벌크 ticker 조회 (1 API call). `get_account_balance()`와 `get_holdings()` 모두 현재가 기반 평가. 조회 실패 시 `avg_buy_price` 폴백.
 - `get_account_balance()` / `get_holdings()`는 `/v1/market/all`의 실제 `KRW-*` 마켓에 없는 자산을 비거래성 자산으로 간주해 제외한다. 마켓 카탈로그 조회가 깨지면 stale cache를 우선 쓰고, cache도 없으면 `avg_buy_price=0` 이고 현재가도 없는 자산만 degraded 규칙으로 제외한다.
@@ -182,8 +183,9 @@ $ARGUMENTS — 검색할 키워드 (예: 주문, 스캐너, 스케줄, 프롬프
 - 코인 체크포인트 리포트 KPI(`total_cycles`, `total_analyses`, `activity_counts` 등)는 `period_started_at ~ period_ended_at` 전체를 exact aggregate로 계산한다. 최근 활동 로그는 prompt 크기 보호용 sample로만 사용하고 KPI와 섞지 않는다.
 - 코인 어드민 수동 스캔 버튼은 HTML inline handler를 쓰지 않고 단일 JS 바인딩만 사용한다. 버튼 상태는 `agent/state`를 기준으로 `요청 중 → 시작 대기 → 진행 중 → 완료/스킵` 흐름을 표시한다.
 - 수동 코인 스캔(`/api/v1/admin-coin/agent/trigger`)은 `run_cycle()` 완료 후 `reconcile_market_watchlist("BITHUMB")`를 다시 호출해 최근 선정 종목이 즉시 코인 WebSocket desired set에 반영되도록 유지한다.
-- 코인 수동 리포트 생성 API는 `POST /api/v1/admin-coin/reports/generate` 이고, 현재 시점 기준 체크포인트 회고를 만든 뒤 활성 규칙을 즉시 재적용한다.
-- 수동 리포트는 시장 개요 조회가 실패하면 저장하지 않고 실패 메시지를 반환한다. 자동 pre-cycle 회고도 같은 조건에서는 새 리포트를 만들지 않고 기존 회고/규칙을 유지한다.
+- 코인 수동 리포트 생성 API는 `POST /api/v1/admin-coin/reports/generate` 이고, 현재 정산 윈도우 기준 스냅샷 리포트를 만든 뒤 활성 규칙을 즉시 재적용한다.
+- 수동 리포트는 시장 개요 조회가 실패하면 저장하지 않고 실패 메시지를 반환한다. 자동 정산 리포트도 같은 조건에서는 새 리포트를 만들지 않는다.
+- `/api/v1/admin-coin/settings`에서 `CRYPTO_TIMEBOX_HOURS`를 바꾸면 루트 `.env`도 함께 갱신되어 재시작 후 유지된다.
 - 코인 어드민 좌측 내비게이션은 `실시간 모니터링`, `최신 리포트`, `과거 리포트` 목록으로 나뉘며, 중앙 패널에서 선택한 체크포인트 리포트를 상세 조회한다.
 - 코인 리포트 상세 하단 활동 로그는 `GET /api/v1/admin-coin/reports/{report_id}/activities` 로 조회하고, 선택한 리포트의 `period_started_at ~ period_ended_at` 구간만 반환한다.
 - 코인 시스템 상태 API(`/api/v1/admin-coin/system/status`)는 `bithumb_connectivity`를 포함한다. `dns_api_ok`, `dns_ws_ok`, `market_catalog_ok`, `ticker_probe_ok`, `public_api_ok`, `last_error_stage`, `last_error`, `checked_at`로 빗썸 연결 상태를 노출한다.

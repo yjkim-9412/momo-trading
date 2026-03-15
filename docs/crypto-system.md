@@ -41,7 +41,7 @@ flowchart LR
 
 ## 2. 24/7 운영 모델
 
-코인은 장 시간 개념이 없습니다. 24시간 365일 스캔과 매매가 이루어집니다.
+코인은 장 시간 개념이 없습니다. 24시간 365일 스캔과 매매가 이루어지며, 포지션은 `timebox` 기준으로 정리됩니다.
 
 ### 스캔 사이클 (기본 4시간)
 
@@ -63,12 +63,25 @@ flowchart LR
 - 손절/익절 조건 확인
 - Admin 대시보드에 상태 업데이트
 
-### 체크포인트 리포트
+### 타임박스 정산 (기본 30분 주기)
 
-스캔 사이클 전후에 AI가 해당 기간의 성과를 복기합니다:
-- 기간 내 총 사이클 수, 분석 수, 매매 수
-- 승률, 총 손익, 미실현 손익
-- 시장 요약, 교훈, 다음 기간 계획
+- 각 포지션은 `CRYPTO_TIMEBOX_HOURS` 기준으로 최대 보유시간을 가집니다.
+- 기본값은 `12시간`, admin-coin 설정에서 `24시간`으로 바꿀 수 있습니다.
+- admin-coin에서 변경한 `CRYPTO_TIMEBOX_HOURS`는 루트 `.env`에 저장되어 서버 재시작 후에도 유지됩니다.
+- 스케줄러는 `30분`마다 정산 스윕을 실행해 `entry_at + timebox`를 넘긴 포지션만 자동 매도합니다.
+- 이 정산은 `AUTONOMOUS/SEMI_AUTO`와 무관한 리스크 정책이며, `CRYPTO_TRADING_ENABLED=true`일 때만 실제 주문이 나갑니다.
+
+### 자동 리포트
+
+자동 리포트는 더 이상 스캔 직전에 생성되지 않습니다. 실제 타임박스 청산이 1건 이상 성공하고 계좌 재동기화가 끝난 뒤에만 생성됩니다:
+- `report_source = AUTO_SETTLEMENT`
+- `trigger_reason = TIMEBOX_12H` 또는 `TIMEBOX_24H`
+- 구간 시작점은 이전 `AUTO_SETTLEMENT` 리포트의 `period_ended_at`
+
+### 수동 리포트
+
+- `POST /api/v1/admin-coin/reports/generate` 는 계속 지원됩니다.
+- 수동 리포트는 현재 정산 윈도우 스냅샷을 만들지만, 다음 자동 정산 리포트의 구간 경계를 바꾸지 않습니다.
 
 ---
 
@@ -133,10 +146,11 @@ flowchart TD
 | 기능 | 설명 |
 |------|------|
 | 시스템 상태 | 빗썸 연결 상태, 스케줄러, 에이전트 상태 |
+| 운영 설정 | 스캔 주기, 자율 모드, `12h/24h` 타임박스 정산 기준 변경 |
 | 실시간 피드 | SSE 기반 활동 스트림 (스캔, 분석, 주문, 에러) |
 | 추천 목록 | SEMI_AUTO 모드: 대기 중인 매수 추천 승인/거절 |
 | 보유종목 | 현재 포지션, 수익률, 미실현 손익 |
-| 체크포인트 리포트 | 기간별 성과 리포트, KPI, 활동 로그 |
+| 정산/수동 리포트 | 자동 정산 리포트와 수동 스냅샷 리포트, KPI, 활동 로그 |
 | 수동 트리거 | 스캔 실행, 리포트 생성 등 |
 
 ---
@@ -181,6 +195,7 @@ flowchart TD
 | `CRYPTO_AUTONOMY_MODE` | SEMI_AUTO | 운영 모드 |
 | `CRYPTO_SCAN_INTERVAL_HOURS` | 4 | 스캔 주기 (시간) |
 | `CRYPTO_HOLDINGS_CHECK_INTERVAL_HOURS` | 2 | 보유 점검 주기 (시간) |
+| `CRYPTO_TIMEBOX_HOURS` | 12 | 최대 보유시간 (`12` 또는 `24`) |
 | `CRYPTO_WATCHLIST_SYMBOLS` | BTC,ETH,XRP,SOL | 시드 심볼 |
 | `CRYPTO_SCAN_LIMIT` | 15 | 스캔당 최대 후보 수 |
 

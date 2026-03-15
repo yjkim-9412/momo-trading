@@ -8,7 +8,7 @@ import * as Monitor from '../shared/admin-monitor.js';
 import { state, API } from './coin-state.js';
 import {
   formatDuration, formatTimeAgo, formatDateTime, truncateText, formatPrice,
-  formatCoinScanSource, setInlineStatus, setStatusText, setTextContent,
+  formatCoinScanSource, formatTimeboxHours, setInlineStatus, setStatusText, setTextContent,
 } from './coin-utils.js';
 
 // Late-bound references for functions defined in other coin modules.
@@ -90,6 +90,17 @@ function describeConnectivity(connectivity, errorLimit) {
     className: 'text-green-300',
     color: '#34d399',
   };
+}
+
+function resolveTimeboxHours(status) {
+  var statusValue = Number(status && (status.timebox_hours ?? status.crypto_timebox_hours));
+  if (Number.isFinite(statusValue) && statusValue > 0) return statusValue;
+
+  var settingsSelect = document.getElementById('set-timebox');
+  var selectedValue = Number(settingsSelect && settingsSelect.value);
+  if (Number.isFinite(selectedValue) && selectedValue > 0) return selectedValue;
+
+  return null;
 }
 
 // -- Load system status --
@@ -174,13 +185,15 @@ export async function loadSystemStatus() {
 
     var sessionLabel = getSessionLabel(s.market_session);
     var connectivityMeta = describeConnectivity(connectivity, 88);
+    var timeboxHours = resolveTimeboxHours(s);
+    var timeboxSuffix = timeboxHours ? ' · 정산 ' + formatTimeboxHours(timeboxHours) : '';
     if (s.last_cycle_error) {
       setStatusText('마지막 사이클 오류 · ' + truncateText(s.last_cycle_error, 88), '#f87171');
     } else if (!connectivityMeta.ok) {
       setStatusText(connectivityMeta.statusText, connectivityMeta.color);
     } else {
       var cycleState = s.last_cycle_status ? ' · 마지막 ' + s.last_cycle_status : '';
-      setStatusText(sessionLabel + ' · 스캔 ' + (s.scheduler_running ? '동작' : '중지') + cycleState, '#9ca3af');
+      setStatusText(sessionLabel + ' · 스캔 ' + (s.scheduler_running ? '동작' : '중지') + timeboxSuffix + cycleState, '#9ca3af');
     }
 
     if (_updateScanTimeline) _updateScanTimeline();
@@ -227,6 +240,8 @@ export function renderScanScheduleSummary(status) {
   var sessionLabel = getSessionLabel(status.market_session);
   var connectivity = status.bithumb_connectivity || {};
   var connectivityMeta = describeConnectivity(connectivity, 30);
+  var timeboxHours = resolveTimeboxHours(status);
+  var timeboxLabel = timeboxHours ? formatTimeboxHours(timeboxHours) : '--';
 
   container.innerHTML = `
   <div class="text-xs text-gray-300 space-y-2">
@@ -237,6 +252,10 @@ export function renderScanScheduleSummary(status) {
     <div class="flex justify-between gap-3">
       <span class="text-gray-500">주기</span>
       <span class="text-gray-300">${escapeHtml(state.scanIntervalHours ? state.scanIntervalHours + '시간 고정' : '--')}</span>
+    </div>
+    <div class="flex justify-between gap-3">
+      <span class="text-gray-500">정산 기준</span>
+      <span class="text-gray-300">${escapeHtml(timeboxLabel)}</span>
     </div>
     <div class="flex justify-between gap-3">
       <span class="text-gray-500">최근 상태</span>

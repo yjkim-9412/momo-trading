@@ -49,7 +49,8 @@ CLAUDE.md와 AGENTS.md에서 공유하는 운영 규칙. 양쪽 지침 파일이
 - 빗썸 rate limit 공식 한도는 Public **150 req/s**, Private **140 req/s**, 주문(생성/취소) **10 req/s**. 코드(`BithumbClient`)는 burst 방지를 위해 보수적으로 Public 10, Private 5 semaphore를 설정한다. 필요 시 상향 가능하나 두 브로커의 rate limiter를 공유하지 말 것.
 - 빗썸 캔들 응답은 newest-first일 수 있다. KIS 해외 일봉과 동일한 방어로 `BithumbClient`에서 oldest-first 정렬한다. 분석 파이프라인의 이중 정렬 방어는 코인에도 적용된다.
 - 코인 수량은 소수점이다 (`OrderRequest.quantity = float`). 주식은 항상 정수만 전달하므로 하위호환. `Decimal`은 `BithumbClient` 내부 계산에서만 사용하고, API 경계에서 float로 변환한다.
-- 코인은 24/7 시장이므로 `buy_cutoff`, `force_liquidation`, `장 시작/마감` 개념이 없다. `market_calendar.is_trading_hours("BITHUMB")`는 항상 True를 반환한다. 코인에 시간 기반 매수 차단을 넣지 말 것.
+- 코인은 24/7 시장이므로 주식식 `buy_cutoff`, `장 시작/마감`, 장종료 일괄 `force_liquidation` 개념을 그대로 쓰지 않는다. `market_calendar.is_trading_hours("BITHUMB")`는 항상 True를 반환한다.
+- 대신 코인 포지션은 `CRYPTO_TIMEBOX_HOURS` 기준 rolling timebox 정산을 사용한다. timebox 만료 청산은 장마감 개념이 아니라 포지션별 최대 보유시간 리스크 정책으로 유지할 것.
 - 코인 시장 국면은 `BULL_RUN`/`BEAR_MARKET`/`CONSOLIDATION`/`ALTSEASON`이다. 주식의 `BULL`/`BEAR`/`SIDEWAYS`/`THEME`와 다르지만, `risk_manager.CRYPTO_RR_FLOOR`에서 두 체계 모두 매핑한다.
 - 코인 Tier2 스트레스 테스트는 -10%/-7% (주식의 -5%/-3%보다 넓다). 코인 변동성 기준을 주식 수준으로 좁히지 말 것.
 - `/admin-coin` 페이지는 주식 `/admin`과 완전 별도 SPA이다. API prefix는 `/api/v1/admin-coin/*`, SSE는 독립 `coin_sse_manager`를 사용한다. 주식 SSE와 코인 SSE를 공유하지 말 것.
