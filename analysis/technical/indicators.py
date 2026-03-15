@@ -79,15 +79,6 @@ class TechnicalIndicators:
                         result["bb_squeeze_ratio"] = round(squeeze_ratio, 3)
                         result["bb_squeeze"] = squeeze_ratio < 0.5
 
-            # VWAP (거래량가중평균가격) - 당일 기준
-            if "volume" in df.columns and len(df) >= 2:
-                typical_price = (df["high"] + df["low"] + df["close"]) / 3
-                cumul_tp_vol = (typical_price * df["volume"]).cumsum()
-                cumul_vol = df["volume"].cumsum()
-                vwap = cumul_tp_vol / cumul_vol.replace(0, float("nan"))
-                if not vwap.empty and not pd.isna(vwap.iloc[-1]):
-                    result["vwap"] = round(vwap.iloc[-1], 2)
-
             # 피보나치 되돌림 레벨
             if len(df) >= 20:
                 recent_high = df["high"].iloc[-20:].max()
@@ -202,7 +193,6 @@ class TechnicalIndicators:
             "cross_signal": "크로스 시그널",
             "bb_squeeze_ratio": "볼린저 Squeeze 비율",
             "bb_squeeze": "볼린저 Squeeze 여부",
-            "vwap": "VWAP",
             "fib_236": "피보나치 23.6%",
             "fib_382": "피보나치 38.2%",
             "fib_500": "피보나치 50.0%",

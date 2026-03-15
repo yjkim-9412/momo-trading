@@ -1,13 +1,19 @@
 """KIS WebSocket 실시간 시세 스트리밍"""
 import asyncio
 import json
-from typing import Callable, Coroutine, Any
+from typing import Any, Callable, Coroutine
 
 import websockets
 from loguru import logger
 
 from core.config import settings
 from trading.market_profile import build_ws_key, is_domestic_market, normalize_market
+
+
+_WS_RECORD_SIZES: dict[str, tuple[int, ...]] = {
+    "H0STCNT0": (46,),
+    "HDFSCNT0": (26, 25),
+}
 
 
 def _ws_is_closed(ws) -> bool:
@@ -38,8 +44,24 @@ class KISWebSocket:
     async def connect(self) -> None:
         """WebSocket 연결 시작"""
         self._running = True
+        self._approval_key = None
         await self._get_approval_key()
+        if not self._approval_key:
+            self._running = False
+            raise ConnectionError("WebSocket approval key 발급 실패")
         logger.info("KIS WebSocket 연결 시작")
+
+    async def reset_runtime_state(self) -> None:
+        """런타임 연결 상태만 초기화 (desired 구독은 상위 매니저가 복원)"""
+        for attr_name in ("_ws_domestic", "_ws_overseas"):
+            ws = getattr(self, attr_name)
+            if ws and not _ws_is_closed(ws):
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            setattr(self, attr_name, None)
+        self._subscriptions.clear()
 
     async def disconnect(self) -> None:
         """WebSocket 연결 종료"""
@@ -55,19 +77,39 @@ class KISWebSocket:
     async def _get_approval_key(self) -> None:
         """WebSocket 접속 키 발급"""
         import httpx
+
+        base_url = (
+            "https://openapivts.koreainvestment.com:29443"
+            if settings.is_paper_trading
+            else "https://openapi.koreainvestment.com:9443"
+        )
+        if settings.is_paper_trading:
+            app_key = settings.KIS_PAPER_APP_KEY or settings.KIS_APP_KEY
+            app_secret = settings.KIS_PAPER_APP_SECRET or settings.KIS_APP_SECRET
+        else:
+            app_key = settings.KIS_APP_KEY
+            app_secret = settings.KIS_APP_SECRET
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/plain",
+            "charset": "UTF-8",
+        }
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    "https://openapi.koreainvestment.com:9443/oauth2/Approval",
+                    f"{base_url}/oauth2/Approval",
+                    headers=headers,
                     json={
                         "grant_type": "client_credentials",
-                        "appkey": settings.KIS_PAPER_APP_KEY if settings.is_paper_trading else settings.KIS_APP_KEY,
-                        "secretkey": settings.KIS_PAPER_APP_SECRET if settings.is_paper_trading else settings.KIS_APP_SECRET,
+                        "appkey": app_key,
+                        "secretkey": app_secret,
                     },
                 )
                 if resp.status_code == 200:
                     self._approval_key = resp.json().get("approval_key")
                     logger.debug("WebSocket approval key 발급 완료")
+                else:
+                    logger.warning("WebSocket approval key 발급 실패: HTTP {} - {}", resp.status_code, resp.text[:200])
         except Exception as e:
             logger.warning("WebSocket approval key 발급 실패: {}", str(e))
 
@@ -175,6 +217,28 @@ class KISWebSocket:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
+            for task in pending:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            first_error = None
+            for task in done:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    continue
+                except Exception as e:
+                    first_error = first_error or e
+
+            if first_error:
+                raise first_error
+
+            if self._running:
+                raise ConnectionError("WebSocket listener ended unexpectedly")
 
     async def _listen_ws(self, ws, ws_type: str) -> None:
         """개별 WebSocket 메시지 수신"""
@@ -183,12 +247,22 @@ class KISWebSocket:
                 if not self._running:
                     break
                 await self._handle_message(raw_msg, ws_type, ws)
-        except websockets.ConnectionClosed:
-            logger.warning("{} WebSocket 연결 끊김, 재연결 시도...", ws_type)
+        except websockets.ConnectionClosed as e:
+            logger.warning("{} WebSocket 연결 끊김, 재연결 시도... ({})", ws_type, str(e))
+            if ws_type == "domestic":
+                self._ws_domestic = None
+            else:
+                self._ws_overseas = None
             if self._running:
-                await asyncio.sleep(self._reconnect_delay)
+                raise ConnectionError(f"{ws_type} WebSocket 연결 끊김")
         except Exception as e:
+            if ws_type == "domestic":
+                self._ws_domestic = None
+            else:
+                self._ws_overseas = None
             logger.error("{} WebSocket 오류: {}", ws_type, str(e))
+            if self._running:
+                raise
 
     async def _handle_message(self, raw_msg: str, ws_type: str, ws) -> None:
         """수신된 메시지 처리"""
@@ -205,9 +279,10 @@ class KISWebSocket:
                     tr_id = parts[1]
                     data_count = int(parts[2])
                     data_str = parts[3]
-                    price_data = self._parse_price_data(tr_id, data_str)
-                    if price_data and self._on_price_callback:
-                        await self._on_price_callback(price_data)
+                    price_rows = self._parse_price_rows(tr_id, data_str, data_count)
+                    if price_rows and self._on_price_callback:
+                        for price_data in price_rows:
+                            await self._on_price_callback(price_data)
             else:
                 # JSON 형태 응답 (구독 확인 등)
                 data = json.loads(raw_msg)
@@ -217,57 +292,125 @@ class KISWebSocket:
         except Exception as e:
             logger.debug("메시지 파싱 오류 (무시): {}", str(e))
 
-    def _parse_price_data(self, tr_id: str, data_str: str) -> dict | None:
-        """체결 데이터 파싱"""
+    def _parse_price_rows(self, tr_id: str, data_str: str, data_count: int) -> list[dict]:
+        """TR별 실시간 payload를 레코드 단위로 분리 후 파싱"""
+        records = self._split_records(tr_id, data_str, data_count)
+        parsed_rows: list[dict] = []
+        for fields in records:
+            try:
+                parsed = self._parse_price_fields(tr_id, fields)
+            except Exception as e:
+                logger.debug("실시간 레코드 파싱 오류 (무시): tr_id={} err={}", tr_id, str(e))
+                continue
+            if parsed:
+                parsed_rows.append(parsed)
+        return parsed_rows
+
+    def _split_records(self, tr_id: str, data_str: str, data_count: int) -> list[list[str]]:
+        """TR별 payload를 data_count 기준 개별 레코드로 분리"""
+        if data_count <= 0:
+            return []
+
+        record_sizes = _WS_RECORD_SIZES.get(tr_id)
+        if not record_sizes:
+            return []
+
         fields = data_str.split("^")
-        if not fields:
-            return None
+        total_fields = len(fields)
+        for record_size in record_sizes:
+            if total_fields == record_size * data_count:
+                return [
+                    fields[index:index + record_size]
+                    for index in range(0, total_fields, record_size)
+                ]
 
-        def _parse_overseas_symbol(raw_symbol: str) -> tuple[str, str, str]:
-            token = raw_symbol.upper()
-            prefixes = {
-                "DNAS": ("NASDAQ", token[4:], "US_DELAYED"),
-                "DNYS": ("NYSE", token[4:], "US_DELAYED"),
-                "DAMS": ("AMEX", token[4:], "US_DELAYED"),
-                "RBAQ": ("NASDAQ", token[4:], "US_DAYTIME"),
-                "RBAY": ("NYSE", token[4:], "US_DAYTIME"),
-                "RBAA": ("AMEX", token[4:], "US_DAYTIME"),
-            }
-            for prefix, parsed in prefixes.items():
-                if token.startswith(prefix):
-                    return parsed
-            return "NASDAQ", token, ""
+        logger.debug(
+            "실시간 payload 필드 수 불일치: tr_id={} count={} fields={} candidates={}",
+            tr_id,
+            data_count,
+            total_fields,
+            ",".join(str(size) for size in record_sizes),
+        )
+        return []
 
-        if tr_id in ("H0STCNT0",):  # 국내 실시간 체결
-            if len(fields) < 20:
-                return None
+    def _parse_price_fields(self, tr_id: str, fields: list[str]) -> dict | None:
+        """단일 레코드 필드 파싱"""
+        if tr_id == "H0STCNT0":  # 국내 실시간 체결
             return {
                 "market": "KRX",
                 "symbol": fields[0],
                 "time": fields[1],
-                "price": float(fields[2]) if fields[2] else 0,
-                "change": float(fields[4]) if fields[4] else 0,
-                "change_rate": float(fields[5]) if fields[5] else 0,
-                "volume": int(fields[12]) if fields[12] else 0,
-                "cumulative_volume": int(fields[13]) if fields[13] else 0,
+                "price": self._to_float(fields[2]),
+                "change": self._to_float(fields[4]),
+                "change_rate": self._to_float(fields[5]),
+                "volume": self._to_int(fields[12]),
+                "cumulative_volume": self._to_int(fields[13]),
             }
-        elif tr_id in ("HDFSCNT0",):  # 해외 실시간 체결
-            if len(fields) < 10:
-                return None
-            market, symbol, session = _parse_overseas_symbol(fields[0])
-            return {
-                "market": market,
-                "symbol": symbol,
-                "session": session,
-                "currency": "USD",
-                "time": fields[1],
-                "price": float(fields[2]) if fields[2] else 0,
-                "change": float(fields[6]) if fields[6] else 0,
-                "change_rate": float(fields[7]) if fields[7] else 0,
-                "volume": int(fields[8]) if fields[8] else 0,
-                "cumulative_volume": int(fields[9]) if fields[9] else 0,
-            }
+
+        if tr_id == "HDFSCNT0":  # 해외 실시간 체결
+            raw_symbol = fields[0]
+            market, derived_symbol, session = self._parse_overseas_symbol(raw_symbol)
+
+            if len(fields) == 26:
+                symbol = fields[1].strip().upper() or derived_symbol
+                return {
+                    "market": market,
+                    "symbol": symbol,
+                    "session": session,
+                    "currency": "USD",
+                    "time": fields[7],
+                    "price": self._to_float(fields[11]),
+                    "change": self._to_float(fields[13]),
+                    "change_rate": self._to_float(fields[14]),
+                    "volume": self._to_int(fields[19]),
+                    "cumulative_volume": self._to_int(fields[20]),
+                }
+
+            if len(fields) == 25:
+                return {
+                    "market": market,
+                    "symbol": derived_symbol,
+                    "session": session,
+                    "currency": "USD",
+                    "time": fields[6],
+                    "price": self._to_float(fields[10]),
+                    "change": self._to_float(fields[12]),
+                    "change_rate": self._to_float(fields[13]),
+                    "volume": self._to_int(fields[18]),
+                    "cumulative_volume": self._to_int(fields[19]),
+                }
+
         return None
+
+    @staticmethod
+    def _parse_overseas_symbol(raw_symbol: str) -> tuple[str, str, str]:
+        token = (raw_symbol or "").strip().upper()
+        prefixes = {
+            "DNAS": ("NASDAQ", token[4:], "US_DELAYED"),
+            "DNYS": ("NYSE", token[4:], "US_DELAYED"),
+            "DAMS": ("AMEX", token[4:], "US_DELAYED"),
+            "RBAQ": ("NASDAQ", token[4:], "US_DAYTIME"),
+            "RBAY": ("NYSE", token[4:], "US_DAYTIME"),
+            "RBAA": ("AMEX", token[4:], "US_DAYTIME"),
+        }
+        for prefix, parsed in prefixes.items():
+            if token.startswith(prefix):
+                return parsed
+        return "NASDAQ", token, ""
+
+    @staticmethod
+    def _to_float(value: str) -> float:
+        normalized = (value or "").strip()
+        if not normalized:
+            return 0.0
+        return float(normalized)
+
+    @staticmethod
+    def _to_int(value: str) -> int:
+        normalized = (value or "").strip()
+        if not normalized:
+            return 0
+        return int(float(normalized))
 
     @property
     def subscription_count(self) -> int:

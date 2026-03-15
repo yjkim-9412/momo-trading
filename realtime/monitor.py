@@ -21,9 +21,13 @@ class RealtimeMonitor:
 
     async def start(self) -> None:
         """실시간 모니터링 시작"""
-        self._running = True
         kis_websocket.set_on_price(self._on_price_update)
-        await stream_manager.start()
+        try:
+            await stream_manager.start()
+        except Exception:
+            self._running = False
+            raise
+        self._running = True
         logger.info("실시간 모니터 시작")
 
     async def stop(self) -> None:
@@ -34,6 +38,7 @@ class RealtimeMonitor:
 
     async def _on_price_update(self, data: dict) -> None:
         """WebSocket에서 가격 데이터 수신 시 호출"""
+        stream_manager.note_message_received()
         await event_detector.on_price_update(data)
 
     @property

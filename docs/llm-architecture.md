@@ -1,5 +1,7 @@
 # LLM Provider Architecture
 
+> **개발자 대상 LLM 엔진 아키텍처 문서입니다.** 일반 개요는 [README](../README.md)를 참조하세요.
+
 ## 1. 전체 시스템 아키텍처
 
 ```mermaid
@@ -266,7 +268,7 @@ flowchart LR
 
     BASE["codex exec --json --skip-git-repo-check -o result.txt"]
     MODEL["--model gpt-5.4"]
-    EFFORT["-c model_reasoning_effort=xhigh"]
+    EFFORT["-c model_reasoning_effort=<profile/default>"]
     SESSION{"Session state?"}
     NEW["--sandbox read-only"]
     RESUME["resume thread_id"]

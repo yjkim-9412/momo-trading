@@ -13,75 +13,116 @@ from loguru import logger
 from analysis.llm.base import empty_usage_snapshot
 from core.config import settings
 from trading.enums import LLMProvider, LLMTier
+from trading.market_profile import normalize_market_scope
 
 
 class CodexCLIProvider:
     """Codex CLI를 subprocess로 호출하는 LLM provider"""
 
-    _active_session_id: str | None = None
-    _session_enabled: bool = False
-    _session_initialized: bool = False
-    _session_lock: asyncio.Lock | None = None
+    _session_states: dict[tuple[str, str], dict[str, Any]] = {}
+    _session_locks: dict[tuple[str, str], asyncio.Lock] = {}
     cumulative_usage: dict[str, Any] = empty_usage_snapshot(LLMProvider.CODEX_CLI)
 
-    def __init__(self, tier: LLMTier = LLMTier.TIER1):
+    def __init__(
+        self,
+        tier: LLMTier = LLMTier.TIER1,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ):
         self._tier = tier
         self._codex_path: str | None = None
-        self._model = settings.get_llm_model(LLMProvider.CODEX_CLI, tier)
-        self._reasoning_effort = settings.get_llm_reasoning_effort(
-            LLMProvider.CODEX_CLI,
-            tier,
+        self._model = model if model is not None else settings.get_llm_model(LLMProvider.CODEX_CLI, tier)
+        self._reasoning_effort = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else settings.get_llm_reasoning_effort(LLMProvider.CODEX_CLI, tier)
         )
         self._resolved_model = f"codex:{self._model}" if self._model else "codex"
 
     @classmethod
-    def _get_lock(cls) -> asyncio.Lock:
-        """세션 재개 호출 직렬화"""
-        if cls._session_lock is None:
-            cls._session_lock = asyncio.Lock()
-        return cls._session_lock
+    def _session_key(cls, scope: str, phase: str) -> tuple[str, str]:
+        return normalize_market_scope(scope), phase or "cycle"
 
     @classmethod
-    def start_session(cls) -> str | None:
+    def _get_state(cls, scope: str, phase: str) -> dict[str, Any]:
+        key = cls._session_key(scope, phase)
+        return cls._session_states.setdefault(
+            key,
+            {
+                "active_session_id": None,
+                "session_enabled": False,
+                "session_initialized": False,
+            },
+        )
+
+    @classmethod
+    def _get_lock(cls, scope: str, phase: str) -> asyncio.Lock:
+        """세션 재개 호출 직렬화"""
+        key = cls._session_key(scope, phase)
+        if key not in cls._session_locks:
+            cls._session_locks[key] = asyncio.Lock()
+        return cls._session_locks[key]
+
+    @classmethod
+    def start_session(cls, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """새 세션 시작 요청"""
-        cls._session_enabled = True
-        cls._active_session_id = None
-        cls._session_initialized = False
-        logger.info("Codex 세션 시작")
+        state = cls._get_state(scope, phase)
+        state["session_enabled"] = True
+        state["active_session_id"] = None
+        state["session_initialized"] = False
+        logger.info("Codex 세션 시작 [{}:{}]", normalize_market_scope(scope), phase)
         return None
 
     @classmethod
-    def end_session(cls) -> str | None:
+    def end_session(cls, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """세션 종료"""
-        session_id = cls._active_session_id
+        key = cls._session_key(scope, phase)
+        state = cls._session_states.get(key, {})
+        session_id = state.get("active_session_id")
         if session_id:
-            logger.info("Codex 세션 종료: {}", session_id[:8])
-        cls._session_enabled = False
-        cls._active_session_id = None
-        cls._session_initialized = False
+            logger.info("Codex 세션 종료: {} [{}:{}]", session_id[:8], key[0], key[1])
+        cls._session_states.pop(key, None)
         return session_id
 
     @classmethod
-    def pause_session(cls) -> str | None:
+    def pause_session(cls, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """세션 일시 중지"""
-        session_id = cls._active_session_id
+        state = cls._get_state(scope, phase)
+        session_id = state.get("active_session_id")
         if session_id:
-            logger.info("Codex 세션 일시 중지: {} (병렬 구간)", session_id[:8])
-        cls._session_enabled = False
+            logger.info(
+                "Codex 세션 일시 중지: {} [{}:{}] (병렬 구간)",
+                session_id[:8],
+                normalize_market_scope(scope),
+                phase,
+            )
+        state["session_enabled"] = False
         return session_id
 
     @classmethod
-    def resume_session(cls, session_id: str) -> None:
+    def resume_session(cls, session_id: str, scope: str = "KRX", phase: str = "cycle") -> None:
         """기존 세션 재개"""
-        cls._session_enabled = True
-        cls._active_session_id = session_id
-        cls._session_initialized = True
-        logger.info("Codex 세션 재개: {}", session_id[:8])
+        state = cls._get_state(scope, phase)
+        state["session_enabled"] = True
+        state["active_session_id"] = session_id
+        state["session_initialized"] = True
+        logger.info(
+            "Codex 세션 재개: {} [{}:{}]",
+            session_id[:8],
+            normalize_market_scope(scope),
+            phase,
+        )
 
     @classmethod
-    def get_session_id(cls) -> str | None:
+    def get_session_id(cls, scope: str | None = None, phase: str = "cycle") -> str | None:
         """현재 세션 ID 반환"""
-        return cls._active_session_id
+        if scope is None:
+            for state in cls._session_states.values():
+                if state.get("active_session_id"):
+                    return state["active_session_id"]
+            return None
+        return cls._get_state(scope, phase).get("active_session_id")
 
     @property
     def provider(self) -> LLMProvider:
@@ -117,19 +158,33 @@ class CodexCLIProvider:
             return path
         return None
 
-    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        *,
+        scope: str | None = None,
+        phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
+    ) -> str:
         """codex exec로 텍스트 생성"""
         codex = self._find_codex()
         if not codex:
             raise RuntimeError("codex CLI를 찾을 수 없습니다 (PATH 확인)")
 
         actual_prompt = self._build_prompt(prompt, system_prompt)
-        cmd, output_path = self._build_command(codex)
+        state = self.__class__._get_state(scope, phase) if scope is not None else {
+            "session_enabled": False,
+            "active_session_id": None,
+            "session_initialized": False,
+        }
+        reasoning_effort = reasoning_effort_override or self._reasoning_effort
+        cmd, output_path = self._build_command(codex, state, reasoning_effort)
 
-        if self.__class__._session_enabled:
-            async with self._get_lock():
-                return await self._execute(cmd, actual_prompt, output_path)
-        return await self._execute(cmd, actual_prompt, output_path)
+        if state["session_enabled"] and scope is not None:
+            async with self._get_lock(scope, phase):
+                return await self._execute(cmd, actual_prompt, output_path, state)
+        return await self._execute(cmd, actual_prompt, output_path, state)
 
     @staticmethod
     def _build_prompt(prompt: str, system_prompt: str) -> str:
@@ -138,18 +193,24 @@ class CodexCLIProvider:
             return prompt
         return f"[역할]\n{system_prompt}\n\n[요청]\n{prompt}"
 
-    def _append_reasoning_effort(self, cmd: list[str]) -> None:
+    @staticmethod
+    def _append_reasoning_effort(cmd: list[str], reasoning_effort: str | None) -> None:
         """Codex reasoning effort override 추가"""
-        if self._reasoning_effort:
-            cmd.extend(["-c", f"model_reasoning_effort={self._reasoning_effort}"])
+        if reasoning_effort:
+            cmd.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
 
-    def _build_command(self, codex_path: str) -> tuple[list[str], str]:
+    def _build_command(
+        self,
+        codex_path: str,
+        state: dict[str, Any],
+        reasoning_effort: str | None = None,
+    ) -> tuple[list[str], str]:
         """세션 상태에 맞는 Codex CLI 명령 구성"""
         fd, output_path = tempfile.mkstemp(prefix="codex-llm-", suffix=".txt")
         os.close(fd)
 
-        if self.__class__._session_enabled:
-            if self.__class__._session_initialized and self.__class__._active_session_id:
+        if state["session_enabled"]:
+            if state["session_initialized"] and state["active_session_id"]:
                 cmd = [
                     codex_path,
                     "exec",
@@ -161,8 +222,8 @@ class CodexCLIProvider:
                 ]
                 if self._model:
                     cmd.extend(["--model", self._model])
-                self._append_reasoning_effort(cmd)
-                cmd.extend([self.__class__._active_session_id, "-"])
+                self._append_reasoning_effort(cmd, reasoning_effort)
+                cmd.extend([state["active_session_id"], "-"])
                 return cmd, output_path
 
             cmd = [
@@ -177,7 +238,7 @@ class CodexCLIProvider:
             ]
             if self._model:
                 cmd.extend(["--model", self._model])
-            self._append_reasoning_effort(cmd)
+            self._append_reasoning_effort(cmd, reasoning_effort)
             cmd.append("-")
             return cmd, output_path
 
@@ -194,7 +255,7 @@ class CodexCLIProvider:
         ]
         if self._model:
             cmd.extend(["--model", self._model])
-        self._append_reasoning_effort(cmd)
+        self._append_reasoning_effort(cmd, reasoning_effort)
         cmd.append("-")
         return cmd, output_path
 
@@ -203,6 +264,7 @@ class CodexCLIProvider:
         cmd: list[str],
         prompt: str,
         output_path: str,
+        state: dict[str, Any],
     ) -> str:
         """subprocess 실행 + JSONL 파싱"""
         try:
@@ -233,12 +295,12 @@ class CodexCLIProvider:
             parsed = self.parse_event_stream(raw_stdout)
             result_text = self._read_result_text(output_path, parsed.get("fallback_text", ""))
 
-            if self.__class__._session_enabled and not self.__class__._session_initialized:
+            if state["session_enabled"] and not state["session_initialized"]:
                 session_id = parsed.get("session_id")
                 if not session_id:
                     raise RuntimeError("Codex 세션 ID를 찾을 수 없습니다")
-                self.__class__._active_session_id = session_id
-                self.__class__._session_initialized = True
+                state["active_session_id"] = session_id
+                state["session_initialized"] = True
 
             self._track_usage(parsed.get("usage", {}))
 
@@ -335,7 +397,7 @@ class CodexCLIProvider:
         usage = cls.cumulative_usage
         return {
             "provider": LLMProvider.CODEX_CLI.value,
-            "session_id": cls._active_session_id,
+            "session_id": cls.get_session_id(),
             "total_calls": usage["total_calls"],
             "total_cost_usd": usage["total_cost_usd"],
             "total_input_tokens": usage["total_input_tokens"],

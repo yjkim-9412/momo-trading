@@ -5,6 +5,10 @@ from typing import Iterable
 
 from trading.enums import Market
 
+MARKET_SCOPE_KRX = "KRX"
+MARKET_SCOPE_US = "US"
+MARKET_SCOPE_CRYPTO = "CRYPTO"
+
 
 @dataclass(frozen=True)
 class MarketProfile:
@@ -74,6 +78,15 @@ _MARKET_PROFILES = {
         kis_exchange_code="AMS",
         is_domestic=False,
     ),
+    "BITHUMB": MarketProfile(
+        code="BITHUMB",
+        region="CRYPTO",
+        label="빗썸 암호화폐",
+        currency="KRW",
+        timezone="Asia/Seoul",
+        kis_exchange_code="",
+        is_domestic=False,
+    ),
 }
 
 _MARKET_ALIASES = {
@@ -86,9 +99,15 @@ _MARKET_ALIASES = {
     "NAS": "NASDAQ",
     "NYS": "NYSE",
     "AMS": "AMEX",
+    "CRYPTO": "BITHUMB",
+    "BTH": "BITHUMB",
+    "COIN": "BITHUMB",
 }
 
 _US_SCAN_TARGETS = ("NASDAQ", "NYSE", "AMEX")
+_KR_SCOPE_MARKETS = ("KRX", "KOSPI", "KOSDAQ")
+_US_SCOPE_MARKETS = ("NASDAQ", "NYSE", "AMEX")
+_CRYPTO_SCOPE_MARKETS = ("BITHUMB",)
 _ORDER_EXCHANGE_CODES = {
     "NASDAQ": "NASD",
     "NYSE": "NYSE",
@@ -137,6 +156,42 @@ def is_domestic_market(market: str | Market | None) -> bool:
 def is_us_market(market: str | Market | None) -> bool:
     """미국 시장 여부"""
     return get_market_profile(market).region == "US"
+
+
+def is_crypto_market(market: str | Market | None) -> bool:
+    """암호화폐 시장 여부"""
+    return get_market_profile(market).region == "CRYPTO"
+
+
+def requires_mcp_connection(market: str | Market | None) -> bool:
+    """장중 트레이딩 진입 전에 KIS MCP 연결이 필요한 시장 여부."""
+    return not is_crypto_market(market)
+
+
+def normalize_market_scope(scope_or_market: str | Market | None, default: str = MARKET_SCOPE_KRX) -> str:
+    """시장 scope를 KRX/US/CRYPTO 중 하나로 정규화"""
+    raw = str(scope_or_market or default).strip().upper()
+    if raw in {MARKET_SCOPE_KRX, MARKET_SCOPE_US, MARKET_SCOPE_CRYPTO}:
+        return raw
+    normalized = normalize_market(raw or default)
+    if is_crypto_market(normalized):
+        return MARKET_SCOPE_CRYPTO
+    return MARKET_SCOPE_US if is_us_market(normalized) else MARKET_SCOPE_KRX
+
+
+def market_scope(market: str | Market | None) -> str:
+    """실제 시장 코드를 runtime/report용 scope로 매핑"""
+    return normalize_market_scope(market)
+
+
+def markets_for_scope(scope_or_market: str | Market | None) -> tuple[str, ...]:
+    """scope에 속한 실제 시장 코드 목록"""
+    normalized_scope = normalize_market_scope(scope_or_market)
+    if normalized_scope == MARKET_SCOPE_CRYPTO:
+        return _CRYPTO_SCOPE_MARKETS
+    if normalized_scope == MARKET_SCOPE_US:
+        return _US_SCOPE_MARKETS
+    return _KR_SCOPE_MARKETS
 
 
 def market_currency(market: str | Market | None) -> str:

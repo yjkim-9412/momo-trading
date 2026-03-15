@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 from agent.market_scanner import MarketScanner
 from trading.models import AccountBalance
+from trading.models import MCPResponse
 from core.config import settings
 
 
@@ -69,6 +70,69 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
             result = await scanner.scan(cycle_id="cycle-1")
 
         self.assertEqual(result["available_cash"], 700000)
+
+    async def test_scan_uses_prefetched_account_snapshot_when_provided(self):
+        scanner = MarketScanner()
+        balance = AccountBalance(
+            total_asset=1000000,
+            cash=0,
+            raw_cash=0,
+            effective_cash=700000,
+            cash_source="TOTAL_ASSET_PROXY",
+            stock_value=300000,
+            total_pnl=0,
+            total_pnl_rate=0,
+            market="NASDAQ",
+            currency="KRW",
+            exchange_rate_to_krw=1450.0,
+        )
+
+        with patch("agent.market_scanner.account_manager.get_account_snapshot", AsyncMock()) as snapshot_mock, \
+                patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[])), \
+                patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
+                patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
+                patch("agent.market_scanner.llm_factory.generate_tier1", AsyncMock(return_value=(
+                    '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
+                    "TEST",
+                ))), \
+                patch("agent.market_scanner.activity_logger.log", AsyncMock()):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-1",
+                account_snapshot=(balance, []),
+            )
+
+        snapshot_mock.assert_not_awaited()
+        self.assertEqual(result["available_cash"], 700000)
+
+
+class MarketScannerRankTest(unittest.IsolatedAsyncioTestCase):
+    async def test_get_volume_rank_sorts_across_markets(self):
+        scanner = MarketScanner()
+        responses = [
+            MCPResponse(
+                success=True,
+                data={
+                    "stocks": [
+                        {"symbol": "AAPL", "market": "NASDAQ", "volume": 100},
+                        {"symbol": "MSFT", "market": "NASDAQ", "volume": 90},
+                    ],
+                },
+            ),
+            MCPResponse(
+                success=True,
+                data={
+                    "stocks": [
+                        {"symbol": "BAC", "market": "NYSE", "volume": 1000},
+                    ],
+                },
+            ),
+        ]
+
+        with patch("agent.market_scanner.mcp_client.get_volume_rank", new=AsyncMock(side_effect=responses)):
+            stocks = await scanner._get_volume_rank(["NASDAQ", "NYSE"])
+
+        self.assertEqual([item["symbol"] for item in stocks[:3]], ["BAC", "AAPL", "MSFT"])
 
 
 if __name__ == "__main__":

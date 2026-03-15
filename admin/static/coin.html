@@ -1,0 +1,1123 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MOMO Coin Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            dark: { 800: '#1a1520', 900: '#0f0d15', 700: '#2a2235' },
+            coin: {
+              purple: '#a78bfa', gold: '#fbbf24', green: '#34d399',
+              red: '#f87171', dim: '#6b5b8d'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="/admin/static/css/admin.css">
+  <style>
+    /* ── Base ── */
+    body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    ::-webkit-scrollbar-track { background: #1a1520; }
+    ::-webkit-scrollbar-thumb { background: #4b4060; border-radius: 3px; }
+
+    /* ── Animations ── */
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    @keyframes livePulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.6); }
+      50% { box-shadow: 0 0 12px 4px rgba(167, 139, 250, 0.2); }
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes scanProgress { from { width: 0%; } to { width: 100%; } }
+    @keyframes cardPulsePurple {
+      0% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.4); }
+      70% { box-shadow: 0 0 0 4px rgba(167, 139, 250, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0); }
+    }
+    @keyframes cardPulseGold {
+      0% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.4); }
+      70% { box-shadow: 0 0 0 4px rgba(251, 191, 36, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0); }
+    }
+    @keyframes countdownPulse {
+      0%, 100% { color: #a78bfa; }
+      50% { color: #c4b5fd; }
+    }
+
+    .animate-fade-in { animation: fadeIn 0.3s ease-out; }
+
+    /* ── 24/7 LIVE Badge ── */
+    .live-badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 3px 10px; border-radius: 20px;
+      background: rgba(167, 139, 250, 0.12);
+      border: 1px solid rgba(167, 139, 250, 0.35);
+      animation: livePulse 2.5s ease-in-out infinite;
+    }
+    .live-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: #a78bfa;
+      animation: pulse 1.5s infinite;
+    }
+
+    /* ── Sidebar Collapsible ── */
+    .sidebar-left, .sidebar-right {
+      transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1), min-width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      overflow: hidden;
+    }
+    .sidebar-left.collapsed, .sidebar-right.collapsed { width: 48px !important; min-width: 48px !important; }
+    .sidebar-left.collapsed .sidebar-content,
+    .sidebar-right.collapsed .sidebar-content { opacity: 0; pointer-events: none; overflow: hidden; }
+    .sidebar-content { transition: opacity 0.18s ease; }
+    .sidebar-toggle-btn {
+      position: absolute; top: 8px; z-index: 10;
+      width: 20px; height: 20px; border-radius: 50%;
+      background: #2a2235; border: 1px solid #3d3350;
+      color: #9ca3af; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.15s, color 0.15s;
+    }
+    .sidebar-toggle-btn:hover { background: #3d3350; color: #e5e7eb; }
+    .sidebar-toggle-left { right: -10px; }
+    .sidebar-toggle-right { left: -10px; }
+
+    /* ── Collapsible Sections ── */
+    .section-body { transition: max-height 0.25s ease-out, opacity 0.2s ease; overflow: hidden; }
+    .section-body.collapsed-section { max-height: 0 !important; opacity: 0; }
+    .section-toggle-icon { transition: transform 0.2s ease; display: inline-flex; }
+    .section-toggle-icon.collapsed-icon { transform: rotate(-90deg); }
+
+    /* ── Coin Holding Card ── */
+    .coin-holding-card {
+      border: 1px solid #3d3350; border-radius: 8px; padding: 8px 10px;
+      margin-bottom: 4px; background: rgba(26, 21, 32, 0.6);
+      transition: background 0.15s;
+    }
+    .coin-holding-card:hover { background: rgba(42, 34, 53, 0.7); }
+    .coin-pending-card {
+      border: 1px solid #3d3350; border-radius: 8px; padding: 8px 10px;
+      margin-bottom: 4px; background: rgba(26, 21, 32, 0.5);
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .coin-pending-card:hover {
+      background: rgba(42, 34, 53, 0.68);
+      border-color: rgba(167, 139, 250, 0.35);
+    }
+    .coin-side-chip,
+    .coin-status-chip,
+    .metric-delta {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .coin-side-chip {
+      padding: 2px 7px;
+      border: 1px solid rgba(75, 64, 96, 0.9);
+    }
+    .coin-side-chip.buy {
+      color: #fca5a5;
+      border-color: rgba(248, 113, 113, 0.22);
+      background: rgba(127, 29, 29, 0.28);
+    }
+    .coin-side-chip.sell {
+      color: #93c5fd;
+      border-color: rgba(96, 165, 250, 0.22);
+      background: rgba(30, 58, 138, 0.28);
+    }
+    .coin-status-chip {
+      padding: 2px 6px;
+      border: 1px solid rgba(75, 64, 96, 0.8);
+      color: #cbd5e1;
+      background: rgba(15, 13, 21, 0.82);
+    }
+    .coin-status-chip.status-partial {
+      color: #fde68a;
+      border-color: rgba(251, 191, 36, 0.22);
+      background: rgba(120, 53, 15, 0.28);
+    }
+    .coin-status-chip.status-filled {
+      color: #86efac;
+      border-color: rgba(52, 211, 153, 0.22);
+      background: rgba(21, 128, 61, 0.24);
+    }
+    .coin-status-chip.status-canceled {
+      color: #cbd5e1;
+      border-color: rgba(148, 163, 184, 0.2);
+      background: rgba(51, 65, 85, 0.28);
+    }
+    .metric-delta {
+      opacity: 0;
+      transform: translateY(2px);
+      transition: opacity 0.2s ease, transform 0.2s ease;
+      padding: 1px 6px;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }
+    .metric-delta.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .metric-delta.positive {
+      color: #86efac;
+      background: rgba(22, 101, 52, 0.22);
+      border-color: rgba(52, 211, 153, 0.2);
+    }
+    .metric-delta.negative {
+      color: #fca5a5;
+      background: rgba(127, 29, 29, 0.22);
+      border-color: rgba(248, 113, 113, 0.2);
+    }
+
+    /* ── Scan Timeline Bar ── */
+    .scan-timeline-bar {
+      background: linear-gradient(180deg, rgba(42, 34, 53, 0.6) 0%, rgba(15, 13, 21, 0.8) 100%);
+      border: 1px solid rgba(167, 139, 250, 0.15);
+      border-radius: 10px; padding: 12px 16px;
+    }
+    .scan-progress-track {
+      width: 100%; height: 6px; border-radius: 3px;
+      background: #2a2235; overflow: hidden;
+    }
+    .scan-progress-fill {
+      height: 100%; border-radius: 3px;
+      background: linear-gradient(90deg, #a78bfa 0%, #fbbf24 100%);
+      transition: width 0.5s ease-out;
+    }
+
+    /* ── Recommendation Card ── */
+    .rec-card {
+      border: 1px solid #3d3350; border-radius: 10px;
+      overflow: hidden; animation: fadeIn 0.3s ease-out;
+      transition: border-color 0.2s;
+    }
+    .rec-card.rec-buy {
+      border-left: 3px solid #34d399;
+      animation: fadeIn 0.3s ease-out, cardPulsePurple 2s infinite;
+    }
+    .rec-card.rec-sell {
+      border-left: 3px solid #fbbf24;
+      animation: fadeIn 0.3s ease-out, cardPulseGold 2s infinite;
+    }
+    .rec-card-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 12px; cursor: pointer; user-select: none;
+      transition: background 0.15s;
+    }
+    .rec-card-header:hover { background: rgba(255, 255, 255, 0.02); }
+
+    .confidence-bar-track {
+      width: 100%; height: 4px; border-radius: 2px;
+      background: #2a2235; overflow: hidden;
+    }
+    .confidence-bar-fill {
+      height: 100%; border-radius: 2px;
+      transition: width 0.5s ease-out;
+    }
+
+    /* ── Activity Feed Card (Coin) ── */
+    .coin-card {
+      border: 1px solid #3d3350; border-radius: 10px;
+      margin: 4px 0; overflow: hidden; animation: fadeIn 0.3s ease-out;
+    }
+    .coin-card.outcome-buy { border-left: 3px solid #34d399; }
+    .coin-card.outcome-sell { border-left: 3px solid #fbbf24; }
+    .coin-card.outcome-hold { border-left: 3px solid #6b5b8d; opacity: 0.8; }
+    .coin-card.outcome-error { border-left: 3px solid #f87171; opacity: 0.9; }
+    .coin-card.outcome-progress { border-left: 3px solid #a78bfa; }
+    .coin-card-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; cursor: pointer; user-select: none;
+      transition: background 0.15s;
+    }
+    .coin-card-header:hover { background: rgba(255, 255, 255, 0.03); }
+    .coin-card-body { max-height: 0; overflow: hidden; transition: max-height 0.3s ease-out; }
+    .coin-card-body.open { max-height: 3000px; overflow-y: auto; }
+    .detail-content {
+      display: none;
+      margin-top: 8px;
+      padding: 10px;
+      border-radius: 8px;
+      background: rgba(15, 13, 21, 0.8);
+      border: 1px solid rgba(167, 139, 250, 0.12);
+      color: #94a3b8;
+    }
+    .detail-content.open { display: block; }
+    .llm-conversation { display: flex; flex-direction: column; gap: 8px; }
+    .llm-model-tag {
+      align-self: flex-start;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(34, 211, 238, 0.12);
+      color: #67e8f9;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .llm-msg {
+      border-radius: 8px;
+      border: 1px solid rgba(75, 64, 96, 0.8);
+      background: rgba(26, 21, 32, 0.75);
+      overflow: hidden;
+    }
+    .llm-msg.type-system { border-color: rgba(71, 85, 105, 0.5); }
+    .llm-msg.type-prompt { border-color: rgba(14, 165, 233, 0.3); }
+    .llm-msg.type-response { border-color: rgba(167, 139, 250, 0.4); }
+
+    .llm-role {
+      padding: 6px 10px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+      user-select: none;
+      color: #9ca3af;
+      background: rgba(42, 34, 53, 0.5);
+    }
+    .type-system .llm-role { background: rgba(30, 41, 59, 0.7); color: #94a3b8; }
+    .type-prompt .llm-role { background: rgba(12, 74, 110, 0.4); color: #7dd3fc; }
+    .type-response .llm-role { background: rgba(42, 34, 53, 0.8); color: #c4b5fd; }
+
+    .type-system .llm-role:hover { background: rgba(51, 65, 85, 0.8); }
+    .type-prompt .llm-role:hover { background: rgba(2, 132, 199, 0.3); }
+    .type-response .llm-role:hover { background: rgba(47, 38, 61, 0.9); }
+
+    .llm-body {
+      padding: 10px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #d1d5db;
+      font-size: 11px;
+      line-height: 1.45;
+      max-height: 0;
+      overflow: hidden;
+      opacity: 0;
+      transition: max-height 0.3s ease, opacity 0.2s ease, padding 0.3s ease;
+    }
+    .llm-body.open {
+      max-height: 2000px; /* arbitrary large value */
+      opacity: 1;
+    }
+    /* Add padding zero state for smooth collapse */
+    .llm-msg:not(:has(.llm-body.open)) .llm-body {
+      padding-top: 0;
+      padding-bottom: 0;
+    }
+    .tech-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+      color: #cbd5e1;
+      border: 1px solid rgba(75, 64, 96, 0.8);
+      overflow: hidden;
+      border-radius: 8px;
+    }
+    .tech-table th, .tech-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid rgba(75, 64, 96, 0.6);
+      vertical-align: top;
+    }
+    .tech-table td.label {
+      color: #94a3b8;
+      width: 22%;
+    }
+    .agent-state-panel {
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(167, 139, 250, 0.16);
+      background: rgba(26, 21, 32, 0.72);
+      margin-bottom: 8px;
+    }
+    .agent-state-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      background: rgba(167, 139, 250, 0.12);
+      color: #c4b5fd;
+      margin: 2px 4px 0 0;
+    }
+
+    /* ── Watchlist Card (Coin) ── */
+    .coin-watchlist-card {
+      border: 1px solid #3d3350; border-radius: 8px; padding: 6px 8px;
+      margin-bottom: 4px; background: rgba(26, 21, 32, 0.5);
+      transition: background 0.15s;
+    }
+    .coin-watchlist-card:hover { background: rgba(42, 34, 53, 0.6); }
+    .coin-watchlist-stream {
+      border: 1px solid rgba(75, 64, 96, 0.9);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      background: rgba(15, 13, 21, 0.75);
+    }
+    .coin-watchlist-gauge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #cbd5e1;
+    }
+    .coin-watchlist-gauge-track {
+      flex: 1;
+      min-width: 0;
+      height: 5px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(75, 64, 96, 0.5);
+    }
+    .coin-watchlist-gauge-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #a78bfa 0%, #34d399 100%);
+      transition: width 0.4s ease;
+    }
+    .coin-watchlist-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      border: 1px solid rgba(75, 64, 96, 0.9);
+      background: rgba(26, 21, 32, 0.85);
+      color: #cbd5e1;
+    }
+    .coin-watchlist-chip.holding {
+      color: #86efac;
+      border-color: rgba(52, 211, 153, 0.25);
+      background: rgba(22, 78, 48, 0.18);
+    }
+    .coin-watchlist-chip.watching {
+      color: #c4b5fd;
+      border-color: rgba(167, 139, 250, 0.25);
+      background: rgba(76, 29, 149, 0.18);
+    }
+    .coin-watchlist-chip.pending {
+      color: #9ca3af;
+      border-color: rgba(107, 114, 128, 0.25);
+      background: rgba(31, 41, 55, 0.28);
+    }
+    .coin-watchlist-thresholds {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .coin-watchlist-threshold {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      color: #94a3b8;
+      background: rgba(30, 41, 59, 0.4);
+      border: 1px solid rgba(71, 85, 105, 0.35);
+    }
+
+    /* ── Settings Toggle ── */
+    .coin-toggle {
+      width: 36px; height: 20px; border-radius: 10px;
+      appearance: none; background: #4b4060; position: relative;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .coin-toggle:checked { background: #34d399; }
+    .coin-toggle::after {
+      content: ''; position: absolute; top: 2px; left: 2px;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: white; transition: transform 0.2s;
+    }
+    .coin-toggle:checked::after { transform: translateX(16px); }
+
+    /* ── Cycle Divider ── */
+    .cycle-divider {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 12px; margin: 10px 0 4px 0;
+      color: #9ca3af; font-size: 12px;
+    }
+    .cycle-divider::before, .cycle-divider::after {
+      content: ''; flex: 1; height: 1px;
+      background: rgba(167, 139, 250, 0.15);
+    }
+
+    /* ── Toast ── */
+    .toast {
+      padding: 10px 16px; border-radius: 8px; font-size: 13px; font-weight: 500;
+      max-width: 340px; animation: fadeIn 0.3s ease-out;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
+    .toast-success { background: rgba(22, 78, 48, 0.92); color: #86efac; border: 1px solid rgba(34, 197, 94, 0.3); }
+    .toast-error { background: rgba(80, 20, 20, 0.92); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .toast-info { background: rgba(42, 24, 84, 0.92); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.3); }
+    .toast-fade-out { animation: toastOut 0.3s ease-in forwards; }
+    @keyframes toastOut { from { opacity: 1; transform: translateY(0); } to { opacity: 0; transform: translateY(12px); } }
+
+    /* ── Scroll FAB ── */
+    .scroll-fab {
+      position: absolute; bottom: 56px; right: 20px; z-index: 10;
+      display: flex; align-items: center; gap: 6px;
+      padding: 8px 14px 8px 12px; border-radius: 20px;
+      background: rgba(26, 21, 32, 0.85);
+      backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(167, 139, 250, 0.2);
+      color: #94a3b8; cursor: pointer;
+      font-size: 12px; font-weight: 500; font-family: inherit;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+      transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1),
+                  opacity 0.25s ease, box-shadow 0.3s ease, border-color 0.3s ease;
+    }
+    .scroll-fab:hover {
+      color: #e2e8f0;
+      border-color: rgba(167, 139, 250, 0.45);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5), 0 0 12px rgba(167, 139, 250, 0.15);
+      transform: translateY(-1px);
+    }
+    .scroll-fab.hidden { opacity: 0; pointer-events: none; transform: translateY(12px); }
+
+    @keyframes cardPulseGreen {
+      0% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.35); }
+      70% { box-shadow: 0 0 0 4px rgba(52, 211, 153, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+    }
+    @keyframes cardPulseGold {
+      0% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.35); }
+      70% { box-shadow: 0 0 0 4px rgba(251, 191, 36, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0); }
+    }
+    @keyframes cardHighlightCoin {
+      0% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0.45); }
+      50% { box-shadow: 0 0 18px 4px rgba(167, 139, 250, 0.25); }
+      100% { box-shadow: 0 0 0 0 rgba(167, 139, 250, 0); }
+    }
+
+    .coin-admin-theme .agent-monitor {
+      background: rgba(18, 15, 28, 0.96);
+      border-bottom: 1px solid rgba(61, 51, 80, 0.9);
+    }
+    .coin-admin-theme .agent-monitor-bar:hover { background: rgba(255, 255, 255, 0.02); }
+    .coin-admin-theme .agent-monitor-icon {
+      background: rgba(42, 34, 53, 0.9);
+      border-color: rgba(75, 64, 96, 0.9);
+    }
+    .coin-admin-theme .agent-monitor-icon.active {
+      background: rgba(167, 139, 250, 0.14);
+      border-color: rgba(167, 139, 250, 0.35);
+      color: #c4b5fd;
+    }
+    .coin-admin-theme .agent-monitor-progress { background: rgba(42, 34, 53, 0.9); }
+    .coin-admin-theme .agent-monitor-progress-bar {
+      background: linear-gradient(90deg, #a78bfa 0%, #fbbf24 100%);
+    }
+    .coin-admin-theme .monitor-slot {
+      background: rgba(26, 21, 32, 0.88);
+      border-color: rgba(75, 64, 96, 0.9);
+    }
+    .coin-admin-theme .monitor-slot::before {
+      background: linear-gradient(90deg, transparent 0%, #c4b5fd 50%, transparent 100%);
+    }
+    .coin-admin-theme .pipeline-step {
+      background: rgba(42, 34, 53, 0.9);
+      border-color: rgba(75, 64, 96, 0.9);
+    }
+    .coin-admin-theme .pipeline-step.step-done {
+      background: #34d399;
+      border-color: #34d399;
+      box-shadow: 0 0 6px rgba(52, 211, 153, 0.24);
+    }
+    .coin-admin-theme .pipeline-step.step-active {
+      background: #a78bfa;
+      border-color: #c4b5fd;
+      box-shadow: 0 0 8px rgba(167, 139, 250, 0.3);
+    }
+    .coin-admin-theme .pipeline-connector { background: rgba(75, 64, 96, 0.8); }
+    .coin-admin-theme .pipeline-connector.conn-done { background: rgba(52, 211, 153, 0.65); }
+    .coin-admin-theme .monitor-completed-badge {
+      background: rgba(26, 21, 32, 0.92);
+      border-color: rgba(75, 64, 96, 0.9);
+    }
+    .coin-admin-theme .monitor-completed-badge.badge-buy {
+      border-color: rgba(52, 211, 153, 0.3);
+      color: #86efac;
+    }
+    .coin-admin-theme .monitor-completed-badge.badge-sell {
+      border-color: rgba(251, 191, 36, 0.3);
+      color: #fde68a;
+    }
+
+    .coin-admin-theme .feed-load-more-bar {
+      border-bottom-color: rgba(61, 51, 80, 0.9);
+      background: rgba(18, 15, 28, 0.96);
+    }
+    .coin-admin-theme .feed-load-more-btn {
+      border-color: rgba(75, 64, 96, 0.9);
+      background: rgba(26, 21, 32, 0.88);
+    }
+    .coin-admin-theme .feed-load-more-btn:hover:not(:disabled) {
+      background: rgba(167, 139, 250, 0.14);
+      border-color: rgba(167, 139, 250, 0.45);
+    }
+
+    .coin-admin-theme .stock-card {
+      border-color: rgba(75, 64, 96, 0.9);
+      background: rgba(18, 15, 28, 0.5);
+    }
+    .coin-admin-theme .stock-card.outcome-progress { border-left-color: #a78bfa; }
+    .coin-admin-theme .stock-card.outcome-buy {
+      border-left-color: #34d399;
+      animation: fadeIn 0.3s ease-out, cardPulseGreen 2s infinite;
+    }
+    .coin-admin-theme .stock-card.outcome-sell {
+      border-left-color: #fbbf24;
+      animation: fadeIn 0.3s ease-out, cardPulseGold 2s infinite;
+    }
+    .coin-admin-theme .stock-card.outcome-error { border-left-color: #f87171; }
+    .coin-admin-theme .stock-card-header:hover { background: rgba(255, 255, 255, 0.025); }
+    .coin-admin-theme .stock-card-body { background: rgba(18, 15, 28, 0.2); }
+    .coin-admin-theme .stock-step { border-top-color: rgba(75, 64, 96, 0.65); }
+    .coin-admin-theme .stock-card.highlighted { animation: cardHighlightCoin 1.5s ease-out 2; }
+    .coin-admin-theme .cycle-divider::before,
+    .coin-admin-theme .cycle-divider::after { background: rgba(167, 139, 250, 0.18); }
+    .coin-admin-theme .cycle-divider.cycle-start::before,
+    .coin-admin-theme .cycle-divider.cycle-start::after { border-top-color: rgba(167, 139, 250, 0.32); }
+
+    .coin-admin-theme .sse-disconnect-banner {
+      border-bottom-color: rgba(248, 113, 113, 0.35);
+      background: rgba(80, 20, 20, 0.35);
+    }
+    .coin-admin-theme .scroll-fab {
+      border-color: rgba(167, 139, 250, 0.25);
+      background: rgba(26, 21, 32, 0.9);
+      color: #cbd5e1;
+    }
+    .coin-admin-theme .scroll-fab:hover {
+      border-color: rgba(167, 139, 250, 0.45);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5), 0 0 12px rgba(167, 139, 250, 0.16);
+    }
+    .coin-admin-theme .scroll-fab-badge {
+      background: #a78bfa;
+      box-shadow: 0 0 8px rgba(167, 139, 250, 0.25);
+    }
+    .coin-admin-theme .toast-info {
+      background: rgba(42, 24, 84, 0.92);
+      color: #ddd6fe;
+      border-color: rgba(167, 139, 250, 0.3);
+    }
+    .coin-admin-theme .toast-high {
+      background: rgba(120, 53, 15, 0.94);
+      color: #fde68a;
+      border-color: rgba(251, 191, 36, 0.45);
+    }
+    .coin-admin-theme .toast-critical {
+      background: rgba(20, 83, 45, 0.95);
+      color: #bbf7d0;
+      border-color: rgba(52, 211, 153, 0.45);
+    }
+
+    /* ── Progress Spinner ── */
+    .progress-spinner {
+      display: inline-block; width: 12px; height: 12px;
+      border: 2px solid #4b4060; border-top-color: #a78bfa;
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+      margin-right: 6px; vertical-align: middle;
+    }
+
+    /* ── Keyboard Focus ── */
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid #a78bfa; outline-offset: 2px;
+    }
+
+    /* ── Filter Track ── */
+    .log-filter-track {
+      display: flex; background: #1a1520; border: 1px solid #3d3350;
+      border-radius: 8px; padding: 3px; gap: 2px;
+    }
+    .log-filter-btn {
+      flex: 1; padding: 4px 12px; border: none; background: transparent;
+      color: #9ca3af; font-size: 11px; font-weight: 600;
+      cursor: pointer; border-radius: 6px; transition: all 0.2s;
+    }
+    .log-filter-btn.active { background: #2a2235; color: #e5e7eb; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2); }
+    .log-filter-btn:not(.active):hover { color: #9ca3af; background: rgba(255, 255, 255, 0.02); }
+
+    /* ── Schedule Fixed Timeline ── */
+    .schedule-timeline { position: relative; padding-left: 18px; }
+    .schedule-timeline::before {
+      content: ''; position: absolute; left: 5px; top: 6px; bottom: 6px;
+      width: 1.5px; background: #3d3350;
+    }
+    .sched-item {
+      position: relative; display: flex; align-items: center; gap: 8px;
+      padding: 3px 0; min-height: 22px;
+    }
+    .sched-dot {
+      position: absolute; left: -18px;
+      width: 8px; height: 8px; border-radius: 50%;
+      border: 1.5px solid #4b4060; background: #2a2235; z-index: 1;
+    }
+    .sched-item.sched-done .sched-dot {
+      background: #34d399; border-color: #34d399; box-shadow: 0 0 4px rgba(52, 211, 153, 0.25);
+    }
+    .sched-item.sched-next .sched-dot {
+      background: #a78bfa; border-color: #a78bfa;
+      box-shadow: 0 0 6px rgba(167, 139, 250, 0.4); animation: pulse 2s infinite;
+    }
+    .sched-time {
+      font-size: 10px; font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+      color: #6b5b8d; min-width: 40px; flex-shrink: 0;
+    }
+    .sched-item.sched-done .sched-time { color: #4b4060; }
+    .sched-item.sched-next .sched-time { color: #a78bfa; font-weight: 600; }
+    .sched-label { font-size: 11px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sched-item.sched-done .sched-label { color: #4b4060; }
+    .sched-item.sched-next .sched-label { color: #e5e7eb; font-weight: 500; }
+  </style>
+</head>
+<body class="coin-admin-theme dark bg-dark-900 text-gray-200 h-screen flex flex-col overflow-hidden">
+
+  <!-- ════════ Header ════════ -->
+  <header class="bg-dark-800 border-b border-[#3d3350] px-4 py-2 flex items-center justify-between shrink-0">
+    <div class="flex items-center gap-3">
+      <h1 class="text-lg font-bold text-white flex items-center gap-2">
+        <i data-lucide="bitcoin" class="w-5 h-5 text-coin-gold"></i>
+        MOMO Coin
+      </h1>
+      <div class="live-badge">
+        <span class="live-dot"></span>
+        <span class="text-xs font-semibold text-coin-purple">24/7 LIVE</span>
+      </div>
+    </div>
+
+    <!-- Status Badges -->
+    <div class="flex items-center gap-3 text-sm whitespace-nowrap overflow-x-auto no-scrollbar">
+      <span id="badge-crypto" class="px-2 py-0.5 rounded text-xs font-medium bg-green-900/50 text-green-300">CRYPTO</span>
+      <span id="badge-trading" class="px-2 py-0.5 rounded text-xs font-medium"></span>
+      <span id="badge-mode" class="px-2 py-0.5 rounded bg-purple-900/50 text-purple-300 text-xs"></span>
+      <span id="badge-sse" class="px-2 py-0.5 rounded text-xs"></span>
+    </div>
+
+    <!-- Stock Admin Link -->
+    <a href="/admin" class="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300 transition px-3 py-1.5 rounded-lg border border-[#3d3350] hover:border-gray-500">
+      <i data-lucide="bar-chart-3" class="w-3.5 h-3.5"></i>
+      주식 Admin
+    </a>
+  </header>
+
+  <!-- ════════ Main 3-Column Layout ════════ -->
+  <div class="flex flex-1 overflow-x-auto overflow-y-hidden">
+
+    <!-- ──── Left Sidebar (280px) ──── -->
+    <aside id="left-sidebar" class="sidebar-left bg-dark-800 border-r border-[#3d3350] flex flex-col shrink-0 relative" style="width:280px; min-width:280px;">
+      <button onclick="toggleLeftSidebar()" class="sidebar-toggle-btn sidebar-toggle-left" aria-label="사이드바 접기/펼치기">
+        <i data-lucide="panel-left-close" class="w-3 h-3 sidebar-collapse-icon"></i>
+      </button>
+      <div class="sidebar-content flex flex-col flex-1 overflow-hidden">
+
+        <!-- ── Navigation ── -->
+        <nav class="p-3 space-y-1 shrink-0">
+          <button id="nav-live" type="button" onclick="switchView('live')"
+            class="w-full text-left px-3 py-2 rounded-lg text-sm font-medium bg-blue-900/30 text-blue-300 flex items-center gap-2">
+            <i data-lucide="activity" class="w-4 h-4"></i> 실시간 모니터링
+          </button>
+          <button id="nav-latest-report" type="button" onclick="switchView('latest-report')"
+            class="w-full text-left px-3 py-2 rounded-lg text-sm text-gray-400 hover:bg-dark-700 flex items-center gap-2 transition">
+            <i data-lucide="clipboard-list" class="w-4 h-4"></i> 최신 리포트
+          </button>
+          <div class="pt-2">
+            <div class="text-xs text-gray-500 px-3 mb-1">과거 리포트</div>
+            <div id="report-list" class="space-y-1 max-h-40 overflow-y-auto">
+              <div class="px-3 text-xs text-gray-500">로딩 중...</div>
+            </div>
+          </div>
+        </nav>
+
+        <div class="border-t border-[#3d3350] mx-3"></div>
+
+        <!-- ── Account Balance ── -->
+        <div class="p-3 space-y-2">
+          <div class="sticky top-0 bg-dark-800 z-[1] pb-1">
+            <div class="text-xs text-coin-dim font-medium mb-1 flex items-center gap-1.5">
+              <i data-lucide="wallet" class="w-3.5 h-3.5 text-coin-purple"></i>
+              계좌 잔고
+            </div>
+            <div id="account-info" class="space-y-2 animate-fade-in">
+              <div class="flex justify-between items-baseline">
+                <span class="text-xs text-gray-400">KRW 현금</span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                  <span id="cash-balance" class="text-sm font-bold text-white">--</span>
+                  <span id="cash-balance-delta" class="metric-delta"></span>
+                </span>
+              </div>
+              <div class="flex justify-between items-baseline">
+                <span class="text-xs text-gray-400">코인 평가</span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                  <span id="coin-eval" class="text-sm font-bold text-coin-gold">--</span>
+                  <span id="coin-eval-delta" class="metric-delta"></span>
+                </span>
+              </div>
+              <div class="flex justify-between items-baseline">
+                <span class="text-xs text-gray-400">잠금 KRW</span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                  <span id="locked-krw" class="text-sm font-bold text-gray-300">--</span>
+                  <span id="locked-krw-delta" class="metric-delta"></span>
+                </span>
+              </div>
+              <div class="flex justify-between items-baseline border-t border-[#3d3350] pt-1">
+                <span class="text-xs text-gray-400">총 자산</span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                  <span id="total-asset" class="text-sm font-bold text-coin-purple">--</span>
+                  <span id="total-asset-delta" class="metric-delta"></span>
+                </span>
+              </div>
+              <div class="flex justify-between items-baseline">
+                <span class="text-xs text-gray-400">총 수익률</span>
+                <span id="total-pnl" class="text-xs font-medium">--</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="border-t border-[#3d3350] mx-3"></div>
+
+        <!-- ── Holdings ── -->
+        <div class="p-3 flex-1 overflow-y-auto">
+          <div id="holdings-section">
+            <button onclick="toggleSection('holdings')" class="flex items-center justify-between w-full text-left mb-1" aria-expanded="true">
+              <span class="flex items-center gap-1">
+                <span class="section-toggle-icon" id="holdings-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+                <span class="text-xs text-coin-green font-medium">보유 코인</span>
+              </span>
+              <span id="holdings-count" class="text-xs text-coin-dim">0종목</span>
+            </button>
+            <div id="holdings-list" class="section-body text-xs space-y-1 max-h-64 overflow-y-auto" style="max-height:256px">
+              <!-- Coin holding cards rendered by JS -->
+              <div class="text-gray-500 text-xs py-2">로딩 중...</div>
+            </div>
+          </div>
+
+          <div class="border-t border-[#3d3350] mt-3 pt-3"></div>
+
+          <div id="pending-section" class="mt-3">
+            <button onclick="toggleSection('pending')" class="flex items-center justify-between w-full text-left mb-1" aria-expanded="true">
+              <span class="flex items-center gap-1">
+                <span class="section-toggle-icon" id="pending-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+                <span class="text-xs text-coin-gold font-medium">미체결 주문</span>
+              </span>
+              <span id="pending-count" class="text-xs text-coin-dim">0건</span>
+            </button>
+            <div id="pending-list" class="section-body text-xs space-y-1 max-h-64 overflow-y-auto" style="max-height:256px">
+              <div class="text-gray-500 text-xs py-2">미체결 주문 없음</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="border-t border-[#3d3350] mx-3"></div>
+
+        <!-- ── System Settings ── -->
+        <div class="p-3 shrink-0">
+          <button onclick="toggleSettings()" class="flex items-center justify-between w-full text-xs text-coin-dim font-medium hover:text-gray-300 transition" aria-expanded="false" id="settings-toggle-btn">
+            <span class="flex items-center gap-1.5"><i data-lucide="settings" class="w-4 h-4"></i> 설정</span>
+            <span id="settings-arrow" style="transition:transform 0.2s ease; transform:rotate(-90deg)"><i data-lucide="chevron-down" class="w-4 h-4"></i></span>
+          </button>
+          <div id="settings-body" class="space-y-3 mt-2 hidden">
+            <label class="flex items-center justify-between">
+              <span class="text-sm">매매 활성화</span>
+              <input type="checkbox" id="set-trading" class="coin-toggle"
+                onchange="updateSetting('CRYPTO_TRADING_ENABLED', this.checked)"
+                aria-label="매매 활성화">
+            </label>
+            <label class="flex items-center justify-between">
+              <span class="text-sm">코인 기능</span>
+              <input type="checkbox" id="set-auto-scan" class="coin-toggle"
+                onchange="updateSetting('CRYPTO_ENABLED', this.checked)"
+                aria-label="코인 기능">
+            </label>
+            <div>
+              <label class="text-sm block mb-1">모드</label>
+              <select id="set-mode" onchange="updateSetting('CRYPTO_AUTONOMY_MODE', this.value)"
+                class="w-full bg-dark-700 border border-[#3d3350] rounded px-2 py-1.5 text-sm text-gray-200">
+                <option value="SEMI_AUTO">SEMI_AUTO</option>
+                <option value="AUTONOMOUS">AUTONOMOUS</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-sm block mb-1">스캔 주기</label>
+              <select id="set-risk" onchange="updateSetting('CRYPTO_SCAN_INTERVAL_HOURS', Number(this.value))"
+                class="w-full bg-dark-700 border border-[#3d3350] rounded px-2 py-1.5 text-sm text-gray-200">
+                <option value="1">1시간</option>
+                <option value="2">2시간</option>
+                <option value="4">4시간</option>
+                <option value="6">6시간</option>
+                <option value="12">12시간</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="border-t border-[#3d3350] mx-3"></div>
+
+        <!-- ── Manual Scan Trigger ── -->
+        <div class="p-3 space-y-2 shrink-0">
+          <button id="btn-trigger-scan" type="button"
+            class="w-full bg-coin-purple/20 hover:bg-coin-purple/30 text-coin-purple border border-coin-purple/30 text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2">
+            <i data-lucide="scan" class="w-4 h-4"></i> 수동 스캔 실행
+          </button>
+          <button id="btn-generate-report" type="button"
+            class="w-full bg-blue-900/20 hover:bg-blue-900/30 text-blue-300 border border-blue-400/20 text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2">
+            <i data-lucide="file-text" class="w-4 h-4"></i> 수동 리포트 생성
+          </button>
+        </div>
+      </div><!-- /sidebar-content -->
+    </aside>
+
+    <!-- ──── Center (Main Feed) ──── -->
+    <main class="flex-1 flex flex-col overflow-hidden relative" style="min-width: 500px;">
+
+      <!-- Filter Bar -->
+      <div class="bg-dark-800 border-b border-[#3d3350] px-4 py-2 shrink-0 flex justify-between items-center">
+        <div id="main-panel-title" class="text-xs font-medium text-gray-400 flex items-center gap-2">
+          <i data-lucide="activity" class="w-3.5 h-3.5 text-coin-purple"></i>
+          Activity Feed
+        </div>
+        <div id="feed-filter-track" class="log-filter-track">
+          <button type="button" class="log-filter-btn active" data-filter="ALL" onclick="setLogFilter('ALL')">전체 로그</button>
+          <button type="button" class="log-filter-btn" data-filter="SIGNAL" onclick="setLogFilter('SIGNAL')">시그널만 보기</button>
+        </div>
+      </div>
+
+      <!-- Agent Pipeline Monitor -->
+      <div id="agent-monitor" class="agent-monitor shrink-0">
+        <div class="agent-monitor-bar" onclick="toggleMonitorExpand()">
+          <div class="flex items-center gap-2">
+            <span class="agent-monitor-icon" id="monitor-status-icon">
+              <i data-lucide="cpu" class="w-3.5 h-3.5"></i>
+            </span>
+            <span class="text-xs font-semibold text-gray-300" id="monitor-title">Agent Monitor</span>
+            <span class="text-xs text-gray-500" id="monitor-status">대기 중</span>
+          </div>
+          <div class="flex items-center gap-3">
+            <div class="agent-monitor-progress" id="monitor-progress-wrap" style="display:none">
+              <div class="agent-monitor-progress-bar" id="monitor-progress-bar" style="width:0%"></div>
+            </div>
+            <span class="text-xs text-gray-500 font-mono" id="monitor-elapsed"></span>
+          </div>
+        </div>
+        <div class="agent-monitor-body" id="monitor-body" style="display:none">
+          <div class="agent-monitor-slots" id="monitor-slots"></div>
+          <div class="agent-monitor-completed" id="monitor-completed" style="display:none">
+            <div class="text-[10px] text-gray-600 uppercase tracking-wider mb-1">완료</div>
+            <div class="flex flex-wrap gap-1.5" id="monitor-completed-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="feed-load-more-bar" class="feed-load-more-bar hidden shrink-0">
+        <button id="feed-load-more-btn" type="button" class="feed-load-more-btn" onclick="loadMoreActivities()">
+          <i data-lucide="chevrons-up" class="w-3.5 h-3.5"></i>
+          <span>이전 내역 더보기</span>
+        </button>
+        <span id="feed-load-more-meta" class="feed-load-more-meta"></span>
+      </div>
+
+      <!-- Activity Feed -->
+      <div id="chat-container" class="flex-1 overflow-y-auto p-4 space-y-2" aria-live="polite" aria-atomic="false">
+        <div class="text-center text-gray-500 text-sm py-8">
+          <i data-lucide="loader" class="w-5 h-5 inline-block animate-spin text-coin-purple mb-2"></i>
+          <br>연결 중...
+        </div>
+      </div>
+
+      <!-- Scroll to bottom FAB -->
+      <button id="scroll-to-bottom" onclick="scrollToBottom()" class="scroll-fab hidden" aria-label="최하단으로 이동" title="최신 분석으로 이동">
+        <i data-lucide="arrow-down" class="w-3.5 h-3.5"></i>
+        <span>최신 분석</span>
+        <span id="scroll-fab-badge" class="scroll-fab-badge"></span>
+      </button>
+
+      <!-- Bottom Bar -->
+      <div class="bg-dark-800 border-t border-[#3d3350] px-4 py-2 flex items-center justify-between text-xs text-gray-500 shrink-0">
+        <span id="status-text">연결 대기</span>
+        <div class="flex items-center gap-3">
+          <span id="activity-count">0건</span>
+          <button id="btn-main-clear" onclick="handleMainClear()" title="화면 비우기" aria-label="활동 피드 클리어"
+            class="text-gray-500 hover:text-gray-300 transition flex items-center gap-1.5">
+            <i id="main-clear-icon" data-lucide="trash-2" class="w-4 h-4"></i>
+            <span id="main-clear-label">클리어</span>
+          </button>
+          <button id="btn-main-refresh" onclick="refreshCurrentView()" title="새로고침" aria-label="활동 새로고침"
+            class="text-gray-500 hover:text-gray-300 transition flex items-center gap-1.5">
+            <i id="main-refresh-icon" data-lucide="refresh-cw" class="w-4 h-4"></i>
+            <span id="main-refresh-label">새로고침</span>
+          </button>
+        </div>
+      </div>
+    </main>
+
+    <!-- ──── Right Sidebar (260px) ──── -->
+    <aside id="right-sidebar" class="sidebar-right bg-dark-800 border-l border-[#3d3350] flex flex-col shrink-0 relative" style="width:320px; min-width:320px;">
+      <button onclick="toggleRightSidebar()" class="sidebar-toggle-btn sidebar-toggle-right" aria-label="우측 패널 접기/펼치기">
+        <i data-lucide="panel-right-close" class="w-3 h-3 sidebar-collapse-icon"></i>
+      </button>
+      <div class="sidebar-content overflow-y-auto flex-1">
+        <div class="p-3 space-y-3">
+
+          <!-- ── AI Watchlist ── -->
+          <div id="watchlist-section">
+            <div class="flex items-center justify-between mb-2">
+              <div class="flex items-center gap-1.5">
+                <i data-lucide="eye" class="w-3.5 h-3.5 text-coin-purple"></i>
+                <span class="text-xs text-coin-purple font-medium">AI 감시 코인</span>
+                <span id="watchlist-stream-dot" class="w-1.5 h-1.5 rounded-full bg-gray-600"></span>
+              </div>
+              <span id="watchlist-count" class="text-xs text-coin-dim">0종목</span>
+            </div>
+            <div id="watchlist-list" class="text-xs space-y-1 max-h-60 overflow-y-auto">
+              <!-- Watchlist cards rendered by JS -->
+              <div class="text-gray-500 text-xs py-1">로딩 중...</div>
+            </div>
+          </div>
+
+          <div class="border-t border-[#3d3350]"></div>
+
+          <!-- ── Scan Timeline ── -->
+          <div>
+            <div class="flex items-center gap-1.5 mb-2">
+              <i data-lucide="radar" class="w-3.5 h-3.5 text-coin-purple"></i>
+              <span class="text-xs text-coin-purple font-medium">스캔 타임라인</span>
+            </div>
+            <div class="scan-timeline-bar">
+              <div class="flex items-center justify-between mb-2">
+                <div class="flex items-center gap-2">
+                  <span id="scan-cycle-label" class="text-[10px] text-coin-dim px-2 py-0.5 rounded bg-dark-700">4h 주기</span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <span class="text-xs text-gray-500">다음 스캔</span>
+                  <span id="scan-countdown" class="text-xs font-mono font-semibold text-coin-purple" style="animation: countdownPulse 2s infinite;">--:--:--</span>
+                </div>
+              </div>
+              <div class="scan-progress-track">
+                <div id="scan-progress-fill" class="scan-progress-fill" style="width: 0%"></div>
+              </div>
+              <div class="flex items-center justify-between mt-1.5">
+                <span id="scan-last-time" class="text-[10px] text-coin-dim">마지막: --</span>
+                <span id="scan-next-time" class="text-[10px] text-coin-dim">다음: --</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="border-t border-[#3d3350]"></div>
+
+          <!-- ── Recommendation Queue (SEMI_AUTO) ── -->
+          <div id="rec-queue-section" class="hidden">
+            <div class="flex items-center gap-2 mb-2">
+              <i data-lucide="bell-ring" class="w-3.5 h-3.5 text-coin-gold"></i>
+              <span class="text-xs font-semibold text-coin-gold">승인 대기 추천</span>
+              <span id="rec-count" class="text-[10px] bg-coin-gold/20 text-coin-gold px-2 py-0.5 rounded-full font-bold">0</span>
+            </div>
+            <div id="rec-queue" class="space-y-2 max-h-80 overflow-y-auto">
+              <!-- Recommendation cards rendered by JS -->
+            </div>
+          </div>
+
+          <div class="border-t border-[#3d3350]"></div>
+
+          <!-- ── System Status ── -->
+          <div>
+            <div class="flex items-center gap-1.5 mb-2">
+              <i data-lucide="cpu" class="w-3.5 h-3.5 text-coin-dim"></i>
+              <span class="text-xs text-coin-dim font-medium">시스템 상태</span>
+            </div>
+            <div id="sys-status" class="text-xs space-y-1.5">
+              <div class="flex justify-between">
+                <span class="text-gray-500">거래소 연결</span>
+                <span id="sys-exchange" class="text-gray-400">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">스캔 엔진</span>
+                <span id="sys-scan-engine" class="text-gray-400">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">AI 에이전트</span>
+                <span id="sys-agent" class="text-gray-400">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">SSE 스트림</span>
+                <span id="sys-sse" class="text-gray-400">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">WS 감시</span>
+                <span id="sys-realtime" class="text-gray-400">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">자산/주문 동기화</span>
+                <span id="sys-private-sync" class="text-gray-400">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">업타임</span>
+                <span id="sys-uptime" class="text-gray-400 font-mono">--</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-gray-500">오늘 체결</span>
+                <span id="sys-trades-today" class="text-gray-400">--</span>
+              </div>
+            </div>
+          </div>
+          <div class="border-t border-[#3d3350]"></div>
+
+          <!-- ── Scan Schedule ── -->
+          <div>
+            <div class="flex items-center gap-1.5 mb-2">
+              <i data-lucide="clock" class="w-3.5 h-3.5 text-coin-dim"></i>
+              <span class="text-xs text-coin-dim font-medium">스캔 스케줄</span>
+            </div>
+            <div id="scan-schedule" class="schedule-timeline">
+              <div class="text-xs text-gray-500 py-1">로딩 중...</div>
+            </div>
+          </div>
+
+          <div class="border-t border-[#3d3350]"></div>
+
+          <!-- ── Latest Report ── -->
+          <div>
+            <div class="flex items-center gap-1.5 mb-2">
+              <i data-lucide="file-text" class="w-3.5 h-3.5 text-coin-dim"></i>
+              <span class="text-xs text-coin-dim font-medium">최신 리포트</span>
+            </div>
+            <div id="latest-report" class="text-xs text-gray-500">
+              로딩 중...
+            </div>
+          </div>
+
+        </div>
+      </div><!-- /sidebar-content -->
+    </aside>
+
+  </div>
+
+  <!-- ════════ Toast Container ════════ -->
+  <div id="toast-container" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2" style="max-width:360px"></div>
+
+  <script type="module" src="/admin/static/js/coin/coin-main.js"></script>
+</body>
+</html>

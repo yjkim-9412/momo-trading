@@ -1,0 +1,95 @@
+"""시장별 실시간 감시 종목 동기화."""
+from loguru import logger
+
+from trading.market_profile import is_crypto_market, normalize_market
+
+
+def _normalize_selected_watchlist(
+    market: str,
+    selected_watchlist: list[dict[str, object]] | None,
+) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in selected_watchlist or []:
+        symbol = str(item.get("symbol", "")).upper().strip()
+        if not symbol:
+            continue
+        market_code = normalize_market(item.get("market") or market)
+        key = (market_code, symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+        enriched: dict[str, object] = {
+            "symbol": symbol,
+            "market": market_code,
+            "name": str(item.get("name", "") or ""),
+        }
+        for meta_key in (
+            "scan_source",
+            "price",
+            "change_rate",
+            "volume",
+            "trade_value",
+            "strategy_type",
+            "reason",
+        ):
+            value = item.get(meta_key)
+            if value not in (None, ""):
+                enriched[meta_key] = value
+        normalized.append(enriched)
+    return normalized
+
+
+async def reconcile_market_watchlist(
+    market: str,
+    selected_watchlist: list[dict[str, object]] | None = None,
+) -> list[tuple[str, str]]:
+    """최근 선정 종목과 보유 종목을 합쳐 scope별 desired 구독을 재계산."""
+    from agent.trading_agent import trading_agent
+    from trading.account_manager import account_manager
+
+    market_code = normalize_market(market)
+    runtime = trading_agent.get_runtime(market_code)
+    if selected_watchlist is not None:
+        runtime.last_selected_watchlist = _normalize_selected_watchlist(
+            market_code,
+            selected_watchlist,
+        )
+
+    desired_symbols: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in runtime.last_selected_watchlist:
+        symbol = str(item.get("symbol", "")).upper()
+        item_market = normalize_market(item.get("market") or market_code)
+        key = (item_market, symbol)
+        if not symbol or key in seen:
+            continue
+        seen.add(key)
+        desired_symbols.append((symbol, item_market))
+
+    holdings = await account_manager.get_holdings(market_code)
+    for holding in holdings:
+        symbol = str(holding.symbol or "").upper()
+        if not symbol:
+            continue
+        holding_market = normalize_market(holding.market or market_code)
+        key = (holding_market, symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+        desired_symbols.append((symbol, holding_market))
+
+    if is_crypto_market(market_code):
+        from realtime.coin_stream_manager import coin_stream_manager
+
+        synced_symbols = desired_symbols
+        await coin_stream_manager.replace_market_subscriptions(market_code, synced_symbols)
+    else:
+        from realtime.stream_manager import stream_manager
+
+        synced_symbols = desired_symbols[:41]
+        await stream_manager.replace_market_subscriptions(market_code, synced_symbols)
+
+    logger.info("[{}] 실시간 감시 종목 동기화: {}종목", market_code, len(synced_symbols))
+    return synced_symbols

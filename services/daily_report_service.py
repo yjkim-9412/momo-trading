@@ -15,6 +15,7 @@ from services.activity_logger import activity_logger
 from core.config import settings
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
+from trading.market_profile import market_scope as resolve_market_scope, normalize_market_scope
 
 DAILY_REPORT_PROMPT = """당신은 AI 트레이딩 시스템의 일일 리포트 작성자입니다.
 오늘 하루의 활동 데이터를 기반으로 다음 항목을 한국어로 작성해주세요.
@@ -54,104 +55,96 @@ DAILY_REPORT_PROMPT = """당신은 AI 트레이딩 시스템의 일일 리포트
 class DailyReportService:
     """일일 리포트 생성 서비스 (자체 세션 사용)"""
 
-    async def generate_daily_report(self, report_date: date | None = None) -> DailyReport | None:
+    async def generate_daily_report(
+        self,
+        report_date: date | None = None,
+        market_scope: str | None = None,
+    ) -> DailyReport | None:
         """일일 리포트 생성"""
-        from util.time_util import now_kst
+        from scheduler.market_calendar import market_calendar
+
+        scope = normalize_market_scope(market_scope or settings.primary_market_code)
         if report_date is None:
-            report_date = now_kst().date()
+            report_date = market_calendar.market_date(market=scope)
 
-        logger.info("일일 리포트 생성 시작: {}", report_date)
+        logger.info("[{}] 일일 리포트 생성 시작: {}", scope, report_date)
 
-        await activity_logger.log(
-            ActivityType.REPORT, ActivityPhase.START,
-            f"\U0001f4cb 일일 리포트 생성 시작: {report_date}",
-        )
+        with activity_logger.context(market_scope=scope, trading_date=report_date):
+            await activity_logger.log(
+                ActivityType.REPORT, ActivityPhase.START,
+                f"\U0001f4cb [{scope}] 일일 리포트 생성 시작: {report_date}",
+            )
 
-        try:
-            # 계좌 스냅샷 조회 (세션 밖에서 — MCP 호출)
-            unrealized_pnl = 0.0
-            open_position_count = 0
-            total_asset = 0.0
-            cash = 0.0
-            stock_value = 0.0
             try:
-                balance, holdings = await account_manager.get_account_snapshot(settings.primary_market_code)
-                unrealized_pnl = balance.total_pnl
-                open_position_count = len(holdings)
-                total_asset = balance.total_asset
-                cash = balance.cash
-                stock_value = balance.stock_value
-            except Exception as e:
-                logger.warning("계좌 스냅샷 조회 실패 (리포트 계속): {}", str(e))
+                # 계좌 스냅샷 조회 (세션 밖에서 — MCP 호출)
+                unrealized_pnl = 0.0
+                open_position_count = 0
+                total_asset = 0.0
+                cash = 0.0
+                stock_value = 0.0
+                representative_market = "NASDAQ" if scope == "US" else scope
+                try:
+                    balance, holdings = await account_manager.get_account_snapshot(representative_market)
+                    scoped_holdings = [holding for holding in holdings if resolve_market_scope(holding.market) == scope]
+                    unrealized_pnl = sum(holding.pnl for holding in scoped_holdings)
+                    open_position_count = len(scoped_holdings)
+                    total_asset = balance.total_asset
+                    cash = balance.cash
+                    stock_value = sum(holding.current_price * holding.quantity for holding in scoped_holdings)
+                except Exception as e:
+                    logger.warning("계좌 스냅샷 조회 실패 (리포트 계속): {}", str(e))
 
-            async with AsyncSessionLocal() as session:
-                async with session.begin():
-                    activity_repo = AgentActivityRepository(session)
-                    report_repo = DailyReportRepository(session)
+                async with AsyncSessionLocal() as session:
+                    async with session.begin():
+                        activity_repo = AgentActivityRepository(session)
+                        report_repo = DailyReportRepository(session)
 
-                    # 기존 리포트 확인 (중복 방지)
-                    existing = await report_repo.get_by_date(report_date)
-                    if existing:
-                        logger.info("이미 리포트 존재: {}", report_date)
-                        return existing
+                        # 기존 리포트 확인 (중복 방지)
+                        existing = await report_repo.get_by_date(report_date, market_scope=scope)
+                        if existing:
+                            logger.info("[{}] 이미 리포트 존재: {}", scope, report_date)
+                            return existing
 
-                    # 활동 데이터 집계
-                    activities = await activity_repo.get_by_date(report_date, limit=500)
-                    activity_counts = await activity_repo.count_by_date(report_date)
+                        # 활동 데이터 집계
+                        activities = await activity_repo.get_by_date(report_date, limit=500, market_scope=scope)
+                        activity_counts = await activity_repo.count_by_date(report_date, market_scope=scope)
 
-                    # 기본 통계
-                    total_cycles = activity_counts.get("CYCLE", 0) // 2  # START + COMPLETE
-                    total_analyses = activity_counts.get("TIER1_ANALYSIS", 0)
-                    total_recommendations = activity_counts.get("DECISION", 0)
+                        # 기본 통계
+                        total_cycles = activity_counts.get("CYCLE", 0) // 2  # START + COMPLETE
+                        total_analyses = activity_counts.get("TIER1_ANALYSIS", 0)
+                        total_recommendations = activity_counts.get("DECISION", 0)
 
-                    # TradeResult 기반 매수/매도/승패/손익 집계
-                    trade_result_repo = TradeResultRepository(session)
-                    opened_trades = await trade_result_repo.get_opened_by_date(report_date)
-                    completed_trades = await trade_result_repo.get_completed_by_date(report_date)
+                        # TradeResult 기반 매수/매도/승패/손익 집계
+                        trade_result_repo = TradeResultRepository(session)
+                        opened_trades = await trade_result_repo.get_opened_by_date(report_date, market_scope=scope)
+                        completed_trades = await trade_result_repo.get_completed_by_date(report_date, market_scope=scope)
 
-                    buy_count = len(opened_trades)
-                    sell_count = len(completed_trades)
-                    total_orders = buy_count + sell_count
-                    win_count = sum(1 for t in completed_trades if t.is_win)
-                    loss_count = sum(1 for t in completed_trades if not t.is_win)
-                    total_pnl = sum(t.pnl for t in completed_trades)
+                        buy_count = len(opened_trades)
+                        sell_count = len(completed_trades)
+                        total_orders = buy_count + sell_count
+                        win_count = sum(1 for t in completed_trades if t.is_win)
+                        loss_count = sum(1 for t in completed_trades if not t.is_win)
+                        total_pnl = sum(t.pnl for t in completed_trades)
 
-                    # DB에 미청산 포지션이 없으면 계좌 보유 종목 수 사용
-                    if open_position_count == 0:
-                        all_open = await trade_result_repo.get_all_open()
-                        if all_open:
-                            open_position_count = len(all_open)
+                        if open_position_count == 0:
+                            all_open = await trade_result_repo.get_all_open(market_scope=scope)
+                            if all_open:
+                                open_position_count = len(all_open)
 
-                    # LLM으로 리포트 생성
-                    recent_summaries = "\n".join(
-                        f"[{a.activity_type}] {a.summary}" for a in activities[-30:]
-                    )
-                    activity_count_text = "\n".join(
-                        f"- {k}: {v}건" for k, v in activity_counts.items()
-                    )
+                        recent_summaries = "\n".join(
+                            f"[{a.activity_type}] {a.summary}" for a in activities[-30:]
+                        )
+                        activity_count_text = "\n".join(
+                            f"- {k}: {v}건" for k, v in activity_counts.items()
+                        )
 
-                    report = DailyReport(
-                        report_date=report_date,
-                        total_cycles=total_cycles,
-                        total_analyses=total_analyses,
-                        total_recommendations=total_recommendations,
-                        total_orders=total_orders,
-                        buy_count=buy_count,
-                        sell_count=sell_count,
-                        win_count=win_count,
-                        loss_count=loss_count,
-                        total_pnl=total_pnl,
-                        unrealized_pnl=unrealized_pnl,
-                        open_position_count=open_position_count,
-                    )
-
-                    # LLM 요약 생성 시도
-                    try:
-                        prompt = DAILY_REPORT_PROMPT.format(
+                        report = DailyReport(
+                            market_scope=scope,
                             report_date=report_date,
                             total_cycles=total_cycles,
                             total_analyses=total_analyses,
                             total_recommendations=total_recommendations,
+                            total_orders=total_orders,
                             buy_count=buy_count,
                             sell_count=sell_count,
                             win_count=win_count,
@@ -159,57 +152,76 @@ class DailyReportService:
                             total_pnl=total_pnl,
                             unrealized_pnl=unrealized_pnl,
                             open_position_count=open_position_count,
-                            total_asset=total_asset,
-                            cash=cash,
-                            stock_value=stock_value,
-                            activity_counts=activity_count_text or "활동 없음",
-                            recent_activities=recent_summaries or "활동 없음",
                         )
-                        result_text, provider = await llm_factory.generate_tier1(prompt)
-                        parsed = self._parse_json(result_text)
 
-                        if parsed:
-                            report.market_summary = parsed.get("market_summary", "")
-                            report.performance_review = parsed.get("performance_review", "")
-                            report.lessons_learned = parsed.get("lessons_learned", "")
-                            report.next_day_plan = parsed.get("next_day_plan", "")
-                            report.top_picks = json.dumps(
-                                parsed.get("top_picks", []), ensure_ascii=False
+                        try:
+                            prompt = DAILY_REPORT_PROMPT.format(
+                                report_date=report_date,
+                                total_cycles=total_cycles,
+                                total_analyses=total_analyses,
+                                total_recommendations=total_recommendations,
+                                buy_count=buy_count,
+                                sell_count=sell_count,
+                                win_count=win_count,
+                                loss_count=loss_count,
+                                total_pnl=total_pnl,
+                                unrealized_pnl=unrealized_pnl,
+                                open_position_count=open_position_count,
+                                total_asset=total_asset,
+                                cash=cash,
+                                stock_value=stock_value,
+                                activity_counts=activity_count_text or "활동 없음",
+                                recent_activities=recent_summaries or "활동 없음",
                             )
-                    except Exception as e:
-                        logger.warning("LLM 리포트 요약 생성 실패: {}", str(e))
-                        report.market_summary = "LLM 요약 생성 실패"
-                        report.performance_review = f"활동 {len(activities)}건 기록됨"
+                            result_text, provider = await llm_factory.generate_tier1(
+                                prompt,
+                                scope=scope,
+                                phase="after_hours",
+                            )
+                            parsed = self._parse_json(result_text)
 
-                    report.strategy_stats = json.dumps(activity_counts, ensure_ascii=False)
-                    session.add(report)
+                            if parsed:
+                                report.market_summary = parsed.get("market_summary", "")
+                                report.performance_review = parsed.get("performance_review", "")
+                                report.lessons_learned = parsed.get("lessons_learned", "")
+                                report.next_day_plan = parsed.get("next_day_plan", "")
+                                report.top_picks = json.dumps(
+                                    parsed.get("top_picks", []), ensure_ascii=False
+                                )
+                        except Exception as e:
+                            logger.warning("LLM 리포트 요약 생성 실패: {}", str(e))
+                            report.market_summary = "LLM 요약 생성 실패"
+                            report.performance_review = f"활동 {len(activities)}건 기록됨"
 
-        except Exception as e:
-            logger.error("일일 리포트 생성 실패: {}", str(e))
+                        report.strategy_stats = json.dumps(activity_counts, ensure_ascii=False)
+                        session.add(report)
+            except Exception as e:
+                logger.error("일일 리포트 생성 실패: {}", str(e))
+                await activity_logger.log(
+                    ActivityType.REPORT, ActivityPhase.ERROR,
+                    f"\u274c [{scope}] 일일 리포트 생성 실패: {str(e)[:100]}",
+                    error_message=str(e),
+                )
+                return None
+
             await activity_logger.log(
-                ActivityType.REPORT, ActivityPhase.ERROR,
-                f"\u274c 일일 리포트 생성 실패: {str(e)[:100]}",
-                error_message=str(e),
+                ActivityType.REPORT, ActivityPhase.COMPLETE,
+                f"\U0001f4cb [{scope}] 일일 리포트 생성 완료: {report_date}"
+                f"\n   사이클 {total_cycles}회 | 매수 {buy_count}건 | 매도 {sell_count}건"
+                f"\n   실현 {total_pnl:+,.0f}원 | 미실현 {unrealized_pnl:+,.0f}원",
+                detail={
+                    "report_date": str(report_date),
+                    "market_scope": scope,
+                    "total_cycles": total_cycles,
+                    "buy_count": buy_count,
+                    "sell_count": sell_count,
+                    "total_pnl": total_pnl,
+                    "unrealized_pnl": unrealized_pnl,
+                },
             )
-            return None
 
-        await activity_logger.log(
-            ActivityType.REPORT, ActivityPhase.COMPLETE,
-            f"\U0001f4cb 일일 리포트 생성 완료: {report_date}"
-            f"\n   사이클 {total_cycles}회 | 매수 {buy_count}건 | 매도 {sell_count}건"
-            f"\n   실현 {total_pnl:+,.0f}원 | 미실현 {unrealized_pnl:+,.0f}원",
-            detail={
-                "report_date": str(report_date),
-                "total_cycles": total_cycles,
-                "buy_count": buy_count,
-                "sell_count": sell_count,
-                "total_pnl": total_pnl,
-                "unrealized_pnl": unrealized_pnl,
-            },
-        )
-
-        logger.info("일일 리포트 생성 완료: {}", report_date)
-        return report
+            logger.info("[{}] 일일 리포트 생성 완료: {}", scope, report_date)
+            return report
 
     def _parse_json(self, text: str) -> dict | None:
         result = parse_llm_json(text)

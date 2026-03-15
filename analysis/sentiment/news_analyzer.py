@@ -2,7 +2,7 @@
 from loguru import logger
 
 from analysis.llm.llm_factory import llm_factory
-from trading.enums import LLMTier
+from trading.enums import Tier1Profile
 
 
 class NewsAnalyzer:
@@ -33,7 +33,10 @@ sentiment: POSITIVE | NEUTRAL | NEGATIVE
 score: 0.0 (매우 부정) ~ 1.0 (매우 긍정)"""
 
         try:
-            result, provider = await llm_factory.generate_tier1(prompt)
+            result, provider = await llm_factory.generate_tier1(
+                prompt,
+                profile=Tier1Profile.SCAN,
+            )
             import json
             # JSON 파싱 시도
             start = result.find("{")

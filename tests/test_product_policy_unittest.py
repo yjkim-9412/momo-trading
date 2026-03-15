@@ -47,8 +47,23 @@ class ProductPolicyTest(unittest.TestCase):
 
         self.assertEqual(leveraged.product_type, "LEVERAGED_ETF")
         self.assertTrue(leveraged.is_leveraged)
+        self.assertEqual(leveraged.leverage_multiplier, 3.0)
+        self.assertEqual(leveraged.signed_exposure, 3.0)
         self.assertEqual(inverse.product_type, "INVERSE_ETF")
         self.assertTrue(inverse.is_inverse)
+        self.assertEqual(inverse.leverage_multiplier, 3.0)
+        self.assertEqual(inverse.signed_exposure, -3.0)
+
+    def test_inverse_without_explicit_multiplier_defaults_to_one_x(self):
+        inverse = classify_product(
+            symbol="SH",
+            market="NYSE",
+            name="ProShares Short S&P500",
+        )
+
+        self.assertEqual(inverse.product_type, "INVERSE_ETF")
+        self.assertEqual(inverse.leverage_multiplier, 1.0)
+        self.assertEqual(inverse.signed_exposure, -1.0)
 
     def test_coerce_restricted_strategy_to_stable(self):
         classification = classify_product(

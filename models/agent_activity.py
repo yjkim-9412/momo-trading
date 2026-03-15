@@ -1,7 +1,8 @@
 """에이전트 활동 로그 - 채팅형 모니터링을 위한 모든 활동 기록"""
+from datetime import date
 from uuid import uuid4
 
-from sqlalchemy import Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Date, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base, TimestampMixin
@@ -12,6 +13,8 @@ class AgentActivityLog(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     cycle_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    market_scope: Mapped[str | None] = mapped_column(String(10), nullable=True, index=True)
+    trading_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
 
     activity_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     # CYCLE / SCAN / SCREENING / TIER1_ANALYSIS / TIER2_REVIEW /

@@ -12,26 +12,94 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PID_FILE="$APP_DIR/.momo.pid"
 
+wait_for_exit() {
+    local pid="$1"
+    local attempts="${2:-5}"
+    local i
+
+    for ((i=0; i<attempts; i++)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+stop_process_tree() {
+    local pid="$1"
+    local children
+
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    children="$(pgrep -P "$pid" || true)"
+    kill -TERM "$pid" 2>/dev/null || true
+    if [ -n "$children" ]; then
+        kill -TERM $children 2>/dev/null || true
+    fi
+
+    if wait_for_exit "$pid" 5; then
+        return 0
+    fi
+
+    if [ -n "$children" ]; then
+        kill -KILL $children 2>/dev/null || true
+    fi
+    kill -KILL "$pid" 2>/dev/null || true
+    wait_for_exit "$pid" 2 || true
+}
+
+stop_process_group() {
+    local pid="$1"
+    local pgid
+
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    if [ -z "$pgid" ]; then
+        stop_process_tree "$pid"
+        return 0
+    fi
+    if [ "$pgid" != "$pid" ]; then
+        stop_process_tree "$pid"
+        return 0
+    fi
+
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    if wait_for_exit "$pid" 5; then
+        return 0
+    fi
+
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+    wait_for_exit "$pid" 2 || true
+}
+
 stop_server() {
     local stopped=false
+    local pid
+    local parent_pid
 
     # PID 파일 기반 종료
     if [ -f "$PID_FILE" ]; then
-        PID=$(cat "$PID_FILE")
-        if kill -0 "$PID" 2>/dev/null; then
-            echo "🛑 momo-trading 서버 종료 (PID: $PID)"
-            kill "$PID"
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "🛑 momo-trading 서버 종료 (PID: $pid)"
+            stop_process_group "$pid"
             stopped=true
         fi
         rm -f "$PID_FILE"
     fi
 
     # uvicorn 프로세스 직접 종료 (포그라운드 실행 대응)
-    if pgrep -f "uvicorn main:app" >/dev/null 2>&1; then
-        echo "🛑 uvicorn 프로세스 종료"
-        pkill -f "uvicorn main:app" 2>/dev/null || true
+    for parent_pid in $(pgrep -f "uvicorn main:app" || true); do
+        echo "🛑 uvicorn 프로세스 종료 (PID: $parent_pid)"
+        stop_process_tree "$parent_pid"
         stopped=true
-    fi
+    done
 
     if [ "$stopped" = false ]; then
         echo "ℹ️  실행 중인 서버 없음"
