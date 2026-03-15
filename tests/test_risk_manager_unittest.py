@@ -13,6 +13,13 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
             "TRADING_ENABLED": settings.TRADING_ENABLED,
             "MAX_SINGLE_ORDER_KRW": settings.MAX_SINGLE_ORDER_KRW,
             "MIN_BUY_QUANTITY": settings.MIN_BUY_QUANTITY,
+            "CRYPTO_TRADING_ENABLED": settings.CRYPTO_TRADING_ENABLED,
+            "CRYPTO_MAX_SINGLE_ORDER_KRW": settings.CRYPTO_MAX_SINGLE_ORDER_KRW,
+            "CRYPTO_MIN_BUY_QUANTITY": settings.CRYPTO_MIN_BUY_QUANTITY,
+            "CRYPTO_MIN_CASH_RATIO": settings.CRYPTO_MIN_CASH_RATIO,
+            "CRYPTO_MAX_POSITION_PCT": settings.CRYPTO_MAX_POSITION_PCT,
+            "CRYPTO_MAX_DAILY_TRADES": settings.CRYPTO_MAX_DAILY_TRADES,
+            "CRYPTO_TRADING_STYLE_MODE": settings.CRYPTO_TRADING_STYLE_MODE,
             "US_LEVERAGED_PRODUCTS_ENABLED": settings.US_LEVERAGED_PRODUCTS_ENABLED,
             "US_INVERSE_PRODUCTS_ENABLED": settings.US_INVERSE_PRODUCTS_ENABLED,
             "US_LEVERAGE_ALLOWED_SESSIONS": settings.US_LEVERAGE_ALLOWED_SESSIONS,
@@ -22,6 +29,13 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
         settings.TRADING_ENABLED = True
         settings.MAX_SINGLE_ORDER_KRW = 10000
         settings.MIN_BUY_QUANTITY = 1
+        settings.CRYPTO_TRADING_ENABLED = True
+        settings.CRYPTO_MAX_SINGLE_ORDER_KRW = 0
+        settings.CRYPTO_MIN_BUY_QUANTITY = 0.0
+        settings.CRYPTO_MIN_CASH_RATIO = 0.10
+        settings.CRYPTO_MAX_POSITION_PCT = 20.0
+        settings.CRYPTO_MAX_DAILY_TRADES = 0
+        settings.CRYPTO_TRADING_STYLE_MODE = "CONSERVATIVE"
         settings.US_LEVERAGED_PRODUCTS_ENABLED = True
         settings.US_INVERSE_PRODUCTS_ENABLED = True
         settings.US_LEVERAGE_ALLOWED_SESSIONS = "US_REGULAR"
@@ -270,6 +284,73 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["approved"])
         self.assertIn("종목별 주문가능금액 조회 실패", result["reason"])
+
+    async def test_crypto_conservative_mode_blocks_rr_below_two_in_bull_regime(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="BTC",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=100.0,
+            suggested_quantity=100.0,
+            suggested_amount_krw=10000.0,
+            target_price=116.0,
+            stop_loss_price=90.0,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="AGGRESSIVE_SHORT",
+            metadata={
+                "market": "BITHUMB",
+                "price_krw": 100.0,
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50000,
+                portfolio_budget=100000,
+                today_trade_count=0,
+                current_holding_count=0,
+                market_regime="ALTSEASON",
+            )
+
+        self.assertFalse(result["approved"])
+        self.assertIn("최소 2.0:1 필요", result["reason"])
+
+    async def test_crypto_aggressive_mode_allows_rr_one_point_six_in_bull_regime(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="BTC",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=100.0,
+            suggested_quantity=100.0,
+            suggested_amount_krw=10000.0,
+            target_price=116.0,
+            stop_loss_price=90.0,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="AGGRESSIVE_SHORT",
+            metadata={
+                "market": "BITHUMB",
+                "price_krw": 100.0,
+            },
+        )
+
+        with patch.object(settings, "CRYPTO_TRADING_STYLE_MODE", "AGGRESSIVE"), \
+                patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50000,
+                portfolio_budget=100000,
+                today_trade_count=0,
+                current_holding_count=0,
+                market_regime="ALTSEASON",
+            )
+
+        self.assertTrue(result["approved"])
+        self.assertNotIn("리스크:보상 비율 부족", result["reason"])
 
 
 if __name__ == "__main__":

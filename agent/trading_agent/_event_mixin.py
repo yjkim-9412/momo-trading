@@ -132,7 +132,7 @@ class EventMixin:
 
                         dynamic_limits = await ai_risk_tuner.compute_limits(
                             market=market_code,
-                            risk_appetite=settings.RISK_APPETITE,
+                            risk_appetite=settings.risk_appetite_for_market(market_code),
                             cycle_id=cycle_id,
                             balance=balance,
                         )

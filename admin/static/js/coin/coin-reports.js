@@ -512,6 +512,7 @@ export function renderSettings(settings) {
   if (settings.CRYPTO_TRADING_ENABLED != null && el('set-trading')) el('set-trading').checked = !!settings.CRYPTO_TRADING_ENABLED;
   if (settings.CRYPTO_ENABLED != null && el('set-auto-scan')) el('set-auto-scan').checked = !!settings.CRYPTO_ENABLED;
   if (settings.CRYPTO_AUTONOMY_MODE && el('set-mode')) el('set-mode').value = settings.CRYPTO_AUTONOMY_MODE;
+  if (settings.CRYPTO_TRADING_STYLE_MODE && el('set-trading-style')) el('set-trading-style').value = settings.CRYPTO_TRADING_STYLE_MODE;
   if (settings.CRYPTO_SCAN_INTERVAL_HOURS != null && el('set-risk')) el('set-risk').value = String(settings.CRYPTO_SCAN_INTERVAL_HOURS);
   if (settings.CRYPTO_TIMEBOX_HOURS != null && el('set-timebox')) el('set-timebox').value = String(settings.CRYPTO_TIMEBOX_HOURS);
 }

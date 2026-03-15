@@ -103,6 +103,13 @@ export function formatTimeboxHours(hours) {
   return value + '시간';
 }
 
+export function formatTradingStyleMode(mode) {
+  var value = String(mode || '').toUpperCase();
+  if (value === 'AGGRESSIVE') return '공격적';
+  if (value === 'CONSERVATIVE') return '보수적';
+  return value || '--';
+}
+
 // ── Truncate with ellipsis ──
 export function truncateText(text, limit) {
   if (!text) return '';

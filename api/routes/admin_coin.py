@@ -468,10 +468,12 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "crypto_primary_market": crypto_market,
         "crypto_trading_enabled": settings.CRYPTO_TRADING_ENABLED,
         "crypto_autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
+        "crypto_trading_style_mode": settings.crypto_trading_style_mode,
         "crypto_timebox_hours": settings.crypto_timebox_hours,
         "crypto_dynamic_discovery_enabled": settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED,
         "trading_enabled": settings.CRYPTO_TRADING_ENABLED,
         "autonomy_mode": settings.CRYPTO_AUTONOMY_MODE,
+        "trading_style_mode": settings.crypto_trading_style_mode,
         "scheduler_running": trading_scheduler.is_running,
         "agent_running": trading_agent._running,
         "market": crypto_market,
@@ -542,6 +544,7 @@ COIN_MUTABLE_SETTINGS = [
     "CRYPTO_PRIMARY_MARKET",
     "CRYPTO_TRADING_ENABLED",
     "CRYPTO_AUTONOMY_MODE",
+    "CRYPTO_TRADING_STYLE_MODE",
     "CRYPTO_RECOMMENDATION_EXPIRE_MIN",
     "CRYPTO_SCAN_INTERVAL_HOURS",
     "CRYPTO_TIMEBOX_HOURS",
@@ -549,6 +552,7 @@ COIN_MUTABLE_SETTINGS = [
     "CRYPTO_MIN_CASH_RATIO",
     "CRYPTO_MAX_SINGLE_ORDER_KRW",
 ]
+COIN_ENV_PERSISTED_SETTINGS = {"CRYPTO_TIMEBOX_HOURS", "CRYPTO_TRADING_STYLE_MODE"}
 
 
 @router.get("/settings")
@@ -558,6 +562,9 @@ async def get_coin_settings():
     for key in COIN_MUTABLE_SETTINGS:
         if key == "CRYPTO_TIMEBOX_HOURS":
             data[key] = settings.crypto_timebox_hours
+            continue
+        if key == "CRYPTO_TRADING_STYLE_MODE":
+            data[key] = settings.crypto_trading_style_mode
             continue
         data[key] = getattr(settings, key, None)
     return SuccessResponse(data=data)
@@ -571,20 +578,32 @@ async def update_coin_settings(updates: dict):
     for key, value in updates.items():
         if key not in COIN_MUTABLE_SETTINGS:
             continue
-        old = settings.crypto_timebox_hours if key == "CRYPTO_TIMEBOX_HOURS" else getattr(settings, key, None)
+        if key == "CRYPTO_TIMEBOX_HOURS":
+            old = settings.crypto_timebox_hours
+        elif key == "CRYPTO_TRADING_STYLE_MODE":
+            old = settings.crypto_trading_style_mode
+        else:
+            old = getattr(settings, key, None)
         if isinstance(old, bool):
             value = str(value).lower() in ("true", "1", "yes")
         elif isinstance(old, int):
             value = int(value)
         elif isinstance(old, float):
             value = float(value)
+        elif key == "CRYPTO_TRADING_STYLE_MODE":
+            value = str(value or "").strip().upper()
 
         if key == "CRYPTO_TIMEBOX_HOURS" and value not in {12, 24}:
             rejected[key] = {"attempted": value, "reason": "12 또는 24만 허용"}
             logger.warning("코인 설정 변경 거부: {} = {}", key, value)
             continue
 
-        if key == "CRYPTO_TIMEBOX_HOURS":
+        if key == "CRYPTO_TRADING_STYLE_MODE" and value not in {"CONSERVATIVE", "AGGRESSIVE"}:
+            rejected[key] = {"attempted": value, "reason": "CONSERVATIVE 또는 AGGRESSIVE만 허용"}
+            logger.warning("코인 설정 변경 거부: {} = {}", key, value)
+            continue
+
+        if key in COIN_ENV_PERSISTED_SETTINGS:
             try:
                 _persist_env_setting(key, value)
             except OSError as exc:

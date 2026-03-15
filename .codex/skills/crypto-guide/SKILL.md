@@ -83,6 +83,7 @@ CRYPTO_ENABLED                          # 코인 기능 on/off
 CRYPTO_PRIMARY_MARKET                   # 코인 기본 시장 코드, 비어있거나 잘못되면 BITHUMB 고정
 CRYPTO_TRADING_ENABLED                  # 실제 주문 허용
 CRYPTO_AUTONOMY_MODE                    # SEMI_AUTO / AUTONOMOUS
+CRYPTO_TRADING_STYLE_MODE               # CONSERVATIVE / AGGRESSIVE (admin-coin 변경 시 .env에도 반영)
 CRYPTO_SCAN_INTERVAL_HOURS              # 자동 스캔 주기 (기본 4h)
 CRYPTO_TIMEBOX_HOURS                    # 포지션 최대 보유시간 (12 또는 24, 만료 시 자동 청산/정산)
 CRYPTO_WATCHLIST_SYMBOLS                # 감시 코인 목록
@@ -123,15 +124,15 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - JWT 인증: PyJWT HS256. `Authorization: Bearer {jwt}`. Payload: access_key, nonce(UUID), timestamp(ms), query_hash(SHA512)
 - 시장 국면 canonical 값: `BULL_RUN` / `BEAR_MARKET` / `CONSOLIDATION` / `ALTSEASON` / `THEME`
 - legacy alias는 `normalize_crypto_regime()`에서 `BEAR -> BEAR_MARKET`, `SIDEWAYS -> CONSOLIDATION`, `ALT_SEASON -> ALTSEASON`으로 정규화한다
-- R:R floor: BULL_RUN=2.0, BEAR_MARKET=1.5 (주식보다 넓게)
+- R:R floor: `CONSERVATIVE`는 BULL_RUN/ALTSEASON/THEME=2.0, BEAR_MARKET/CONSOLIDATION=1.5를 사용한다. `AGGRESSIVE`는 강세 국면 RR floor를 1.6까지 완화하고 방어 국면 1.5는 유지한다.
 - 코인 기본 시장 fallback은 `PRIMARY_MARKET`를 공유하지 않는다. 코인 경로는 `CRYPTO_PRIMARY_MARKET`를 우선 사용하고, 값이 비어 있거나 잘못되면 `BITHUMB`로 고정한다.
-- 코인 프롬프트 스택(`market_scan.py`, `stock_analysis.py`, `final_review.py`)은 `빗썸 KRW 현물`, `12h/24h timebox`, `BUY/HOLD 전용`, `24h 거래대금 기반 유동성 확인`을 공통 계약으로 유지한다
+- 코인 프롬프트 스택(`market_scan.py`, `stock_analysis.py`, `final_review.py`)은 `빗썸 KRW 현물`, `12h/24h timebox`, `BUY/HOLD 전용`, `24h 거래대금 기반 유동성 확인`을 공통 계약으로 유지하고, `CRYPTO_TRADING_STYLE_MODE`에 따라 보수적/공격적 진입 편향을 다르게 준다.
 - 코인 프롬프트 스택은 `BUY 판단은 KRW 투자금 기준`, `Tier2 BUY는 suggested_amount_krw 필수`, `suggested_quantity는 추정치` 계약을 함께 유지한다.
 - 코인 정산 회고 프롬프트는 `analysis/llm/prompts/crypto_cycle_review.py`를 사용하며, 표현도 `직전 정산 구간` / `다음 정산 윈도우` 기준으로 유지한다.
 - 코인 자동 정산/수동 리포트는 LLM `phase="report"`를 사용한다. Codex는 기본 `xhigh`, Claude는 `CRYPTO_CLAUDE_EFFORT_REPORT=max` 같은 report 전용 override를 줄 수 있다.
 - Product Policy: 크립토는 항상 COMMON (Spot only)
 - 24/7 스케줄: 주식식 buy cutoff / 장종료 강제 청산 없음. 대신 `CRYPTO_TIMEBOX_HOURS` rolling 정산을 사용한다.
-- `/api/v1/admin-coin/settings`에서 `CRYPTO_TIMEBOX_HOURS`를 바꾸면 루트 `.env`도 함께 갱신되어 재시작 후에도 유지된다.
+- `/api/v1/admin-coin/settings`에서 `CRYPTO_TIMEBOX_HOURS`, `CRYPTO_TRADING_STYLE_MODE`를 바꾸면 루트 `.env`도 함께 갱신되어 재시작 후에도 유지된다.
 - scheduled 자동 코인 사이클은 새 리포트를 만들지 않고 `최신 정산 리포트 기준 refresh_runtime_trading_rules() → CryptoScanner.scan()` 순서로 실행된다.
 - 코인 타임박스 정산은 `30분` 주기 sweep이 담당하며, `entry_at + CRYPTO_TIMEBOX_HOURS`를 넘긴 포지션만 자동 청산한다.
 - 자동 리포트는 `AUTO_SETTLEMENT` source로, 실제 청산 성공 + 계좌 재동기화 이후에만 생성된다.

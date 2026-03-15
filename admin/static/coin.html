@@ -854,12 +854,21 @@
                 aria-label="코인 기능">
             </label>
             <div>
-              <label class="text-sm block mb-1">모드</label>
+              <label class="text-sm block mb-1">주문 모드</label>
               <select id="set-mode" onchange="updateSetting('CRYPTO_AUTONOMY_MODE', this.value)"
                 class="w-full bg-dark-700 border border-[#3d3350] rounded px-2 py-1.5 text-sm text-gray-200">
                 <option value="SEMI_AUTO">SEMI_AUTO</option>
                 <option value="AUTONOMOUS">AUTONOMOUS</option>
               </select>
+            </div>
+            <div>
+              <label class="text-sm block mb-1">매매 성향</label>
+              <select id="set-trading-style" onchange="updateSetting('CRYPTO_TRADING_STYLE_MODE', this.value)"
+                class="w-full bg-dark-700 border border-[#3d3350] rounded px-2 py-1.5 text-sm text-gray-200">
+                <option value="CONSERVATIVE">보수적</option>
+                <option value="AGGRESSIVE">공격적</option>
+              </select>
+              <div class="mt-1 text-[11px] text-gray-500">보수적은 현재 기준 유지, 공격적은 강세장 진입 기준을 완화합니다</div>
             </div>
             <div>
               <label class="text-sm block mb-1">스캔 주기</label>

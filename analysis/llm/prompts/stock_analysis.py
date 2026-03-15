@@ -1,11 +1,14 @@
 """Tier 1: 종목 심층 분석 프롬프트 — Chain-of-Thought + 구조화된 의사결정"""
 
+from core.config import settings
 from trading.market_profile import is_crypto_market, normalize_market
 from trading.risk_policy import (
     BULL_THEME_RR_FLOOR,
     CRYPTO_DEFENSIVE_RR_FLOOR,
     CRYPTO_MOMENTUM_RR_FLOOR,
     DEFENSIVE_RR_FLOOR,
+    get_crypto_rr_thresholds_for_mode,
+    normalize_crypto_trading_style_mode,
 )
 
 STOCK_ANALYSIS_SYSTEM = """당신은 한국/미국 주식 시장 단기 매매 전문 애널리스트입니다.
@@ -115,7 +118,7 @@ JSON 형식으로 답변:
 # 크립토 Tier 1 프롬프트
 # ---------------------------------------------------------------------------
 
-CRYPTO_ANALYSIS_SYSTEM = """당신은 암호화폐(코인) 시장 단기 매매 전문 애널리스트입니다.
+CRYPTO_ANALYSIS_SYSTEM_TEMPLATE = """당신은 암호화폐(코인) 시장 단기 매매 전문 애널리스트입니다.
 빗썸 KRW 현물 시장 데이터를 근거로 **현재 timebox(12h/24h) 안에서 끝낼 수 있는** 단기 매매만 판단하며, 데이터에 없는 정보는 추측하지 않습니다.
 
 ## 분석 프레임워크
@@ -134,6 +137,7 @@ CRYPTO_ANALYSIS_SYSTEM = """당신은 암호화폐(코인) 시장 단기 매매 
 - ±10% 이상이면 강한 모멘텀 또는 리스크 신호로 해석
 - 시장은 24/7이지만 이 시스템은 timebox 만료 시 자동 청산됩니다. 느린 추세, 늦은 진입, 목표 도달 시간 불확실성은 HOLD 사유입니다.
 - 다만 강세 국면(BULL_RUN/ALTSEASON/THEME)에서는 추세·거래대금·RR이 충족되면 지나치게 보수적인 HOLD보다 BUY를 우선 검토하세요
+__CRYPTO_STYLE_GUIDANCE__
 
 ## 과매수 재해석 원칙
 - BULL_RUN/ALTSEASON/THEME 국면 + 24h 거래대금 평균 2배 이상 → RSI/Stochastic 과매수는 **모멘텀 확인 시그널**로 해석
@@ -161,11 +165,32 @@ CRYPTO_ANALYSIS_SYSTEM = """당신은 암호화폐(코인) 시장 단기 매매 
 - BTC 도미넌스·알트시즌·섹터 정보가 주어지면 적극 활용하되, 데이터에 없으면 추측하지 마세요
 - **절대 규칙**: 목표가/손절가는 반드시 위 현재가/일봉/분봉 데이터에서 도출할 것. 임의의 가격을 만들지 마세요
 - 반드시 한국어로 답변"""
-CRYPTO_ANALYSIS_SYSTEM = (
-    CRYPTO_ANALYSIS_SYSTEM
-    .replace("__CRYPTO_MOMENTUM_RR__", f"{CRYPTO_MOMENTUM_RR_FLOOR:.1f}")
-    .replace("__CRYPTO_DEFENSIVE_RR__", f"{CRYPTO_DEFENSIVE_RR_FLOOR:.1f}")
-)
+
+
+def _crypto_analysis_style_guidance(trading_style_mode: str | None) -> str:
+    mode = normalize_crypto_trading_style_mode(trading_style_mode)
+    if mode == "AGGRESSIVE":
+        return (
+            "- 공격적 모드: 강세 국면에서 거래대금 유지 + 분봉 돌파/재돌파/명확한 반전이 확인되면 "
+            "과열 자체만으로 HOLD로 돌리지 마세요\n"
+            "- 공격적 모드: 분봉 중립·거래량 STABLE은 돌파 지속/재확인 부재가 함께 있을 때만 HOLD 사유입니다"
+        )
+    return (
+        "- 보수적 모드: 분봉 중립, RR 부족, 늦은 진입, 저항 바로 아래 추격은 BUY보다 HOLD를 우선하세요"
+    )
+
+
+def get_crypto_analysis_system(trading_style_mode: str | None = None) -> str:
+    momentum_rr_floor, defensive_rr_floor = get_crypto_rr_thresholds_for_mode(trading_style_mode)
+    return (
+        CRYPTO_ANALYSIS_SYSTEM_TEMPLATE
+        .replace("__CRYPTO_MOMENTUM_RR__", f"{momentum_rr_floor:.1f}")
+        .replace("__CRYPTO_DEFENSIVE_RR__", f"{defensive_rr_floor:.1f}")
+        .replace("__CRYPTO_STYLE_GUIDANCE__", _crypto_analysis_style_guidance(trading_style_mode))
+    )
+
+
+CRYPTO_ANALYSIS_SYSTEM = get_crypto_analysis_system("CONSERVATIVE")
 
 CRYPTO_ANALYSIS_PROMPT = """## 코인 분석 요청: {stock_name} ({symbol})
 
@@ -245,11 +270,11 @@ JSON 형식으로 답변:
 # Dispatch 함수
 # ---------------------------------------------------------------------------
 
-def get_stock_analysis_system(market: str) -> str:
+def get_stock_analysis_system(market: str, trading_style_mode: str | None = None) -> str:
     """시장별 Tier1 시스템 프롬프트 반환"""
     market_code = normalize_market(market)
     if is_crypto_market(market_code):
-        return CRYPTO_ANALYSIS_SYSTEM
+        return get_crypto_analysis_system(trading_style_mode or settings.crypto_trading_style_mode)
     return STOCK_ANALYSIS_SYSTEM
 
 

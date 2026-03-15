@@ -1,6 +1,8 @@
 """Tier 1: 시장 스캔 + 종목 선정 프롬프트 — 시장 국면 판단 + 전략 배정 통합"""
 
+from core.config import settings
 from trading.market_profile import is_crypto_market, is_us_market, market_label, normalize_market
+from trading.risk_policy import normalize_crypto_trading_style_mode
 
 MARKET_SCAN_SYSTEM = """당신은 한국 주식 시장(KOSPI/KOSDAQ) 전문 스크리너입니다.
 주어진 시장 데이터만을 분석하여 단기 매매(1~5일) 후보 종목을 선별하고 전략을 배정합니다.
@@ -155,7 +157,7 @@ JSON:
 ```"""
 
 
-CRYPTO_MARKET_SCAN_SYSTEM = """당신은 암호화폐(코인) 시장 전문 스크리너입니다.
+CRYPTO_MARKET_SCAN_SYSTEM_TEMPLATE = """당신은 암호화폐(코인) 시장 전문 스크리너입니다.
 빗썸 거래소의 KRW 현물 데이터를 분석하여 **12h/24h timebox 안에 종료 가능한** 단기 매매 후보 코인을 선별하고 전략을 배정합니다.
 
 ## 분석 프레임워크
@@ -174,6 +176,7 @@ CRYPTO_MARKET_SCAN_SYSTEM = """당신은 암호화폐(코인) 시장 전문 스�
   - BULL_RUN → 대형 + 리더 알트 혼합 / BEAR_MARKET → 대형 코인 위주 또는 0개 허용
   - ALTSEASON/THEME → 주도 알트·섹터 코인 AGGRESSIVE_SHORT 적극 선정
   - 강세 국면(BULL_RUN/ALTSEASON/THEME)에서는 유동성·추세·실행 가능성이 확인된 후보가 있으면 0개보다 1개 이상 선정을 우선하세요
+__CRYPTO_STYLE_GUIDANCE__
 
 **Step 3. 코인 시장 특성 + timebox 반영**
   - 시장은 24/7이지만 이 시스템은 포지션을 timebox 만료 시 자동 청산합니다
@@ -198,10 +201,33 @@ CRYPTO_MARKET_SCAN_SYSTEM = """당신은 암호화폐(코인) 시장 전문 스�
 - 반드시 한국어로 답변
 - **간결하게**: JSON만 출력, 부연 설명 불필요"""
 
+
+def _crypto_market_scan_style_guidance(trading_style_mode: str | None) -> str:
+    mode = normalize_crypto_trading_style_mode(trading_style_mode)
+    if mode == "AGGRESSIVE":
+        return (
+            "  - 공격적 모드: ALTSEASON/THEME/BULL_RUN에서 거래대금 유지 + 재돌파/명확한 반전이 보이면 1~2개는 적극 선정\n"
+            "  - 공격적 모드: 과열 자체만으로 자동 제외하지 말고, timebox 내 종료 논리가 있으면 후보에 남길 것"
+        )
+    return (
+        "  - 보수적 모드: 추격 리스크, RR 부족, 돌파 확인 부족이 겹치면 0개 유지 허용을 우선한다"
+    )
+
+
+def get_crypto_market_scan_system(trading_style_mode: str | None = None) -> str:
+    return CRYPTO_MARKET_SCAN_SYSTEM_TEMPLATE.replace(
+        "__CRYPTO_STYLE_GUIDANCE__",
+        _crypto_market_scan_style_guidance(trading_style_mode),
+    )
+
+
+CRYPTO_MARKET_SCAN_SYSTEM = get_crypto_market_scan_system("CONSERVATIVE")
+
 CRYPTO_MARKET_SCAN_PROMPT = """## 코인 시장 데이터
 
 현재 시각(KST): {current_time} | 시장: 24시간 운영 (세션 종료 없음)
 현재 운영 타임박스: {timebox_hours}시간 (만료 시 자동 청산/정산)
+현재 매매 성향: {trading_style_mode_label} ({trading_style_summary})
 투자 가용 현금: {available_cash:,.0f} KRW | 코인당 최대: {max_per_stock:,.0f} KRW
 실행 계약: 코인 BUY는 수량 중심이 아니라 **KRW 투자금 중심**으로 판단하며, 최소 주문금액은 5,000 KRW
 보유 코인 수: {holding_count}개
@@ -248,11 +274,11 @@ JSON:
 ```"""
 
 
-def get_market_scan_system(primary_market: str) -> str:
+def get_market_scan_system(primary_market: str, trading_style_mode: str | None = None) -> str:
     """시장별 스캔 시스템 프롬프트 반환"""
     market_code = normalize_market(primary_market)
     if is_crypto_market(market_code):
-        return CRYPTO_MARKET_SCAN_SYSTEM
+        return get_crypto_market_scan_system(trading_style_mode or settings.crypto_trading_style_mode)
     if is_us_market(market_code):
         return US_MARKET_SCAN_SYSTEM
     return MARKET_SCAN_SYSTEM

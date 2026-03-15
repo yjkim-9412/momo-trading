@@ -58,6 +58,7 @@ from trading.quantity_policy import (
     has_quantity,
     normalize_quantity,
 )
+from trading.risk_policy import get_crypto_trading_style_profile, resolve_crypto_rr_floor
 
 from agent.trading_agent._types import _ENTRY_MODE_NEW
 
@@ -575,10 +576,17 @@ class AnalysisMixin:
                         **(mkt_state.rr_floor_overrides or {}),
                         **rr_overrides,
                     }
-                    min_rr = risk_manager.resolve_rr_floor(
-                        mkt_state.market_regime,
-                        merged_rr_overrides,
-                    )
+                    if scope == "CRYPTO":
+                        min_rr = resolve_crypto_rr_floor(
+                            mkt_state.market_regime,
+                            settings.crypto_trading_style_mode,
+                            merged_rr_overrides,
+                        )
+                    else:
+                        min_rr = risk_manager.resolve_rr_floor(
+                            mkt_state.market_regime,
+                            merged_rr_overrides,
+                        )
                     if code_rr < min_rr:
                         await activity_logger.log(
                             ActivityType.TRADING_RULE, ActivityPhase.SKIP,
@@ -1227,9 +1235,12 @@ class AnalysisMixin:
         )
 
         if scope == "CRYPTO":
+            trading_style_profile = get_crypto_trading_style_profile(settings.crypto_trading_style_mode)
             context += (
                 f"\n코인 운영: 포지션별 최대 {settings.crypto_timebox_hours}시간 보유 | "
                 f"만료 시 자동 청산·정산 | 스캔 전 자동 리포트 없음"
+                f"\n코인 매매 성향: {trading_style_profile['mode']} "
+                f"({trading_style_profile['label']} | {trading_style_profile['summary']})"
             )
         elif not settings.DAY_TRADING_ONLY:
             context += (
@@ -1417,7 +1428,10 @@ class AnalysisMixin:
         try:
             result_text, provider = await llm_factory.generate_tier1(
                 prompt,
-                system_prompt=get_stock_analysis_system(market_code),
+                system_prompt=get_stock_analysis_system(
+                    market_code,
+                    trading_style_mode=settings.crypto_trading_style_mode if scope == "CRYPTO" else None,
+                ),
                 profile=Tier1Profile.ANALYSIS,
                 scope=scope,
                 phase="cycle",
@@ -1510,7 +1524,10 @@ class AnalysisMixin:
             )
             max_hold_window = f"{max_hold_days}일"
 
-        review_prompt_template = get_final_review_prompt(market_code)
+        review_prompt_template = get_final_review_prompt(
+            market_code,
+            trading_style_mode=settings.crypto_trading_style_mode if scope == "CRYPTO" else None,
+        )
         prompt = review_prompt_template.format(
             tier1_analysis=json.dumps(tier1_prompt_payload, ensure_ascii=False, indent=2),
             stock_name=name,
@@ -1543,7 +1560,10 @@ class AnalysisMixin:
         try:
             result_text, provider = await llm_factory.generate_tier2(
                 prompt,
-                system_prompt=get_final_review_system(market_code),
+                system_prompt=get_final_review_system(
+                    market_code,
+                    trading_style_mode=settings.crypto_trading_style_mode if scope == "CRYPTO" else None,
+                ),
                 scope=scope,
                 phase="cycle",
                 symbol=symbol,
