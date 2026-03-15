@@ -77,6 +77,35 @@ function _removeToast(el) {
   if (el && el.parentNode) el.remove();
 }
 
+function _parseActivityDetail(detail) {
+  if (!detail) return null;
+  if (typeof detail === 'object') return detail;
+  try {
+    return JSON.parse(detail);
+  } catch (e) {
+    return null;
+  }
+}
+
+function _isHoldLikeTier1Summary(summary, summaryUpper) {
+  return summaryUpper.includes('HOLD')
+    || summary.includes('스킵')
+    || summary.includes('관망')
+    || summary.includes('보류')
+    || summary.includes('미승인');
+}
+
+function _buildTier1Signal(symbol, summary, recommendation) {
+  if (recommendation === 'BUY' || recommendation === 'SELL') {
+    return {
+      level: 'HIGH',
+      title: recommendation === 'BUY' ? '\uB9E4\uC218 \uC2E0\uD638' : '\uB9E4\uB3C4 \uC2E0\uD638',
+      body: (symbol || '') + ' \u2014 ' + (summary || ''),
+    };
+  }
+  return { level: 'NONE' };
+}
+
 /**
  * Classify an activity's importance for notification routing.
  * Returns { level: 'CRITICAL'|'HIGH'|'MEDIUM'|'INFO'|'NONE', title?, body? }
@@ -84,29 +113,40 @@ function _removeToast(el) {
 export function classifyImportance(data) {
   var t = data.activity_type;
   var p = data.phase;
-  var s = (data.summary || '').toUpperCase();
+  var summary = data.summary || '';
+  var s = summary.toUpperCase();
+  var detail = _parseActivityDetail(data.detail);
+  var recommendation = detail && typeof detail.recommendation === 'string'
+    ? detail.recommendation.toUpperCase()
+    : '';
 
   if ((t === 'ORDER' || t === 'TRADE_RESULT') && p === 'COMPLETE') {
     return {
       level: 'CRITICAL',
       title: (s.includes('\uB9E4\uB3C4') || s.includes('SELL')) ? '\uB9E4\uB3C4 \uCCB4\uACB0' : '\uB9E4\uC218 \uCCB4\uACB0',
-      body: (data.symbol || '') + ' \u2014 ' + (data.summary || ''),
+      body: (data.symbol || '') + ' \u2014 ' + summary,
     };
   }
 
-  if (t === 'TIER1_ANALYSIS' && p === 'COMPLETE' && (s.includes('BUY') || s.includes('SELL'))) {
-    return {
-      level: 'HIGH',
-      title: s.includes('BUY') ? '\uB9E4\uC218 \uC2E0\uD638' : '\uB9E4\uB3C4 \uC2E0\uD638',
-      body: (data.symbol || '') + ' \u2014 ' + (data.summary || ''),
-    };
+  if (t === 'TIER1_ANALYSIS' && p === 'COMPLETE') {
+    if (recommendation === 'HOLD' || _isHoldLikeTier1Summary(summary, s)) {
+      return { level: 'NONE' };
+    }
+
+    if (recommendation === 'BUY' || recommendation === 'SELL') {
+      return _buildTier1Signal(data.symbol, summary, recommendation);
+    }
+
+    if (s.includes('BUY') || s.includes('SELL')) {
+      return _buildTier1Signal(data.symbol, summary, s.includes('BUY') ? 'BUY' : 'SELL');
+    }
   }
 
   if (t === 'TIER2_REVIEW' && p === 'COMPLETE' && s.includes('\uBBF8\uC2B9\uC778')) {
     return {
       level: 'HIGH',
       title: 'TIER2 \uBBF8\uC2B9\uC778',
-      body: (data.symbol || '') + ' \u2014 ' + (data.summary || ''),
+      body: (data.symbol || '') + ' \u2014 ' + summary,
     };
   }
 
@@ -114,7 +154,7 @@ export function classifyImportance(data) {
     return {
       level: 'HIGH',
       title: '\uC8FC\uBB38 \uC2E4\uD589',
-      body: (data.symbol || '') + ' \u2014 ' + (data.summary || ''),
+      body: (data.symbol || '') + ' \u2014 ' + summary,
     };
   }
 

@@ -154,6 +154,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 빗썸 `ord_type="price"` 시장가 매수의 체결가는 `executed_funds / executed_volume`으로 평균 체결단가를 계산한다. REST/WS payload의 `price`를 체결단가로 그대로 신뢰하지 말 것.
 - 코인 수동 주문 API 에러는 `validation`, `funds`, `auth`, `order_state`, `upstream` 으로 표준화하고, `broker_error_code`/`broker_error_message`를 함께 반환한다.
 - 코인 어드민 중앙 라이브 워크스페이스는 주식 어드민과 동일한 `Agent Monitor → grouped symbol cards → 중요도 기반 toast/브라우저 알림/탭 강조 → SSE reconnect banner` 흐름을 사용한다.
+- 공용 알림 분류기(`admin/static/js/shared/admin-toast.js`)는 코인 `TIER1_ANALYSIS COMPLETE`를 `summary` 키워드가 아니라 `detail.recommendation` 우선으로 해석한다. `HOLD/스킵/관망/보류/미승인` 문구 안에 `BUY/SELL` 단어가 있어도 알림을 띄우지 않게 유지한다.
 - 코인 어드민 상태/중앙 모니터는 `/api/v1/admin-coin/system/status` alias 필드(`trading_enabled`, `autonomy_mode`, `scheduler_running`, `agent_running`, `sse_clients`)와 `/api/v1/admin-coin/agent/state` 파이프라인 스냅샷을 함께 사용한다.
 - 코인 어드민 watchlist는 `/api/v1/admin-coin/watchlist`의 `stream_status`, `is_subscribed`, `thresholds`를 사용해 WS 감시 상태를 렌더링한다.
 - 코인 어드민 시스템 상태는 `/system/status`의 `realtime_monitor_running`, `realtime`, `private_sync`를 함께 사용한다.
