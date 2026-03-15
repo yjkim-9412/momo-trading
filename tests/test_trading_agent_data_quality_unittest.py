@@ -6,6 +6,10 @@ import pandas as pd
 from agent.trading_agent import TradingAgent
 from analysis.chart_analyzer import ChartAnalysisResult
 from analysis.llm.prompts.daily_plan import DAILY_PLAN_PROMPT
+from analysis.llm.prompts.crypto_cycle_review import (
+    CRYPTO_CYCLE_REVIEW_PROMPT,
+    CRYPTO_CYCLE_REVIEW_SYSTEM,
+)
 from analysis.llm.prompts.final_review import (
     CRYPTO_REVIEW_PROMPT,
     CRYPTO_REVIEW_SYSTEM,
@@ -172,6 +176,13 @@ class TradingAgentDataQualityTest(unittest.TestCase):
 
     def test_daily_plan_prompt_limits_action_items_to_top_changes(self):
         self.assertIn("action_items는 가장 중요한 3~5개만 제안하세요", DAILY_PLAN_PROMPT)
+
+    def test_crypto_cycle_review_prompt_targets_next_cycle_feedback(self):
+        self.assertIn("다음 코인 사이클", CRYPTO_CYCLE_REVIEW_SYSTEM)
+        self.assertIn("직전 자동 운영 구간", CRYPTO_CYCLE_REVIEW_PROMPT)
+        self.assertIn("다음 적용 사이클", CRYPTO_CYCLE_REVIEW_PROMPT)
+        self.assertIn('"next_cycle_plan"', CRYPTO_CYCLE_REVIEW_PROMPT)
+        self.assertIn("ALL / BULL_RUN / BEAR_MARKET / CONSOLIDATION / ALTSEASON / THEME", CRYPTO_CYCLE_REVIEW_SYSTEM)
 
     def test_should_skip_tier2_blocks_restricted_products(self):
         self.assertFalse(

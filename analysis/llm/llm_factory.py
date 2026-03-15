@@ -65,6 +65,7 @@ class LLMFactory:
         *,
         scope: str | None = None,
         profile: Tier1Profile | None = None,
+        phase: str = "cycle",
     ) -> LLMProviderProtocol:
         """scope/profile 기준으로 provider 인스턴스 생성"""
         provider_class = self.PROVIDER_CLASSES[provider]
@@ -76,6 +77,7 @@ class LLMFactory:
                 provider,
                 tier,
                 profile,
+                phase,
             ),
         )
 
@@ -128,12 +130,18 @@ class LLMFactory:
         self,
         profile: Tier1Profile,
         scope: str | None = None,
+        phase: str = "cycle",
     ) -> LLMProviderProtocol:
         """Tier1 profile/scope 기준 provider 인스턴스 반환"""
         provider_enum = settings.llm_provider_for_scope(scope)
         provider = self._get_provider(LLMTier.TIER1, scope=scope)
         expected_model = settings.get_llm_model_for_scope(scope, LLMTier.TIER1, profile)
-        expected_effort = settings.get_llm_reasoning_effort_for_scope(scope, LLMTier.TIER1, profile)
+        expected_effort = settings.get_llm_reasoning_effort_for_scope(
+            scope,
+            LLMTier.TIER1,
+            profile,
+            phase,
+        )
         if (
             provider.provider == provider_enum
             and provider.configured_model == expected_model
@@ -145,6 +153,7 @@ class LLMFactory:
             LLMTier.TIER1,
             scope=scope,
             profile=profile,
+            phase=phase,
         )
 
     def _get_session_provider_class(self, scope: str | None = None) -> type[LLMSessionProtocol]:
@@ -308,6 +317,7 @@ class LLMFactory:
             tier,
             scope=scope,
             profile=profile,
+            phase=phase,
         )
         if not await fallback_provider.is_available():
             logger.warning(
@@ -457,7 +467,7 @@ class LLMFactory:
         cycle_id: str | None = None,
     ) -> tuple[str, str]:
         """Tier 1 (빠른 분석용)"""
-        provider = self._get_profiled_tier1_provider(profile, scope=scope)
+        provider = self._get_profiled_tier1_provider(profile, scope=scope, phase=phase)
         return await self._generate_with_provider(
             provider,
             prompt,
@@ -467,11 +477,6 @@ class LLMFactory:
             phase=phase,
             symbol=symbol,
             cycle_id=cycle_id,
-            reasoning_effort_override=settings.get_llm_reasoning_effort_for_scope(
-                scope,
-                LLMTier.TIER1,
-                profile,
-            ),
             profile=profile,
         )
 

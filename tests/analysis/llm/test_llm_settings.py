@@ -149,6 +149,72 @@ def test_crypto_scope_provider_specific_model_and_effort():
     assert codex_effort == "minimal"
 
 
+def test_report_phase_defaults_codex_to_xhigh():
+    settings = Settings(_env_file=None)
+
+    stock_effort = settings.get_llm_reasoning_effort_for_scope_provider(
+        "KRX",
+        LLMProvider.CODEX_CLI,
+        LLMTier.TIER1,
+        Tier1Profile.ANALYSIS,
+        phase="report",
+    )
+    crypto_effort = settings.get_llm_reasoning_effort_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CODEX_CLI,
+        LLMTier.TIER1,
+        Tier1Profile.ANALYSIS,
+        phase="report",
+    )
+
+    assert stock_effort == "xhigh"
+    assert crypto_effort == "xhigh"
+
+
+def test_report_phase_prefers_report_overrides_and_allows_claude_max():
+    settings = Settings(
+        _env_file=None,
+        CLAUDE_CODE_EFFORT_REPORT="high",
+        CRYPTO_CLAUDE_EFFORT_REPORT="MAX",
+        CODEX_REASONING_EFFORT_REPORT="HIGH",
+        CRYPTO_CODEX_REASONING_EFFORT_REPORT="minimal",
+    )
+
+    stock_claude_effort = settings.get_llm_reasoning_effort_for_scope_provider(
+        "KRX",
+        LLMProvider.CLAUDE_CODE,
+        LLMTier.TIER1,
+        Tier1Profile.ANALYSIS,
+        phase="report",
+    )
+    crypto_claude_effort = settings.get_llm_reasoning_effort_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CLAUDE_CODE,
+        LLMTier.TIER1,
+        Tier1Profile.ANALYSIS,
+        phase="report",
+    )
+    stock_codex_effort = settings.get_llm_reasoning_effort_for_scope_provider(
+        "KRX",
+        LLMProvider.CODEX_CLI,
+        LLMTier.TIER1,
+        Tier1Profile.ANALYSIS,
+        phase="report",
+    )
+    crypto_codex_effort = settings.get_llm_reasoning_effort_for_scope_provider(
+        "CRYPTO",
+        LLMProvider.CODEX_CLI,
+        LLMTier.TIER1,
+        Tier1Profile.ANALYSIS,
+        phase="report",
+    )
+
+    assert stock_claude_effort == "high"
+    assert crypto_claude_effort == "max"
+    assert stock_codex_effort == "high"
+    assert crypto_codex_effort == "minimal"
+
+
 def test_validate_on_startup_warns_for_invalid_codex_reasoning_effort(monkeypatch):
     dummy_logger = DummyLogger()
     monkeypatch.setattr(config_module, "logger", dummy_logger)

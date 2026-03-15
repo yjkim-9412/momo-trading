@@ -62,6 +62,70 @@ check_crypto_env() {
     fi
 }
 
+run_bithumb_preflight() {
+    echo "🌐 빗썸 Python DNS/httpx preflight 확인..."
+    if ! python - <<'PY'
+import socket
+import sys
+
+import httpx
+
+
+def preview(text: str, limit: int = 160) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact or "<empty>"
+    return compact[:limit] + "..."
+
+
+errors: list[str] = []
+
+for host in ("api.bithumb.com", "ws-api.bithumb.com"):
+    try:
+        entries = socket.getaddrinfo(host, 443, 0, socket.SOCK_STREAM)
+        sockaddr = entries[0][4] if entries else ()
+        ip = sockaddr[0] if isinstance(sockaddr, tuple) and sockaddr else "-"
+        print(f"   DNS OK   {host} -> {ip}")
+    except Exception as exc:
+        errors.append(f"DNS {host}: {exc}")
+
+timeout = httpx.Timeout(10.0, connect=5.0)
+headers = {"accept": "application/json"}
+probes = (
+    ("market_catalog", "/v1/market/all", {"isDetails": "false"}),
+    ("ticker_probe", "/v1/ticker", {"markets": "KRW-BTC,KRW-ETH"}),
+)
+
+with httpx.Client(base_url="https://api.bithumb.com", timeout=timeout, headers=headers) as client:
+    for label, path, params in probes:
+        try:
+            response = client.get(path, params=params)
+            content_type = response.headers.get("content-type", "") or "-"
+            body_preview = preview(response.text)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"HTTP {response.status_code} | content-type={content_type} | body={body_preview}"
+                )
+            response.json()
+            print(f"   HTTP OK  {label}")
+        except Exception as exc:
+            errors.append(f"HTTP {label}: {exc}")
+
+if errors:
+    print("❌ 빗썸 preflight 실패", file=sys.stderr)
+    for error in errors:
+        print(f"   - {error}", file=sys.stderr)
+    sys.exit(1)
+
+print("✅ 빗썸 preflight 통과")
+PY
+    then
+        echo "❌ Python 런타임에서 빗썸 DNS/httpx 확인 실패"
+        echo "   curl 성공 여부와 무관하게 현재 런타임으로는 코인 리포트/스캔이 안정적으로 동작하지 않습니다."
+        exit 1
+    fi
+}
+
 ensure_runtime_dirs() {
     mkdir -p "$LOG_DIR" "$DATA_DIR"
 }
@@ -188,6 +252,7 @@ case "${1:-}" in
         activate_venv
         check_env
         check_crypto_env
+        run_bithumb_preflight
         check_port
         migrate_db
 
@@ -204,6 +269,7 @@ case "${1:-}" in
         activate_venv
         check_env
         check_crypto_env
+        run_bithumb_preflight
         check_port
         migrate_db
 

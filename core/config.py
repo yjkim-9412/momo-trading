@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from trading.enums import LLMProvider, LLMTier, Tier1Profile
 
 VALID_CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+REPORT_LLM_PHASES = {"report", "after_hours"}
 
 
 class Settings(BaseSettings):
@@ -104,8 +105,10 @@ class Settings(BaseSettings):
     CRYPTO_CLAUDE_EFFORT_TIER1_SCAN: str = ""  # 코인 스캔 effort
     CRYPTO_CLAUDE_EFFORT_TIER1_ANALYSIS: str = ""  # 코인 분석 effort
     CRYPTO_CLAUDE_EFFORT_TIER2: str = ""  # 코인 최종검토 effort
+    CRYPTO_CLAUDE_EFFORT_REPORT: str = ""  # 코인 체크포인트 리포트 effort (예: max)
     # Codex CLI 설정
     CRYPTO_CODEX_MODEL: str = ""  # 코인 전용 Codex 모델, 비어있으면 CODEX_MODEL 사용
+    CRYPTO_CODEX_REASONING_EFFORT_REPORT: str = ""  # 코인 체크포인트 리포트 추론 강도
     CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN: str = ""  # 코인 스캔 추론 강도
     CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS: str = ""  # 코인 분석 추론 강도
     CRYPTO_CODEX_REASONING_EFFORT_TIER2: str = ""  # 코인 최종검토 추론 강도
@@ -117,6 +120,7 @@ class Settings(BaseSettings):
     CLAUDE_CODE_MODEL: str = "sonnet"  # 기본 모델 (Tier별 미지정 시 사용)
     CLAUDE_CODE_MODEL_TIER1: str = "haiku"  # Tier1 (스캔/분석): 빠른 모델
     CLAUDE_CODE_MODEL_TIER2: str = "sonnet"  # Tier2 (최종 검토): 정확한 모델
+    CLAUDE_CODE_EFFORT_REPORT: str = ""  # 리포트/회고 생성 effort (예: max)
     CLAUDE_CODE_PATH: str = ""  # 비어있으면 자동 탐색 (예: /opt/homebrew/bin/claude)
 
     # Codex CLI
@@ -124,6 +128,7 @@ class Settings(BaseSettings):
     CODEX_MODEL_TIER1: str = ""
     CODEX_MODEL_TIER2: str = ""
     CODEX_REASONING_EFFORT: str = ""
+    CODEX_REASONING_EFFORT_REPORT: str = ""  # 리포트/회고 생성 추론 강도
     CODEX_REASONING_EFFORT_TIER1: str = ""
     CODEX_REASONING_EFFORT_TIER1_SCAN: str = ""
     CODEX_REASONING_EFFORT_TIER1_ANALYSIS: str = ""
@@ -470,6 +475,40 @@ class Settings(BaseSettings):
             return normalized
         return self.get_llm_reasoning_effort(provider, tier, profile)
 
+    def get_report_llm_reasoning_effort_for_provider(
+        self,
+        provider: LLMProvider,
+    ) -> str | None:
+        """장마감/회고 리포트 생성용 추론 강도 반환"""
+        if provider == LLMProvider.CLAUDE_CODE:
+            normalized = (self.CLAUDE_CODE_EFFORT_REPORT or "").strip().lower()
+            return normalized if normalized else "high"
+
+        normalized, is_valid = self._parse_codex_reasoning_effort(
+            self.CODEX_REASONING_EFFORT_REPORT
+        )
+        if normalized and is_valid:
+            return normalized
+        return "xhigh"
+
+    def get_crypto_report_llm_reasoning_effort_for_provider(
+        self,
+        provider: LLMProvider,
+    ) -> str | None:
+        """코인 체크포인트 리포트 생성용 추론 강도 반환"""
+        if provider == LLMProvider.CLAUDE_CODE:
+            normalized = (self.CRYPTO_CLAUDE_EFFORT_REPORT or "").strip().lower()
+            if normalized:
+                return normalized
+            return self.get_report_llm_reasoning_effort_for_provider(provider)
+
+        normalized, is_valid = self._parse_codex_reasoning_effort(
+            self.CRYPTO_CODEX_REASONING_EFFORT_REPORT
+        )
+        if normalized and is_valid:
+            return normalized
+        return self.get_report_llm_reasoning_effort_for_provider(provider)
+
     def get_llm_model_for_scope(
         self,
         scope: str | None,
@@ -503,6 +542,7 @@ class Settings(BaseSettings):
         scope: str | None,
         tier: LLMTier,
         profile: Tier1Profile | None = None,
+        phase: str | None = None,
     ) -> str | None:
         """scope 기준 reasoning effort 반환"""
         return self.get_llm_reasoning_effort_for_scope_provider(
@@ -510,6 +550,7 @@ class Settings(BaseSettings):
             self.llm_provider_for_scope(scope),
             tier,
             profile,
+            phase,
         )
 
     def get_llm_reasoning_effort_for_scope_provider(
@@ -518,9 +559,15 @@ class Settings(BaseSettings):
         provider: LLMProvider,
         tier: LLMTier,
         profile: Tier1Profile | None = None,
+        phase: str | None = None,
     ) -> str | None:
         """scope와 provider 기준 reasoning effort 반환"""
         from trading.market_profile import normalize_market_scope
+
+        if self._is_report_phase(phase):
+            if scope and normalize_market_scope(scope) == "CRYPTO":
+                return self.get_crypto_report_llm_reasoning_effort_for_provider(provider)
+            return self.get_report_llm_reasoning_effort_for_provider(provider)
 
         if scope and normalize_market_scope(scope) == "CRYPTO":
             return self.get_crypto_llm_reasoning_effort_for_provider(provider, tier, profile)
@@ -709,14 +756,25 @@ class Settings(BaseSettings):
             return None, True
         return normalized, normalized in VALID_CODEX_REASONING_EFFORTS
 
+    @staticmethod
+    def _is_report_phase(phase: str | None) -> bool:
+        """리포트/회고 생성 phase 여부"""
+        normalized = (phase or "").strip().lower()
+        return normalized in REPORT_LLM_PHASES
+
     def _validate_codex_reasoning_efforts(self) -> None:
         """Codex reasoning effort 설정 유효성 검증"""
         for field_name in (
             "CODEX_REASONING_EFFORT",
+            "CODEX_REASONING_EFFORT_REPORT",
             "CODEX_REASONING_EFFORT_TIER1",
             "CODEX_REASONING_EFFORT_TIER1_SCAN",
             "CODEX_REASONING_EFFORT_TIER1_ANALYSIS",
             "CODEX_REASONING_EFFORT_TIER2",
+            "CRYPTO_CODEX_REASONING_EFFORT_REPORT",
+            "CRYPTO_CODEX_REASONING_EFFORT_TIER1_SCAN",
+            "CRYPTO_CODEX_REASONING_EFFORT_TIER1_ANALYSIS",
+            "CRYPTO_CODEX_REASONING_EFFORT_TIER2",
         ):
             raw_value = getattr(self, field_name)
             normalized, is_valid = self._parse_codex_reasoning_effort(raw_value)

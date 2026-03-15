@@ -16,7 +16,7 @@ from core.database import get_async_db, get_async_db_with_transaction
 from models.coin_activity_log import CoinActivityLog
 from models.coin_broker_order import CoinBrokerOrder
 from models.coin_recommendation import CoinRecommendation
-from repositories.daily_report_repository import DailyReportRepository
+from repositories.coin_daily_report_repository import CoinDailyReportRepository
 from scheduler.market_calendar import market_calendar
 from schemas.coin_order_schema import (
     CoinOrderCancelResponse,
@@ -28,8 +28,12 @@ from schemas.coin_order_schema import (
 )
 from schemas.activity_schema import ActivityFeedCursor, ActivityFeedResponse
 from schemas.common import SuccessResponse
-from schemas.daily_report_schema import DailyReportResponse
+from schemas.coin_daily_report_schema import CoinDailyReportResponse
 from services.activity_logger import activity_logger
+from services.coin_daily_report_service import (
+    CoinReportGenerationError,
+    coin_daily_report_service,
+)
 from services.coin_order_service import CoinOrderService
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
@@ -423,6 +427,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "enabled": bool(settings.CRYPTO_DYNAMIC_DISCOVERY_ENABLED),
         **bithumb_client.get_discovery_cache_status(),
     }
+    connectivity = await bithumb_client.get_connectivity_status()
 
     return SuccessResponse(data={
         "crypto_enabled": settings.CRYPTO_ENABLED,
@@ -448,6 +453,7 @@ async def get_coin_system_status(db: AsyncSession = Depends(get_async_db)):
         "watchlist_symbols": settings.crypto_watchlist_symbols,
         "watchlist_count": len(watchlist),
         "discovery_cache": discovery_cache,
+        "bithumb_connectivity": connectivity,
         "coin_sse_clients": coin_sse_manager.client_count,
         "sse_clients": coin_sse_manager.client_count,
         "app_started_at": APP_STARTED_AT.isoformat(),
@@ -566,7 +572,11 @@ async def trigger_coin_cycle():
     )
 
     async def _run_crypto_cycle():
-        result = await trading_agent.run_cycle(market=crypto_market)
+        result = await trading_agent.run_cycle(
+            market=crypto_market,
+            trigger_source="MANUAL_API",
+            trigger_reason="manual_trigger",
+        )
         if result.get("skipped"):
             logger.info("수동 코인 스캔 스킵: {}", result.get("reason", "skipped"))
             return
@@ -592,23 +602,100 @@ async def trigger_coin_cycle():
 
 
 # ── 리포트 ──
-@router.get("/reports", response_model=SuccessResponse[list[DailyReportResponse]])
+@router.get("/reports", response_model=SuccessResponse[list[CoinDailyReportResponse]])
 async def get_coin_reports(
     limit: int = Query(30, ge=1, le=100),
     db: AsyncSession = Depends(get_async_db),
 ):
-    """코인 일일 리포트 목록"""
-    repo = DailyReportRepository(db)
-    reports = await repo.get_reports(limit, market_scope=MARKET_SCOPE_CRYPTO)
-    return SuccessResponse(data=reports)
+    """코인 체크포인트 리포트 목록"""
+    repo = CoinDailyReportRepository(db)
+    reports = await repo.get_reports(limit)
+    return SuccessResponse(
+        data=[CoinDailyReportResponse.model_validate(report) for report in reports],
+    )
 
 
-@router.get("/reports/latest", response_model=SuccessResponse[DailyReportResponse | None])
+@router.get("/reports/latest", response_model=SuccessResponse[CoinDailyReportResponse | None])
 async def get_latest_coin_report(db: AsyncSession = Depends(get_async_db)):
-    """최신 코인 리포트"""
-    repo = DailyReportRepository(db)
-    report = await repo.get_latest(market_scope=MARKET_SCOPE_CRYPTO)
-    return SuccessResponse(data=report)
+    """최신 코인 체크포인트 리포트"""
+    repo = CoinDailyReportRepository(db)
+    report = await repo.get_latest()
+    return SuccessResponse(
+        data=CoinDailyReportResponse.model_validate(report) if report else None,
+    )
+
+
+@router.get("/reports/{report_id}/activities")
+async def get_coin_report_activities(
+    report_id: str,
+    limit: int = Query(500, ge=1, le=500),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """선택한 코인 리포트 구간의 활동 로그를 반환한다."""
+    repo = CoinDailyReportRepository(db)
+    report = await repo.filter_by_one(id=report_id)
+    if not report:
+        return SuccessResponse(data=[], message="코인 리포트를 찾을 수 없습니다")
+
+    stmt = select(CoinActivityLog)
+    if report.period_started_at and report.period_ended_at:
+        stmt = (
+            stmt.where(CoinActivityLog.created_at >= report.period_started_at)
+            .where(CoinActivityLog.created_at <= report.period_ended_at)
+        )
+    else:
+        stmt = stmt.where(CoinActivityLog.trading_date == report.report_date)
+
+    rows = (
+        await db.execute(
+            stmt.order_by(CoinActivityLog.created_at.desc(), CoinActivityLog.id.desc()).limit(limit)
+        )
+    ).scalars().all()
+    return SuccessResponse(data=[_serialize_activity(row) for row in rows])
+
+
+@router.post("/reports/generate", response_model=SuccessResponse[CoinDailyReportResponse | None])
+async def generate_coin_report():
+    """코인 체크포인트 리포트를 수동 생성하고 즉시 규칙을 반영한다."""
+    from agent.trading_agent import trading_agent
+
+    if not settings.CRYPTO_ENABLED:
+        return SuccessResponse(
+            data=None,
+            message="코인 기능이 비활성화되어 있습니다",
+        )
+
+    runtime = trading_agent.get_runtime(MARKET_SCOPE_CRYPTO)
+    if runtime.cycle_lock.locked():
+        return SuccessResponse(
+            data=None,
+            message="코인 사이클 실행 중이라 수동 리포트를 생성할 수 없습니다",
+        )
+
+    try:
+        report = await coin_daily_report_service.generate_checkpoint_report(
+            market=_crypto_market_code(),
+            report_source="MANUAL",
+            trigger_reason="manual_generate",
+            market_regime=runtime.market_regime,
+            market_context=runtime.market_context,
+            raise_on_error=True,
+        )
+    except CoinReportGenerationError as exc:
+        return SuccessResponse(data=None, message=exc.user_message)
+    except Exception as exc:
+        return SuccessResponse(data=None, message=f"코인 리포트 생성 실패: {str(exc)[:120]}")
+    if not report:
+        return SuccessResponse(data=None, message="코인 리포트 생성 실패")
+
+    await trading_agent.refresh_runtime_trading_rules(
+        market=MARKET_SCOPE_CRYPTO,
+        emit_activity=True,
+    )
+    return SuccessResponse(
+        data=CoinDailyReportResponse.model_validate(report),
+        message="코인 리포트 생성 완료",
+    )
 
 
 # ── 직렬화 헬퍼 ──

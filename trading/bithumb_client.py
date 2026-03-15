@@ -10,12 +10,14 @@ import base64
 import hashlib
 import hmac
 import json
+import socket
 import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 from urllib.parse import urlencode
+from urllib.parse import urlparse
 
 import httpx
 from loguru import logger
@@ -31,6 +33,9 @@ _PRIVATE_RATE_LIMIT_PER_SEC = 5
 _RATE_LIMIT_WINDOW = 1.0  # 초
 _MAX_CANDLE_COUNT = 200  # 빗썸 캔들 API 최대 조회 건수
 _TRADEABLE_SYMBOL_CACHE_TTL = 300.0  # 초
+_CONNECTIVITY_STATUS_TTL = 30.0  # 초
+_TICKER_BATCH_SIZE = 40
+_TICKER_PROBE_MARKETS = ("KRW-BTC", "KRW-ETH")
 
 # 분봉 단위 매핑: 내부 interval(분) → 빗썸 API path unit
 _MINUTE_UNIT_MAP: dict[int, int] = {
@@ -131,6 +136,8 @@ class BithumbClient:
         self._discovery_universe_cached_at_epoch: float | None = None
         self._discovery_universe_last_error: str | None = None
         self._discovery_universe_last_source: str = "empty"
+        self._connectivity_status_cache: dict[str, Any] | None = None
+        self._connectivity_status_cached_at: float | None = None
 
         # Rate limiter: 슬라이딩 윈도우 타임스탬프 + 세마포어
         self._public_timestamps: list[float] = []
@@ -158,6 +165,102 @@ class BithumbClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+    async def _resolve_host_status(self, host: str, port: int = 443) -> dict[str, Any]:
+        try:
+            entries = await asyncio.to_thread(
+                socket.getaddrinfo,
+                host,
+                port,
+                0,
+                socket.SOCK_STREAM,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "host": host,
+                "ip": None,
+                "error": str(exc),
+            }
+
+        ip = None
+        if entries:
+            sockaddr = entries[0][4]
+            if isinstance(sockaddr, tuple) and sockaddr:
+                ip = sockaddr[0]
+
+        return {
+            "ok": True,
+            "host": host,
+            "ip": ip,
+            "error": None,
+        }
+
+    async def get_connectivity_status(self, *, force: bool = False) -> dict[str, Any]:
+        now = time.monotonic()
+        if (
+            not force
+            and self._connectivity_status_cache is not None
+            and self._connectivity_status_cached_at is not None
+            and now - self._connectivity_status_cached_at < _CONNECTIVITY_STATUS_TTL
+        ):
+            return dict(self._connectivity_status_cache)
+
+        api_host = urlparse(self.BASE_URL).hostname or "api.bithumb.com"
+        ws_host = urlparse(settings.BITHUMB_WS_URL_PUBLIC).hostname or "ws-api.bithumb.com"
+
+        api_dns, ws_dns = await asyncio.gather(
+            self._resolve_host_status(api_host),
+            self._resolve_host_status(ws_host),
+        )
+
+        market_catalog_ok = False
+        ticker_probe_ok = False
+        public_api_ok = False
+        last_error = api_dns["error"] or ws_dns["error"]
+        last_error_stage = "dns_resolution" if last_error else None
+        if api_dns["ok"]:
+            market_catalog = await self._public_get("/v1/market/all", params={"isDetails": "false"})
+            market_catalog_ok = bool(market_catalog.success and market_catalog.data is not None)
+            if not market_catalog_ok:
+                last_error = market_catalog.error or "bithumb_market_catalog_unavailable"
+                last_error_stage = "market_catalog"
+            else:
+                ticker_probe = await self._get_ticker_items_by_market_codes(
+                    list(_TICKER_PROBE_MARKETS),
+                    error_stage="ticker_probe",
+                )
+                ticker_probe_ok = bool(
+                    ticker_probe.success
+                    and ticker_probe.data is not None
+                    and ticker_probe.data.get("items")
+                )
+                if not ticker_probe_ok:
+                    last_error = ticker_probe.error or "bithumb_ticker_probe_unavailable"
+                    last_error_stage = (
+                        ticker_probe.data.get("error_stage")
+                        if isinstance(ticker_probe.data, dict)
+                        else "ticker_probe"
+                    )
+            public_api_ok = bool(api_dns["ok"] and market_catalog_ok and ticker_probe_ok)
+
+        status = {
+            "dns_api_ok": bool(api_dns["ok"]),
+            "dns_ws_ok": bool(ws_dns["ok"]),
+            "market_catalog_ok": market_catalog_ok,
+            "ticker_probe_ok": ticker_probe_ok,
+            "public_api_ok": public_api_ok,
+            "api_host": api_host,
+            "ws_host": ws_host,
+            "api_ip": api_dns["ip"],
+            "ws_ip": ws_dns["ip"],
+            "last_error_stage": last_error_stage,
+            "last_error": last_error,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._connectivity_status_cache = status
+        self._connectivity_status_cached_at = now
+        return dict(status)
 
     # ------------------------------------------------------------------
     # JWT 인증
@@ -413,8 +516,11 @@ class BithumbClient:
         """여러 코인의 현재가를 벌크 조회 → {symbol: price} dict"""
         if not symbols:
             return {}
-        market_codes = ",".join(_to_market_code(s) for s in symbols)
-        resp = await self._public_get("/v1/ticker", params={"markets": market_codes})
+        market_codes = [_to_market_code(symbol) for symbol in symbols]
+        resp = await self._get_ticker_items_by_market_codes(
+            market_codes,
+            error_stage="price_batch",
+        )
         if not resp.success or not resp.data:
             return {}
         prices: dict[str, float] = {}
@@ -437,6 +543,82 @@ class BithumbClient:
             seen.add(sym)
             unique.append(sym)
         return unique
+
+    @staticmethod
+    def _chunk_values(values: list[str], chunk_size: int) -> list[list[str]]:
+        if chunk_size <= 0:
+            return [values]
+        return [
+            values[index:index + chunk_size]
+            for index in range(0, len(values), chunk_size)
+        ]
+
+    async def _get_ticker_items_by_market_codes(
+        self,
+        market_codes: list[str],
+        *,
+        error_stage: str,
+    ) -> MCPResponse:
+        unique_market_codes = self._dedupe_symbols(market_codes)
+        if not unique_market_codes:
+            return MCPResponse(success=True, data={"items": [], "count": 0})
+
+        batches = self._chunk_values(unique_market_codes, _TICKER_BATCH_SIZE)
+        all_items: list[dict[str, Any]] = []
+
+        for batch_index, batch in enumerate(batches, start=1):
+            response = await self._public_get(
+                "/v1/ticker",
+                params={"markets": ",".join(batch)},
+            )
+            if not response.success or not response.data:
+                detail: dict[str, Any] = {
+                    "error_stage": error_stage,
+                    "batch_index": batch_index,
+                    "batch_count": len(batches),
+                    "batch_size": len(batch),
+                    "symbol_count": len(unique_market_codes),
+                    "market_sample": batch[:5],
+                }
+                if isinstance(response.data, dict):
+                    for key in ("status_code", "content_type", "body_preview"):
+                        if response.data.get(key) is not None:
+                            detail[key] = response.data[key]
+                return MCPResponse(
+                    success=False,
+                    error=response.error or f"{error_stage}_unavailable",
+                    data=detail,
+                )
+
+            items = [
+                item
+                for item in response.data.get("items", [])
+                if isinstance(item, dict)
+            ]
+            if not items:
+                return MCPResponse(
+                    success=False,
+                    error=f"{error_stage}_empty_batch",
+                    data={
+                        "error_stage": error_stage,
+                        "batch_index": batch_index,
+                        "batch_count": len(batches),
+                        "batch_size": len(batch),
+                        "symbol_count": len(unique_market_codes),
+                        "market_sample": batch[:5],
+                    },
+                )
+            all_items.extend(items)
+
+        return MCPResponse(
+            success=True,
+            data={
+                "items": all_items,
+                "count": len(all_items),
+                "batch_count": len(batches),
+                "batch_size": _TICKER_BATCH_SIZE,
+            },
+        )
 
     def _discovery_universe_ttl_seconds(self) -> float:
         refresh_minutes = max(1, int(settings.CRYPTO_DISCOVERY_REFRESH_MINUTES or 360))
@@ -642,8 +824,10 @@ class BithumbClient:
         if not unique_symbols:
             return MCPResponse(success=True, data={"items": [], "count": 0, "symbols": []})
 
-        market_codes = ",".join(_to_market_code(symbol) for symbol in unique_symbols)
-        resp = await self._public_get("/v1/ticker", params={"markets": market_codes})
+        resp = await self._get_ticker_items_by_market_codes(
+            [_to_market_code(symbol) for symbol in unique_symbols],
+            error_stage="ticker_snapshots",
+        )
         if not resp.success or not resp.data:
             return resp
 
@@ -1044,11 +1228,13 @@ class BithumbClient:
         """전체 시장 종목 요약 — KRW 마켓 전체 ticker 조회.
 
         1) ``GET /v1/market/all`` 로 KRW 마켓 코드 목록 확보
-        2) ``GET /v1/ticker?markets=KRW-BTC,KRW-ETH,...`` 로 일괄 현재가 조회
+        2) ``GET /v1/ticker?markets=...`` 를 40개 단위 batch로 나눠 조회
         """
         # 1단계: 마켓 코드 조회
-        markets_resp = await self._public_get("/v1/market/all")
+        markets_resp = await self._public_get("/v1/market/all", params={"isDetails": "false"})
         if not markets_resp.success or not markets_resp.data:
+            if isinstance(markets_resp.data, dict):
+                markets_resp.data.setdefault("error_stage", "market_catalog")
             return markets_resp
 
         all_markets = markets_resp.data.get("items", [])
@@ -1058,12 +1244,16 @@ class BithumbClient:
             if isinstance(m, dict) and str(m.get("market", "")).startswith("KRW-")
         ]
         if not krw_codes:
-            return MCPResponse(success=False, error="KRW 마켓 코드 없음")
+            return MCPResponse(
+                success=False,
+                error="KRW 마켓 코드 없음",
+                data={"error_stage": "market_catalog"},
+            )
 
-        # 2단계: 전체 ticker 일괄 조회
-        ticker_resp = await self._public_get(
-            "/v1/ticker",
-            params={"markets": ",".join(krw_codes)},
+        # 2단계: 전체 ticker batch 조회
+        ticker_resp = await self._get_ticker_items_by_market_codes(
+            krw_codes,
+            error_stage="ticker_batch",
         )
         if not ticker_resp.success or not ticker_resp.data:
             return ticker_resp

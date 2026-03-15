@@ -50,8 +50,99 @@ class TradingAgentBrokerAvailabilityTest(unittest.IsolatedAsyncioTestCase):
         run_trading_cycle.assert_awaited_once_with(
             "BITHUMB",
             scheduled_budget_remaining=None,
+            trigger_source="SYSTEM",
+            trigger_reason=None,
         )
         self.assertEqual(result, expected)
+
+    async def test_run_cycle_forwards_manual_trigger_context_for_crypto(self):
+        agent = TradingAgent()
+        expected = {"market_scope": "CRYPTO", "scanned": 1}
+
+        with patch.object(settings, "DAY_TRADING_ONLY", False), \
+                patch("agent.trading_agent.market_calendar.is_trading_hours", return_value=True), \
+                patch.object(type(mcp_client), "is_connected", new_callable=PropertyMock, return_value=False), \
+                patch.object(agent, "_run_trading_cycle", AsyncMock(return_value=expected)) as run_trading_cycle:
+            result = await agent.run_cycle(
+                market="BITHUMB",
+                trigger_source="MANUAL_API",
+                trigger_reason="manual_trigger",
+            )
+
+        run_trading_cycle.assert_awaited_once_with(
+            "BITHUMB",
+            scheduled_budget_remaining=None,
+            trigger_source="MANUAL_API",
+            trigger_reason="manual_trigger",
+        )
+        self.assertEqual(result, expected)
+
+    async def test_prepare_crypto_cycle_feedback_generates_report_for_scheduled_auto_only(self):
+        agent = TradingAgent()
+        runtime = agent.get_runtime("CRYPTO")
+
+        with patch(
+            "services.coin_daily_report_service.coin_daily_report_service.generate_checkpoint_report",
+            AsyncMock(),
+        ) as generate_report, patch.object(
+            agent,
+            "refresh_runtime_trading_rules",
+            AsyncMock(),
+        ) as refresh_rules:
+            await agent._prepare_crypto_cycle_feedback(
+                "BITHUMB",
+                runtime,
+                cycle_id="cycle-auto",
+                trigger_source="SCHEDULED_AUTO",
+                trigger_reason="adaptive_rescan",
+            )
+
+        generate_report.assert_awaited_once_with(
+            market="BITHUMB",
+            report_source="AUTO_PRE_CYCLE",
+            trigger_reason="adaptive_rescan",
+            applied_cycle_id="cycle-auto",
+            market_regime="",
+            market_context="",
+        )
+        refresh_rules.assert_awaited_once_with(
+            market="BITHUMB",
+            cycle_id="cycle-auto",
+            emit_activity=True,
+        )
+
+    async def test_prepare_crypto_cycle_feedback_skips_report_for_manual_cycle(self):
+        agent = TradingAgent()
+        runtime = agent.get_runtime("CRYPTO")
+
+        with patch(
+            "services.coin_daily_report_service.coin_daily_report_service.generate_checkpoint_report",
+            AsyncMock(),
+        ) as generate_report, patch.object(
+            agent,
+            "refresh_runtime_trading_rules",
+            AsyncMock(),
+        ) as refresh_rules, patch(
+            "agent.trading_agent._cycle_mixin.activity_logger.log",
+            AsyncMock(),
+        ) as log_activity:
+            await agent._prepare_crypto_cycle_feedback(
+                "BITHUMB",
+                runtime,
+                cycle_id="cycle-manual",
+                trigger_source="MANUAL_API",
+                trigger_reason="manual_trigger",
+            )
+
+        generate_report.assert_not_awaited()
+        refresh_rules.assert_awaited_once_with(
+            market="BITHUMB",
+            cycle_id="cycle-manual",
+            emit_activity=True,
+        )
+        self.assertTrue(
+            any(call.args[:2] == ("REPORT", "SKIP") for call in log_activity.await_args_list)
+        )
 
 
 class TradingAgentCycleFailureHandlingTest(unittest.IsolatedAsyncioTestCase):

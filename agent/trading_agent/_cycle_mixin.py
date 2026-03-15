@@ -98,6 +98,8 @@ class CycleMixin:
         market: str | None = None,
         *,
         scheduled_budget_remaining: int | None = None,
+        trigger_source: str = "SYSTEM",
+        trigger_reason: str | None = None,
     ) -> dict:
         """에이전트 1회 실행 사이클 — 장중이면 매매, 장외면 리뷰"""
         target = normalize_market(market or settings.primary_market_code)
@@ -170,6 +172,8 @@ class CycleMixin:
                     return await self._run_trading_cycle(
                         target,
                         scheduled_budget_remaining=scheduled_budget_remaining,
+                        trigger_source=trigger_source,
+                        trigger_reason=trigger_reason,
                     )
                 review_preview = await self._preview_after_hours_cycle(target, runtime, trading_date)
                 if review_preview.get("skipped"):
@@ -186,6 +190,8 @@ class CycleMixin:
         market: str | None = None,
         *,
         scheduled_budget_remaining: int | None = None,
+        trigger_source: str = "SYSTEM",
+        trigger_reason: str | None = None,
     ) -> dict:
         """장중 사이클: 스캔 → 분석 → 매매"""
         target = normalize_market(market or settings.primary_market_code)
@@ -254,6 +260,16 @@ class CycleMixin:
                 "\U0001f504 장중 매매 사이클 시작",
                 cycle_id=cycle_id,
             )
+
+            if is_crypto_market(target):
+                stage = "prepare_crypto_cycle_feedback"
+                await self._prepare_crypto_cycle_feedback(
+                    target,
+                    state,
+                    cycle_id=cycle_id,
+                    trigger_source=trigger_source,
+                    trigger_reason=trigger_reason,
+                )
 
             state._pipeline_snapshot = {
                 "cycle_id": cycle_id,
@@ -607,6 +623,48 @@ class CycleMixin:
                     state.session_ids["cycle"] = llm_factory.end_session(scope=scope, phase="cycle")
                 except Exception as e:
                     logger.warning("LLM 세션 종료 실패 [{}]: {}", scope, str(e))
+
+    async def _prepare_crypto_cycle_feedback(
+        self,
+        market: str,
+        state,
+        *,
+        cycle_id: str,
+        trigger_source: str,
+        trigger_reason: str | None,
+    ) -> None:
+        """코인 사이클 시작 전에 회고 리포트와 활성 규칙을 준비한다."""
+        from services.coin_daily_report_service import coin_daily_report_service
+
+        if trigger_source == "SCHEDULED_AUTO":
+            report = await coin_daily_report_service.generate_checkpoint_report(
+                market=market,
+                report_source="AUTO_PRE_CYCLE",
+                trigger_reason=trigger_reason,
+                applied_cycle_id=cycle_id,
+                market_regime=state.market_regime,
+                market_context=state.market_context,
+            )
+            if report is None:
+                await activity_logger.log(
+                    ActivityType.REPORT,
+                    ActivityPhase.SKIP,
+                    "📘 [CRYPTO] 자동 코인 사이클은 새 회고 리포트를 건너뛰고 기존 회고/규칙을 유지합니다",
+                    cycle_id=cycle_id,
+                )
+        elif trigger_source == "MANUAL_API":
+            await activity_logger.log(
+                ActivityType.REPORT,
+                ActivityPhase.SKIP,
+                "📘 [CRYPTO] 수동 코인 사이클은 새 회고 리포트를 만들지 않고 기존 회고를 참조합니다",
+                cycle_id=cycle_id,
+            )
+
+        await self.refresh_runtime_trading_rules(
+            market=market,
+            cycle_id=cycle_id,
+            emit_activity=True,
+        )
 
     async def _run_after_hours_cycle(self, market: str | None = None) -> dict:
         """장외 사이클: 오늘 데이트레이딩 성과 리뷰 (피드백 학습용)"""

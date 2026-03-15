@@ -60,6 +60,9 @@ class StateMixin:
             runtime.trading_context = ""
             runtime.market_regime = ""
             runtime.session_ids = {}
+            runtime.active_trading_rules = {}
+            runtime.rr_floor_overrides = {}
+            runtime.strategies = _default_strategies()
             runtime.last_completed_review_date = None
             runtime.last_schedule_hint = {}
             runtime.last_selected_watchlist = []
@@ -67,6 +70,47 @@ class StateMixin:
             runtime.last_cycle_status = None
             runtime.last_cycle_error = None
         return trading_date
+
+    async def refresh_runtime_trading_rules(
+        self,
+        market: str | None = None,
+        *,
+        cycle_id: str | None = None,
+        emit_activity: bool = False,
+    ) -> dict:
+        """현재 runtime에 활성 트레이딩 규칙을 다시 로드해 적용한다."""
+        from analysis.feedback.trading_rules import trading_rule_engine
+
+        scope = normalize_market_scope(market or settings.primary_market_code)
+        runtime = self._get_state(scope)
+        runtime.strategies = _default_strategies()
+
+        active_rules = await trading_rule_engine.load_active_rules(scope)
+        trading_rule_engine.apply_to_strategies(runtime.strategies, active_rules)
+        runtime.active_trading_rules = active_rules
+        runtime.rr_floor_overrides = active_rules.get("rr_floor_overrides", {})
+
+        rules = list(active_rules.get("rules", []) or [])
+        if rules and emit_activity:
+            rule_summary = ", ".join(
+                f"{rule.param_name}={rule.param_value}" for rule in rules[:5]
+            )
+            await activity_logger.log(
+                ActivityType.TRADING_RULE,
+                ActivityPhase.COMPLETE,
+                f"📋 [{scope}] 트레이딩 규칙 {len(rules)}건 적용: {rule_summary}",
+                cycle_id=cycle_id,
+                market_scope=scope,
+            )
+            await trading_rule_engine.record_application(
+                [str(rule.id) for rule in rules],
+                market_scope=scope,
+            )
+
+        expired = await trading_rule_engine.expire_old_rules(scope)
+        if expired:
+            logger.info("[{}] 만료된 트레이딩 규칙 {}건 비활성화", scope, expired)
+        return active_rules
 
     @staticmethod
     def _truncate_error_message(message: str | None, limit: int = 500) -> str | None:

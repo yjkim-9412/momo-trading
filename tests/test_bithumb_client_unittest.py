@@ -112,6 +112,145 @@ async def test_public_get_reports_http_status_and_body_for_non_json_response():
 
 
 @pytest.mark.asyncio
+async def test_get_connectivity_status_reports_dns_and_public_api_health():
+    client = BithumbClient()
+
+    with patch.object(
+        client,
+        "_resolve_host_status",
+        AsyncMock(side_effect=[
+            {"ok": True, "host": "api.bithumb.com", "ip": "203.0.113.10", "error": None},
+            {"ok": False, "host": "ws-api.bithumb.com", "ip": None, "error": "dns failure"},
+        ]),
+    ) as resolve_host, patch.object(
+        client,
+        "_public_get",
+        AsyncMock(return_value=MCPResponse(success=True, data={"items": [{"market": "KRW-BTC"}]})),
+    ) as public_get, patch.object(
+        client,
+        "_get_ticker_items_by_market_codes",
+        AsyncMock(return_value=MCPResponse(success=True, data={"items": [{"market": "KRW-BTC"}]})),
+    ) as ticker_probe:
+        status = await client.get_connectivity_status(force=True)
+
+    assert status["dns_api_ok"] is True
+    assert status["dns_ws_ok"] is False
+    assert status["market_catalog_ok"] is True
+    assert status["ticker_probe_ok"] is True
+    assert status["public_api_ok"] is True
+    assert status["api_ip"] == "203.0.113.10"
+    assert status["ws_ip"] is None
+    assert status["last_error_stage"] == "dns_resolution"
+    assert status["last_error"] == "dns failure"
+    resolve_host.assert_awaited()
+    public_get.assert_awaited_once_with("/v1/market/all", params={"isDetails": "false"})
+    ticker_probe.assert_awaited_once_with(["KRW-BTC", "KRW-ETH"], error_stage="ticker_probe")
+
+
+@pytest.mark.asyncio
+async def test_get_market_overview_batches_ticker_requests_and_preserves_market_names():
+    client = BithumbClient()
+    market_rows = [
+        {
+            "market": f"KRW-COIN{index:02d}",
+            "korean_name": f"코인{index:02d}",
+            "english_name": f"Coin {index:02d}",
+        }
+        for index in range(45)
+    ]
+    first_batch = [
+        {
+            "market": row["market"],
+            "trade_price": 1000 + index,
+            "signed_change_rate": 0.01,
+            "acc_trade_volume_24h": 10 + index,
+            "acc_trade_price_24h": 100_000 + index,
+        }
+        for index, row in enumerate(market_rows[:40])
+    ]
+    second_batch = [
+        {
+            "market": row["market"],
+            "trade_price": 2000 + index,
+            "signed_change_rate": -0.02,
+            "acc_trade_volume_24h": 20 + index,
+            "acc_trade_price_24h": 200_000 + index,
+        }
+        for index, row in enumerate(market_rows[40:])
+    ]
+
+    with patch.object(
+        client,
+        "_public_get",
+        AsyncMock(
+            side_effect=[
+                MCPResponse(success=True, data={"items": market_rows}),
+                MCPResponse(success=True, data={"items": first_batch}),
+                MCPResponse(success=True, data={"items": second_batch}),
+            ]
+        ),
+    ) as public_get:
+        response = await client.get_market_overview("BITHUMB")
+
+    assert response.success is True
+    assert response.data["count"] == 45
+    assert response.data["items"][0]["korean_name"] == "코인00"
+    assert response.data["items"][44]["english_name"] == "Coin 44"
+    assert public_get.await_count == 3
+    assert public_get.await_args_list[0].kwargs == {"params": {"isDetails": "false"}}
+    assert len(public_get.await_args_list[1].kwargs["params"]["markets"].split(",")) == 40
+    assert len(public_get.await_args_list[2].kwargs["params"]["markets"].split(",")) == 5
+
+
+@pytest.mark.asyncio
+async def test_get_market_overview_returns_ticker_batch_error_detail_when_large_request_fails():
+    client = BithumbClient()
+    market_rows = [
+        {
+            "market": f"KRW-COIN{index:02d}",
+            "korean_name": f"코인{index:02d}",
+            "english_name": f"Coin {index:02d}",
+        }
+        for index in range(45)
+    ]
+    first_batch = [
+        {
+            "market": row["market"],
+            "trade_price": 1000 + index,
+            "signed_change_rate": 0.01,
+            "acc_trade_volume_24h": 10 + index,
+            "acc_trade_price_24h": 100_000 + index,
+        }
+        for index, row in enumerate(market_rows[:40])
+    ]
+
+    with patch.object(
+        client,
+        "_public_get",
+        AsyncMock(
+            side_effect=[
+                MCPResponse(success=True, data={"items": market_rows}),
+                MCPResponse(success=True, data={"items": first_batch}),
+                MCPResponse(
+                    success=False,
+                    error="HTTP 414 | content-type=- | body=<empty>",
+                    data={"status_code": 414, "content_type": None, "body_preview": None},
+                ),
+            ]
+        ),
+    ):
+        response = await client.get_market_overview("BITHUMB")
+
+    assert response.success is False
+    assert response.data["error_stage"] == "ticker_batch"
+    assert response.data["batch_index"] == 2
+    assert response.data["batch_count"] == 2
+    assert response.data["batch_size"] == 5
+    assert response.data["symbol_count"] == 45
+    assert "HTTP 414" in (response.error or "")
+
+
+@pytest.mark.asyncio
 async def test_get_volume_rank_reuses_overview_data_without_refetch():
     client = BithumbClient()
     overview = MCPResponse(

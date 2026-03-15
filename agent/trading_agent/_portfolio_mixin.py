@@ -654,9 +654,8 @@ class PortfolioMixin:
 
     async def _get_today_trade_stats(self, market: str | None = None) -> dict:
         """오늘 매매 승/패 집계 (trade_results 테이블)"""
-        from models.trade_result import TradeResult
         from sqlalchemy import select
-        from trading.market_profile import markets_for_scope
+        from trading.market_profile import MARKET_SCOPE_CRYPTO, markets_for_scope
 
         scope = normalize_market_scope(market or settings.primary_market_code)
         trading_date = market_calendar.market_date(market=scope)
@@ -664,14 +663,28 @@ class PortfolioMixin:
         stats = {"wins": 0, "losses": 0, "total": 0}
         try:
             async with AsyncSessionLocal() as session:
-                result = await session.execute(
-                    select(TradeResult.pnl).where(
-                        TradeResult.market.in_(markets_for_scope(scope)),
-                        TradeResult.exit_at.isnot(None),
-                        TradeResult.exit_at >= start,
-                        TradeResult.exit_at <= end,
+                if scope == MARKET_SCOPE_CRYPTO:
+                    from models.coin_trade_result import CoinTradeResult
+
+                    result = await session.execute(
+                        select(CoinTradeResult.pnl).where(
+                            CoinTradeResult.side == "BUY",
+                            CoinTradeResult.exit_at.isnot(None),
+                            CoinTradeResult.exit_at >= start,
+                            CoinTradeResult.exit_at <= end,
+                        )
                     )
-                )
+                else:
+                    from models.trade_result import TradeResult
+
+                    result = await session.execute(
+                        select(TradeResult.pnl).where(
+                            TradeResult.market.in_(markets_for_scope(scope)),
+                            TradeResult.exit_at.isnot(None),
+                            TradeResult.exit_at >= start,
+                            TradeResult.exit_at <= end,
+                        )
+                    )
                 for (pnl,) in result:
                     stats["total"] += 1
                     if pnl >= 0:
@@ -685,26 +698,39 @@ class PortfolioMixin:
     async def _get_today_trade_count(self, market: str | None = None) -> int:
         """당일 체결 건수 조회"""
         try:
-            from models.order import Order
-            from models.stock import Stock
             from sqlalchemy import select, func
-            from trading.market_profile import markets_for_scope
+            from trading.market_profile import MARKET_SCOPE_CRYPTO, markets_for_scope
 
             scope = normalize_market_scope(market or settings.primary_market_code)
             trading_date = market_calendar.market_date(market=scope)
             start, end = market_calendar.market_day_bounds(scope, trading_date)
             async with AsyncSessionLocal() as session:
-                result = await session.execute(
-                    select(func.count(Order.id))
-                    .select_from(Order)
-                    .join(Stock, Stock.id == Order.stock_id)
-                    .where(
-                        Stock.market.in_(markets_for_scope(scope)),
-                        Order.status == "FILLED",
-                        Order.created_at >= start,
-                        Order.created_at <= end,
+                if scope == MARKET_SCOPE_CRYPTO:
+                    from models.coin_broker_order import CoinBrokerOrder
+
+                    result = await session.execute(
+                        select(func.count(CoinBrokerOrder.id)).where(
+                            CoinBrokerOrder.filled_quantity > 0,
+                            CoinBrokerOrder.filled_at.is_not(None),
+                            CoinBrokerOrder.filled_at >= start,
+                            CoinBrokerOrder.filled_at <= end,
+                        )
                     )
-                )
+                else:
+                    from models.order import Order
+                    from models.stock import Stock
+
+                    result = await session.execute(
+                        select(func.count(Order.id))
+                        .select_from(Order)
+                        .join(Stock, Stock.id == Order.stock_id)
+                        .where(
+                            Stock.market.in_(markets_for_scope(scope)),
+                            Order.status == "FILLED",
+                            Order.created_at >= start,
+                            Order.created_at <= end,
+                        )
+                    )
                 return result.scalar() or 0
         except Exception as e:
             logger.warning("당일 체결 건수 조회 실패: {}", str(e))

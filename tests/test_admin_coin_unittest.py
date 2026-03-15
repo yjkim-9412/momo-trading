@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -11,12 +12,14 @@ from api.routes.admin_coin import (
     cancel_coin_order,
     get_coin_order,
     _serialize_recommendation,
+    generate_coin_report,
     get_coin_activity_feed,
     get_coin_overview,
     get_coin_system_status,
     get_coin_watchlist,
     place_coin_order,
     preview_coin_order,
+    trigger_coin_cycle,
 )
 from realtime.coin_monitor import coin_realtime_monitor
 from scheduler.scheduler import trading_scheduler
@@ -28,6 +31,7 @@ from schemas.coin_order_schema import (
     CoinOrderPreviewResponse,
     CoinOrderStatusResponse,
 )
+from services.coin_daily_report_service import CoinReportGenerationError
 from trading.enums import OrderSide, OrderType
 from trading.models import AccountBalance, AccountOverview, HoldingInfo, PendingOrderInfo
 
@@ -49,6 +53,141 @@ class _ExecuteResult:
 
 
 class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
+    async def test_trigger_coin_cycle_runs_manual_api_context(self):
+        preview = {
+            "allowed": True,
+            "mode": "TRADING",
+            "market_scope": "CRYPTO",
+            "trading_date": "2026-03-14",
+        }
+        created_tasks = []
+        original_create_task = asyncio.create_task
+
+        def capture_task(coro):
+            task = original_create_task(coro)
+            created_tasks.append(task)
+            return task
+
+        with patch.object(admin_coin.settings, "CRYPTO_ENABLED", True), \
+                patch.object(trading_agent, "preview_cycle", AsyncMock(return_value=preview)), \
+                patch("api.routes.admin_coin.activity_logger.log", AsyncMock()), \
+                patch.object(
+                    trading_agent,
+                    "run_cycle",
+                    AsyncMock(return_value={"skipped": False}),
+                ) as run_cycle, \
+                patch(
+                    "api.routes.admin_coin.asyncio.create_task",
+                    side_effect=capture_task,
+                ), \
+                patch(
+                    "services.watchlist_sync.reconcile_market_watchlist",
+                    AsyncMock(return_value=["BTC"]),
+                ) as reconcile_watchlist:
+            response = await trigger_coin_cycle()
+            await asyncio.gather(*created_tasks)
+
+        run_cycle.assert_awaited_once_with(
+            market="BITHUMB",
+            trigger_source="MANUAL_API",
+            trigger_reason="manual_trigger",
+        )
+        reconcile_watchlist.assert_awaited_once_with("BITHUMB")
+        self.assertFalse(response.data["skipped"])
+        self.assertEqual(response.data["market"], "BITHUMB")
+        self.assertEqual(response.data["market_scope"], "CRYPTO")
+
+    async def test_generate_coin_report_uses_service_and_refreshes_rules(self):
+        runtime = MarketState(scope="CRYPTO", market_regime="BULL_RUN", market_context="최근 회고 문맥")
+        report_time = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+        report = SimpleNamespace(
+            id="report-1",
+            market_scope="CRYPTO",
+            report_date=report_time.date(),
+            report_source="MANUAL",
+            trigger_reason="manual_generate",
+            applied_cycle_id=None,
+            period_started_at=report_time - timedelta(hours=4),
+            period_ended_at=report_time,
+            total_cycles=2,
+            total_analyses=4,
+            total_recommendations=1,
+            total_orders=1,
+            buy_count=1,
+            sell_count=0,
+            win_count=0,
+            loss_count=0,
+            total_pnl=25000.0,
+            unrealized_pnl=10000.0,
+            open_position_count=1,
+            total_24h_volume=123456789.0,
+            btc_dominance=52.4,
+            market_regime="BULL_RUN",
+            market_summary="시장 요약",
+            performance_review="성과 요약",
+            lessons_learned="학습 포인트",
+            next_day_plan="다음 사이클 계획",
+            top_picks='["BTC"]',
+            strategy_stats="{}",
+            created_at=report_time,
+        )
+
+        with patch.object(admin_coin.settings, "CRYPTO_ENABLED", True), \
+                patch.object(trading_agent, "get_runtime", return_value=runtime), \
+                patch.object(
+                    admin_coin.coin_daily_report_service,
+                    "generate_checkpoint_report",
+                    AsyncMock(return_value=report),
+                ) as generate_report, \
+                patch.object(
+                    trading_agent,
+                    "refresh_runtime_trading_rules",
+                    AsyncMock(),
+                ) as refresh_rules:
+            response = await generate_coin_report()
+
+        generate_report.assert_awaited_once_with(
+            market="BITHUMB",
+            report_source="MANUAL",
+            trigger_reason="manual_generate",
+            market_regime="BULL_RUN",
+            market_context="최근 회고 문맥",
+            raise_on_error=True,
+        )
+        refresh_rules.assert_awaited_once_with(
+            market="CRYPTO",
+            emit_activity=True,
+        )
+        self.assertEqual(response.data.report_source, "MANUAL")
+        self.assertEqual(response.data.market_scope, "CRYPTO")
+        self.assertEqual(response.message, "코인 리포트 생성 완료")
+
+    async def test_generate_coin_report_returns_failure_message_on_market_overview_error(self):
+        runtime = MarketState(scope="CRYPTO", market_regime="BULL_RUN", market_context="최근 회고 문맥")
+
+        with patch.object(admin_coin.settings, "CRYPTO_ENABLED", True), \
+                patch.object(trading_agent, "get_runtime", return_value=runtime), \
+                patch.object(
+                    admin_coin.coin_daily_report_service,
+                    "generate_checkpoint_report",
+                    AsyncMock(
+                        side_effect=CoinReportGenerationError(
+                            "시장 개요 조회 실패",
+                            user_message="시장 개요 조회 실패로 코인 리포트를 생성하지 않았습니다: DNS 해석 실패",
+                        )
+                    ),
+                ), \
+                patch.object(
+                    trading_agent,
+                    "refresh_runtime_trading_rules",
+                    AsyncMock(),
+                ) as refresh_rules:
+            response = await generate_coin_report()
+
+        refresh_rules.assert_not_awaited()
+        self.assertIsNone(response.data)
+        self.assertIn("시장 개요 조회 실패", response.message)
+
     async def test_preview_coin_order_wraps_service_result(self):
         preview = CoinOrderPreviewResponse(
             symbol="BTC",
@@ -243,6 +382,25 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
                     return_value=True,
                 ), \
                 patch(
+                    "trading.bithumb_client.bithumb_client.get_connectivity_status",
+                    AsyncMock(
+                        return_value={
+                            "dns_api_ok": False,
+                            "dns_ws_ok": False,
+                            "market_catalog_ok": False,
+                            "ticker_probe_ok": False,
+                            "public_api_ok": False,
+                            "api_host": "api.bithumb.com",
+                            "ws_host": "ws-api.bithumb.com",
+                            "api_ip": None,
+                            "ws_ip": None,
+                            "last_error_stage": "dns_resolution",
+                            "last_error": "nodename nor servname provided, or not known",
+                            "checked_at": "2026-03-14T00:01:00+00:00",
+                        }
+                    ),
+                ), \
+                patch(
                     "trading.bithumb_client.bithumb_client.get_discovery_cache_status",
                     return_value={
                         "source": "stale_cache",
@@ -258,6 +416,11 @@ class AdminCoinRouteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data["discovery_cache"]["source"], "stale_cache")
         self.assertEqual(response.data["discovery_cache"]["symbol_count"], 30)
         self.assertEqual(response.data["watchlist_count"], 1)
+        self.assertFalse(response.data["bithumb_connectivity"]["dns_api_ok"])
+        self.assertFalse(response.data["bithumb_connectivity"]["market_catalog_ok"])
+        self.assertFalse(response.data["bithumb_connectivity"]["ticker_probe_ok"])
+        self.assertFalse(response.data["bithumb_connectivity"]["public_api_ok"])
+        self.assertEqual(response.data["bithumb_connectivity"]["last_error_stage"], "dns_resolution")
 
     async def test_get_coin_activity_feed_returns_next_cursor_when_more_rows_exist(self):
         resolved_date = date(2026, 3, 14)

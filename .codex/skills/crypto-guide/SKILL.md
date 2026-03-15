@@ -34,7 +34,7 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 | 파일 | 역할 |
 |------|------|
 | `trading/broker_base.py` | BrokerClient / MarketDataProvider / RealtimeProvider Protocol |
-| `trading/bithumb_client.py` | 빗썸 REST 클라이언트 (JWT 인증, rate limiting) |
+| `trading/bithumb_client.py` | 빗썸 REST 클라이언트 (JWT 인증, rate limiting, connectivity 진단, overview batch 조회) |
 | `trading/quantity_policy.py` | 코인/주식 수량 정책 분기 (코인 8자리 소수점, 주식 정수) |
 | `trading/bithumb_websocket.py` | 빗썸 Public/Private WS 런타임 (`ticker`/`trade` + `myOrder`/`myAsset`) |
 | `realtime/coin_stream_manager.py` | 코인 desired/active 구독 상태, admin stream status |
@@ -65,9 +65,10 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 | 파일 | 역할 |
 |------|------|
 | `api/routes/admin_coin.py` | `/admin-coin` 전용 API (`/api/v1/admin-coin/*`, `/system/status`, `/agent/state`, 체크포인트 리포트/구간 활동 로그) |
+| `admin/static/js/coin/` | 코인 어드민 분리 JS 모듈 (`coin-system.js`, `coin-reports.js`, `coin-actions.js` 등) |
 | `schemas/coin_order_schema.py` | 코인 수동 주문 preview/place/get/cancel 요청·응답 스키마 |
 | `schemas/coin_daily_report_schema.py` | 코인 체크포인트 리포트 응답 스키마 |
-| `start-coin.sh` | 코인 전용 실행 (Docker 불필요) |
+| `start-coin.sh` | 코인 전용 실행 + Python DNS/httpx preflight (Docker 불필요) |
 | `.env.example-coin` | 환경변수 예제 |
 | `docs/bithumb-api/websocket/` | 빗썸 WebSocket API 문서 6개 (기본정보, ticker, trade, orderbook, myOrder, myAsset) |
 
@@ -135,9 +136,11 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 코인 스캔은 `CRYPTO_DYNAMIC_DISCOVERY_ENABLED=true`일 때 `get_discovery_universe()`로 저빈도 broad refresh를 수행하고, `CRYPTO_DISCOVERY_UNIVERSE_SIZE` 상위 유동성 코인을 메모리 캐시에 유지한다.
 - broad refresh 기본 주기는 `CRYPTO_DISCOVERY_REFRESH_MINUTES=360`이며, 평소 스캔은 cached universe 심볼과 `CRYPTO_WATCHLIST_SYMBOLS`만 `get_ticker_snapshots()`로 selective 조회한다.
 - live broad refresh가 실패해도 stale discovery cache가 있으면 `DISCOVERY` 후보를 계속 유지하고, cache도 없을 때만 watchlist/보유 코인 현재가 기반 degraded 스캔으로 내려간다.
+- `BithumbClient.get_market_overview()`는 `/v1/market/all`로 KRW 마켓 목록을 가져온 뒤 `/v1/ticker?markets=...`를 40개 단위로 batch 조회한다. 큰 단일 요청으로 되돌리지 말 것. 실패 detail은 `error_stage=ticker_batch|market_catalog`를 남긴다.
 - 코인 후보/선정 결과에는 `scan_source`가 붙는다. 정상 경로는 `DISCOVERY` / `WATCHLIST`, degraded 경로는 `WATCHLIST_FALLBACK` / `HOLDING_FALLBACK`를 사용한다.
 - `BithumbClient.get_current_price()` / overview ticker 정규화에서 공통 `change` 필드는 숫자 변화량으로 맞춘다. 원본 방향 문자열은 `change_direction`, 부호 있는 변화량은 `signed_change_price`로 별도 보존한다.
 - `BithumbClient._public_get()`는 HTTP status, content-type, body preview를 함께 로그에 남긴다. `Expecting value`만 보고 원인을 추측하지 말고 upstream HTML/빈 본문/5xx를 먼저 확인한다.
+- `start-coin.sh`는 서버 기동 전에 venv Python 기준 `socket.getaddrinfo(api.bithumb.com/ws-api.bithumb.com)`와 `httpx` public probe(`/v1/market/all`, `/v1/ticker?markets=KRW-BTC,KRW-ETH`)를 확인한다. `curl`만 성공하고 Python이 실패하는 상태는 정상으로 보지 않는다.
 - 코인 scope에서 `CRYPTO_LLM_PROVIDER=CODEX_CLI`이고 Codex 인증/세션 갱신이 실패하면 `analysis/llm/llm_factory.py`가 `CLAUDE_CODE` fallback을 1회 시도한다.
 - 주문 체결 확인: `POST /v1/orders` 접수 후 `GET /v1/order?uuid=...` 개별 조회로 상태를 추적한다
 - 보유 코인 현재가: `_fetch_coin_prices()` 벌크 ticker 조회. 실패 시 avg_buy_price 폴백
@@ -162,7 +165,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 코인 어드민 최신 리포트 카드에는 `report_source`와 `period_ended_at` 우선 시각을 표시한다.
 - 코인 어드민 좌측 내비게이션은 `실시간 모니터링`, `최신 리포트`, `과거 리포트` 목록으로 나뉘며, 중앙 패널에서 선택한 체크포인트 리포트를 상세 조회한다.
 - 코인 리포트 상세 하단 활동 로그는 `GET /api/v1/admin-coin/reports/{report_id}/activities` 로 조회하고, 선택한 리포트의 `period_started_at ~ period_ended_at` 구간만 반환한다.
-- 코인 시스템 상태 API(`/api/v1/admin-coin/system/status`)는 `bithumb_connectivity`를 포함한다. `dns_api_ok`, `dns_ws_ok`, `public_api_ok`, `last_error`, `checked_at`로 빗썸 연결 상태를 노출한다.
+- 코인 시스템 상태 API(`/api/v1/admin-coin/system/status`)는 `bithumb_connectivity`를 포함한다. `dns_api_ok`, `dns_ws_ok`, `market_catalog_ok`, `ticker_probe_ok`, `public_api_ok`, `last_error_stage`, `last_error`, `checked_at`로 빗썸 연결 상태를 노출한다.
 - 크립토 스캔 결과의 `monitoring` 필드는 `null`을 포함할 수 있으므로 `_apply_scan_thresholds()`에서는 `None`/빈값을 float 캐스팅하지 말고 무시해야 한다.
 - SSE: `coin_sse_manager` 독립 인스턴스 (activity_logger 자동 분기). 코인 admin stream(`/api/v1/admin-coin/stream`)은 `activity`, `agent_state`, `account_changed` 이벤트를 받아 중앙 Agent Monitor 와 좌측 계좌/미체결 패널을 실시간 갱신한다.
 - 코인 어드민 `/api/v1/admin-coin/account/overview` 는 `balance + holdings + pending_orders` 를 함께 반환하며, `balance.locked_krw` 와 `pending_orders[].status/status_detail/submitted_at/updated_at` 를 포함한다.
@@ -175,7 +178,7 @@ Scheduler (4h 고정 cron)
   └─ TradingAgent.run_cycle(market="BITHUMB")
        ├─ _prepare_crypto_cycle_feedback() # scheduled 자동: 회고 생성 + 규칙 즉시 반영 / manual: 기존 회고 참조 + 규칙 재적용
        ├─ CryptoScanner.scan()             # 전체 코인 티커 → AI 선별
-       │    └─ get_market_overview() 1회 조회 → volume/surge 파생 → LLM Tier1 스캔
+       │    └─ get_market_overview() 1회 조회 (KRW 마켓 목록 + 40개 단위 ticker batch) → volume/surge 파생 → LLM Tier1 스캔
        └─ 종목별 분석 (동일 파이프라인)
             ├─ BithumbClient 데이터 수집 (현재가, 일봉, 분봉)
             ├─ ChartAnalyzer (RSI, MACD, BB — 주식과 동일)

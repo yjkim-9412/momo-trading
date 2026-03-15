@@ -727,36 +727,12 @@ class TradingScheduler:
 
         # 4. 활성 트레이딩 규칙 로드 + 적용 (일일 리뷰 피드백 자동 학습)
         try:
-            from analysis.feedback.trading_rules import trading_rule_engine
             from agent.trading_agent import trading_agent
-            from strategy.risk_manager import risk_manager
 
-            active_rules = await trading_rule_engine.load_active_rules(scope)
-            rules = active_rules.get("rules", [])
-
-            if rules:
-                runtime = trading_agent.get_runtime(scope)
-                trading_rule_engine.apply_to_strategies(
-                    runtime.strategies, active_rules,
-                )
-                runtime.active_trading_rules = active_rules
-                runtime.rr_floor_overrides = active_rules.get("rr_floor_overrides", {})
-
-                rule_summary = ", ".join(
-                    f"{r.param_name}={r.param_value}" for r in rules[:5]
-                )
-                await activity_logger.log(
-                    ActivityType.TRADING_RULE, ActivityPhase.COMPLETE,
-                    f"📋 [{market}] 트레이딩 규칙 {len(rules)}건 적용: {rule_summary}",
-                )
-                await trading_rule_engine.record_application(
-                    [r.id for r in rules],
-                    market_scope=scope,
-                )
-
-            expired = await trading_rule_engine.expire_old_rules(scope)
-            if expired:
-                logger.info("[{}] 만료된 트레이딩 규칙 {}건 비활성화", market, expired)
+            await trading_agent.refresh_runtime_trading_rules(
+                market=scope,
+                emit_activity=True,
+            )
         except Exception as e:
             logger.warning("[{}] 트레이딩 규칙 로드 실패: {}", market, str(e))
 
@@ -815,6 +791,8 @@ class TradingScheduler:
             result = await trading_agent.run_cycle(
                 market=market,
                 scheduled_budget_remaining=scheduled_budget_remaining,
+                trigger_source="SCHEDULED_AUTO",
+                trigger_reason=trigger_reason,
             )
             if result.get("skipped"):
                 reason = result.get("reason", "skipped")

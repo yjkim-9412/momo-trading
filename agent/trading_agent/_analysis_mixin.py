@@ -1232,7 +1232,39 @@ class AnalysisMixin:
                 f"AGGRESSIVE {settings.MAX_HOLD_DAYS_AGGRESSIVE}일)"
             )
 
+        if scope == "CRYPTO":
+            review_reference = await self._load_coin_review_reference()
+            if review_reference:
+                context += f"\n최근 회고 참고:\n{review_reference}"
+
         return context
+
+    async def _load_coin_review_reference(self) -> str:
+        """최신 코인 회고 리포트를 프롬프트용 짧은 문장으로 정리한다."""
+        from repositories.coin_daily_report_repository import CoinDailyReportRepository
+        from util.time_util import ensure_kst
+
+        try:
+            async with AsyncSessionLocal() as session:
+                repo = CoinDailyReportRepository(session)
+                report = await repo.get_latest()
+        except Exception as e:
+            logger.debug("코인 회고 리포트 참조 로드 실패: {}", str(e))
+            return ""
+
+        if not report:
+            return ""
+
+        source_label = "자동 회고" if report.report_source == "AUTO_PRE_CYCLE" else "수동 생성"
+        ended_at = ensure_kst(report.period_ended_at or report.created_at)
+        lines = [f"- 기준 시각: {ended_at.strftime('%m/%d %H:%M')} KST ({source_label})"]
+        if report.market_summary:
+            lines.append(f"- 시장 요약: {str(report.market_summary)[:180]}")
+        if report.lessons_learned:
+            lines.append(f"- 학습 포인트: {str(report.lessons_learned)[:180]}")
+        if report.next_day_plan:
+            lines.append(f"- 다음 사이클 계획: {str(report.next_day_plan)[:180]}")
+        return "\n".join(lines)
 
     # ── 임계값 적용 ──
 

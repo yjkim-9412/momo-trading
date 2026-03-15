@@ -157,6 +157,24 @@ async def test_generate_routes_to_selected_provider(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_generate_report_uses_report_specific_effort(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
+    monkeypatch.setattr(settings, "CRYPTO_LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
+    monkeypatch.setitem(llm_factory.PROVIDER_CLASSES, LLMProvider.CODEX_CLI, DummyCodexProvider)
+
+    result, provider = await llm_factory.generate_tier1(
+        "PROMPT",
+        system_prompt="SYSTEM",
+        profile=Tier1Profile.ANALYSIS,
+        scope="CRYPTO",
+        phase="report",
+    )
+
+    assert result == "CODEX_CLI:gpt-5.4:CRYPTO:report:no-session:xhigh|SYSTEM|PROMPT"
+    assert provider == LLMProvider.CODEX_CLI.value
+
+
+@pytest.mark.asyncio
 async def test_get_llm_status_uses_selected_provider(monkeypatch):
     monkeypatch.setattr(settings, "LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
     monkeypatch.setitem(llm_factory.PROVIDER_CLASSES, LLMProvider.CODEX_CLI, DummyCodexProvider)
@@ -279,6 +297,31 @@ async def test_crypto_codex_auth_failure_falls_back_to_claude(monkeypatch):
     assert provider == LLMProvider.CLAUDE_CODE.value
     assert result.startswith("CLAUDE_CODE:claude-crypto-scan:CRYPTO:cycle:")
     assert any("fallback" in call.args[2] for call in log_activity.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_crypto_report_codex_auth_failure_falls_back_to_claude_with_report_effort(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
+    monkeypatch.setattr(settings, "CRYPTO_LLM_PROVIDER", LLMProvider.CODEX_CLI.value)
+    monkeypatch.setattr(settings, "CRYPTO_CODEX_MODEL", "codex-crypto")
+    monkeypatch.setattr(settings, "CRYPTO_CLAUDE_EFFORT_REPORT", "max")
+    monkeypatch.setitem(llm_factory.PROVIDER_CLASSES, LLMProvider.CODEX_CLI, FailingCodexProvider)
+    monkeypatch.setitem(llm_factory.PROVIDER_CLASSES, LLMProvider.CLAUDE_CODE, DummyClaudeProvider)
+
+    with patch("services.activity_logger.activity_logger.log", AsyncMock()):
+        result, provider = await llm_factory.generate_tier1(
+            "PROMPT",
+            system_prompt="SYSTEM",
+            profile=Tier1Profile.ANALYSIS,
+            scope="CRYPTO",
+            phase="report",
+            cycle_id="cycle-report-1",
+        )
+
+    assert provider == LLMProvider.CLAUDE_CODE.value
+    assert result.startswith("CLAUDE_CODE:")
+    assert ":CRYPTO:report:" in result
+    assert ":max|SYSTEM|PROMPT" in result
 
 
 @pytest.mark.asyncio
