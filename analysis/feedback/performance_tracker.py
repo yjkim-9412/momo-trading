@@ -6,6 +6,7 @@ from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.trade_result import TradeResult
+from trading.market_profile import markets_for_scope
 
 
 @dataclass
@@ -32,7 +33,18 @@ class PerformanceTracker:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get_strategy_stats(self, strategy_type: str, limit: int = 100) -> PerformanceStat:
+    @staticmethod
+    def _apply_market_scope(stmt, market_scope: str | None):
+        if not market_scope:
+            return stmt
+        return stmt.where(TradeResult.market.in_(markets_for_scope(market_scope)))
+
+    async def get_strategy_stats(
+        self,
+        strategy_type: str,
+        limit: int = 100,
+        market_scope: str | None = None,
+    ) -> PerformanceStat:
         """전략별 성과 통계"""
         stmt = (
             select(TradeResult)
@@ -40,11 +52,17 @@ class PerformanceTracker:
             .order_by(TradeResult.created_at.desc())
             .limit(limit)
         )
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         trades = result.scalars().all()
         return self._calc_stat(trades)
 
-    async def get_symbol_stats(self, symbol: str, limit: int = 50) -> PerformanceStat:
+    async def get_symbol_stats(
+        self,
+        symbol: str,
+        limit: int = 50,
+        market_scope: str | None = None,
+    ) -> PerformanceStat:
         """종목별 성과 통계"""
         stmt = (
             select(TradeResult)
@@ -52,11 +70,17 @@ class PerformanceTracker:
             .order_by(TradeResult.created_at.desc())
             .limit(limit)
         )
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         trades = result.scalars().all()
         return self._calc_stat(trades)
 
-    async def get_pattern_stats(self, pattern: str, limit: int = 50) -> PerformanceStat:
+    async def get_pattern_stats(
+        self,
+        pattern: str,
+        limit: int = 50,
+        market_scope: str | None = None,
+    ) -> PerformanceStat:
         """차트 패턴별 성과 통계 (예: GOLDEN_CROSS, HAMMER 등)"""
         stmt = (
             select(TradeResult)
@@ -64,11 +88,17 @@ class PerformanceTracker:
             .order_by(TradeResult.created_at.desc())
             .limit(limit)
         )
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         trades = result.scalars().all()
         return self._calc_stat(trades)
 
-    async def get_rsi_range_stats(self, rsi_low: float, rsi_high: float) -> PerformanceStat:
+    async def get_rsi_range_stats(
+        self,
+        rsi_low: float,
+        rsi_high: float,
+        market_scope: str | None = None,
+    ) -> PerformanceStat:
         """특정 RSI 구간 진입 시 성과"""
         stmt = (
             select(TradeResult)
@@ -82,11 +112,16 @@ class PerformanceTracker:
             .order_by(TradeResult.created_at.desc())
             .limit(100)
         )
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         trades = result.scalars().all()
         return self._calc_stat(trades)
 
-    async def get_market_regime_stats(self, regime: str) -> PerformanceStat:
+    async def get_market_regime_stats(
+        self,
+        regime: str,
+        market_scope: str | None = None,
+    ) -> PerformanceStat:
         """시장 국면별 성과 (상승장/하락장/횡보장)"""
         stmt = (
             select(TradeResult)
@@ -94,11 +129,16 @@ class PerformanceTracker:
             .order_by(TradeResult.created_at.desc())
             .limit(100)
         )
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         trades = result.scalars().all()
         return self._calc_stat(trades)
 
-    async def get_recent_losses(self, limit: int = 10) -> list[TradeResult]:
+    async def get_recent_losses(
+        self,
+        limit: int = 10,
+        market_scope: str | None = None,
+    ) -> list[TradeResult]:
         """최근 손실 거래 목록 (AI에게 실패 사례로 제공)"""
         stmt = (
             select(TradeResult)
@@ -106,10 +146,15 @@ class PerformanceTracker:
             .order_by(TradeResult.created_at.desc())
             .limit(limit)
         )
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_recent_wins(self, limit: int = 5) -> list[TradeResult]:
+    async def get_recent_wins(
+        self,
+        limit: int = 5,
+        market_scope: str | None = None,
+    ) -> list[TradeResult]:
         """최근 성공 거래 목록 (AI에게 성공 패턴으로 제공)"""
         stmt = (
             select(TradeResult)
@@ -117,16 +162,18 @@ class PerformanceTracker:
             .order_by(TradeResult.created_at.desc())
             .limit(limit)
         )
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_consecutive_losses(self) -> int:
+    async def get_consecutive_losses(self, market_scope: str | None = None) -> int:
         """최근 연속 손실 횟수"""
         stmt = (
             select(TradeResult)
             .order_by(TradeResult.created_at.desc())
             .limit(20)
         )
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         trades = list(result.scalars().all())
         count = 0
@@ -137,9 +184,10 @@ class PerformanceTracker:
                 break
         return count
 
-    async def get_overall_stats(self) -> dict:
+    async def get_overall_stats(self, market_scope: str | None = None) -> dict:
         """전체 요약 통계"""
         stmt = select(TradeResult).order_by(TradeResult.created_at.desc()).limit(200)
+        stmt = self._apply_market_scope(stmt, market_scope)
         result = await self.session.execute(stmt)
         trades = list(result.scalars().all())
 

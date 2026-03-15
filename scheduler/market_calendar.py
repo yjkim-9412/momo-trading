@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 try:
@@ -9,7 +9,13 @@ except ImportError:  # pragma: no cover - 의존성 미설치 로컬 폴백
     holidays = None
 
 from core.config import settings
-from trading.market_profile import is_domestic_market, is_us_market, normalize_market
+from trading.market_profile import (
+    is_crypto_market,
+    is_domestic_market,
+    is_us_market,
+    normalize_market,
+    normalize_market_scope,
+)
 from util.time_util import KST, now_kst
 
 _KR_HOLIDAYS = holidays.KR(years=range(2024, 2031)) if holidays else set()
@@ -26,6 +32,7 @@ class MarketCalendar:
 
     KRX_OPEN = time(9, 0)
     KRX_CLOSE = time(15, 30)
+    KRX_REVIEW_OPEN = time(15, 40)
 
     NXT_PRE_OPEN = time(8, 0)
     NXT_PRE_CLOSE = time(8, 50)
@@ -36,6 +43,7 @@ class MarketCalendar:
     US_REGULAR_OPEN = time(9, 30)
     US_REGULAR_CLOSE = time(16, 0)
     US_AFTER_CLOSE = time(20, 0)
+    US_REVIEW_OPEN = time(16, 10)
 
     @staticmethod
     def _to_kst(dt: datetime | None = None) -> datetime:
@@ -54,8 +62,11 @@ class MarketCalendar:
 
     @staticmethod
     def is_holiday(market: str | None = None, dt: datetime | None = None) -> bool:
-        """시장 휴장일 여부"""
+        """시장 휴장일 여부 (크립토는 항상 False)"""
         market_code = normalize_market(market or settings.primary_market_code)
+        if is_crypto_market(market_code):
+            return False
+
         current = MarketCalendar._to_kst(dt)
 
         if is_domestic_market(market_code):
@@ -143,8 +154,10 @@ class MarketCalendar:
 
     @staticmethod
     def is_trading_hours(market: str | None = None, dt: datetime | None = None) -> bool:
-        """시장별 거래 가능 여부"""
+        """시장별 거래 가능 여부 (크립토는 항상 True)"""
         market_code = normalize_market(market or settings.primary_market_code)
+        if is_crypto_market(market_code):
+            return True
         if is_domestic_market(market_code):
             return MarketCalendar.is_domestic_trading_hours(dt)
         if is_us_market(market_code):
@@ -155,6 +168,9 @@ class MarketCalendar:
     def get_market_session(dt: datetime | None = None, market: str | None = None) -> str:
         """현재 시장 세션 반환"""
         market_code = normalize_market(market or settings.primary_market_code)
+        if is_crypto_market(market_code):
+            return "CRYPTO_ACTIVE"
+
         current = MarketCalendar._to_kst(dt)
 
         if is_domestic_market(market_code):
@@ -203,14 +219,49 @@ class MarketCalendar:
     @staticmethod
     def market_date(dt: datetime | None = None, market: str | None = None):
         """시장 현지 기준 날짜"""
-        market_code = normalize_market(market or settings.primary_market_code)
+        market_code = normalize_market_scope(market or settings.primary_market_code)
+        if is_crypto_market(market_code):
+            return MarketCalendar._to_kst(dt).date()
         if is_us_market(market_code):
             return MarketCalendar._to_new_york(dt).date()
         return MarketCalendar._to_kst(dt).date()
 
     @staticmethod
+    def market_day_bounds(
+        market: str | None = None,
+        trading_date: date | None = None,
+    ) -> tuple[datetime, datetime]:
+        """시장 거래일의 KST 기준 시작/종료 시각 반환"""
+        scope = normalize_market_scope(market or settings.primary_market_code)
+        local_date = trading_date or MarketCalendar.market_date(market=scope)
+        tz = _NY_TZ if is_us_market(scope) else KST
+        start_local = datetime.combine(local_date, time.min, tzinfo=tz)
+        end_local = datetime.combine(local_date, time.max, tzinfo=tz)
+        start_kst = start_local.astimezone(KST).replace(tzinfo=None)
+        end_kst = end_local.astimezone(KST).replace(tzinfo=None)
+        return start_kst, end_kst
+
+    @staticmethod
+    def is_post_market_review_time(market: str | None = None, dt: datetime | None = None) -> bool:
+        """시장별 장마감 리뷰 허용 시각 여부 (크립토는 고정 시각 00:00 KST)"""
+        market_code = normalize_market(market or settings.primary_market_code)
+
+        if is_crypto_market(market_code):
+            return MarketCalendar._to_kst(dt).time() >= time(0, 0) and MarketCalendar._to_kst(dt).time() < time(0, 30)
+
+        if not MarketCalendar.is_trading_day(market_code, dt):
+            return False
+
+        if is_us_market(market_code):
+            return MarketCalendar._to_new_york(dt).time() >= MarketCalendar.US_REVIEW_OPEN
+
+        return MarketCalendar._to_kst(dt).time() >= MarketCalendar.KRX_REVIEW_OPEN
+
+    @staticmethod
     def is_any_market_open(dt: datetime | None = None) -> bool:
-        """국내 또는 미국장 개장 여부"""
+        """국내·미국장·크립토 개장 여부"""
+        if settings.CRYPTO_ENABLED:
+            return True
         return (
             MarketCalendar.is_domestic_trading_hours(dt)
             or MarketCalendar.is_us_trading_hours(dt)
@@ -245,8 +296,10 @@ class MarketCalendar:
 
     @staticmethod
     def next_market_open(dt: datetime | None = None, market: str | None = None) -> datetime:
-        """시장별 다음 개장 시각"""
+        """시장별 다음 개장 시각 (크립토는 항상 현재)"""
         market_code = normalize_market(market or settings.primary_market_code)
+        if is_crypto_market(market_code):
+            return MarketCalendar._to_kst(dt)
         if is_domestic_market(market_code):
             current = MarketCalendar._to_kst(dt)
             if current.time() < MarketCalendar.NXT_PRE_OPEN and MarketCalendar.is_krx_trading_day(current):
@@ -260,9 +313,78 @@ class MarketCalendar:
         return MarketCalendar.next_krx_open(dt)
 
     @staticmethod
-    def get_holiday_name(dt: datetime | None = None, market: str | None = None) -> str | None:
-        """공휴일이면 휴일명 반환"""
+    def get_session_schedule(market: str | None = None, dt: datetime | None = None) -> dict:
+        """시장별 세션 스케줄 정보 반환 (현지 시간 + KST 변환)"""
         market_code = normalize_market(market or settings.primary_market_code)
+        current_session = MarketCalendar.get_market_session(dt=dt, market=market_code)
+
+        if is_crypto_market(market_code):
+            return {
+                "current_session": current_session,
+                "sessions": [
+                    {"key": "CRYPTO_ACTIVE", "label": "24/7 운영", "open": "00:00", "close": "24:00", "tz": "KST"},
+                ],
+                "tz_label": "KST",
+                "dst_active": False,
+            }
+
+        if is_domestic_market(market_code):
+            sessions = [
+                {"key": "NXT_PRE", "label": "NXT 프리", "open": "08:00", "close": "08:50", "tz": "KST"},
+                {"key": "KRX_NXT", "label": "정규장", "open": "09:00", "close": "15:20", "tz": "KST"},
+                {"key": "KRX_CLOSE", "label": "동시호가", "open": "15:20", "close": "15:30", "tz": "KST"},
+                {"key": "NXT_AFTER", "label": "NXT 애프터", "open": "15:30", "close": "20:00", "tz": "KST"},
+            ]
+            return {
+                "current_session": current_session,
+                "sessions": sessions,
+                "tz_label": "KST",
+                "dst_active": False,
+            }
+
+        # US market — ET 기준, DST 반영
+        ny_now = MarketCalendar._to_new_york(dt)
+        dst_active = bool(ny_now.dst())
+        tz_label = "EDT" if dst_active else "EST"
+        kst_offset = 13 if dst_active else 14  # ET → KST 시차
+
+        def _to_kst_str(hh: int, mm: int) -> str:
+            total = (hh + kst_offset) * 60 + mm
+            kh, km = divmod(total % 1440, 60)
+            return f"{kh:02d}:{km:02d}"
+
+        include_pre, include_after = MarketCalendar._us_session_flags()
+        sessions = []
+        if include_pre:
+            sessions.append({
+                "key": "US_PRE", "label": "프리마켓",
+                "open": "04:00", "close": "09:30", "tz": tz_label,
+                "open_kst": _to_kst_str(4, 0), "close_kst": _to_kst_str(9, 30),
+            })
+        sessions.append({
+            "key": "US_REGULAR", "label": "정규장",
+            "open": "09:30", "close": "16:00", "tz": tz_label,
+            "open_kst": _to_kst_str(9, 30), "close_kst": _to_kst_str(16, 0),
+        })
+        if include_after:
+            sessions.append({
+                "key": "US_AFTER", "label": "애프터마켓",
+                "open": "16:00", "close": "20:00", "tz": tz_label,
+                "open_kst": _to_kst_str(16, 0), "close_kst": _to_kst_str(20, 0),
+            })
+        return {
+            "current_session": current_session,
+            "sessions": sessions,
+            "tz_label": tz_label,
+            "dst_active": dst_active,
+        }
+
+    @staticmethod
+    def get_holiday_name(dt: datetime | None = None, market: str | None = None) -> str | None:
+        """공휴일이면 휴일명 반환 (크립토는 항상 None)"""
+        market_code = normalize_market(market or settings.primary_market_code)
+        if is_crypto_market(market_code):
+            return None
         current = MarketCalendar._to_kst(dt)
         if is_domestic_market(market_code):
             return _KR_HOLIDAYS.get(current.date())

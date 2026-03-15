@@ -6,7 +6,7 @@ from loguru import logger
 from analysis.llm.llm_factory import llm_factory
 from analysis.llm.prompts.market_scan import STOCK_SCREENING_PROMPT
 from services.activity_logger import activity_logger
-from trading.enums import ActivityPhase, ActivityType
+from trading.enums import ActivityPhase, ActivityType, Tier1Profile
 
 
 class StockScreener:
@@ -44,7 +44,10 @@ class StockScreener:
         )
 
         try:
-            result_text, provider = await llm_factory.generate_tier1(prompt)
+            result_text, provider = await llm_factory.generate_tier1(
+                prompt,
+                profile=Tier1Profile.SCAN,
+            )
             parsed = self._parse_json_response(result_text)
             selected = parsed.get("selected", [])
             elapsed = activity_logger.elapsed_ms(timer)

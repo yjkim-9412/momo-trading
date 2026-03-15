@@ -15,8 +15,8 @@ from core.database import AsyncSessionLocal
 from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
-from trading.enums import ActivityPhase, ActivityType
-from trading.market_profile import is_us_market, normalize_market
+from trading.enums import ActivityPhase, ActivityType, Tier1Profile
+from trading.market_profile import is_us_market, market_scope, normalize_market
 from trading.mcp_client import mcp_client
 from trading.product_policy import (
     classify_product,
@@ -117,7 +117,29 @@ class MarketScanner:
             )
         return filtered
 
-    async def scan(self, market: str | None = None, cycle_id: str | None = None, dynamic_limits: dict | None = None) -> dict:
+    @staticmethod
+    def _selection_target_range(
+        market: str,
+        session: str,
+        minutes_until_cutoff: int,
+    ) -> str:
+        market_code = normalize_market(market)
+        session_code = str(session or "").upper()
+        if is_us_market(market_code) and session_code == "US_PRE":
+            return "3~6"
+        if minutes_until_cutoff <= 30:
+            return "0~3"
+        if minutes_until_cutoff <= 90:
+            return "3~5"
+        return "5~8"
+
+    async def scan(
+        self,
+        market: str | None = None,
+        cycle_id: str | None = None,
+        dynamic_limits: dict | None = None,
+        account_snapshot: tuple | None = None,
+    ) -> dict:
         """시장 스캔 + 종목 선별 통합 실행"""
         target = normalize_market(market or settings.primary_market_code)
         primary_market = target
@@ -135,19 +157,32 @@ class MarketScanner:
         )
 
         scan_markets = settings.scan_markets_for(target)
-        (
-            account_snapshot,
-            volume_rank,
-            surge_data,
-            drop_data,
-            performance_summary,
-        ) = await asyncio.gather(
-            account_manager.get_account_snapshot(target),
-            self._get_volume_rank(scan_markets),
-            self._get_fluctuation_rank(scan_markets, "top"),
-            self._get_fluctuation_rank(scan_markets, "bottom"),
-            self._get_performance_summary(),
-        )
+        if account_snapshot is None:
+            (
+                account_snapshot,
+                volume_rank,
+                surge_data,
+                drop_data,
+                performance_summary,
+            ) = await asyncio.gather(
+                account_manager.get_account_snapshot(target),
+                self._get_volume_rank(scan_markets),
+                self._get_fluctuation_rank(scan_markets, "top"),
+                self._get_fluctuation_rank(scan_markets, "bottom"),
+                self._get_performance_summary(target),
+            )
+        else:
+            (
+                volume_rank,
+                surge_data,
+                drop_data,
+                performance_summary,
+            ) = await asyncio.gather(
+                self._get_volume_rank(scan_markets),
+                self._get_fluctuation_rank(scan_markets, "top"),
+                self._get_fluctuation_rank(scan_markets, "bottom"),
+                self._get_performance_summary(target),
+            )
         balance, holdings = account_snapshot
         available_cash = balance.effective_cash
         max_pos_pct = 0.2
@@ -172,11 +207,20 @@ class MarketScanner:
             second=0, microsecond=0,
         )
         minutes_until_cutoff = max(0, int((cutoff_time - now).total_seconds() / 60))
+        session = market_calendar.get_market_session(dt=now, market=target)
+        selection_target_range = self._selection_target_range(
+            target,
+            session,
+            minutes_until_cutoff,
+        )
 
         prompt = get_market_scan_prompt(primary_market).format(
             market_label=get_market_label(primary_market),
             current_time=now.strftime("%H:%M"),
+            timezone_label=now.tzname() or "LOCAL",
+            market_session=session,
             minutes_until_cutoff=minutes_until_cutoff,
+            selection_target_range=selection_target_range,
             available_cash=available_cash,
             max_per_stock=max_per_stock,
             volume_rank_data=self._format_data(volume_rank),
@@ -189,7 +233,11 @@ class MarketScanner:
 
         try:
             result_text, provider = await llm_factory.generate_tier1(
-                prompt, system_prompt=get_market_scan_system(primary_market)
+                prompt,
+                system_prompt=get_market_scan_system(primary_market),
+                profile=Tier1Profile.SCAN,
+                scope=market_scope(target),
+                phase="cycle",
             )
             parsed = self._parse_json_response(result_text)
             selected = parsed.get("selected", [])
@@ -262,12 +310,13 @@ class MarketScanner:
             )
             return {"selected": [], "market_summary": "스캔 실패", "available_cash": available_cash}
 
-    async def _get_performance_summary(self) -> str:
+    async def _get_performance_summary(self, market: str | None = None) -> str:
         """과거 매매 성과 요약 텍스트 생성"""
         try:
+            scope = market_scope(market or settings.primary_market_code)
             async with AsyncSessionLocal() as session:
                 tracker = PerformanceTracker(session)
-                stats = await tracker.get_overall_stats()
+                stats = await tracker.get_overall_stats(market_scope=scope)
 
             overall = stats.get("overall")
             if not overall or overall.total_trades == 0:
@@ -298,7 +347,9 @@ class MarketScanner:
             *[mcp_client.get_volume_rank(market=market) for market in markets],
             return_exceptions=True,
         )
-        return self._merge_scan_stocks(markets, responses)
+        stocks = self._merge_scan_stocks(markets, responses)
+        stocks.sort(key=lambda item: float(item.get("volume", 0)), reverse=True)
+        return stocks[:30]
 
     async def _get_fluctuation_rank(self, markets: list[str], sort: str) -> list[dict]:
         responses = await asyncio.gather(

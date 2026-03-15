@@ -55,13 +55,29 @@ def _get_app_secret() -> str:
     return settings.KIS_APP_SECRET
 
 
-def _get_account_parts() -> tuple[str, str]:
-    """KIS 계좌번호를 8자리/2자리로 분리"""
-    raw = settings.KIS_PAPER_STOCK if settings.is_paper_trading else settings.KIS_ACCT_STOCK
+def _resolve_account_parts(raw: str, prod_type_override: str = "") -> tuple[str, str]:
+    """KIS 계좌번호를 CANO/상품코드로 정규화"""
     digits = "".join(ch for ch in raw if ch.isdigit())
-    if len(digits) < 10:
-        raise ValueError("KIS 계좌번호가 올바르지 않습니다. 10자리 계좌번호를 설정하세요.")
-    return digits[:8], digits[8:10]
+    prod_digits = "".join(ch for ch in prod_type_override if ch.isdigit())
+
+    if prod_digits and len(prod_digits) != 2:
+        raise ValueError("KIS_PROD_TYPE 는 2자리여야 합니다.")
+
+    if len(digits) == 10:
+        return digits[:8], prod_digits or digits[8:10]
+
+    if len(digits) == 8 and prod_digits:
+        return digits, prod_digits
+
+    raise ValueError(
+        "KIS 계좌번호는 10자리 전체 또는 CANO 8자리 + KIS_PROD_TYPE 이 필요합니다."
+    )
+
+
+def _get_account_parts() -> tuple[str, str]:
+    """활성 계좌번호를 CANO/상품코드로 분리"""
+    raw = settings.KIS_PAPER_STOCK if settings.is_paper_trading else settings.KIS_ACCT_STOCK
+    return _resolve_account_parts(raw, settings.KIS_PROD_TYPE)
 
 
 def _request_headers(token: str, tr_id: str, tr_cont: str = "") -> dict[str, str]:
@@ -491,7 +507,7 @@ async def get_overseas_daily_price(symbol: str, market: str = "NASDAQ") -> dict:
                 "SYMB": symbol,
                 "GUBN": "0",
                 "BYMD": "",
-                "MODP": "1",
+                "MODP": "0",
             },
         )
         result["success"] = result.get("rt_cd") == "0"
@@ -562,6 +578,36 @@ async def get_overseas_present_balance(market: str = "NASDAQ") -> dict:
         return {"success": False, "error": str(e), "output1": [], "output2": []}
 
 
+async def get_overseas_psamount(
+    symbol: str,
+    price: float,
+    market: str = "NASDAQ",
+) -> dict:
+    """해외주식 종목별 매수가능금액 조회"""
+    market_code = normalize_market(market)
+    cano, acnt_prdt_cd = _get_account_parts()
+    try:
+        result = await _request_json(
+            "/uapi/overseas-stock/v1/trading/inquire-psamount",
+            "VTTS3007R" if settings.is_paper_trading else "TTTS3007R",
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "OVRS_EXCG_CD": kis_order_exchange_code(market_code),
+                "OVRS_ORD_UNPR": f"{float(price or 0.0):.8f}",
+                "ITEM_CD": symbol,
+            },
+            use_trading_domain=True,
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 매수가능금액 조회 오류 ({} {}): {}", market_code, symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
+
+
 async def get_overseas_balance(market: str = "NASDAQ") -> dict:
     """해외주식 보유잔고 조회"""
     market_code = normalize_market(market)
@@ -593,7 +639,10 @@ async def get_overseas_order_list(market: str = "NASDAQ") -> dict:
     """해외주식 주문/체결 내역 조회"""
     market_code = normalize_market(market)
     cano, acnt_prdt_cd = _get_account_parts()
-    today = datetime.now().strftime("%Y%m%d")
+    from scheduler.market_calendar import market_calendar
+
+    today = market_calendar.market_date(market=market_code).strftime("%Y%m%d")
+    overseas_exchange = "" if settings.is_paper_trading else kis_balance_exchange_code(market_code)
     try:
         result = await _request_paged_json(
             "/uapi/overseas-stock/v1/trading/inquire-ccnl",
@@ -601,7 +650,7 @@ async def get_overseas_order_list(market: str = "NASDAQ") -> dict:
             params={
                 "CANO": cano,
                 "ACNT_PRDT_CD": acnt_prdt_cd,
-                "OVRS_EXCG_CD": kis_balance_exchange_code(market_code),
+                "OVRS_EXCG_CD": overseas_exchange,
                 "PDNO": "",
                 "ORD_STRT_DT": today,
                 "ORD_END_DT": today,

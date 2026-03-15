@@ -5,6 +5,8 @@
 """
 from strategy.signal import TradeSignal
 from trading.enums import SignalAction, SignalUrgency
+from trading.market_profile import is_crypto_market
+from trading.risk_policy import normalize_crypto_regime
 
 
 class AggressiveShortStrategy:
@@ -20,8 +22,12 @@ class AggressiveShortStrategy:
 
     REGIME_PARAMS = {
         "BULL":  {"stop_loss_pct": -4.0, "take_profit_pct": 10.0},
+        "BULL_RUN": {"stop_loss_pct": -4.0, "take_profit_pct": 10.0},
+        "ALTSEASON": {"stop_loss_pct": -5.0, "take_profit_pct": 12.0},
         "THEME": {"stop_loss_pct": -5.0, "take_profit_pct": 12.0},
         "BEAR":  {"stop_loss_pct": -3.0, "take_profit_pct": 6.0},
+        "BEAR_MARKET": {"stop_loss_pct": -3.0, "take_profit_pct": 6.0},
+        "CONSOLIDATION": {"stop_loss_pct": -3.0, "take_profit_pct": 6.0},
     }
 
     def __init__(
@@ -48,7 +54,12 @@ class AggressiveShortStrategy:
         price_krw = float(analysis.get("price_krw", current_price * exchange_rate) or 0.0)
 
         # 국면별 동적 파라미터 (기본값 폴백)
-        params = self.REGIME_PARAMS.get(market_regime, {})
+        regime_key = (
+            normalize_crypto_regime(market_regime)
+            if is_crypto_market(market)
+            else str(market_regime or "").upper()
+        )
+        params = self.REGIME_PARAMS.get(regime_key, {})
         eff_stop = params.get("stop_loss_pct", self.stop_loss_pct)
         eff_target = params.get("take_profit_pct", self.take_profit_pct)
 

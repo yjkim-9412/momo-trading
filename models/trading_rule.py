@@ -25,6 +25,7 @@ class TradingRule(Base, TimestampMixin):
     __tablename__ = "trading_rules"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    market_scope: Mapped[str] = mapped_column(String(10), default="KRX", nullable=False, index=True)
 
     # 규칙 분류
     rule_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)

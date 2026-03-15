@@ -2,12 +2,13 @@ from enum import Enum
 
 
 class Market(str, Enum):
-    """주식 시장"""
+    """거래 시장"""
     KOSPI = "KOSPI"
     KOSDAQ = "KOSDAQ"
     NASDAQ = "NASDAQ"
     NYSE = "NYSE"
     AMEX = "AMEX"
+    BITHUMB = "BITHUMB"
 
 
 class OrderSide(str, Enum):
@@ -92,6 +93,12 @@ class LLMTier(str, Enum):
     """LLM 계층"""
     TIER1 = "TIER1"      # 빠른 분석 (스캔/선별)
     TIER2 = "TIER2"      # 프리미엄 (최종 검토)
+
+
+class Tier1Profile(str, Enum):
+    """Tier1 호출 프로필"""
+    SCAN = "scan"
+    ANALYSIS = "analysis"
 
 
 class LLMProvider(str, Enum):

@@ -37,7 +37,7 @@ class CurrentPrice(BaseModel):
     exchange_rate_to_krw: float = 1.0
     change: float
     change_rate: float
-    volume: int
+    volume: float
     session: str = ""
     timestamp: datetime
 
@@ -48,7 +48,7 @@ class OrderRequest(BaseModel):
     market: Market
     side: OrderSide
     order_type: OrderType
-    quantity: int
+    quantity: float
     price: Optional[float] = None  # 시장가 주문 시 None
     currency: str = "KRW"
     exchange_rate_to_krw: float = 1.0
@@ -59,7 +59,7 @@ class OrderResult(BaseModel):
     success: bool
     order_id: Optional[str] = None
     message: str
-    filled_quantity: int = 0
+    filled_quantity: float = 0
     filled_price: float = 0.0
     currency: str = "KRW"
     filled_price_krw: float = 0.0
@@ -70,6 +70,7 @@ class AccountBalance(BaseModel):
     total_asset: float
     cash: float
     stock_value: float
+    locked_krw: float = 0.0
     total_pnl: float
     total_pnl_rate: float
     raw_total_pnl: float = 0.0
@@ -91,7 +92,7 @@ class HoldingInfo(BaseModel):
     name: str
     market: str = "KRX"
     currency: str = "KRW"
-    quantity: int
+    quantity: float
     avg_buy_price: float
     current_price: float
     pnl: float
@@ -107,9 +108,25 @@ class PendingOrderInfo(BaseModel):
     market: str = "KRX"
     currency: str = "KRW"
     side: str               # 매수/매도
-    order_qty: int          # 주문수량
-    filled_qty: int         # 체결수량
-    remaining_qty: int      # 미체결수량
+    order_qty: float        # 주문수량
+    filled_qty: float       # 체결수량
+    remaining_qty: float    # 미체결수량
     order_price: float      # 주문단가
     order_time: str         # 주문시각
     exchange_rate_to_krw: float = 1.0
+    status: str = ""
+    status_detail: str = ""
+    submitted_at: str | None = None
+    updated_at: str | None = None
+
+
+class AccountOverview(BaseModel):
+    """관리자 계좌 overview 응답"""
+    balance: AccountBalance
+    holdings: list[HoldingInfo]
+    pending_orders: list[PendingOrderInfo]
+
+
+def coin_side_label(side: str) -> str:
+    """코인 주문 방향을 한국어로 변환한다."""
+    return "매수" if str(side or "").upper() == "BUY" else "매도"

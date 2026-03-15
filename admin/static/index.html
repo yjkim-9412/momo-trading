@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MOMO Trading Admin</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
@@ -18,55 +19,7 @@
       }
     }
   </script>
-  <style>
-    body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
-    .chat-bubble { animation: fadeIn 0.3s ease-out; }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-    .detail-content { max-height: 0; overflow: hidden; transition: max-height 0.4s ease-out; }
-    .detail-content.open { max-height: 2000px; overflow-y: auto; }
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: #1a1b2e; }
-    ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-    .confidence-bar { transition: width 0.5s ease-out; }
-    .status-dot { animation: pulse 2s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-
-    /* LLM Conversation */
-    .llm-conversation { display: flex; flex-direction: column; gap: 8px; }
-    .llm-model-tag { display: inline-block; background: #1e293b; color: #94a3b8; font-size: 10px; padding: 2px 8px; border-radius: 4px; margin-bottom: 4px; }
-    .llm-msg { border-left: 3px solid; padding: 6px 10px; border-radius: 4px; }
-    .llm-system { border-color: #a78bfa; background: rgba(167,139,250,0.06); }
-    .llm-user { border-color: #60a5fa; background: rgba(96,165,250,0.06); }
-    .llm-assistant { border-color: #34d399; background: rgba(52,211,153,0.06); }
-    .llm-role { font-size: 10px; font-weight: 600; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
-    .llm-system .llm-role { color: #a78bfa; }
-    .llm-user .llm-role { color: #60a5fa; }
-    .llm-assistant .llm-role { color: #34d399; }
-    .llm-body { white-space: pre-wrap; word-break: break-all; color: #d1d5db; line-height: 1.5; max-height: 300px; overflow-y: auto; }
-
-    /* Progress spinner for in-progress activities */
-    .progress-spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #4b5563; border-top-color: #60a5fa; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; vertical-align: middle; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-
-    /* Stock group card */
-    .stock-card { border: 1px solid #374151; border-radius: 10px; margin: 4px 0; overflow: hidden; animation: fadeIn 0.3s ease-out; }
-    .stock-card.outcome-buy { border-left: 3px solid #f87171; }
-    .stock-card.outcome-sell { border-left: 3px solid #60a5fa; }
-    .stock-card.outcome-hold { border-left: 3px solid #6b7280; }
-    .stock-card.outcome-error { border-left: 3px solid #fbbf24; }
-    .stock-card.outcome-progress { border-left: 3px solid #a78bfa; }
-    .stock-card-header { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; user-select: none; transition: background 0.15s; }
-    .stock-card-header:hover { background: rgba(255,255,255,0.03); }
-    .stock-card-body { max-height: 0; overflow: hidden; transition: max-height 0.3s ease-out; }
-    .stock-card-body.open { max-height: 3000px; overflow-y: auto; }
-    .stock-card-steps { padding: 0 12px 8px 12px; }
-    .stock-step { display: flex; align-items: flex-start; gap: 8px; padding: 4px 0; border-top: 1px solid #1f2937; }
-    .stock-step:first-child { border-top: none; }
-
-    /* Cycle divider */
-    .cycle-divider { display: flex; align-items: center; gap: 8px; padding: 6px 12px; margin: 8px 0 4px 0; color: #6b7280; font-size: 12px; }
-    .cycle-divider::before, .cycle-divider::after { content: ''; flex: 1; height: 1px; background: #374151; }
-  </style>
+  <link rel="stylesheet" href="/admin/static/css/admin.css">
 </head>
 <body class="dark bg-dark-900 text-gray-200 h-screen flex flex-col overflow-hidden">
   <!-- Header -->
@@ -74,6 +27,22 @@
     <div class="flex items-center gap-3">
       <h1 class="text-lg font-bold text-white">MOMO Trading Admin</h1>
       <span id="version" class="text-xs text-gray-500">v0.1.0</span>
+    </div>
+    <!-- Market Tabs (header) -->
+    <div id="market-header-tabs" class="hidden">
+      <div class="market-header-tabs">
+        <div class="market-header-indicator" id="market-header-indicator"></div>
+        <button type="button" class="market-header-btn active" data-market="KRX" onclick="switchMarket('KRX')">
+          <span class="market-header-label">국내</span>
+          <span class="market-header-sub">KRX</span>
+          <span id="market-badge-KRX" class="market-badge-new" style="display:none"></span>
+        </button>
+        <button type="button" class="market-header-btn" data-market="NASDAQ" onclick="switchMarket('NASDAQ')">
+          <span class="market-header-label">해외</span>
+          <span class="market-header-sub">US</span>
+          <span id="market-badge-US" class="market-badge-new" style="display:none"></span>
+        </button>
+      </div>
     </div>
     <div class="flex items-center gap-4 text-sm">
       <span id="badge-trading" class="px-2 py-0.5 rounded text-xs font-medium"></span>
@@ -83,17 +52,39 @@
     </div>
   </header>
 
+  <!-- Market Context Bar -->
+  <div id="market-context-bar" class="market-context-bar hidden shrink-0">
+    <div class="market-context-accent flex items-center gap-2">
+      <span class="market-ctx-dot"></span>
+      <span id="ctx-market-label" class="text-white font-medium">KRX 국내주식</span>
+      <span class="text-gray-500">·</span>
+      <span id="ctx-market-status">장외</span>
+      <span class="text-gray-500">·</span>
+      <span id="ctx-trading-date"></span>
+      <span class="text-gray-500">·</span>
+      <span id="ctx-session-schedule" class="flex items-center gap-1"></span>
+    </div>
+    <div class="text-xs text-gray-500 flex items-center gap-3">
+      <span id="ctx-last-cycle"></span>
+      <span id="ctx-dst-badge"></span>
+    </div>
+  </div>
+
   <!-- Main Content -->
   <div class="flex flex-1 overflow-hidden">
     <!-- Left Sidebar -->
-    <aside class="w-64 bg-dark-800 border-r border-gray-700 flex flex-col shrink-0">
+    <aside id="left-sidebar" class="sidebar-left w-64 bg-dark-800 border-r border-gray-700 flex flex-col shrink-0 relative">
+      <button onclick="toggleLeftSidebar()" class="sidebar-toggle-btn sidebar-toggle-left" aria-label="사이드바 접기/펼치기">
+        <i data-lucide="panel-left-close" class="w-3 h-3 sidebar-collapse-icon"></i>
+      </button>
+      <div class="sidebar-content flex flex-col flex-1 overflow-hidden">
       <!-- Navigation -->
       <nav class="p-3 space-y-1">
-        <button onclick="switchView('live')" id="nav-live" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm font-medium bg-blue-900/30 text-blue-300">
-          &#x1f4e1; &#xc2e4;&#xc2dc;&#xac04; &#xbaa8;&#xb2c8;&#xd130;&#xb9c1;
+        <button onclick="switchView('live')" id="nav-live" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm font-medium bg-blue-900/30 text-blue-300 flex items-center gap-2">
+          <i data-lucide="activity" class="w-4 h-4"></i> 실시간 모니터링
         </button>
-        <button onclick="switchView('today')" id="nav-today" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm text-gray-400 hover:bg-dark-700">
-          &#x1f4cb; &#xc624;&#xb298; &#xb9ac;&#xd3ec;&#xd2b8;
+        <button onclick="switchView('today')" id="nav-today" class="nav-btn w-full text-left px-3 py-2 rounded-lg text-sm text-gray-400 hover:bg-dark-700 flex items-center gap-2">
+          <i data-lucide="clipboard-list" class="w-4 h-4"></i> 오늘 리포트
         </button>
         <div class="pt-2">
           <div class="text-xs text-gray-500 px-3 mb-1">&#xacfc;&#xac70; &#xb9ac;&#xd3ec;&#xd2b8;</div>
@@ -105,72 +96,57 @@
 
       <!-- Account Info -->
       <div class="p-3 space-y-2 flex-1 overflow-y-auto">
-        <div class="text-xs text-gray-500 font-medium">계좌 잔고</div>
-        <div id="account-info" class="text-xs space-y-1">
-          <div class="text-gray-600">로딩 중...</div>
+        <!-- Balance (sticky) -->
+        <div class="sticky top-0 bg-dark-800 z-[1] pb-1">
+          <div class="flex items-center justify-between">
+            <div class="text-xs text-gray-500 font-medium">계좌 잔고</div>
+            <span id="cash-source-badge" class="hidden px-2 py-0.5 rounded-full text-[11px] bg-sky-950/70 text-sky-300"></span>
+          </div>
+          <div id="account-info" class="text-xs space-y-1 account-data-transition">
+            <div class="text-gray-500">로딩 중...</div>
+          </div>
         </div>
 
-        <!-- 보유종목 -->
+        <!-- 보유종목 (collapsible) -->
         <div id="holdings-section">
-          <div id="holdings-header" class="flex items-center justify-between mt-3 mb-1">
-            <span class="text-xs text-green-400 font-medium">보유종목</span>
-            <span id="holdings-count" class="text-xs text-gray-600">0종목</span>
-          </div>
-          <div id="holdings-info" class="text-xs space-y-1 max-h-60 overflow-y-auto"></div>
+          <button onclick="toggleAccountSection('holdings')" class="flex items-center justify-between mt-3 mb-1 w-full text-left" aria-expanded="true">
+            <span class="flex items-center gap-1">
+              <span class="section-toggle-icon" id="holdings-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+              <span class="text-xs text-green-400 font-medium">보유종목</span>
+            </span>
+            <span id="holdings-count" class="text-xs text-gray-500">0종목</span>
+          </button>
+          <div id="holdings-info" class="account-section-body text-xs space-y-1 max-h-60 overflow-y-auto account-data-transition" style="max-height:240px"></div>
         </div>
 
-        <!-- 미체결 주문 -->
+        <!-- 미체결 주문 (collapsible) -->
         <div id="pending-section">
-          <div id="pending-header" class="flex items-center justify-between mt-3 mb-1">
-            <span class="text-xs text-yellow-400 font-medium">미체결 주문</span>
-            <span id="pending-count" class="text-xs text-gray-600">0건</span>
-          </div>
-          <div id="pending-orders-info" class="text-xs space-y-1 max-h-40 overflow-y-auto"></div>
+          <button onclick="toggleAccountSection('pending')" class="flex items-center justify-between mt-3 mb-1 w-full text-left" aria-expanded="true">
+            <span class="flex items-center gap-1">
+              <span class="section-toggle-icon" id="pending-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+              <span class="text-xs text-yellow-400 font-medium">미체결 주문</span>
+            </span>
+            <span id="pending-count" class="text-xs text-gray-500">0건</span>
+          </button>
+          <div id="pending-orders-info" class="account-section-body text-xs space-y-1 max-h-40 overflow-y-auto account-data-transition" style="max-height:160px"></div>
         </div>
 
-        <div id="us-stock-section" class="mt-4 rounded-xl border border-sky-900/50 bg-slate-950/70 p-3 space-y-3">
-          <div class="flex items-start justify-between gap-2">
-            <div>
-              <div class="text-[11px] tracking-[0.22em] uppercase text-sky-400">US Desk</div>
-              <div class="text-xs text-gray-500">미국주식 전용 인터페이스</div>
-            </div>
-            <span id="us-cash-source-badge" class="px-2 py-0.5 rounded-full text-[10px] bg-sky-950/70 text-sky-300">브로커 현금</span>
-          </div>
-
-          <div id="us-account-info" class="text-xs space-y-1">
-            <div class="text-gray-600">로딩 중...</div>
-          </div>
-
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-sky-300 font-medium">보유종목</span>
-              <span id="us-holdings-count" class="text-xs text-gray-600">0종목</span>
-            </div>
-            <div id="us-holdings-info" class="text-xs space-y-1 max-h-48 overflow-y-auto"></div>
-          </div>
-
-          <div>
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-xs text-amber-300 font-medium">미체결 주문</span>
-              <span id="us-pending-count" class="text-xs text-gray-600">0건</span>
-            </div>
-            <div id="us-pending-orders-info" class="text-xs space-y-1 max-h-36 overflow-y-auto"></div>
-          </div>
-        </div>
+        <!-- AI 관심종목: moved to right panel -->
       </div>
 
       <div class="border-t border-gray-700 my-2"></div>
 
       <!-- Settings (접이식) -->
       <div class="p-3 shrink-0">
-        <button onclick="toggleSettings()" class="flex items-center justify-between w-full text-xs text-gray-500 font-medium hover:text-gray-300 transition">
-          <span>설정</span>
-          <span id="settings-arrow" class="transition-transform" style="transform:rotate(-90deg)">&#x25BC;</span>
+        <button onclick="toggleSettings()" class="flex items-center justify-between w-full text-xs text-gray-500 font-medium hover:text-gray-300 transition" aria-expanded="false" id="settings-toggle-btn">
+          <span class="flex items-center gap-1.5"><i data-lucide="settings" class="w-4 h-4"></i> 설정</span>
+          <span id="settings-arrow" style="transition:transform 0.2s ease; transform:rotate(-90deg)"><i data-lucide="chevron-down" class="w-4 h-4"></i></span>
         </button>
         <div id="settings-body" class="space-y-3 mt-2 hidden">
           <label class="flex items-center justify-between">
             <span class="text-sm">매매 활성화</span>
-            <input type="checkbox" id="set-trading" onchange="updateSetting('TRADING_ENABLED', this.checked)"
+            <input type="checkbox" id="set-trading" role="switch" onchange="updateSetting('TRADING_ENABLED', this.checked); this.setAttribute('aria-checked', this.checked)"
+              aria-checked="false" aria-label="매매 활성화"
               class="w-9 h-5 rounded-full appearance-none bg-gray-600 checked:bg-green-500 relative cursor-pointer
               after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-4 after:h-4 after:rounded-full after:bg-white after:transition-transform checked:after:translate-x-4">
           </label>
@@ -197,7 +173,9 @@
           <div class="border-t border-gray-700 pt-2">
             <div class="text-xs text-gray-500 font-medium mb-1">LLM</div>
             <div class="text-xs text-gray-400">선택된 로컬 CLI Provider</div>
-            <div id="llm-tier1-model" class="text-xs text-gray-500 mt-0.5 truncate"></div>
+            <div id="llm-agent-summary" class="mt-1 space-y-1.5">
+              <div class="text-xs text-gray-500">로딩 중...</div>
+            </div>
           </div>
         </div>
       </div>
@@ -209,46 +187,140 @@
         <div class="text-xs text-gray-500 font-medium">&#xc2dc;&#xc2a4;&#xd15c;</div>
         <div id="sys-status" class="text-xs space-y-1"></div>
         <button onclick="triggerCycle()"
-          class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg py-2 transition">
-          &#x25b6;&#xfe0f; &#xc218;&#xb3d9; &#xc0ac;&#xc774;&#xd074; &#xc2e4;&#xd589;
+          class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2">
+          <i data-lucide="play" class="w-4 h-4 fill-current"></i> 수동 사이클 실행
         </button>
         <button onclick="generateReport()"
-          class="w-full bg-gray-700 hover:bg-gray-600 text-gray-200 text-sm rounded-lg py-1.5 transition">
-          &#x1f4cb; &#xb9ac;&#xd3ec;&#xd2b8; &#xc0dd;&#xc131;
+          class="w-full bg-gray-700 hover:bg-gray-600 text-gray-200 text-sm rounded-lg py-1.5 transition flex items-center justify-center gap-2">
+          <i data-lucide="file-text" class="w-4 h-4"></i> 리포트 생성
         </button>
       </div>
+      </div><!-- /sidebar-content -->
     </aside>
 
     <!-- Chat Area -->
-    <main class="flex-1 flex flex-col overflow-hidden">
+    <main class="flex-1 flex flex-col overflow-hidden relative">
+      <!-- Chat Filter Bar -->
+      <div class="bg-dark-800 border-b border-gray-700 px-4 py-2 shrink-0 flex justify-between items-center">
+        <div class="text-xs font-medium text-gray-400">Activity Feed <span id="feed-market-label" class="text-gray-600"></span></div>
+        <div class="log-filter-track">
+          <button type="button" class="log-filter-btn active" data-filter="ALL" onclick="setLogFilter('ALL')">전체 로그</button>
+          <button type="button" class="log-filter-btn" data-filter="SIGNAL" onclick="setLogFilter('SIGNAL')">시그널만 보기 (매수/매도)</button>
+        </div>
+      </div>
+
+      <!-- Agent Pipeline Monitor -->
+      <div id="agent-monitor" class="agent-monitor shrink-0">
+        <!-- Status Bar (always visible) -->
+        <div class="agent-monitor-bar" onclick="toggleMonitorExpand()">
+          <div class="flex items-center gap-2">
+            <span class="agent-monitor-icon" id="monitor-status-icon">
+              <i data-lucide="cpu" class="w-3.5 h-3.5"></i>
+            </span>
+            <span class="text-xs font-semibold text-gray-300" id="monitor-title">Agent Monitor</span>
+            <span class="text-xs text-gray-500" id="monitor-status">대기 중</span>
+          </div>
+          <div class="flex items-center gap-3">
+            <div class="agent-monitor-progress" id="monitor-progress-wrap" style="display:none">
+              <div class="agent-monitor-progress-bar" id="monitor-progress-bar" style="width:0%"></div>
+            </div>
+            <span class="text-xs text-gray-500 font-mono" id="monitor-elapsed"></span>
+          </div>
+        </div>
+
+        <!-- Expandable Slots Panel -->
+        <div class="agent-monitor-body" id="monitor-body" style="display:none">
+          <!-- Active Analysis Slots (max 3) -->
+          <div class="agent-monitor-slots" id="monitor-slots"></div>
+
+          <!-- Completed Analyses Row -->
+          <div class="agent-monitor-completed" id="monitor-completed" style="display:none">
+            <div class="text-[10px] text-gray-600 uppercase tracking-wider mb-1">완료</div>
+            <div class="flex flex-wrap gap-1.5" id="monitor-completed-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="feed-load-more-bar" class="feed-load-more-bar hidden shrink-0">
+        <button id="feed-load-more-btn" type="button" class="feed-load-more-btn" onclick="loadMoreActivities()">
+          <i data-lucide="chevrons-up" class="w-3.5 h-3.5"></i>
+          <span>이전 내역 더보기</span>
+        </button>
+        <span id="feed-load-more-meta" class="feed-load-more-meta"></span>
+      </div>
+
       <!-- Chat messages -->
-      <div id="chat-container" class="flex-1 overflow-y-auto p-4 space-y-2">
+      <div id="chat-container" class="flex-1 overflow-y-auto p-4 space-y-2" aria-live="polite" aria-atomic="false">
         <div class="text-center text-gray-500 text-sm py-8">
           &#xc5f0;&#xacb0; &#xc911;...
         </div>
       </div>
+
+      <!-- Scroll to bottom FAB -->
+      <button id="scroll-to-bottom" onclick="scrollToBottom()" class="scroll-fab hidden" aria-label="최하단으로 이동" title="최신 대화로 이동">
+        <i data-lucide="arrow-down" class="w-3.5 h-3.5"></i>
+        <span>최신 대화</span>
+        <span id="scroll-fab-badge" class="scroll-fab-badge"></span>
+      </button>
 
       <!-- Bottom bar -->
       <div class="bg-dark-800 border-t border-gray-700 px-4 py-2 flex items-center justify-between text-xs text-gray-500 shrink-0">
         <span id="status-text">&#xc5f0;&#xacb0; &#xb300;&#xae30;</span>
         <div class="flex items-center gap-3">
           <span id="activity-count">0&#xac74;</span>
-          <button onclick="clearChat()" title="&#xd654;&#xba74; &#xbe44;&#xc6b0;&#xae30; (DB &#xc720;&#xc9c0;)"
-            class="text-gray-500 hover:text-gray-300 transition">&#x1f5d1; &#xd074;&#xb9ac;&#xc5b4;</button>
-          <button onclick="loadTodayActivities()" title="&#xc624;&#xb298; &#xd65c;&#xb3d9; &#xb2e4;&#xc2dc; &#xbd88;&#xb7ec;&#xc624;&#xae30;"
-            class="text-gray-500 hover:text-gray-300 transition">&#x1f504; &#xc0c8;&#xb85c;&#xace0;&#xce68;</button>
+          <button onclick="clearChat()" title="화면 비우기 (DB 유지)" aria-label="활동 피드 클리어"
+            class="text-gray-500 hover:text-gray-300 transition flex items-center gap-1.5"><i data-lucide="trash-2" class="w-4 h-4"></i> 클리어</button>
+          <button onclick="loadTodayActivities()" title="오늘 활동 다시 불러오기" aria-label="활동 새로고침"
+            class="text-gray-500 hover:text-gray-300 transition flex items-center gap-1.5"><i data-lucide="refresh-cw" class="w-4 h-4"></i> 새로고침</button>
         </div>
       </div>
     </main>
 
-    <!-- Right Sidebar: LLM Usage -->
-    <aside class="w-64 bg-dark-800 border-l border-gray-700 flex flex-col shrink-0 overflow-y-auto">
+    <!-- Right Sidebar: Tabbed Panel -->
+    <aside id="right-sidebar" class="sidebar-right w-96 bg-dark-800 border-l border-gray-700 flex flex-col shrink-0 relative">
+      <button onclick="toggleRightSidebar()" class="sidebar-toggle-btn sidebar-toggle-right" aria-label="우측 패널 접기/펼치기">
+        <i data-lucide="panel-right-close" class="w-3 h-3 sidebar-collapse-icon"></i>
+      </button>
+      <div class="sidebar-content overflow-y-auto flex-1">
       <div class="p-3 space-y-3">
+        <!-- AI Watchlist -->
+        <div id="watchlist-section">
+          <div class="flex items-center justify-between mb-2">
+            <div class="flex items-center gap-1.5">
+              <span class="text-xs text-purple-400 font-medium">AI 관심종목</span>
+              <span id="watchlist-stream-dot" class="w-1.5 h-1.5 rounded-full bg-gray-600"></span>
+            </div>
+            <span id="watchlist-count" class="text-xs text-gray-500">0종목</span>
+          </div>
+          <div id="watchlist-info" class="text-xs space-y-1"></div>
+        </div>
+        <div class="border-t border-gray-700"></div>
+
+        <!-- Schedule Timeline -->
+        <div id="schedule-panel">
+          <div class="text-xs text-gray-500 font-medium mb-2">스케줄 타임라인</div>
+          <div id="schedule-adaptive" class="schedule-adaptive-card mb-3">
+            <div class="text-xs text-gray-500">로딩 중...</div>
+          </div>
+          <div id="schedule-fixed" class="schedule-timeline mb-1">
+            <div class="text-xs text-gray-500">로딩 중...</div>
+          </div>
+        </div>
+        <div class="border-t border-gray-700"></div>
+
+        <!-- Analysis Agents -->
+        <div>
+          <div class="text-xs text-gray-500 font-medium mb-2">분석 에이전트</div>
+          <div id="llm-agent-guide" class="space-y-2">
+            <div class="text-gray-500 text-xs">로딩 중...</div>
+          </div>
+        </div>
+
         <div class="text-xs text-gray-500 font-medium">LLM Usage</div>
 
         <!-- Summary -->
         <div id="usage-summary" class="space-y-2">
-          <div class="text-gray-600 text-xs">로딩 중...</div>
+          <div class="text-gray-500 text-xs">로딩 중...</div>
         </div>
 
         <!-- App (trading) usage -->
@@ -269,9 +341,13 @@
           <div id="usage-chart" class="space-y-1"></div>
         </div>
       </div>
+      </div><!-- /sidebar-content -->
     </aside>
   </div>
 
-  <script src="/admin/static/js/app.js"></script>
+  <!-- Toast Container -->
+  <div id="toast-container" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2" style="max-width:360px"></div>
+
+  <script type="module" src="/admin/static/js/app/app-main.js"></script>
 </body>
 </html>

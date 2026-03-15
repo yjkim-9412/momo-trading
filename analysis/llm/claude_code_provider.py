@@ -16,6 +16,7 @@ from loguru import logger
 from analysis.llm.base import empty_usage_snapshot
 from core.config import settings
 from trading.enums import LLMProvider, LLMTier
+from trading.market_profile import normalize_market_scope
 
 
 class ClaudeCodeProvider:
@@ -30,75 +31,120 @@ class ClaudeCodeProvider:
     세션이 없으면 일회성 호출 (--no-session-persistence)
     """
 
-    # 클래스 레벨 세션 관리 (모든 인스턴스 공유)
-    _active_session_id: str | None = None
-    _session_initialized: bool = False  # 첫 호출 완료 여부
-    _session_lock: asyncio.Lock | None = None
+    # 클래스 레벨 세션 관리 ((scope, phase)별)
+    _session_states: dict[tuple[str, str], dict[str, Any]] = {}
+    _session_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     # 클래스 레벨 누적 사용량
     cumulative_usage: dict = empty_usage_snapshot(LLMProvider.CLAUDE_CODE)
 
-    def __init__(self, tier: LLMTier = LLMTier.TIER1):
+    def __init__(
+        self,
+        tier: LLMTier = LLMTier.TIER1,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ):
         self._tier = tier
         self._claude_path: str | None = None
-        self._model = settings.get_llm_model(LLMProvider.CLAUDE_CODE, tier)
-        self._reasoning_effort = settings.get_llm_reasoning_effort(
-            LLMProvider.CLAUDE_CODE,
-            tier,
+        self._model = model if model is not None else settings.get_llm_model(LLMProvider.CLAUDE_CODE, tier)
+        self._reasoning_effort = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else settings.get_llm_reasoning_effort(LLMProvider.CLAUDE_CODE, tier)
         )
         self._resolved_model: str = ""
 
     @classmethod
-    def _get_lock(cls) -> asyncio.Lock:
+    def _session_key(cls, scope: str, phase: str) -> tuple[str, str]:
+        return normalize_market_scope(scope), phase or "cycle"
+
+    @classmethod
+    def _get_state(cls, scope: str, phase: str) -> dict[str, Any]:
+        key = cls._session_key(scope, phase)
+        return cls._session_states.setdefault(
+            key,
+            {
+                "active_session_id": None,
+                "session_initialized": False,
+            },
+        )
+
+    @classmethod
+    def _get_lock(cls, scope: str, phase: str) -> asyncio.Lock:
         """세션 락 (resume 호출 직렬화)"""
-        if cls._session_lock is None:
-            cls._session_lock = asyncio.Lock()
-        return cls._session_lock
+        key = cls._session_key(scope, phase)
+        if key not in cls._session_locks:
+            cls._session_locks[key] = asyncio.Lock()
+        return cls._session_locks[key]
 
     # ── 세션 관리 ──
 
     @classmethod
-    def start_session(cls) -> str:
+    def start_session(cls, scope: str = "KRX", phase: str = "cycle") -> str:
         """새 세션 시작 — 사이클/거래일 시작 시 호출"""
-        cls._active_session_id = str(uuid4())
-        cls._session_initialized = False
-        logger.info("Claude Code 세션 시작: {}", cls._active_session_id[:8])
-        return cls._active_session_id
+        state = cls._get_state(scope, phase)
+        state["active_session_id"] = str(uuid4())
+        state["session_initialized"] = False
+        logger.info(
+            "Claude Code 세션 시작: {} [{}:{}]",
+            state["active_session_id"][:8],
+            normalize_market_scope(scope),
+            phase,
+        )
+        return state["active_session_id"]
 
     @classmethod
-    def end_session(cls) -> str | None:
+    def end_session(cls, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """세션 종료 — 세션 ID 반환 (나중에 resume 가능)"""
-        sid = cls._active_session_id
+        key = cls._session_key(scope, phase)
+        state = cls._session_states.get(key, {})
+        sid = state.get("active_session_id")
         if sid:
-            logger.info("Claude Code 세션 종료: {}", sid[:8])
-        cls._active_session_id = None
-        cls._session_initialized = False
+            logger.info("Claude Code 세션 종료: {} [{}:{}]", sid[:8], key[0], key[1])
+        cls._session_states.pop(key, None)
         return sid
 
     @classmethod
-    def pause_session(cls) -> str | None:
+    def pause_session(cls, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """세션 일시 중지 — 병렬 분석 구간에서 사용
 
         세션 ID를 보존하되 활성 상태 해제 → generate()가 일회성 호출로 동작.
         병렬 분석 완료 후 resume_session()으로 복원.
         """
-        sid = cls._active_session_id
+        state = cls._get_state(scope, phase)
+        sid = state.get("active_session_id")
         if sid:
-            logger.info("Claude Code 세션 일시 중지: {} (병렬 구간)", sid[:8])
-        cls._active_session_id = None
-        # _session_initialized는 보존 (resume 시 그대로 사용)
+            logger.info(
+                "Claude Code 세션 일시 중지: {} [{}:{}] (병렬 구간)",
+                sid[:8],
+                normalize_market_scope(scope),
+                phase,
+            )
+        state["active_session_id"] = None
         return sid
 
     @classmethod
-    def resume_session(cls, session_id: str) -> None:
+    def resume_session(cls, session_id: str, scope: str = "KRX", phase: str = "cycle") -> None:
         """이전 세션 재개 — 장 재개, 다음 사이클 등"""
-        cls._active_session_id = session_id
-        cls._session_initialized = True  # 이미 디스크에 존재
-        logger.info("Claude Code 세션 재개: {}", session_id[:8])
+        state = cls._get_state(scope, phase)
+        state["active_session_id"] = session_id
+        state["session_initialized"] = True  # 이미 디스크에 존재
+        logger.info(
+            "Claude Code 세션 재개: {} [{}:{}]",
+            session_id[:8],
+            normalize_market_scope(scope),
+            phase,
+        )
 
     @classmethod
-    def get_session_id(cls) -> str | None:
-        return cls._active_session_id
+    def get_session_id(cls, scope: str | None = None, phase: str = "cycle") -> str | None:
+        if scope is None:
+            for state in cls._session_states.values():
+                if state.get("active_session_id"):
+                    return state["active_session_id"]
+            return None
+        return cls._get_state(scope, phase).get("active_session_id")
 
     @property
     def provider(self) -> LLMProvider:
@@ -134,7 +180,15 @@ class ClaudeCodeProvider:
             return path
         return None
 
-    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        *,
+        scope: str | None = None,
+        phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
+    ) -> str:
         """claude -p 로 텍스트 생성
 
         세션이 활성화된 경우:
@@ -150,7 +204,7 @@ class ClaudeCodeProvider:
             raise RuntimeError("claude CLI를 찾을 수 없습니다 (PATH 확인)")
 
         # Tier별 effort: TIER1(스캔/분석)=medium, TIER2(최종검토)=high
-        effort = self._reasoning_effort or "medium"
+        effort = reasoning_effort_override or self._reasoning_effort or "medium"
 
         cmd = [
             claude, "-p",
@@ -163,16 +217,24 @@ class ClaudeCodeProvider:
 
         actual_prompt = prompt
 
-        if self._active_session_id:
-            if self._session_initialized:
+        session_id = None
+        session_initialized = False
+        state: dict[str, Any] | None = None
+        if scope is not None:
+            state = self.__class__._get_state(scope, phase)
+            session_id = state.get("active_session_id")
+            session_initialized = bool(state.get("session_initialized"))
+
+        if session_id:
+            if session_initialized:
                 # 기존 세션 이어감
-                cmd.extend(["--resume", self._active_session_id])
+                cmd.extend(["--resume", session_id])
                 # resume 시 system_prompt 변경 불가 → 프롬프트 앞에 역할 명시
                 if system_prompt:
                     actual_prompt = f"[역할]\n{system_prompt}\n\n[요청]\n{prompt}"
             else:
                 # 첫 호출: 세션 생성
-                cmd.extend(["--session-id", self._active_session_id])
+                cmd.extend(["--session-id", session_id])
                 if system_prompt:
                     cmd.extend(["--system-prompt", system_prompt])
         else:
@@ -182,12 +244,12 @@ class ClaudeCodeProvider:
                 cmd.extend(["--system-prompt", system_prompt])
 
         # 세션 사용 시 직렬화 (같은 세션에 동시 resume 방지)
-        if self._active_session_id:
-            async with self._get_lock():
+        if session_id and scope is not None:
+            async with self._get_lock(scope, phase):
                 result = await self._execute(cmd, actual_prompt)
                 # 첫 호출 성공 후 세션 초기화 완료 표시
-                if not self.__class__._session_initialized:
-                    self.__class__._session_initialized = True
+                if state is not None and not state["session_initialized"]:
+                    state["session_initialized"] = True
                 return result
         else:
             return await self._execute(cmd, actual_prompt)
@@ -298,7 +360,7 @@ class ClaudeCodeProvider:
                 model: {**stats}
                 for model, stats in u["by_model"].items()
             },
-            "session_id": cls._active_session_id,
+            "session_id": cls.get_session_id(),
             "provider_data": {},
         }
 

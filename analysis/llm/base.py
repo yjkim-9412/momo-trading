@@ -28,7 +28,15 @@ class LLMProviderProtocol(Protocol):
     @property
     def model_id(self) -> str: ...
 
-    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        *,
+        scope: str | None = None,
+        phase: str = "cycle",
+        reasoning_effort_override: str | None = None,
+    ) -> str:
         """텍스트 생성"""
         ...
 
@@ -42,27 +50,27 @@ class LLMSessionProtocol(Protocol):
     """세션 유지형 LLM provider 공통 인터페이스"""
 
     @classmethod
-    def start_session(cls) -> str | None:
+    def start_session(cls, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """새 세션 시작"""
         ...
 
     @classmethod
-    def end_session(cls) -> str | None:
+    def end_session(cls, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """세션 종료"""
         ...
 
     @classmethod
-    def pause_session(cls) -> str | None:
+    def pause_session(cls, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """세션 일시 중지"""
         ...
 
     @classmethod
-    def resume_session(cls, session_id: str) -> None:
+    def resume_session(cls, session_id: str, scope: str = "KRX", phase: str = "cycle") -> None:
         """세션 재개"""
         ...
 
     @classmethod
-    def get_session_id(cls) -> str | None:
+    def get_session_id(cls, scope: str | None = None, phase: str = "cycle") -> str | None:
         """현재 세션 ID 반환"""
         ...
 

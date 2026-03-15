@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 class DailyReportResponse(BaseModel):
     id: str
+    market_scope: str
     report_date: date
     total_cycles: int
     total_analyses: int

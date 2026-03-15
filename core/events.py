@@ -58,7 +58,20 @@ class EventBus:
         self._running = False
         self._task: asyncio.Task | None = None
 
+    @staticmethod
+    def _same_handler(left: EventHandler, right: EventHandler) -> bool:
+        if left is right:
+            return True
+        return (
+            getattr(left, "__self__", None) is getattr(right, "__self__", None)
+            and getattr(left, "__func__", None) is getattr(right, "__func__", None)
+        )
+
     def subscribe(self, event_type: EventType, handler: EventHandler) -> None:
+        for existing in self._handlers[event_type]:
+            if self._same_handler(existing, handler):
+                logger.debug("이벤트 핸들러 중복 등록 스킵: {} → {}", event_type.value, handler.__name__)
+                return
         self._handlers[event_type].append(handler)
         logger.debug("이벤트 핸들러 등록: {} → {}", event_type.value, handler.__name__)
 
