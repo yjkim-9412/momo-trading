@@ -74,7 +74,7 @@ export function connectSSE() {
           if (scopeKey === myScope) {
             Feed.appendActivity(msg.data);
             if (importance.level === 'CRITICAL' || importance.level === 'HIGH') {
-              setTimeout(function () { Feed.highlightCard(msg.data); }, 100);
+              setTimeout(function () { Feed.highlightCard(msg.data, { skipScroll: true }); }, 100);
             }
           } else {
             var buf = state.activityBuffer[scopeKey];

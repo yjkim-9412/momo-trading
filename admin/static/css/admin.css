@@ -210,6 +210,8 @@ body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, 
 .sidebar-card.sidebar-card-pending { border-color: rgba(234,179,8,0.2); background: rgba(234,179,8,0.03); }
 .sidebar-card.sidebar-card-pending-us { border-color: rgba(245,158,11,0.2); background: rgba(245,158,11,0.03); }
 
+.holdings-summary { background: rgba(55,65,81,0.3); border-radius: 6px; padding: 6px 8px; margin-bottom: 6px; border: 1px solid rgba(75,85,99,0.4); }
+
 /* ── LLM Agent Guide ── */
 .agent-summary-row {
   border: 1px solid #30344f;
@@ -608,6 +610,8 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .wl-thresholds .wl-th-val-surge { color: #fbbf24; }
 .wl-thresholds .wl-th-val-drop { color: #60a5fa; }
 .wl-default-tag { color: #4b5563; font-size: 10px; font-style: italic; margin-top: 3px; }
+.wl-holding-info { margin-top: 4px; font-size: 11px; }
+.wl-holding-info .flex + .flex { margin-top: 1px; }
 
 /* ── Schedule Timeline ── */
 .schedule-adaptive-card {

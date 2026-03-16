@@ -145,9 +145,12 @@ export function createStockCard(symbol, firstActivity) {
   var el = document.createElement('div');
   el.className = 'stock-card outcome-progress';
 
-  var nameMatch = (firstActivity.summary || '').match(/\[([^\]]+)\]/);
-  var stockName = nameMatch ? nameMatch[1] : symbol;
-  if (/^TIER\d/i.test(stockName)) stockName = symbol;
+  var stockName = firstActivity.name || null;
+  if (!stockName) {
+    var nameMatch = (firstActivity.summary || '').match(/\[([^\]]+)\]/);
+    stockName = nameMatch ? nameMatch[1] : symbol;
+    if (/^TIER\d/i.test(stockName)) stockName = symbol;
+  }
 
   // Pick card icon from theme or default (apps set _config.cardTheme)
   var theme = _config.cardTheme || {};
@@ -694,7 +697,7 @@ export function updateScrollBadge() {
 // ────────────────────────────────────────────
 // highlightCard / navigateToCard
 // ────────────────────────────────────────────
-export function highlightCard(data) {
+export function highlightCard(data, options) {
   if (!data || !data.symbol) return;
   var cards = _config.getStockCards();
   var card = null;
@@ -703,7 +706,9 @@ export function highlightCard(data) {
     if (values[i].symbol === data.symbol) { card = values[i]; break; }
   }
   if (!card || !card.element) return;
-  card.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  if (!(options && options.skipScroll)) {
+    card.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
   card.element.classList.add('highlighted');
   setTimeout(function () { card.element.classList.remove('highlighted'); }, 3000);
 }

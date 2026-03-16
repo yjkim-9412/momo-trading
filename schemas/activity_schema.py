@@ -16,6 +16,7 @@ class ActivityResponse(BaseModel):
     phase: str
     stock_id: Optional[str] = None
     symbol: Optional[str] = None
+    name: Optional[str] = None
     summary: str
     detail: Optional[str] = None
     llm_provider: Optional[str] = None

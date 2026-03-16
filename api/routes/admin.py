@@ -87,9 +87,10 @@ async def get_watchlist(market: str | None = Query(None)):
     market_code = market or settings.primary_market_code
     scope = normalize_market_scope(market_code)
 
-    # 1) 보유종목 이름 맵
+    # 1) 보유종목 이름 맵 + 데이터
     holding_names: dict[tuple[str, str], str] = {}
     holding_keys: set[tuple[str, str]] = set()
+    holding_data: dict[tuple[str, str], object] = {}
     try:
         holdings = await account_manager.get_holdings(market_code)
         for h in holdings:
@@ -97,6 +98,7 @@ async def get_watchlist(market: str | None = Query(None)):
                 key = (str(h.market or market_code).upper(), h.symbol.upper())
                 holding_names[key] = h.name or ""
                 holding_keys.add(key)
+                holding_data[key] = h
     except Exception:
         pass
 
@@ -167,21 +169,34 @@ async def get_watchlist(market: str | None = Query(None)):
     symbols_list = []
     for (mk, sym), flags in all_symbols.items():
         th = event_detector._thresholds.get(f"{mk}:{sym}")
+        is_holding = (mk, sym) in holding_keys
         th_data = None
         if th:
             th_dict = asdict(th)
             if th_dict != default_dict:
                 th_data = th_dict
+        holding_info = None
+        if is_holding and (mk, sym) in holding_data:
+            hd = holding_data[(mk, sym)]
+            holding_info = {
+                "pnl_rate": hd.pnl_rate,
+                "pnl": hd.pnl,
+                "current_price": hd.current_price,
+                "avg_buy_price": hd.avg_buy_price,
+                "quantity": hd.quantity,
+                "eval_amount": hd.quantity * hd.current_price,
+            }
         symbols_list.append({
             "symbol": sym,
             "market": mk,
             "name": name_map.get((mk, sym), ""),
-            "is_holding": (mk, sym) in holding_keys,
+            "is_holding": is_holding,
             "is_subscribed": (mk, sym) in active_set,
             "in_desired_set": flags["in_desired_set"],
             "selected_in_last_cycle": flags["selected_in_last_cycle"],
             "has_thresholds": th_data is not None,
             "thresholds": th_data,
+            "holding_info": holding_info,
         })
 
     # 보유종목 우선, 그 다음 최근 선정, 실제 desired, threshold-only 순
@@ -294,6 +309,24 @@ async def get_activity_feed(
         before_created_at=before_created_at,
         before_id=before_id,
     )
+
+    # 종목명 보강 (symbol → stocks.name)
+    symbol_set = {item.symbol for item in items if item.symbol}
+    name_map: dict[str, str] = {}
+    if symbol_set:
+        from models.stock import Stock
+        result = await db.execute(
+            select(Stock.symbol, Stock.name).where(Stock.symbol.in_(symbol_set))
+        )
+        name_map = {row.symbol: row.name for row in result}
+
+    enriched_items = []
+    for item in items:
+        resp = ActivityResponse.model_validate(item)
+        if item.symbol and item.symbol in name_map:
+            resp.name = name_map[item.symbol]
+        enriched_items.append(resp)
+
     next_cursor = None
     if has_more and items:
         last_item = items[-1]
@@ -303,7 +336,7 @@ async def get_activity_feed(
         )
     return SuccessResponse(
         data=ActivityFeedResponse(
-            items=items,
+            items=enriched_items,
             resolved_trading_date=resolved_date,
             has_more=has_more,
             next_cursor=next_cursor,
