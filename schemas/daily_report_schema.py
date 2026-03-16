@@ -36,3 +36,9 @@ class ReportComparisonResponse(BaseModel):
     refreshed: DailyReportResponse
     recommendation: str  # "existing" or "refreshed"
     comparison: dict  # field-level differences
+
+
+class ReportRefreshConfirmRequest(BaseModel):
+    report_date: date
+    market_scope: str
+    choice: str

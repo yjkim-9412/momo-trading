@@ -2,7 +2,7 @@
 import asyncio
 from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from sqlalchemy import select
@@ -22,7 +22,11 @@ from schemas.activity_schema import (
     CycleResponse,
 )
 from schemas.common import SuccessResponse
-from schemas.daily_report_schema import DailyReportResponse, ReportComparisonResponse
+from schemas.daily_report_schema import (
+    DailyReportResponse,
+    ReportComparisonResponse,
+    ReportRefreshConfirmRequest,
+)
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
@@ -888,18 +892,25 @@ async def generate_report(
 
 @router.post("/reports/confirm-refresh")
 async def confirm_refresh_report(
-    report_date: str = Query(...),
-    market_scope: str = Query(...),
-    choice: str = Query(..., description="'existing' or 'refreshed'"),
+    payload: ReportRefreshConfirmRequest | None = Body(None),
+    report_date: str | None = Query(None),
+    market_scope: str | None = Query(None),
+    choice: str | None = Query(None, description="'existing' or 'refreshed'"),
     db: AsyncSession = Depends(get_async_db),
 ):
     """리포트 갱신 확정 — refreshed 선택 시 DB 저장, existing 선택 시 기존 유지"""
     from services.daily_report_service import daily_report_service
 
-    d = date.fromisoformat(report_date)
-    scope = normalize_market_scope(market_scope)
+    resolved_report_date = payload.report_date.isoformat() if payload else report_date
+    resolved_market_scope = payload.market_scope if payload else market_scope
+    resolved_choice = payload.choice if payload else choice
+    if not resolved_report_date or not resolved_market_scope or not resolved_choice:
+        return SuccessResponse(data=None, message="report_date, market_scope, choice는 필수입니다")
 
-    if choice == "existing":
+    d = date.fromisoformat(resolved_report_date)
+    scope = normalize_market_scope(resolved_market_scope)
+
+    if resolved_choice == "existing":
         repo = DailyReportRepository(db)
         existing = await repo.get_by_date(d, market_scope=scope)
         if existing:
@@ -909,7 +920,7 @@ async def confirm_refresh_report(
             )
         return SuccessResponse(data=None, message="기존 리포트 없음")
 
-    if choice == "refreshed":
+    if resolved_choice == "refreshed":
         # 새 데이터를 다시 생성하여 저장
         result = await daily_report_service.regenerate_daily_report(d, market_scope=scope)
         refreshed = result["refreshed"]
@@ -945,4 +956,4 @@ async def confirm_refresh_report(
             message="갱신된 리포트 저장 완료",
         )
 
-    return SuccessResponse(data=None, message=f"잘못된 choice 값: {choice}")
+    return SuccessResponse(data=None, message=f"잘못된 choice 값: {resolved_choice}")
