@@ -693,6 +693,16 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 .sched-item.sched-done .sched-label { color: #4b5563; }
 .sched-item.sched-next .sched-label { color: #e5e7eb; font-weight: 500; }
 
+/* ── Report Comparison ── */
+.report-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 8px; }
+.report-col { background: rgba(26,27,46,0.6); border-radius: 8px; padding: 16px; border: 1px solid #374151; }
+.report-col.recommended { border-color: rgba(96,165,250,0.5); box-shadow: 0 0 8px rgba(96,165,250,0.15); }
+.report-col-header { font-size: 13px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 6px; }
+.report-diff-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 12px; }
+.report-diff-badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: rgba(52,211,153,0.2); color: #34d399; margin-left: 4px; }
+.report-comparison-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; padding: 0 8px; }
+.report-comparison-actions button { padding: 8px 20px; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; border: none; }
+
 /* Workspace theme accents */
 .workspace-krx .schedule-adaptive-card { border-color: rgba(248, 113, 113, 0.15); }
 .workspace-us .schedule-adaptive-card { border-color: rgba(96, 165, 250, 0.2); }

@@ -29,3 +29,10 @@ class DailyReportResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ReportComparisonResponse(BaseModel):
+    existing: Optional[DailyReportResponse] = None
+    refreshed: DailyReportResponse
+    recommendation: str  # "existing" or "refreshed"
+    comparison: dict  # field-level differences

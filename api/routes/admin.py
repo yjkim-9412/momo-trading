@@ -22,7 +22,7 @@ from schemas.activity_schema import (
     CycleResponse,
 )
 from schemas.common import SuccessResponse
-from schemas.daily_report_schema import DailyReportResponse
+from schemas.daily_report_schema import DailyReportResponse, ReportComparisonResponse
 from services.activity_logger import activity_logger
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
@@ -851,17 +851,98 @@ async def trigger_agent_cycle(market: str | None = Query(None)):
 async def generate_report(
     target_date: str | None = Query(None),
     market_scope: str | None = Query(None),
+    refresh: bool = Query(False),
 ):
-    """수동 일일 리포트 생성"""
+    """수동 일일 리포트 생성 (refresh=True 시 기존 리포트와 비교)"""
     from services.daily_report_service import daily_report_service
+
     d = date.fromisoformat(target_date) if target_date else None
-    report = await daily_report_service.generate_daily_report(
-        d,
-        market_scope=market_scope or settings.primary_market_code,
-    )
+    scope = market_scope or settings.primary_market_code
+
+    if refresh:
+        result = await daily_report_service.regenerate_daily_report(d, market_scope=scope)
+        existing_resp = (
+            DailyReportResponse.model_validate(result["existing"])
+            if result["existing"]
+            else None
+        )
+        refreshed_resp = DailyReportResponse.model_validate(result["refreshed"])
+        return SuccessResponse(
+            data=ReportComparisonResponse(
+                existing=existing_resp,
+                refreshed=refreshed_resp,
+                recommendation=result["recommendation"],
+                comparison=result["comparison"],
+            ),
+            message="리포트 비교 완료",
+        )
+
+    report = await daily_report_service.generate_daily_report(d, market_scope=scope)
     if report:
         return SuccessResponse(
             data=DailyReportResponse.model_validate(report),
             message="리포트 생성 완료",
         )
     return SuccessResponse(message="리포트 생성 실패 또는 이미 존재")
+
+
+@router.post("/reports/confirm-refresh")
+async def confirm_refresh_report(
+    report_date: str = Query(...),
+    market_scope: str = Query(...),
+    choice: str = Query(..., description="'existing' or 'refreshed'"),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """리포트 갱신 확정 — refreshed 선택 시 DB 저장, existing 선택 시 기존 유지"""
+    from services.daily_report_service import daily_report_service
+
+    d = date.fromisoformat(report_date)
+    scope = normalize_market_scope(market_scope)
+
+    if choice == "existing":
+        repo = DailyReportRepository(db)
+        existing = await repo.get_by_date(d, market_scope=scope)
+        if existing:
+            return SuccessResponse(
+                data=DailyReportResponse.model_validate(existing),
+                message="기존 리포트 유지",
+            )
+        return SuccessResponse(data=None, message="기존 리포트 없음")
+
+    if choice == "refreshed":
+        # 새 데이터를 다시 생성하여 저장
+        result = await daily_report_service.regenerate_daily_report(d, market_scope=scope)
+        refreshed = result["refreshed"]
+
+        # DailyReport 객체에서 저장할 필드 추출
+        refreshed_data = {
+            "total_cycles": refreshed.total_cycles,
+            "total_analyses": refreshed.total_analyses,
+            "total_recommendations": refreshed.total_recommendations,
+            "total_orders": refreshed.total_orders,
+            "buy_count": refreshed.buy_count,
+            "sell_count": refreshed.sell_count,
+            "win_count": refreshed.win_count,
+            "loss_count": refreshed.loss_count,
+            "total_pnl": refreshed.total_pnl,
+            "unrealized_pnl": refreshed.unrealized_pnl,
+            "open_position_count": refreshed.open_position_count,
+            "market_summary": refreshed.market_summary,
+            "performance_review": refreshed.performance_review,
+            "lessons_learned": refreshed.lessons_learned,
+            "next_day_plan": refreshed.next_day_plan,
+            "top_picks": refreshed.top_picks,
+            "strategy_stats": refreshed.strategy_stats,
+        }
+
+        report = await daily_report_service.apply_refreshed_report(
+            report_date=d,
+            market_scope=scope,
+            refreshed_data=refreshed_data,
+        )
+        return SuccessResponse(
+            data=DailyReportResponse.model_validate(report),
+            message="갱신된 리포트 저장 완료",
+        )
+
+    return SuccessResponse(data=None, message=f"잘못된 choice 값: {choice}")
