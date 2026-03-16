@@ -253,7 +253,7 @@ class LLMFactory:
                     logger.warning("LLM 호출 실패, 재시도: {}", str(e)[:100])
                     await asyncio.sleep(2)
 
-        fallback_result = await self._maybe_generate_with_crypto_fallback(
+        fallback_result = await self._maybe_generate_with_fallback(
             provider=provider,
             last_error=last_error,
             prompt=prompt,
@@ -272,22 +272,34 @@ class LLMFactory:
         raise last_error
 
     @staticmethod
-    def _is_codex_session_failure(error: Exception | None) -> bool:
-        """Codex CLI 인증/세션 불능 계열 오류 여부"""
+    def _is_codex_failure(error: Exception | None) -> bool:
+        """Codex CLI 실패 여부 (인증, 세션, 사용량 소진, 프로세스 실패 포함)"""
         if error is None:
             return False
         message = str(error)
         patterns = (
+            # 인증/세션 오류
             "Auth(",
             "TokenRefreshFailed",
             "Failed to parse server response",
             "Codex CLI 빈 응답",
             "Codex 세션 ID를 찾을 수 없습니다",
             "Transport channel closed",
+            # 사용량/제한 오류
+            "rate limit",
+            "Rate limit",
+            "quota",
+            "insufficient",
+            "billing",
+            "exceeded",
+            "429",
+            "too many requests",
+            # 프로세스 실패
+            "Codex CLI 실패",
         )
         return any(pattern in message for pattern in patterns)
 
-    async def _maybe_generate_with_crypto_fallback(
+    async def _maybe_generate_with_fallback(
         self,
         *,
         provider: LLMProviderProtocol,
@@ -302,13 +314,12 @@ class LLMFactory:
         reasoning_effort_override: str | None,
         profile: Tier1Profile | None,
     ) -> tuple[str, str] | None:
-        """코인 scope에서 Codex 인증/세션 오류 시 Claude fallback 1회 시도"""
+        """Codex CLI 실패 시 Claude Code fallback 1회 시도 (전 스코프)"""
         if (
             settings.llm_provider_for_scope(scope) != LLMProvider.CODEX_CLI
             or provider.provider != LLMProvider.CODEX_CLI
             or not scope
-            or normalize_market_scope(scope) != "CRYPTO"
-            or not self._is_codex_session_failure(last_error)
+            or not self._is_codex_failure(last_error)
         ):
             return None
 

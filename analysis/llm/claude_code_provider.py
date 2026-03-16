@@ -211,9 +211,11 @@ class ClaudeCodeProvider:
             "--output-format", "json",
             "--model", self._model,
             "--max-turns", "1",
-            "--effort", effort,
-            "--dangerously-skip-permissions",
         ]
+        # Haiku는 extended thinking 미지원이므로 effort 생략
+        if "haiku" not in (self._model or "").lower():
+            cmd.extend(["--effort", effort])
+        cmd.append("--dangerously-skip-permissions")
 
         actual_prompt = prompt
 

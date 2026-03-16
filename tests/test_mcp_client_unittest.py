@@ -257,7 +257,7 @@ class MCPClientTest(unittest.IsolatedAsyncioTestCase):
 
 
 class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
-    """US 동적 발굴 + 워치리스트 하이브리드 병합 테스트"""
+    """US discovery 우선 + fallback seed 테스트"""
 
     def _make_stock(self, symbol, volume=100, change_rate=1.0, scan_source="WATCHLIST"):
         return {
@@ -273,8 +273,8 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
             "scan_source": scan_source,
         }
 
-    async def test_hybrid_volume_rank_merges_discovery_and_watchlist(self):
-        """US_DYNAMIC_DISCOVERY_ENABLED=True: MCP 성공 시 동적 결과 + 워치리스트 병합"""
+    async def test_volume_rank_ignores_watchlist_when_discovery_succeeds(self):
+        """US_DYNAMIC_DISCOVERY_ENABLED=True: discovery 성공 시 fallback seed를 섞지 않는다"""
         client = MCPClient()
 
         discovery_items = [{"symb": "TSLA", "last": "250", "tvol": "9999", "rate": "3.0"}]
@@ -285,7 +285,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
                 success=True,
                 data={"output1": discovery_items},
             ))),
-            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
             patch("trading.mcp_client.settings") as mock_settings,
         ):
             mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
@@ -293,11 +293,11 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response.success)
         symbols = [s["symbol"] for s in response.data["stocks"]]
-        self.assertIn("TSLA", symbols)
-        self.assertIn("SOFI", symbols)
+        self.assertEqual(symbols, ["TSLA"])
+        watchlist_mock.assert_not_awaited()
 
-    async def test_hybrid_volume_rank_watchlist_only_when_mcp_fails(self):
-        """US_DYNAMIC_DISCOVERY_ENABLED=True: MCP 실패 시 워치리스트만 반환"""
+    async def test_volume_rank_uses_watchlist_fallback_when_mcp_fails(self):
+        """US_DYNAMIC_DISCOVERY_ENABLED=True: discovery 실패 시 fallback seed만 반환"""
         client = MCPClient()
 
         watchlist_stocks = [self._make_stock("PLTR", volume=300)]
@@ -352,8 +352,8 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(merged[0]["volume"], 1000)
         self.assertEqual(merged[0]["scan_source"], "DISCOVERY")
 
-    async def test_hybrid_volume_rank_applies_cap_after_sorting(self):
-        """미국 거래량 스캔은 병합 후 정렬하고 마지막에만 cap을 적용한다"""
+    async def test_volume_rank_applies_cap_after_sorting_without_watchlist_injection(self):
+        """미국 거래량 스캔은 discovery 결과만 정렬 후 cap을 적용한다"""
         client = MCPClient()
         discovery_items = [
             {"symb": f"D{i:02d}", "last": "10", "tvol": str(500 - i), "rate": "1.0"}
@@ -366,7 +366,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
                 success=True,
                 data={"output1": discovery_items},
             ))),
-            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
             patch("trading.mcp_client.settings") as mock_settings,
         ):
             mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
@@ -375,11 +375,12 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.success)
         stocks = response.data["stocks"]
         self.assertEqual(len(stocks), 30)
-        self.assertEqual(stocks[0]["symbol"], "SOFI")
-        self.assertEqual(stocks[0]["scan_source"], "WATCHLIST")
+        self.assertEqual(stocks[0]["symbol"], "D00")
+        self.assertEqual(stocks[0]["scan_source"], "DISCOVERY")
+        watchlist_mock.assert_not_awaited()
 
-    async def test_hybrid_fluctuation_rank_merges_and_sorts(self):
-        """등락률 하이브리드 스캔: 병합 후 change_rate 기준 정렬"""
+    async def test_fluctuation_rank_ignores_watchlist_when_discovery_succeeds(self):
+        """등락률 스캔도 discovery 성공 시 fallback seed를 섞지 않는다"""
         client = MCPClient()
 
         discovery_items = [{"symb": "MARA", "last": "20", "tvol": "800", "rate": "5.0"}]
@@ -390,7 +391,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
                 success=True,
                 data={"output1": discovery_items},
             ))),
-            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
             patch("trading.mcp_client.settings") as mock_settings,
         ):
             mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
@@ -398,11 +399,11 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(response.success)
         stocks = response.data["stocks"]
-        # change_rate 내림차순: RIOT(8.0) > MARA(5.0)
-        self.assertEqual(stocks[0]["symbol"], "RIOT")
+        self.assertEqual([stock["symbol"] for stock in stocks], ["MARA"])
+        watchlist_mock.assert_not_awaited()
 
-    async def test_hybrid_fluctuation_rank_applies_cap_after_sorting(self):
-        """미국 등락률 스캔도 병합 후 정렬하고 마지막에만 cap을 적용한다"""
+    async def test_fluctuation_rank_applies_cap_after_sorting_without_watchlist_injection(self):
+        """미국 등락률 스캔도 discovery 결과만 정렬 후 cap을 적용한다"""
         client = MCPClient()
         discovery_items = [
             {"symb": f"M{i:02d}", "last": "10", "tvol": "1000", "rate": str(50 - i)}
@@ -415,7 +416,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
                 success=True,
                 data={"output1": discovery_items},
             ))),
-            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
             patch("trading.mcp_client.settings") as mock_settings,
         ):
             mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
@@ -424,8 +425,9 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.success)
         stocks = response.data["stocks"]
         self.assertEqual(len(stocks), 30)
-        self.assertEqual(stocks[0]["symbol"], "AAPL")
-        self.assertEqual(stocks[0]["scan_source"], "WATCHLIST")
+        self.assertEqual(stocks[0]["symbol"], "M00")
+        self.assertEqual(stocks[0]["scan_source"], "DISCOVERY")
+        watchlist_mock.assert_not_awaited()
 
 
 if __name__ == "__main__":

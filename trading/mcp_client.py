@@ -902,19 +902,54 @@ class MCPClient:
         rank_name: str,
         discovery_stocks: list[dict[str, Any]],
         watchlist_stocks: list[dict[str, Any]],
-        merged_stocks: list[dict[str, Any]],
         returned_stocks: list[dict[str, Any]],
+        *,
+        mode: str,
     ) -> None:
         logger.info(
-            "[{}] 미국장 {} 하이브리드 스캔: discovery {}건, watchlist {}건, merged {}건, returned {}건, watchlist 밖 {}건",
+            "[{}] 미국장 {} 스캔: mode={}, discovery {}건, fallback seed {}건, returned {}건",
             market,
             rank_name,
+            mode,
             len(discovery_stocks),
             len(watchlist_stocks),
-            len(merged_stocks),
             len(returned_stocks),
-            self._count_non_watchlist_symbols(returned_stocks, watchlist_stocks),
         )
+
+    async def _rank_us_stocks(
+        self,
+        market: str,
+        rank_name: str,
+        discovery_stocks: list[dict[str, Any]],
+        *,
+        sort_key: str,
+        reverse: bool,
+    ) -> list[dict[str, Any]]:
+        """미국장 랭킹 결과를 discovery 우선, fallback seed 보조로 정렬한다."""
+        watchlist_stocks: list[dict[str, Any]] = []
+        mode = "DISCOVERY"
+        ranked_source = list(discovery_stocks)
+
+        if not settings.US_DYNAMIC_DISCOVERY_ENABLED:
+            watchlist_stocks = await self._build_watchlist_scan(market)
+            ranked_source = list(watchlist_stocks)
+            mode = "SEED_ONLY"
+        elif not ranked_source:
+            watchlist_stocks = await self._build_watchlist_scan(market)
+            ranked_source = list(watchlist_stocks)
+            mode = "FALLBACK_SEED"
+
+        ranked_source.sort(key=lambda item: item.get(sort_key, 0), reverse=reverse)
+        ranked = ranked_source[:_US_SCAN_RESULT_LIMIT]
+        self._log_us_rank_summary(
+            market,
+            rank_name,
+            discovery_stocks,
+            watchlist_stocks,
+            ranked,
+            mode=mode,
+        )
+        return ranked
 
     def _normalize_stock_item(self, item: dict[str, Any], market: str) -> dict[str, Any]:
         """시장 스캔용 종목 데이터 정규화"""
@@ -1418,17 +1453,12 @@ class MCPClient:
                     )
                     discovery_stocks = [self._normalize_stock_item(item, market_code) for item in items]
 
-            watchlist_stocks = await self._build_watchlist_scan(market_code)
-            merged = self._merge_discovery_and_watchlist(discovery_stocks, watchlist_stocks)
-            merged.sort(key=lambda item: item.get("volume", 0), reverse=True)
-            ranked = merged[:_US_SCAN_RESULT_LIMIT]
-            self._log_us_rank_summary(
+            ranked = await self._rank_us_stocks(
                 market_code,
                 "거래량순위",
                 discovery_stocks,
-                watchlist_stocks,
-                merged,
-                ranked,
+                sort_key="volume",
+                reverse=True,
             )
             return MCPResponse(success=bool(ranked), data={"stocks": ranked})
 
@@ -1531,18 +1561,12 @@ class MCPClient:
                     )
                     discovery_stocks = [self._normalize_stock_item(item, market_code) for item in items]
 
-            watchlist_stocks = await self._build_watchlist_scan(market_code)
-            merged = self._merge_discovery_and_watchlist(discovery_stocks, watchlist_stocks)
-            merged.sort(key=lambda item: item.get("change_rate", 0), reverse=(sort != "bottom"))
-            ranked = merged[:_US_SCAN_RESULT_LIMIT]
-            rank_name = "등락률상위" if sort != "bottom" else "등락률하위"
-            self._log_us_rank_summary(
+            ranked = await self._rank_us_stocks(
                 market_code,
-                rank_name,
+                "등락률상위" if sort != "bottom" else "등락률하위",
                 discovery_stocks,
-                watchlist_stocks,
-                merged,
-                ranked,
+                sort_key="change_rate",
+                reverse=(sort != "bottom"),
             )
             return MCPResponse(success=bool(ranked), data={"stocks": ranked})
 

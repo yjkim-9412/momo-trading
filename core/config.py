@@ -48,9 +48,9 @@ class Settings(BaseSettings):
     US_TRADING_ENABLED: bool = False
     US_PREMARKET_ENABLED: bool = False
     US_AFTERMARKET_ENABLED: bool = False
-    US_WATCHLIST_SYMBOLS: str = "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,AMD"
+    US_WATCHLIST_SYMBOLS: str = ""
     US_SCAN_LIMIT: int = 12
-    US_DYNAMIC_DISCOVERY_ENABLED: bool = True  # MCP 동적 발굴 + 워치리스트 병합
+    US_DYNAMIC_DISCOVERY_ENABLED: bool = True  # MCP 동적 발굴 우선, 실패 시 fallback seed 사용
     BASE_CURRENCY: str = "KRW"
     FX_RATE_SOURCE: str = "KIS"
     US_LEVERAGED_PRODUCTS_ENABLED: bool = True
@@ -123,8 +123,13 @@ class Settings(BaseSettings):
 
     # Claude Code CLI
     CLAUDE_CODE_MODEL: str = "sonnet"  # 기본 모델 (Tier별 미지정 시 사용)
-    CLAUDE_CODE_MODEL_TIER1: str = "haiku"  # Tier1 (스캔/분석): 빠른 모델
+    CLAUDE_CODE_MODEL_TIER1: str = "haiku"  # Tier1 기본 (SCAN/ANALYSIS 미지정 시)
+    CLAUDE_CODE_MODEL_TIER1_SCAN: str = ""  # Tier1 스캔 전용 모델
+    CLAUDE_CODE_MODEL_TIER1_ANALYSIS: str = ""  # Tier1 분석 전용 모델
     CLAUDE_CODE_MODEL_TIER2: str = "sonnet"  # Tier2 (최종 검토): 정확한 모델
+    CLAUDE_CODE_EFFORT_TIER1_SCAN: str = ""  # Tier1 스캔 effort (기본: medium)
+    CLAUDE_CODE_EFFORT_TIER1_ANALYSIS: str = ""  # Tier1 분석 effort (기본: medium)
+    CLAUDE_CODE_EFFORT_TIER2: str = ""  # Tier2 effort (기본: high)
     CLAUDE_CODE_EFFORT_REPORT: str = ""  # 리포트/회고 생성 effort (예: max)
     CLAUDE_CODE_PATH: str = ""  # 비어있으면 자동 탐색 (예: /opt/homebrew/bin/claude)
 
@@ -590,7 +595,7 @@ class Settings(BaseSettings):
 
         if scope and normalize_market_scope(scope) == "CRYPTO":
             return self.get_crypto_llm_model_for_provider(provider, tier, profile)
-        return self.get_llm_model(provider, tier)
+        return self.get_llm_model(provider, tier, profile)
 
     def get_llm_reasoning_effort_for_scope(
         self,
@@ -630,7 +635,7 @@ class Settings(BaseSettings):
 
     @property
     def us_watchlist_symbols(self) -> list[str]:
-        """미국장 스캔용 우선 감시 종목"""
+        """미국장 discovery 실패/비활성 시 사용할 fallback seed 종목"""
         return self._parse_csv(self.US_WATCHLIST_SYMBOLS, upper=True)[: self.US_SCAN_LIMIT]
 
     @property
@@ -698,10 +703,24 @@ class Settings(BaseSettings):
             )
             return LLMProvider.CLAUDE_CODE
 
-    def get_llm_model(self, provider: LLMProvider, tier: LLMTier) -> str:
+    def get_llm_model(self, provider: LLMProvider, tier: LLMTier, profile: Tier1Profile | None = None) -> str:
         """provider/tier 조합의 모델명 반환"""
         if provider == LLMProvider.CLAUDE_CODE:
             if tier == LLMTier.TIER1:
+                if profile == Tier1Profile.SCAN:
+                    return (
+                        self.CLAUDE_CODE_MODEL_TIER1_SCAN
+                        or self.CLAUDE_CODE_MODEL_TIER1
+                        or self.CLAUDE_CODE_MODEL
+                        or "haiku"
+                    )
+                if profile == Tier1Profile.ANALYSIS:
+                    return (
+                        self.CLAUDE_CODE_MODEL_TIER1_ANALYSIS
+                        or self.CLAUDE_CODE_MODEL_TIER1
+                        or self.CLAUDE_CODE_MODEL
+                        or "haiku"
+                    )
                 return self.CLAUDE_CODE_MODEL_TIER1 or self.CLAUDE_CODE_MODEL or "haiku"
             return self.CLAUDE_CODE_MODEL_TIER2 or self.CLAUDE_CODE_MODEL or "sonnet"
 
@@ -717,7 +736,16 @@ class Settings(BaseSettings):
     ) -> str | None:
         """provider/tier 조합의 reasoning effort 반환"""
         if provider == LLMProvider.CLAUDE_CODE:
-            return "medium" if tier == LLMTier.TIER1 else "high"
+            if tier == LLMTier.TIER1:
+                if profile == Tier1Profile.SCAN:
+                    raw = self.CLAUDE_CODE_EFFORT_TIER1_SCAN
+                elif profile == Tier1Profile.ANALYSIS:
+                    raw = self.CLAUDE_CODE_EFFORT_TIER1_ANALYSIS
+                else:
+                    raw = ""
+                return (raw or "").strip().lower() or "medium"
+            raw = self.CLAUDE_CODE_EFFORT_TIER2
+            return (raw or "").strip().lower() or "high"
 
         for field_name, raw_value in self._get_codex_reasoning_effort_candidates(
             tier,
