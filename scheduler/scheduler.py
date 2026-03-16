@@ -1526,9 +1526,20 @@ class TradingScheduler:
         try:
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
+            from services.watchlist_sync import cleanup_post_market_stock_watchlist
+
+            async def _cleanup_after_close(retained_symbols: list[tuple[str, str]]) -> None:
+                try:
+                    await cleanup_post_market_stock_watchlist(
+                        market,
+                        retained_symbols=retained_symbols,
+                    )
+                except Exception as cleanup_error:
+                    logger.warning("[{}] 장후 감시 정리 실패: {}", market, str(cleanup_error))
 
             holdings = await account_manager.get_holdings(market)
             if not holdings:
+                await _cleanup_after_close([])
                 await self._log_schedule(
                     market,
                     ActivityPhase.PROGRESS,
@@ -1538,6 +1549,7 @@ class TradingScheduler:
 
             sellable = [h for h in holdings if h.quantity > 0]
             if not sellable:
+                await _cleanup_after_close([])
                 return
 
             # 스윙 모드: 종목별 HOLD/SELL 판정
@@ -1557,6 +1569,9 @@ class TradingScheduler:
             )
 
             if not to_sell:
+                await _cleanup_after_close(
+                    [(str(h.symbol or "").upper(), h.market) for h in to_hold if h.quantity > 0]
+                )
                 return
 
             async def _sell_one(h):
@@ -1613,6 +1628,7 @@ class TradingScheduler:
                     f"\u26a0\ufe0f [{market}] 청산 {len(failed_holdings)}건 실패 → 5초 후 재시도",
                 )
                 await asyncio.sleep(5)
+                remaining_failed_holdings = []
                 retry_results = await asyncio.gather(
                     *[_sell_one(h) for h in failed_holdings],
                     return_exceptions=True,
@@ -1626,7 +1642,9 @@ class TradingScheduler:
                         sold_count += 1
                         logger.info("[{}] 청산 재시도 성공: {}({})", market, h.name, h.symbol)
                     else:
+                        remaining_failed_holdings.append(h)
                         logger.error("[{}] 청산 재시도 실패: {}({}) — {}", market, h.name, h.symbol, resp.error or "")
+                failed_holdings = remaining_failed_holdings
 
             summary = f"\U0001f6a8 [{market}] {mode_label} 완료: {sold_count}건 매도"
             if to_hold:
@@ -1636,12 +1654,12 @@ class TradingScheduler:
                 summary += f" | 실패 {len(failed_holdings)}건"
             await self._log_schedule(market, ActivityPhase.PROGRESS, summary)
 
-            # 매도한 종목만 이벤트 감시 임계값 제거 (HOLD 종목은 유지)
-            from realtime.event_detector import event_detector
-            sold_symbols = {(h.market, h.symbol) for h in to_sell}
-            for h in holdings:
-                if (h.market, h.symbol) in sold_symbols:
-                    event_detector.remove_levels(h.symbol, market=h.market)
+            retained_symbols = [
+                (str(h.symbol or "").upper(), h.market)
+                for h in [*to_hold, *failed_holdings]
+                if h.quantity > 0
+            ]
+            await _cleanup_after_close(retained_symbols)
 
         except Exception as e:
             logger.error("[{}] 청산 오류: {}", market, str(e))
