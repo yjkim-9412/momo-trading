@@ -75,6 +75,19 @@ class FlakyDummyWebSocket(DummyWebSocket):
             raise ConnectionError("approval key failed")
 
 
+class ConditionalListenDummyWebSocket(DummyWebSocket):
+    def __init__(self):
+        super().__init__()
+        self.is_connected = False
+        self.listen_calls = 0
+
+    async def listen(self) -> None:
+        self.listen_calls += 1
+        if not self.is_connected:
+            return
+        await asyncio.sleep(3600)
+
+
 @patch("scheduler.market_calendar.market_calendar.is_trading_hours", return_value=True)
 class StreamManagerTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -131,6 +144,8 @@ class StreamManagerTest(unittest.IsolatedAsyncioTestCase):
         dummy_ws = FlakyDummyWebSocket(connect_failures=1)
         stream_module.kis_websocket = dummy_ws
         manager = StreamManager()
+        manager._desired_by_scope["US"] = {("NASDAQ", "AAPL")}
+        manager._desired_order_by_scope["US"] = [("AAPL", "NASDAQ")]
 
         await manager.start()
 
@@ -184,6 +199,67 @@ class StreamManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["connected"])
         self.assertEqual(status["health"], "ERROR")
         self.assertEqual(status["last_business_error"], "OPSP8996: ALREADY IN USE appkey")
+
+    async def test_start_does_not_spin_listener_when_disconnected_and_idle(self, _mock_trading):
+        dummy_ws = ConditionalListenDummyWebSocket()
+        stream_module.kis_websocket = dummy_ws
+        manager = StreamManager()
+
+        await manager.start()
+        await asyncio.sleep(0.15)
+
+        self.assertEqual(dummy_ws.listen_calls, 0)
+
+        await manager.stop()
+
+    async def test_idle_disconnected_listener_wakes_after_symbol_added(self, _mock_trading):
+        dummy_ws = ConditionalListenDummyWebSocket()
+        stream_module.kis_websocket = dummy_ws
+        manager = StreamManager()
+
+        await manager.start()
+        await asyncio.sleep(0.05)
+        self.assertEqual(dummy_ws.listen_calls, 0)
+
+        await manager.replace_market_subscriptions("US", [("AAPL", "NASDAQ")])
+        await asyncio.sleep(0.05)
+
+        status = manager.stream_status("US")
+        self.assertTrue(status["connected"])
+        self.assertIn(("NASDAQ", "AAPL"), dummy_ws.confirmed)
+        self.assertGreaterEqual(dummy_ws.listen_calls, 1)
+
+        await manager.stop()
+
+    async def test_replace_market_subscriptions_unsubscribes_closed_scope_but_keeps_other_scope(self, _mock_trading):
+        dummy_ws = DummyWebSocket()
+        stream_module.kis_websocket = dummy_ws
+        manager = StreamManager()
+
+        await manager.replace_market_subscriptions("KRX", [("005930", "KRX")])
+        await manager.replace_market_subscriptions("US", [("AAPL", "NASDAQ")])
+
+        with patch(
+            "scheduler.market_calendar.market_calendar.is_trading_hours",
+            side_effect=lambda scope: scope == "US",
+        ):
+            await manager.replace_market_subscriptions("KRX", [("005930", "KRX")])
+
+        self.assertEqual(dummy_ws.confirmed, {("NASDAQ", "AAPL")})
+        self.assertEqual(manager.desired_keys("KRX"), {("KRX", "005930")})
+
+    async def test_replace_market_subscriptions_disconnects_when_only_closed_scope_remains(self, _mock_trading):
+        dummy_ws = DummyWebSocket()
+        stream_module.kis_websocket = dummy_ws
+        manager = StreamManager()
+
+        await manager.replace_market_subscriptions("KRX", [("005930", "KRX")])
+
+        with patch("scheduler.market_calendar.market_calendar.is_trading_hours", return_value=False):
+            await manager.replace_market_subscriptions("KRX", [("005930", "KRX")])
+
+        self.assertFalse(dummy_ws.is_connected)
+        self.assertEqual(dummy_ws.confirmed, set())
 
 
 if __name__ == "__main__":
