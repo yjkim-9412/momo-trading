@@ -1,4 +1,5 @@
-from unittest.mock import AsyncMock
+import json
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -204,3 +205,60 @@ async def test_handle_message_keeps_domestic_mapping_with_official_record_size()
         "volume": 15,
         "cumulative_volume": 123456,
     }]
+
+
+@pytest.mark.asyncio
+async def test_handle_message_confirms_subscription_on_success_ack():
+    ws = KISWebSocket()
+    mock_ws = AsyncMock()
+    ws._requested_subscriptions.add(("KRX", "005930"))
+
+    await ws._handle_message(
+        json.dumps({
+            "header": {"tr_id": "H0STCNT0", "tr_key": "005930", "encrypt": "N"},
+            "body": {"rt_cd": "0", "msg_cd": "OPSP0000", "msg1": "SUBSCRIBE SUCCESS"},
+        }),
+        "domestic",
+        mock_ws,
+    )
+
+    assert ("KRX", "005930") in ws.confirmed_subscription_keys
+    assert ws.last_business_error is None
+    mock_ws.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_message_logs_business_error_without_confirming_subscription():
+    ws = KISWebSocket()
+    ws._requested_subscriptions.add(("KRX", "005930"))
+
+    with patch("trading.kis_websocket.logger.warning") as warning_mock:
+        await ws._handle_message(
+            json.dumps({
+                "header": {"tr_id": "H0STCNT0", "tr_key": "005930", "encrypt": "N"},
+                "body": {"rt_cd": "1", "msg_cd": "OPSP0001", "msg1": "SUBSCRIBE FAILED"},
+            }),
+            "domestic",
+            AsyncMock(),
+        )
+
+    assert ("KRX", "005930") not in ws.confirmed_subscription_keys
+    assert ws.last_business_error == "OPSP0001: SUBSCRIBE FAILED"
+    warning_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_handle_message_raises_on_fatal_business_error():
+    ws = KISWebSocket()
+
+    with pytest.raises(ConnectionError, match="OPSP8996"):
+        await ws._handle_message(
+            json.dumps({
+                "header": {"tr_id": "(null)", "tr_key": "", "encrypt": "N"},
+                "body": {"rt_cd": "9", "msg_cd": "OPSP8996", "msg1": "ALREADY IN USE appkey"},
+            }),
+            "domestic",
+            AsyncMock(),
+        )
+
+    assert ws.fatal_error == "OPSP8996: ALREADY IN USE appkey"

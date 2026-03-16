@@ -70,6 +70,7 @@ class AccountBalance(BaseModel):
     total_asset: float
     cash: float
     stock_value: float
+    operating_cash: float = 0.0  # 총자산 - 주식평가 기준 현금성 자산
     locked_krw: float = 0.0
     total_pnl: float
     total_pnl_rate: float

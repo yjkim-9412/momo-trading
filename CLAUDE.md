@@ -61,3 +61,14 @@ Mixin 파일은 서로를 임포트하지 않으며, 상호 호출은 `self.*`�
 분리된 장 구조, 스케줄 구조, 미국장/코인 구현 회고, 테스트 실행 규칙은 아래 문서에 정의되어 있다. 반드시 참조할 것.
 
 - `docs/shared-guidelines.md`
+
+## 테스트 실행 규칙
+
+- 테스트 러너는 파일명 대신 **실제 테스트 스타일**을 보고 선택할 것.
+- `unittest.TestCase`, `unittest.IsolatedAsyncioTestCase`, `unittest.main()` 기반 파일은 `venv/bin/python -m unittest ... -v`를 사용한다.
+- `def test_*`, `@pytest.mark.asyncio`, fixture 기반 파일은 `venv/bin/pytest ...`를 사용한다.
+- 예시:
+  - `tests/test_stream_manager_unittest.py` → `venv/bin/python -m unittest tests.test_stream_manager_unittest -v`
+  - `tests/test_kis_websocket_unittest.py` → `venv/bin/pytest tests/test_kis_websocket_unittest.py -q`
+- 코드 수정 후에는 가능하면 `venv/bin/python -m py_compile ...`로 문법 검사를 먼저 수행한다.
+- `pytest` 기반 파일이 현재 환경에서 멈추면 `unittest`로 대체 실행하지 말고, `py_compile`와 최소 직접 재현 검증을 수행한 뒤 `pytest` 검증이 미완료였음을 결과에 명시한다.

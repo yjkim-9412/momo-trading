@@ -42,8 +42,10 @@ RISK_TUNING_PROMPT = """## AI 한도 결정 요청
 
 ### 계좌 현황
 - 총자산: {total_asset:,.0f}원
-- 현금: {cash:,.0f}원
+- 현금(예수금): {cash:,.0f}원
+- 매입금액: {purchase_amount:,.0f}원
 - 보유 주식 평가액: {stock_value:,.0f}원
+- **매수가능 금액: {buyable_amount:,.0f}원** (이 금액을 초과하는 주문은 불가)
 - 현재 현금 비율: {cash_ratio:.1f}%
 - 평가 손익: {total_pnl:+,.0f}원 ({total_pnl_rate:+.2f}%)
 

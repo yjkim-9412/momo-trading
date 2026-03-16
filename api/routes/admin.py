@@ -125,6 +125,34 @@ async def get_watchlist(market: str | None = Query(None)):
                 if sym and key not in name_map:
                     name_map[key] = str(sym_info.get("name", "") or "")
 
+    # 2-b) 이름 미해소 심볼 → 최근 활동 로그 summary에서 [종목명] 추출
+    import re as _re
+
+    empty_name_keys = [k for k in name_map if not name_map[k]]
+    if empty_name_keys:
+        try:
+            from core.database import AsyncSessionLocal
+            from models.agent_activity import AgentActivityLog
+
+            async with AsyncSessionLocal() as _db:
+                for mk, sym in empty_name_keys:
+                    result = await _db.execute(
+                        select(AgentActivityLog.summary)
+                        .where(
+                            AgentActivityLog.symbol == sym,
+                            AgentActivityLog.market_scope == scope,
+                        )
+                        .order_by(AgentActivityLog.created_at.desc())
+                        .limit(10)
+                    )
+                    for (summary,) in result:
+                        m = _re.match(r'[^\[]*\[([^\]]+)\]', summary or '')
+                        if m and not _re.match(r'^TIER\d', m.group(1), _re.IGNORECASE):
+                            name_map[(mk, sym)] = m.group(1)
+                            break
+        except Exception as e:
+            logger.debug("종목명 보강(활동로그) 실패: {}", str(e))
+
     # 3) scope에 해당하는 desired 종목 수집
     desired_set = stream_manager.desired_keys(scope)
     active_set = stream_manager.active_keys(scope)
@@ -310,7 +338,9 @@ async def get_activity_feed(
         before_id=before_id,
     )
 
-    # 종목명 보강 (symbol → stocks.name)
+    # 종목명 보강: 1) stocks 테이블 → 2) 보유종목 → 3) summary에서 [종목명] 추출
+    import re as _re
+
     symbol_set = {item.symbol for item in items if item.symbol}
     name_map: dict[str, str] = {}
     if symbol_set:
@@ -319,6 +349,30 @@ async def get_activity_feed(
             select(Stock.symbol, Stock.name).where(Stock.symbol.in_(symbol_set))
         )
         name_map = {row.symbol: row.name for row in result}
+        if name_map:
+            logger.debug("종목명 보강(stocks): {}", list(name_map.keys()))
+
+    if symbol_set - name_map.keys():
+        try:
+            holdings = await account_manager.get_holdings(resolved_scope)
+            for h in holdings:
+                if h.symbol and h.symbol not in name_map and h.name:
+                    name_map[h.symbol] = h.name
+            remaining = symbol_set - name_map.keys()
+            if not remaining:
+                logger.debug("종목명 보강(보유종목): 전체 해소")
+        except Exception as e:
+            logger.debug("종목명 보강(보유종목) 조회 실패: {}", str(e))
+
+    for item in items:
+        if item.symbol and item.symbol not in name_map and item.summary:
+            m = _re.match(r'[^\[]*\[([^\]]+)\]', item.summary)
+            if m and not _re.match(r'^TIER\d', m.group(1), _re.IGNORECASE):
+                name_map[item.symbol] = m.group(1)
+
+    unresolved = symbol_set - name_map.keys()
+    if unresolved:
+        logger.warning("종목명 미해소 심볼: {} (stocks=0, holdings/summary fallback 실패)", unresolved)
 
     enriched_items = []
     for item in items:

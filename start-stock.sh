@@ -281,7 +281,7 @@ case "${1:-}" in
 
         PYTHONUNBUFFERED=1 python -u -m uvicorn main:app \
             --host "$HOST" --port "$PORT" \
-            --log-level info
+            --log-level info 2>&1 | tee -a "$LOG_FILE"
         ;;
 
     *)
