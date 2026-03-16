@@ -916,6 +916,14 @@ class CycleMixin:
                     error_message=str(e),
                 )
 
+            if not is_crypto_market(target):
+                try:
+                    from services.watchlist_sync import cleanup_post_market_stock_watchlist
+
+                    await cleanup_post_market_stock_watchlist(target)
+                except Exception as cleanup_error:
+                    logger.warning("[{}] 장마감 리뷰 후 감시 정리 실패: {}", scope, str(cleanup_error))
+
             from util.time_util import now_kst
             self._last_cycle_time = now_kst()
             elapsed = activity_logger.elapsed_ms(cycle_timer)
