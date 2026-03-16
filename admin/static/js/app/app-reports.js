@@ -1,7 +1,8 @@
 // ── app-reports.js — Report loading and rendering (ES module) ──
 
 import { state, API, formatSignedAmount } from './app-state.js';
-import { fetchJSON, refreshIcons } from '../shared/admin-core.js';
+import { fetchJSON, escapeHtml, refreshIcons } from '../shared/admin-core.js';
+import * as Toast from '../shared/admin-toast.js';
 import * as Feed from '../shared/admin-feed.js';
 
 // ── Report List (left sidebar) ──
@@ -233,4 +234,183 @@ function _appendTextSection(parent, iconName, title, content) {
   section.appendChild(heading);
   section.appendChild(body);
   parent.appendChild(section);
+}
+
+// ── Report Comparison ──
+
+export function renderReportComparison(data) {
+  var wrapper = document.createElement('div');
+  wrapper.className = 'chat-bubble mx-2';
+
+  // Header: "리포트 비교 — {date} ({scope})" + recommendation badge
+  var header = document.createElement('div');
+  header.className = 'flex items-center gap-2 text-lg font-bold text-white mb-4';
+  var headerIcon = document.createElement('i');
+  headerIcon.setAttribute('data-lucide', 'git-compare');
+  headerIcon.className = 'w-5 h-5';
+  header.appendChild(headerIcon);
+
+  var refreshed = data.refreshed || {};
+  var dateStr = refreshed.report_date || '';
+  var scope = refreshed.market_scope || state.currentMarket;
+  header.appendChild(document.createTextNode(' \uB9AC\uD3EC\uD2B8 \uBE44\uAD50 \u2014 ' + escapeHtml(dateStr) + ' (' + escapeHtml(scope) + ') '));
+
+  var recBadge = document.createElement('span');
+  recBadge.className = 'text-xs font-medium px-2 py-0.5 rounded';
+  if (data.recommendation === 'refreshed') {
+    recBadge.className += ' bg-blue-900/50 text-blue-300';
+    recBadge.textContent = '\uC0C8 \uB9AC\uD3EC\uD2B8 \uAD8C\uC7A5';
+  } else {
+    recBadge.className += ' bg-gray-800 text-gray-400';
+    recBadge.textContent = '\uAE30\uC874 \uC720\uC9C0 \uAD8C\uC7A5';
+  }
+  header.appendChild(recBadge);
+  wrapper.appendChild(header);
+
+  // Two-column comparison grid
+  var grid = document.createElement('div');
+  grid.className = 'report-comparison';
+
+  var existingReport = data.existing;
+  var refreshedReport = data.refreshed;
+  var comparison = data.comparison || {};
+
+  grid.appendChild(_buildComparisonColumn('\uAE30\uC874 \uB9AC\uD3EC\uD2B8', existingReport, comparison, 'existing', data.recommendation !== 'refreshed'));
+  grid.appendChild(_buildComparisonColumn('\uC0C8 \uB9AC\uD3EC\uD2B8', refreshedReport, comparison, 'refreshed', data.recommendation === 'refreshed'));
+  wrapper.appendChild(grid);
+
+  // Action buttons
+  var actions = document.createElement('div');
+  actions.className = 'report-comparison-actions';
+
+  var keepBtn = document.createElement('button');
+  keepBtn.className = 'bg-gray-700 text-gray-300 hover:bg-gray-600';
+  keepBtn.textContent = '\uAE30\uC874 \uC720\uC9C0';
+  keepBtn.addEventListener('click', function () {
+    _dismissComparison(wrapper, existingReport);
+  });
+
+  var applyBtn = document.createElement('button');
+  applyBtn.textContent = '\uC0C8 \uB9AC\uD3EC\uD2B8 \uC801\uC6A9';
+  if (data.recommendation === 'refreshed') {
+    applyBtn.className = 'bg-blue-600 text-white hover:bg-blue-500';
+  } else {
+    applyBtn.className = 'bg-gray-600 text-gray-200 hover:bg-gray-500';
+  }
+  applyBtn.addEventListener('click', function () {
+    _confirmRefresh(wrapper, refreshedReport);
+  });
+
+  actions.appendChild(keepBtn);
+  actions.appendChild(applyBtn);
+  wrapper.appendChild(actions);
+
+  return wrapper;
+}
+
+function _buildComparisonColumn(title, report, comparison, side, isRecommended) {
+  var col = document.createElement('div');
+  col.className = 'report-col';
+  if (isRecommended) col.className += ' recommended';
+
+  // Column header
+  var colHeader = document.createElement('div');
+  colHeader.className = 'report-col-header';
+  colHeader.textContent = title;
+  if (isRecommended) {
+    var recTag = document.createElement('span');
+    recTag.className = 'text-xs px-1.5 py-0.5 rounded bg-blue-900/50 text-blue-300';
+    recTag.textContent = '\uAD8C\uC7A5';
+    colHeader.appendChild(recTag);
+  }
+  col.appendChild(colHeader);
+
+  if (!report) {
+    var empty = document.createElement('div');
+    empty.className = 'text-xs text-gray-500 py-4 text-center';
+    empty.textContent = '\uB9AC\uD3EC\uD2B8 \uC5C6\uC74C';
+    col.appendChild(empty);
+    return col;
+  }
+
+  // Metric rows
+  var metrics = [
+    { key: 'total_cycles', label: '\uC0AC\uC774\uD074', value: String(report.total_cycles || 0) },
+    { key: 'total_analyses', label: '\uBD84\uC11D', value: String(report.total_analyses || 0) },
+    { key: 'buy_count', label: '\uB9E4\uC218 \uC8FC\uBB38', value: String(report.buy_count || 0) },
+    { key: 'open_position_count', label: '\uBCF4\uC720\uC885\uBAA9', value: String(report.open_position_count || 0) },
+    { key: 'total_pnl', label: '\uC2E4\uD604\uC190\uC775', value: formatSignedAmount(report.total_pnl, 'KRW') },
+    { key: 'unrealized_pnl', label: '\uBBF8\uC2E4\uD604\uC190\uC775', value: formatSignedAmount(report.unrealized_pnl || 0, 'KRW') },
+  ];
+
+  metrics.forEach(function (m) {
+    var row = document.createElement('div');
+    row.className = 'report-diff-row';
+
+    var label = document.createElement('span');
+    label.className = 'text-gray-500';
+    label.textContent = m.label;
+
+    var valueWrap = document.createElement('span');
+    valueWrap.className = 'text-gray-300';
+    valueWrap.textContent = m.value;
+
+    // Check if this field differs and this side is better
+    if (comparison[m.key]) {
+      var cmp = comparison[m.key];
+      var existVal = Number(cmp.existing) || 0;
+      var refreshVal = Number(cmp.refreshed) || 0;
+      if (existVal !== refreshVal) {
+        var betterSide = refreshVal > existVal ? 'refreshed' : 'existing';
+        if (betterSide === side) {
+          var badge = document.createElement('span');
+          badge.className = 'report-diff-badge';
+          badge.textContent = '\uAC1C\uC120';
+          valueWrap.appendChild(badge);
+        }
+      }
+    }
+
+    row.appendChild(label);
+    row.appendChild(valueWrap);
+    col.appendChild(row);
+  });
+
+  return col;
+}
+
+function _dismissComparison(wrapperEl, existingReport) {
+  var container = document.getElementById('chat-container');
+  container.replaceChildren();
+  if (existingReport) {
+    container.appendChild(createReportCard(existingReport));
+    if (existingReport.report_date) loadDateActivities(existingReport.report_date, container);
+  } else {
+    var msg = document.createElement('div');
+    msg.className = 'text-center text-gray-500 text-sm py-8';
+    msg.textContent = '\uAE30\uC874 \uB9AC\uD3EC\uD2B8\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4';
+    container.appendChild(msg);
+  }
+  refreshIcons();
+}
+
+async function _confirmRefresh(wrapperEl, refreshedReport) {
+  try {
+    await fetchJSON(API + '/reports/confirm-refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ choice: 'refreshed' }),
+    });
+    Toast.show('\uC0C8 \uB9AC\uD3EC\uD2B8 \uC801\uC6A9\uB428', 'success');
+    // Reload the report to show the confirmed version
+    var dateStr = refreshedReport && refreshedReport.report_date;
+    if (dateStr) {
+      loadReport(dateStr);
+    } else {
+      loadReport('today');
+    }
+    loadReportList();
+  } catch (err) {
+    Toast.show('\uB9AC\uD3EC\uD2B8 \uC801\uC6A9 \uC2E4\uD328: ' + err.message, 'error');
+  }
 }

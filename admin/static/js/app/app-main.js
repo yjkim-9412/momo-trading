@@ -10,7 +10,7 @@ import { connectSSE, initAgentMonitor, updateBackgroundBadge } from './app-sse.j
 import { loadMarketAccountInfo, loadWatchlist } from './app-account.js';
 import { loadLLMStatus, loadLLMUsage } from './app-llm.js';
 import { loadScheduleTimeline, loadSystemStatus } from './app-schedule.js';
-import { loadReportList, loadReport } from './app-reports.js';
+import { loadReportList, loadReport, createReportCard, renderReportComparison } from './app-reports.js';
 import * as Toast from '../shared/admin-toast.js';
 import * as Monitor from '../shared/admin-monitor.js';
 import * as Feed from '../shared/admin-feed.js';
@@ -510,8 +510,33 @@ export async function generateReport() {
     btn.disabled = true;
   }
   try {
-    await fetchJSON(API + '/reports/generate?market_scope=' + encodeURIComponent(state.currentMarket), { method: 'POST' });
-    Toast.show('\uB9AC\uD3EC\uD2B8 \uC0DD\uC131 \uC694\uCCAD\uB428', 'success');
+    var json = await fetchJSON(
+      API + '/reports/generate?market_scope=' + encodeURIComponent(state.currentMarket) + '&refresh=true',
+      { method: 'POST' },
+    );
+    var result = json.data || json;
+
+    if (result.refreshed) {
+      // Comparison response — show side-by-side UI
+      var container = document.getElementById('chat-container');
+      container.replaceChildren();
+      container.appendChild(renderReportComparison(result));
+      if (state._insertBackToLiveBar) state._insertBackToLiveBar(container);
+      state.currentView = 'report';
+      refreshIcons();
+    } else {
+      // New report, no existing — display normally
+      var report = result.report || result;
+      if (report && report.report_date) {
+        var container2 = document.getElementById('chat-container');
+        container2.replaceChildren();
+        container2.appendChild(createReportCard(report));
+        if (state._insertBackToLiveBar) state._insertBackToLiveBar(container2);
+        state.currentView = 'report';
+        refreshIcons();
+      }
+      Toast.show('\uB9AC\uD3EC\uD2B8 \uC0DD\uC131 \uC694\uCCAD\uB428', 'success');
+    }
     loadReportList();
   } catch (err) {
     console.error('Report gen error:', err);
