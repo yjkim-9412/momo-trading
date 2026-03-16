@@ -112,7 +112,7 @@ export function connectSSE() {
         if (state.currentView === 'live') {
           Feed.appendActivity(data);
           if (importance.level === 'CRITICAL' || importance.level === 'HIGH') {
-            setTimeout(function () { Feed.highlightCard(data); }, 100);
+            setTimeout(function () { Feed.highlightCard(data, { skipScroll: true }); }, 100);
           }
         } else {
           rememberFeedActivities([data]);

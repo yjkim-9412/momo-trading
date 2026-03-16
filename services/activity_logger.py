@@ -37,6 +37,7 @@ class ActivityLogger:
         trading_date: date | None = None,
         stock_id: str | None = None,
         symbol: str | None = None,
+        name: str | None = None,
         detail: dict | None = None,
         llm_provider: str | None = None,
         llm_tier: str | None = None,
@@ -102,6 +103,14 @@ class ActivityLogger:
                 broadcast_target = coin_sse_manager
             except ImportError:
                 pass
+        # 종목명 자동 추출 (name 미전달 시 summary에서 [종목명] 패턴 추출)
+        resolved_name = name
+        if not resolved_name and symbol and summary:
+            import re
+            m = re.match(r'\[([^\]]+)\]', summary)
+            if m and not re.match(r'^TIER\d', m.group(1), re.IGNORECASE):
+                resolved_name = m.group(1)
+
         try:
             await broadcast_target.broadcast({
                 "type": "activity",
@@ -113,6 +122,7 @@ class ActivityLogger:
                     "activity_type": activity_type,
                     "phase": phase,
                     "symbol": symbol,
+                    "name": resolved_name,
                     "summary": summary,
                     "detail": detail_json,
                     "llm_provider": llm_provider,
