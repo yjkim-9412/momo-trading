@@ -106,7 +106,7 @@ class AccountManagerBalanceTest(unittest.TestCase):
         self.assertEqual(balance.raw_total_pnl_rate, 1.23)
         self.assertEqual(balance.pnl_source, "HOLDINGS_SUM")
 
-    def test_parse_balance_keeps_domestic_cash_unchanged(self):
+    def test_parse_balance_uses_domestic_deposit_when_orderable_missing(self):
         data = {
             "output2": [{
                 "dnca_tot_amt": "1500000",
@@ -120,10 +120,50 @@ class AccountManagerBalanceTest(unittest.TestCase):
         self.assertEqual(balance.cash, 1500000.0)
         self.assertEqual(balance.raw_cash, 1500000.0)
         self.assertEqual(balance.effective_cash, 1500000.0)
-        self.assertEqual(balance.cash_source, "BROKER")
+        self.assertEqual(balance.cash_source, "BROKER_DEPOSIT")
         self.assertEqual(balance.raw_total_pnl, 0.0)
         self.assertEqual(balance.raw_total_pnl_rate, 0.0)
         self.assertEqual(balance.pnl_source, "BROKER_SUMMARY")
+
+    def test_parse_balance_uses_domestic_orderable_cash_and_summary_values(self):
+        holdings = [
+            HoldingInfo(
+                symbol="005930",
+                name="삼성전자",
+                market="KRX",
+                currency="KRW",
+                quantity=1000,
+                avg_buy_price=100000.0,
+                current_price=119431.8,
+                pnl=19431800.0,
+                pnl_rate=19.43,
+                exchange_rate_to_krw=1.0,
+            )
+        ]
+        data = {
+            "output2": [{
+                "dnca_tot_amt": "10000000",
+                "ord_psbl_amt": "1000000",
+                "tot_evlu_amt": "98628090",
+                "scts_evlu_amt": "88628090",
+                "evlu_pfls_smtl_amt": "-1354800",
+                "pchs_amt_smtl_amt": "99982890",
+            }],
+        }
+
+        with patch("trading.account_manager.logger.warning") as warning_mock:
+            balance = self.manager._parse_balance(data, holdings=holdings, market="KRX")
+
+        self.assertEqual(balance.cash, 10000000.0)
+        self.assertEqual(balance.raw_cash, 10000000.0)
+        self.assertEqual(balance.effective_cash, 1000000.0)
+        self.assertEqual(balance.cash_source, "BROKER_ORDERABLE")
+        self.assertEqual(balance.total_asset, 98628090.0)
+        self.assertEqual(balance.stock_value, 88628090.0)
+        self.assertEqual(balance.total_pnl, -1354800.0)
+        self.assertAlmostEqual(balance.total_pnl_rate, (-1354800.0 / 99982890.0) * 100)
+        self.assertEqual(balance.pnl_source, "BROKER_SUMMARY")
+        warning_mock.assert_called_once()
 
     def test_parse_balance_marks_error_payload_invalid(self):
         balance = self.manager._parse_balance(

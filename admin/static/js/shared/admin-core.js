@@ -44,6 +44,11 @@ export function formatKRW(n) {
   return Math.trunc(value).toLocaleString() + '원';
 }
 
+export function formatKRWFull(n) {
+  if (n == null || Number.isNaN(Number(n))) return '-';
+  return Math.trunc(Number(n)).toLocaleString() + '원';
+}
+
 export function formatTime(ts) {
   if (!ts) return '';
   try {
