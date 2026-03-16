@@ -82,6 +82,7 @@ class AccountBalance(BaseModel):
     raw_cash: float = 0.0
     effective_cash: float = 0.0
     cash_source: str = "BROKER"
+    purchase_amount: float = 0.0  # 매입금액합계 (pchs_amt_smtl_amt)
     status_message: str = ""
     is_valid: bool = True  # False이면 조회 실패 상태
 

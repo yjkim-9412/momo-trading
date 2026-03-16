@@ -93,6 +93,56 @@ class AccountManager:
         exchange_rate = holding.exchange_rate_to_krw if holding.exchange_rate_to_krw > 0 else 1.0
         return amount * exchange_rate
 
+    def _calculate_holdings_stock_value(self, holdings: list[HoldingInfo] | None) -> float:
+        """보유 종목 현재가 합계를 KRW로 계산한다."""
+        if not holdings:
+            return 0.0
+        return sum(
+            self._holding_amount_to_krw(holding, holding.current_price * holding.quantity)
+            for holding in holdings
+        )
+
+    def _resolve_krx_cash_values(self, summary: dict) -> tuple[float, float, str]:
+        """국내장 현금성 지표를 예수금/가용현금 기준으로 정리한다."""
+        deposit_cash = self._to_float(
+            self._first_value(summary, "dnca_tot_amt", "cash")
+        )
+        orderable_value = self._first_value(summary, "ord_psbl_amt")
+        if orderable_value is not None:
+            return deposit_cash, self._to_float(orderable_value), "BROKER_ORDERABLE"
+        return deposit_cash, deposit_cash, "BROKER_DEPOSIT"
+
+    def _log_krx_balance_mismatch(
+        self,
+        market: str,
+        holdings: list[HoldingInfo] | None,
+        *,
+        summary_stock_value: float,
+        total_asset: float,
+        cash: float,
+        effective_cash: float,
+        total_pnl: float,
+    ) -> None:
+        """국내장 요약값과 보유종목 합산값이 어긋나면 경고 로그를 남긴다."""
+        if not holdings:
+            return
+
+        holdings_stock_value = self._calculate_holdings_stock_value(holdings)
+        if abs(summary_stock_value - holdings_stock_value) < 1:
+            return
+
+        logger.warning(
+            "[{}] 국내 잔고 요약/보유평가 불일치: summary_stock_value={:,.0f}, holdings_stock_value={:,.0f}, total_asset={:,.0f}, deposit_cash={:,.0f}, effective_cash={:,.0f}, total_pnl={:,.0f}, holdings={}",
+            market,
+            summary_stock_value,
+            holdings_stock_value,
+            total_asset,
+            cash,
+            effective_cash,
+            total_pnl,
+            len(holdings),
+        )
+
     def _resolve_total_pnl(
         self,
         market: str,
@@ -178,6 +228,81 @@ class AccountManager:
         if output2 and isinstance(output2, list):
             summary = output2[0]
             is_error_payload = str(data.get("rt_cd") or "") not in ("", "0")
+            if normalized_market == "KRX":
+                cash, effective_cash, cash_source = self._resolve_krx_cash_values(summary)
+                stock_value = self._to_float(
+                    self._first_value(
+                        summary,
+                        "stock_value",
+                        "scts_evlu_amt",
+                        "evlu_amt_smtl_amt",
+                    ),
+                    default=self._calculate_holdings_stock_value(holdings),
+                )
+                total_asset = self._to_float(
+                    self._first_value(
+                        summary,
+                        "total_asset",
+                        "tot_evlu_amt",
+                    ),
+                    default=cash + stock_value,
+                )
+                total_pnl = self._to_float(
+                    self._first_value(
+                        summary,
+                        "total_pnl",
+                        "evlu_pfls_smtl_amt",
+                    )
+                )
+                total_pnl_rate = self._to_float(
+                    self._first_value(summary, "total_pnl_rate", "evlu_pfls_rt")
+                )
+                purchase_amount = self._to_float(self._first_value(summary, "pchs_amt_smtl_amt"))
+                if total_pnl_rate == 0.0 and purchase_amount > 0:
+                    total_pnl_rate = (total_pnl / purchase_amount) * 100
+                (
+                    total_pnl,
+                    total_pnl_rate,
+                    raw_total_pnl,
+                    raw_total_pnl_rate,
+                    pnl_source,
+                ) = self._resolve_total_pnl(
+                    normalized_market,
+                    total_pnl,
+                    total_pnl_rate,
+                    holdings,
+                )
+                self._log_krx_balance_mismatch(
+                    normalized_market,
+                    holdings,
+                    summary_stock_value=stock_value,
+                    total_asset=total_asset,
+                    cash=cash,
+                    effective_cash=effective_cash,
+                    total_pnl=total_pnl,
+                )
+
+                return AccountBalance(
+                    total_asset=total_asset,
+                    cash=cash,
+                    stock_value=stock_value,
+                    locked_krw=0.0,
+                    total_pnl=total_pnl,
+                    total_pnl_rate=total_pnl_rate,
+                    raw_total_pnl=raw_total_pnl,
+                    raw_total_pnl_rate=raw_total_pnl_rate,
+                    pnl_source=pnl_source,
+                    market=normalized_market,
+                    currency="KRW",
+                    exchange_rate_to_krw=1.0,
+                    raw_cash=cash,
+                    effective_cash=effective_cash,
+                    cash_source=cash_source,
+                    purchase_amount=purchase_amount,
+                    status_message=str(data.get("msg1") or ""),
+                    is_valid=not is_error_payload,
+                )
+
             cash = self._to_float(
                 self._first_value(
                     summary,
@@ -190,13 +315,8 @@ class AccountManager:
                 )
             )
 
-            if holdings:
-                stock_value = sum(
-                    (holding.current_price * holding.exchange_rate_to_krw) * holding.quantity
-                    if holding.currency != "KRW" else holding.current_price * holding.quantity
-                    for holding in holdings
-                )
-            else:
+            stock_value = self._calculate_holdings_stock_value(holdings)
+            if stock_value <= 0:
                 stock_value = self._to_float(
                     self._first_value(
                         summary,

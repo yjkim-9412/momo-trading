@@ -1,7 +1,7 @@
 // ── app-account.js — Account display for KRX/US markets (ES module) ──
 
 import { state, API, formatAmount, formatSignedAmount, convertKrwToUsd } from './app-state.js';
-import { fetchJSON, formatKRW, refreshIcons } from '../shared/admin-core.js';
+import { fetchJSON, formatKRW, formatKRWFull, refreshIcons } from '../shared/admin-core.js';
 
 // ── Account Info ──
 export async function loadMarketAccountInfo() {
@@ -37,6 +37,19 @@ function shouldShowRawPnl(data) {
   if (!data || data.pnl_source !== 'HOLDINGS_SUM') return false;
   return hasMeaningfulDiff(data.raw_total_pnl, data.total_pnl, 1)
     || hasMeaningfulDiff(data.raw_total_pnl_rate, data.total_pnl_rate, 0.01);
+}
+
+function getKrxCashLabels(data) {
+  if (data && data.cash_source === 'BROKER_ORDERABLE') {
+    return {
+      primary: '\uAC00\uC6A9\uD604\uAE08',
+      secondary: '\uC608\uC218\uAE08',
+    };
+  }
+  return {
+    primary: '\uC608\uC218\uAE08',
+    secondary: '\uAC00\uC6A9\uD604\uAE08',
+  };
 }
 
 // ── Main balance renderer ──
@@ -102,20 +115,51 @@ function _renderBalanceUS(el, data, effectiveCash, rawCash, totalPnl, totalPnlRa
 }
 
 function _renderBalanceKRX(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor) {
-  var cashRatio = data.total_asset > 0 ? ((effectiveCash / data.total_asset) * 100).toFixed(1) : '0.0';
-  var rows = [];
-  rows.push(_singleRow('\uCD1D\uC790\uC0B0', formatKRW(data.total_asset), 'text-white font-medium'));
-  rows.push(_singleRow('\uC2E4\uC8FC\uBB38 \uAE30\uC900 \uD604\uAE08', formatAmount(effectiveCash, 'KRW') + ' (' + cashRatio + '%)'));
-  if (Math.abs(effectiveCash - rawCash) >= 1) rows.push(_singleRow('\uBE0C\uB85C\uCEE4 \uD604\uAE08', formatAmount(rawCash, 'KRW')));
-  rows.push(_singleRow('\uC8FC\uC2DD', formatKRW(data.stock_value)));
-  var pnlText = (totalPnl >= 0 ? '+' : '') + formatKRW(totalPnl) + ' (' + (totalPnlRate >= 0 ? '+' : '') + totalPnlRate.toFixed(2) + '%)';
-  rows.push(_singleRow('\uC190\uC775', pnlText, pnlColor));
+  var cashLabels = getKrxCashLabels(data);
+
+  // Hero: 총자산
+  var hero = document.createElement('div');
+  hero.className = 'mb-1';
+  var heroLabel = document.createElement('div');
+  heroLabel.className = 'text-[11px] text-gray-500';
+  heroLabel.textContent = '\uCD1D\uC790\uC0B0';
+  var heroValue = document.createElement('div');
+  heroValue.className = 'text-sm text-white font-semibold';
+  heroValue.textContent = formatKRWFull(data.total_asset);
+  hero.appendChild(heroLabel);
+  hero.appendChild(heroValue);
+  el.appendChild(hero);
+
+  // Key metrics
+  var cashText = formatKRWFull(effectiveCash);
+  var cashLabel = cashLabels.primary;
+  if (effectiveCash > data.total_asset) {
+    cashLabel = '\uC608\uC218\uAE08(D+2)';
+  } else if (data.total_asset > 0) {
+    var cashRatio = (effectiveCash / data.total_asset * 100).toFixed(1);
+    cashText += ' (' + cashRatio + '%)';
+  }
+  el.appendChild(_singleRow(cashLabel, cashText));
+  if (Math.abs(effectiveCash - rawCash) >= 1) el.appendChild(_singleRow(cashLabels.secondary, formatKRWFull(rawCash), 'text-gray-500'));
+  if (data.purchase_amount > 0) el.appendChild(_singleRow('\uB9E4\uC785\uAE08\uC561', formatKRWFull(data.purchase_amount), 'text-gray-500'));
+  el.appendChild(_singleRow('\uC8FC\uC2DD\uD3C9\uAC00', formatKRWFull(data.stock_value)));
+
+  // Separator
+  var sep = document.createElement('div');
+  sep.className = 'border-t border-gray-700/50 my-1';
+  el.appendChild(sep);
+
+  // P&L
+  var pnlText = (totalPnl >= 0 ? '+' : '') + formatKRWFull(totalPnl) + ' (' + (totalPnlRate >= 0 ? '+' : '') + totalPnlRate.toFixed(2) + '%)';
+  el.appendChild(_singleRow('\uC190\uC775', pnlText, pnlColor));
   if (shouldShowRawPnl(data))
-    rows.push(_singleRow('\uBE0C\uB85C\uCEE4 \uC694\uC57D \uC190\uC775', formatSignedAmount(rawTotalPnl, 'KRW') + ' (' + formatSignedAmount(rawTotalPnlRate, 'PCT') + ')', 'text-gray-500'));
-  if (data.cash_source === 'TOTAL_ASSET_PROXY') rows.push(_noteRow('\uCD1D\uC790\uC0B0 - \uC8FC\uC2DD\uD3C9\uAC00\uC561\uC73C\uB85C \uC8FC\uBB38\uAC00\uB2A5 \uD604\uAE08\uC744 \uCD94\uC815\uD569\uB2C8\uB2E4.'));
-  if (data.pnl_source === 'HOLDINGS_SUM') rows.push(_noteRow('\uC190\uC775\uC740 \uBCF4\uC720\uC885\uBAA9 \uAE30\uC900\uC73C\uB85C \uC7AC\uACC4\uC0B0\uD569\uB2C8\uB2E4.'));
-  if (data.status_message) rows.push(_noteRow(data.status_message, 'text-gray-500'));
-  rows.forEach(function (r) { el.appendChild(r); });
+    el.appendChild(_singleRow('\uBE0C\uB85C\uCEE4 \uC694\uC57D \uC190\uC775', formatSignedAmount(rawTotalPnl, 'KRW') + ' (' + formatSignedAmount(rawTotalPnlRate, 'PCT') + ')', 'text-gray-500'));
+
+  // Notes
+  if (data.cash_source === 'BROKER_ORDERABLE') el.appendChild(_noteRow('\uAC00\uC6A9\uD604\uAE08\uC740 \uBE0C\uB85C\uCEE4 \uC8FC\uBB38\uAC00\uB2A5\uAE08\uC561 \uAE30\uC900\uC785\uB2C8\uB2E4.'));
+  if (data.cash_source === 'TOTAL_ASSET_PROXY') el.appendChild(_noteRow('\uCD1D\uC790\uC0B0 - \uC8FC\uC2DD\uD3C9\uAC00\uC561\uC73C\uB85C \uC8FC\uBB38\uAC00\uB2A5 \uD604\uAE08\uC744 \uCD94\uC815\uD569\uB2C8\uB2E4.'));
+  if (data.pnl_source === 'HOLDINGS_SUM') el.appendChild(_noteRow('\uC190\uC775\uC740 \uBCF4\uC720\uC885\uBAA9 \uAE30\uC900\uC73C\uB85C \uC7AC\uACC4\uC0B0\uD569\uB2C8\uB2E4.'));
+  if (data.status_message) el.appendChild(_noteRow(data.status_message, 'text-gray-500'));
 }
 
 function _singleRow(label, value, valueClass) {
@@ -174,6 +218,48 @@ export function renderHoldings(data, market) {
   if (countEl) countEl.textContent = data.length + '\uC885\uBAA9';
   var isUS = market !== 'KRX';
   el.replaceChildren();
+
+  // KRX holdings summary
+  if (!isUS && data.length > 0) {
+    var totalEval = 0;
+    var totalHoldingsPnl = 0;
+    data.forEach(function (h) {
+      totalEval += h.current_price * h.quantity;
+      totalHoldingsPnl += Number(h.pnl || 0);
+    });
+    var totalBuy = totalEval - totalHoldingsPnl;
+    var totalHoldingsPnlRate = totalBuy > 0 ? (totalHoldingsPnl / totalBuy) * 100 : 0;
+    var summaryPnlColor = totalHoldingsPnl >= 0 ? 'text-green-400' : 'text-red-400';
+
+    var summary = document.createElement('div');
+    summary.className = 'holdings-summary';
+    var evalRow = document.createElement('div');
+    evalRow.className = 'flex justify-between text-xs';
+    var evalLabel = document.createElement('span');
+    evalLabel.className = 'text-gray-400';
+    evalLabel.textContent = '\uD3C9\uAC00\uD569\uACC4';
+    var evalValue = document.createElement('span');
+    evalValue.className = 'text-white font-medium';
+    evalValue.textContent = formatKRWFull(totalEval);
+    evalRow.appendChild(evalLabel);
+    evalRow.appendChild(evalValue);
+    summary.appendChild(evalRow);
+
+    var pnlRow = document.createElement('div');
+    pnlRow.className = 'flex justify-between text-xs';
+    var pnlLabel = document.createElement('span');
+    pnlLabel.className = 'text-gray-400';
+    pnlLabel.textContent = '\uC190\uC775\uD569\uACC4';
+    var pnlValue = document.createElement('span');
+    pnlValue.className = summaryPnlColor + ' font-medium';
+    pnlValue.textContent = (totalHoldingsPnl >= 0 ? '+' : '') + formatKRWFull(totalHoldingsPnl) + ' (' + (totalHoldingsPnlRate >= 0 ? '+' : '') + totalHoldingsPnlRate.toFixed(2) + '%)';
+    pnlRow.appendChild(pnlLabel);
+    pnlRow.appendChild(pnlValue);
+    summary.appendChild(pnlRow);
+
+    el.appendChild(summary);
+  }
+
   data.forEach(function (h) {
     var pnlColor = h.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
     var currency = h.currency || (isUS ? 'USD' : 'KRW');
@@ -246,21 +332,24 @@ function _buildKRXHoldingCard(card, h, pnlColor, currency, evalAmt) {
   r1.appendChild(rateEl);
   card.appendChild(r1);
   // Row 2
-  card.appendChild(_flexRow(h.quantity + '\uC8FC | \uD3C9\uB2E8 ' + formatAmount(h.avg_buy_price, currency), '\uD604\uC7AC ' + formatAmount(h.current_price, currency), 'text-gray-500'));
+  var fmtFull = currency === 'KRW' ? formatKRWFull : function (v) { return formatAmount(v, currency); };
+  card.appendChild(_flexRow(h.quantity + '\uC8FC | \uD3C9\uB2E8 ' + fmtFull(h.avg_buy_price), '\uD604\uC7AC ' + fmtFull(h.current_price), 'text-gray-500'));
   // Row 3
   var r3 = document.createElement('div');
   r3.className = 'flex justify-between text-gray-500';
   var evalEl = document.createElement('span');
-  evalEl.textContent = '\uD3C9\uAC00 ' + formatAmount(evalAmt, currency);
+  evalEl.textContent = '\uD3C9\uAC00 ' + fmtFull(evalAmt);
   if (currency !== 'KRW') {
     var sec = document.createElement('span');
     sec.className = 'text-gray-600 ml-1';
-    sec.textContent = formatAmount(evalAmt * (h.exchange_rate_to_krw || 0), 'KRW');
+    sec.textContent = formatKRWFull(evalAmt * (h.exchange_rate_to_krw || 0));
     evalEl.appendChild(sec);
   }
   var pnlEl = document.createElement('span');
   pnlEl.className = pnlColor;
-  pnlEl.textContent = formatSignedAmount(h.pnl, currency);
+  var absPnl = Math.trunc(Math.abs(h.pnl));
+  var pnlSign = absPnl === 0 ? '' : (h.pnl >= 0 ? '+' : '-');
+  pnlEl.textContent = pnlSign + fmtFull(absPnl);
   if (currency !== 'KRW') {
     var sec2 = document.createElement('span');
     sec2.className = 'text-gray-600 ml-1';
@@ -470,6 +559,34 @@ export function renderWatchlist(data) {
     header.appendChild(left);
     header.appendChild(badge);
     card.appendChild(header);
+
+    // Holding P&L info (보유종목 전용)
+    if (s.holding_info) {
+      var hi = s.holding_info;
+      var hiPnlColor = hi.pnl_rate >= 0 ? 'text-green-400' : 'text-red-400';
+      var info = document.createElement('div');
+      info.className = 'wl-holding-info';
+      var r1 = document.createElement('div');
+      r1.className = 'flex justify-between';
+      var rateEl2 = document.createElement('span');
+      rateEl2.className = hiPnlColor + ' font-medium';
+      rateEl2.textContent = (hi.pnl_rate >= 0 ? '+' : '') + hi.pnl_rate.toFixed(2) + '%';
+      var evalEl2 = document.createElement('span');
+      evalEl2.textContent = formatKRWFull(hi.eval_amount);
+      r1.appendChild(rateEl2);
+      r1.appendChild(evalEl2);
+      info.appendChild(r1);
+      var r2 = document.createElement('div');
+      r2.className = 'flex justify-between text-gray-500';
+      var curEl = document.createElement('span');
+      curEl.textContent = '\uD604\uC7AC ' + formatKRWFull(hi.current_price);
+      var avgEl = document.createElement('span');
+      avgEl.textContent = '\uD3C9\uB2E8 ' + formatKRWFull(hi.avg_buy_price);
+      r2.appendChild(curEl);
+      r2.appendChild(avgEl);
+      info.appendChild(r2);
+      card.appendChild(info);
+    }
 
     // Thresholds grid
     var th = s.thresholds;
