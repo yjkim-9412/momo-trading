@@ -11,6 +11,7 @@ from util.time_util import now_kst
 _SUBSCRIBE_RETRY_COOLDOWN = timedelta(seconds=10)
 _INITIAL_MESSAGE_GRACE = timedelta(seconds=20)
 _MESSAGE_STALE_TIMEOUT = timedelta(seconds=90)
+_DISCONNECTED_LISTENER_WAIT_SEC = 1.0
 
 
 class StreamManager:
@@ -149,6 +150,45 @@ class StreamManager:
                 ordered.append((symbol, market_code))
         return ordered
 
+    def _effective_desired_union_ordered(self) -> list[tuple[str, str]]:
+        from scheduler.market_calendar import market_calendar
+
+        ordered: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for scope, symbols in self._desired_order_by_scope.items():
+            if not market_calendar.is_trading_hours(scope):
+                continue
+            for symbol, market_code in symbols:
+                key = (market_code, symbol.upper())
+                if key in seen:
+                    continue
+                seen.add(key)
+                ordered.append((symbol, market_code))
+        return ordered
+
+    async def _maybe_disconnect_if_idle(self) -> None:
+        self._sync_runtime_status_from_ws()
+        if self._requested_symbols or self._active_symbols:
+            return
+        if kis_websocket.is_connected:
+            await kis_websocket.disconnect()
+            self._last_business_error = None
+            self._last_connect_error = None
+
+    async def _deactivate_scope_subscriptions(self, scope: str) -> None:
+        self._sync_runtime_status_from_ws()
+        markets = self._scope_markets(scope)
+        scope_keys = {
+            key for key in (set(self._requested_symbols.keys()) | self._active_symbols)
+            if key[0] in markets
+        }
+        if not scope_keys:
+            await self._maybe_disconnect_if_idle()
+            return
+        to_remove = [(symbol, market) for (market, symbol) in scope_keys]
+        await self._unsubscribe_symbols(to_remove)
+        await self._maybe_disconnect_if_idle()
+
     def desired_keys(self, scope: str | None = None) -> set[tuple[str, str]]:
         if scope is None:
             return {
@@ -262,9 +302,12 @@ class StreamManager:
         }
 
     async def _ensure_connected(self) -> bool:
-        desired = self._desired_union_ordered()
+        desired = self._effective_desired_union_ordered()
         self._sync_runtime_status_from_ws()
         if kis_websocket.is_connected and not kis_websocket.fatal_error:
+            self._last_connect_error = None
+            return True
+        if not desired:
             self._last_connect_error = None
             return True
 
@@ -288,7 +331,7 @@ class StreamManager:
             return False
 
     async def _reconcile_subscriptions(self) -> None:
-        desired_order = self._desired_union_ordered()
+        desired_order = self._effective_desired_union_ordered()
         desired_limited = desired_order[:41]
         desired_set = {(market, symbol.upper()) for symbol, market in desired_limited}
         current_set = set(self._requested_symbols.keys()) | self._active_symbols
@@ -299,6 +342,8 @@ class StreamManager:
 
         if desired_limited:
             await self._subscribe_symbols(desired_limited)
+        else:
+            await self._maybe_disconnect_if_idle()
 
         skipped = len(desired_order) - len(desired_limited)
         if skipped > 0:
@@ -316,6 +361,7 @@ class StreamManager:
 
         from scheduler.market_calendar import market_calendar
         if not market_calendar.is_trading_hours(normalized_scope):
+            await self._deactivate_scope_subscriptions(normalized_scope)
             logger.info("[{}] 장외시간 — WS 구독 보류 (desired {}종목 저장)", normalized_scope, len(normalized_symbols))
             return
 
@@ -340,6 +386,7 @@ class StreamManager:
             normalized_symbols.append((symbol, market_code))
             from scheduler.market_calendar import market_calendar
             if not market_calendar.is_trading_hours(normalized_scope):
+                await self._deactivate_scope_subscriptions(normalized_scope)
                 return
             self._reconnect_event.set()
             if not self._running:
@@ -373,6 +420,20 @@ class StreamManager:
     async def _run_listener(self) -> None:
         """WebSocket 수신 루프 (재연결 포함)"""
         while self._running:
+            if (
+                not kis_websocket.is_connected
+                and not self._requested_symbols
+                and not self._active_symbols
+            ):
+                try:
+                    await asyncio.wait_for(
+                        self._reconnect_event.wait(),
+                        timeout=_DISCONNECTED_LISTENER_WAIT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                self._reconnect_event.clear()
+                continue
             try:
                 await kis_websocket.listen()
             except asyncio.CancelledError:
@@ -392,7 +453,7 @@ class StreamManager:
         """초기 연결 실패/예상 밖 종료 후 주기적 복구"""
         while self._running:
             try:
-                desired_count = len(self._desired_union_ordered())
+                desired_count = len(self._effective_desired_union_ordered())
                 needs_reconcile = desired_count > 0 and len(self._active_symbols) < min(desired_count, 41)
                 if desired_count > 0 and (not kis_websocket.is_connected or kis_websocket.fatal_error):
                     await self._ensure_connected()
