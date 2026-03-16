@@ -200,11 +200,19 @@ class StreamManager:
         """특정 market scope의 감시 종목 전체를 교체"""
         normalized_scope = normalize_market_scope(scope)
         normalized_symbols = self._normalize_symbols(symbols)
+        # desired 목록은 항상 업데이트 (장 시작 시 구독 대상 보존)
         self._desired_by_scope[normalized_scope] = {
             (market_code, symbol.upper())
             for symbol, market_code in normalized_symbols
         }
         self._desired_order_by_scope[normalized_scope] = normalized_symbols
+
+        # 장외시간이면 실제 WS 구독 생략
+        from scheduler.market_calendar import market_calendar
+        if not market_calendar.is_trading_hours(normalized_scope):
+            logger.info("[{}] 장외시간 — WS 구독 보류 (desired {}종목 저장)", normalized_scope, len(normalized_symbols))
+            return
+
         self._reconnect_event.set()
         if not self._running:
             if kis_websocket.is_connected or self.subscription_count > 0:
@@ -224,6 +232,10 @@ class StreamManager:
         if key not in normalized_set:
             normalized_set.add(key)
             normalized_symbols.append((symbol, market_code))
+            # 장외시간이면 desired만 저장
+            from scheduler.market_calendar import market_calendar
+            if not market_calendar.is_trading_hours(normalized_scope):
+                return
             self._reconnect_event.set()
             if not self._running:
                 if kis_websocket.is_connected or self.subscription_count > 0:

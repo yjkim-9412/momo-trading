@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
 import realtime.stream_manager as stream_module
 from realtime.stream_manager import StreamManager
@@ -51,6 +52,7 @@ class FlakyDummyWebSocket(DummyWebSocket):
             raise ConnectionError("approval key failed")
 
 
+@patch("scheduler.market_calendar.market_calendar.is_trading_hours", return_value=True)
 class StreamManagerTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._original_ws = stream_module.kis_websocket
@@ -58,7 +60,7 @@ class StreamManagerTest(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         stream_module.kis_websocket = self._original_ws
 
-    async def test_replace_market_subscriptions_keeps_other_scope(self):
+    async def test_replace_market_subscriptions_keeps_other_scope(self, _mock_trading):
         dummy_ws = DummyWebSocket()
         stream_module.kis_websocket = dummy_ws
         manager = StreamManager()
@@ -86,7 +88,7 @@ class StreamManagerTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_ensure_symbol_adds_to_scope_without_reset(self):
+    async def test_ensure_symbol_adds_to_scope_without_reset(self, _mock_trading):
         dummy_ws = DummyWebSocket()
         stream_module.kis_websocket = dummy_ws
         manager = StreamManager()
@@ -102,7 +104,7 @@ class StreamManagerTest(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_start_keeps_supervisor_alive_after_initial_connect_failure(self):
+    async def test_start_keeps_supervisor_alive_after_initial_connect_failure(self, _mock_trading):
         dummy_ws = FlakyDummyWebSocket(connect_failures=1)
         stream_module.kis_websocket = dummy_ws
         manager = StreamManager()

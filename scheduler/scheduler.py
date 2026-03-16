@@ -278,6 +278,44 @@ class TradingScheduler:
         state.last_run_at = None
         state.last_error = None
 
+    async def _restore_adaptive_count(self, market: str) -> None:
+        """서버 기동 시 당일 완료된 adaptive 사이클 수를 DB에서 복원"""
+        from scheduler.market_calendar import market_calendar
+        from trading.market_profile import market_scope
+
+        scope = market_scope(market)
+        trading_date = market_calendar.market_date(market=scope)
+        state = self._adaptive_state(market)
+
+        try:
+            from core.database import AsyncSessionLocal
+            from models.agent_activity import AgentActivityLog
+            from sqlalchemy import func, or_, select as sa_select
+
+            async with AsyncSessionLocal() as session:
+                count = await session.scalar(
+                    sa_select(func.count(AgentActivityLog.id)).where(
+                        AgentActivityLog.market_scope == scope,
+                        AgentActivityLog.trading_date == trading_date,
+                        AgentActivityLog.activity_type == "SCHEDULE",
+                        or_(
+                            AgentActivityLog.summary.like(f"✅ [{scope}]%재스캔 완료%"),
+                            AgentActivityLog.summary.like(f"✅ [{scope}]%adaptive recovery 완료%"),
+                        ),
+                    )
+                )
+                restored = count or 0
+                state.scheduled_cycle_count_today = restored
+                if restored > 0:
+                    logger.info(
+                        "[{}] adaptive 재스캔 횟수 복원: {}/{}",
+                        market,
+                        restored,
+                        settings.AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION,
+                    )
+        except Exception as e:
+            logger.warning("[{}] adaptive 재스캔 횟수 복원 실패: {}", market, str(e))
+
     def _remaining_scheduled_budget(
         self,
         market: str,
@@ -608,6 +646,7 @@ class TradingScheduler:
         for market_group in settings.enabled_market_groups:
             market = normalize_market(market_group)
             await self._seed_startup_holdings_watchlist(market)
+            await self._restore_adaptive_count(market)
             try:
                 repaired = await decision_maker.repair_recent_broker_orders(
                     market_scope=market,
