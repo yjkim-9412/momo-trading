@@ -3,6 +3,7 @@ from datetime import date
 import pytest
 
 from models.daily_report import DailyReport
+from services.daily_report_service import daily_report_service
 from tests.conftest import TestAsyncSessionLocal
 
 
@@ -76,3 +77,50 @@ async def test_admin_reports_list_filters_by_market_scope(client):
 
     assert resp.status_code == 200
     assert all(item["market_scope"] == "KRX" for item in data)
+
+
+@pytest.mark.asyncio
+async def test_admin_report_confirm_refresh_accepts_json_body(client, monkeypatch):
+    refreshed = DailyReport(
+        market_scope="KRX",
+        report_date=date(2026, 3, 16),
+        total_cycles=7,
+        total_analyses=8,
+        total_recommendations=9,
+        total_orders=10,
+        buy_count=4,
+        sell_count=3,
+        win_count=2,
+        loss_count=1,
+        total_pnl=12345.0,
+    )
+
+    async def fake_regenerate(report_date, market_scope=None):
+        return {
+            "existing": None,
+            "refreshed": refreshed,
+            "recommendation": "refreshed",
+            "comparison": {},
+        }
+
+    async def fake_apply(report_date, market_scope, refreshed_data):
+        _ = refreshed_data
+        return refreshed
+
+    monkeypatch.setattr(daily_report_service, "regenerate_daily_report", fake_regenerate)
+    monkeypatch.setattr(daily_report_service, "apply_refreshed_report", fake_apply)
+
+    resp = await client.post(
+        "/api/v1/admin/reports/confirm-refresh",
+        json={
+            "report_date": "2026-03-16",
+            "market_scope": "KRX",
+            "choice": "refreshed",
+        },
+    )
+    data = resp.json()["data"]
+
+    assert resp.status_code == 200
+    assert data["report_date"] == "2026-03-16"
+    assert data["market_scope"] == "KRX"
+    assert data["total_pnl"] == 12345.0

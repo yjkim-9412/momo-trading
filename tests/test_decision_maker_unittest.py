@@ -89,6 +89,7 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_confirm_and_record_retries_until_overseas_fill_is_visible(self):
         maker = DecisionMaker()
+        maker._load_broker_order = AsyncMock(return_value=None)
         maker._upsert_broker_order = AsyncMock()
         maker._record_trade_result = AsyncMock()
 
@@ -149,6 +150,54 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
         maker._record_trade_result.assert_awaited_once()
         self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_qty"], 1000)
         self.assertEqual(maker._record_trade_result.await_args.kwargs["currency"], "USD")
+
+    async def test_confirm_and_record_falls_back_to_broker_fill_sync_for_domestic_orders(self):
+        maker = DecisionMaker()
+        maker._load_broker_order = AsyncMock(return_value=None)
+        maker._upsert_broker_order = AsyncMock()
+        maker._record_trade_result = AsyncMock()
+
+        with (
+            patch("agent.decision_maker.asyncio.sleep", AsyncMock()),
+            patch(
+                "agent.decision_maker.mcp_client.get_order_list",
+                AsyncMock(return_value=MCPResponse(success=True, data={"output": []})),
+            ),
+            patch("agent.decision_maker.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1.0)),
+            patch(
+                "agent.decision_maker.broker_sync_service.reconcile_order_fill",
+                AsyncMock(return_value={
+                    "order_id": "0000012345",
+                    "market": "KRX",
+                    "symbol": "005930",
+                    "name": "삼성전자",
+                    "status": "FILLED",
+                    "order_qty": 10,
+                    "filled_qty": 10,
+                    "remaining_qty": 0,
+                    "order_price": 70000.0,
+                    "filled_price": 70100.0,
+                    "currency": "KRW",
+                    "exchange_rate_to_krw": 1.0,
+                }),
+            ) as reconcile_mock,
+            patch("trading.account_manager.account_manager.invalidate_cache"),
+        ):
+            await maker.confirm_and_record(
+                symbol="005930",
+                market="KRX",
+                side="BUY",
+                order_id="0000012345",
+                quantity=10,
+                expected_price=70000.0,
+                analysis_context={"stock_name": "삼성전자", "currency": "KRW"},
+                cycle_id="cycle-domestic",
+            )
+
+        reconcile_mock.assert_awaited_once()
+        maker._record_trade_result.assert_awaited_once()
+        self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_price"], 70100.0)
+        self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_qty"], 10)
 
     async def test_execute_logs_error_when_broker_ledger_write_fails(self):
         signal = TradeSignal(

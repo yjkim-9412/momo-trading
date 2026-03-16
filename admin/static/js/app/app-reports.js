@@ -396,14 +396,21 @@ function _dismissComparison(wrapperEl, existingReport) {
 
 async function _confirmRefresh(wrapperEl, refreshedReport) {
   try {
+    var dateStr = refreshedReport && refreshedReport.report_date;
+    var marketScope = refreshedReport && refreshedReport.market_scope
+      ? refreshedReport.market_scope
+      : state.currentMarket;
     await fetchJSON(API + '/reports/confirm-refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ choice: 'refreshed' }),
+      body: JSON.stringify({
+        report_date: dateStr,
+        market_scope: marketScope,
+        choice: 'refreshed',
+      }),
     });
     Toast.show('\uC0C8 \uB9AC\uD3EC\uD2B8 \uC801\uC6A9\uB428', 'success');
     // Reload the report to show the confirmed version
-    var dateStr = refreshedReport && refreshedReport.report_date;
     if (dateStr) {
       loadReport(dateStr);
     } else {
