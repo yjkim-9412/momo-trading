@@ -12,6 +12,7 @@ async def test_admin_account_balance_exposes_effective_cash(client, monkeypatch)
             cash=0,
             raw_cash=0,
             effective_cash=368635000,
+            operating_cash=368635000,
             cash_source="TOTAL_ASSET_PROXY",
             stock_value=531161,
             total_pnl=-249.441,
@@ -34,6 +35,7 @@ async def test_admin_account_balance_exposes_effective_cash(client, monkeypatch)
     assert payload["cash"] == 0
     assert payload["raw_cash"] == 0
     assert payload["effective_cash"] == 368635000
+    assert payload["operating_cash"] == 368635000
     assert payload["cash_source"] == "TOTAL_ASSET_PROXY"
     assert payload["total_pnl"] == -249.441
     assert payload["raw_total_pnl"] == 7497.903
@@ -81,6 +83,7 @@ async def test_admin_account_overview_returns_combined_payload(client, monkeypat
                 cash=0,
                 raw_cash=0,
                 effective_cash=368635000,
+                operating_cash=368635000,
                 cash_source="TOTAL_ASSET_PROXY",
                 stock_value=531161,
                 total_pnl=-249.441,
@@ -132,6 +135,7 @@ async def test_admin_account_overview_returns_combined_payload(client, monkeypat
     assert response.status_code == 200
     payload = response.json()["data"]
     assert payload["balance"]["effective_cash"] == 368635000
+    assert payload["balance"]["operating_cash"] == 368635000
     assert payload["balance"]["market"] == "NASDAQ"
     assert payload["holdings"][0]["symbol"] == "NVDA"
     assert payload["pending_orders"][0]["order_id"] == "123456"

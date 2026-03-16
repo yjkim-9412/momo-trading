@@ -126,6 +126,17 @@ WebSocket → EventDetector → EventBus:
 - loguru 로깅 (logger.info/warning/error)
 - 테스트: `pytest` + `pytest-asyncio` + `unittest` 혼용, `tests/` 디렉토리
 
+## 테스트 실행 규칙
+
+- 테스트 러너는 **파일명 suffix가 아니라 실제 테스트 구현 방식**으로 선택할 것.
+- `unittest.TestCase`, `unittest.IsolatedAsyncioTestCase`, `unittest.main()` 기반 파일은 `venv/bin/python -m unittest ... -v`로 실행한다.
+- `def test_*`, `@pytest.mark.asyncio`, fixture 기반 파일은 `venv/bin/pytest ...`로 실행한다.
+- 예시:
+  - `tests/test_stream_manager_unittest.py` → `venv/bin/python -m unittest tests.test_stream_manager_unittest -v`
+  - `tests/test_kis_websocket_unittest.py` → `venv/bin/pytest tests/test_kis_websocket_unittest.py -q`
+- 수정 파일 검증 전에는 가능하면 `venv/bin/python -m py_compile ...`로 최소 문법 검사를 먼저 수행한다.
+- 현재 환경에서 `pytest` 기반 파일이 비정상적으로 멈추면 `unittest`로 억지 실행하지 말고, `py_compile` + 최소 재현용 직접 호출 검증을 수행한 뒤 `pytest` 검증이 미완료였음을 반드시 보고한다.
+
 ## 공통 운영 지침
 
 분리된 장 구조, 스케줄 구조, 미국장/코인 구현 회고, 테스트 실행 규칙은 아래 문서에 정의되어 있다. 반드시 참조할 것.

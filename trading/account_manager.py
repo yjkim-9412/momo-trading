@@ -70,6 +70,7 @@ class AccountManager:
             total_asset=0,
             cash=0,
             stock_value=0,
+            operating_cash=0,
             total_pnl=0,
             total_pnl_rate=0,
             raw_total_pnl=0,
@@ -111,6 +112,11 @@ class AccountManager:
         if orderable_value is not None:
             return deposit_cash, self._to_float(orderable_value), "BROKER_ORDERABLE"
         return deposit_cash, deposit_cash, "BROKER_DEPOSIT"
+
+    @staticmethod
+    def _calculate_operating_cash(total_asset: float, stock_value: float) -> float:
+        """주식평가를 제외한 현금성 자산을 계산한다."""
+        return max(total_asset - stock_value, 0.0)
 
     def _log_krx_balance_mismatch(
         self,
@@ -247,6 +253,7 @@ class AccountManager:
                     ),
                     default=cash + stock_value,
                 )
+                operating_cash = self._calculate_operating_cash(total_asset, stock_value)
                 total_pnl = self._to_float(
                     self._first_value(
                         summary,
@@ -286,6 +293,7 @@ class AccountManager:
                     total_asset=total_asset,
                     cash=cash,
                     stock_value=stock_value,
+                    operating_cash=operating_cash,
                     locked_krw=0.0,
                     total_pnl=total_pnl,
                     total_pnl_rate=total_pnl_rate,
@@ -336,6 +344,7 @@ class AccountManager:
                 ),
                 default=cash + stock_value,
             )
+            operating_cash = self._calculate_operating_cash(total_asset, stock_value)
             total_pnl = self._to_float(
                 self._first_value(
                     summary,
@@ -381,6 +390,7 @@ class AccountManager:
                 total_asset=total_asset,
                 cash=cash,
                 stock_value=stock_value,
+                operating_cash=operating_cash,
                 locked_krw=0.0,
                 total_pnl=total_pnl,
                 total_pnl_rate=total_pnl_rate,
@@ -400,6 +410,7 @@ class AccountManager:
         cash = self._to_float(data.get("cash", 0))
         total_asset = self._to_float(data.get("total_asset", 0))
         stock_value = self._to_float(data.get("stock_value", 0))
+        operating_cash = self._calculate_operating_cash(total_asset, stock_value)
         locked_krw = self._to_float(data.get("locked_krw", 0))
         effective_cash, cash_source = self._resolve_effective_cash(
             normalized_market,
@@ -426,6 +437,7 @@ class AccountManager:
             total_asset=total_asset,
             cash=cash,
             stock_value=stock_value,
+            operating_cash=operating_cash,
             locked_krw=locked_krw,
             total_pnl=total_pnl,
             total_pnl_rate=total_pnl_rate,
@@ -688,6 +700,7 @@ class AccountManager:
             total_asset=total_asset,
             cash=cash,
             stock_value=stock_value,
+            operating_cash=self._calculate_operating_cash(total_asset, stock_value),
             total_pnl=self._to_float(bal_data.get("total_pnl", 0)),
             total_pnl_rate=self._to_float(bal_data.get("total_pnl_rate", 0)),
             raw_total_pnl=self._to_float(bal_data.get("total_pnl", 0)),

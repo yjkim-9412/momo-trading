@@ -47,6 +47,7 @@ class AccountManagerBalanceTest(unittest.TestCase):
         expected_stock_value = 183.0 * 1450.0 * 2
         self.assertEqual(balance.raw_cash, 0.0)
         self.assertAlmostEqual(balance.stock_value, expected_stock_value)
+        self.assertAlmostEqual(balance.operating_cash, balance.total_asset - expected_stock_value)
         self.assertAlmostEqual(balance.effective_cash, balance.total_asset - expected_stock_value)
         self.assertEqual(balance.cash_source, "TOTAL_ASSET_PROXY")
 
@@ -120,6 +121,7 @@ class AccountManagerBalanceTest(unittest.TestCase):
         self.assertEqual(balance.cash, 1500000.0)
         self.assertEqual(balance.raw_cash, 1500000.0)
         self.assertEqual(balance.effective_cash, 1500000.0)
+        self.assertEqual(balance.operating_cash, 1500000.0)
         self.assertEqual(balance.cash_source, "BROKER_DEPOSIT")
         self.assertEqual(balance.raw_total_pnl, 0.0)
         self.assertEqual(balance.raw_total_pnl_rate, 0.0)
@@ -157,6 +159,7 @@ class AccountManagerBalanceTest(unittest.TestCase):
         self.assertEqual(balance.cash, 10000000.0)
         self.assertEqual(balance.raw_cash, 10000000.0)
         self.assertEqual(balance.effective_cash, 1000000.0)
+        self.assertEqual(balance.operating_cash, 10000000.0)
         self.assertEqual(balance.cash_source, "BROKER_ORDERABLE")
         self.assertEqual(balance.total_asset, 98628090.0)
         self.assertEqual(balance.stock_value, 88628090.0)

@@ -1,6 +1,7 @@
 """KIS WebSocket 실시간 시세 스트리밍"""
 import asyncio
 import json
+from datetime import datetime
 from typing import Any, Callable, Coroutine
 
 import websockets
@@ -8,6 +9,7 @@ from loguru import logger
 
 from core.config import settings
 from trading.market_profile import build_ws_key, is_domestic_market, normalize_market
+from util.time_util import now_kst
 
 
 _WS_RECORD_SIZES: dict[str, tuple[int, ...]] = {
@@ -33,10 +35,15 @@ class KISWebSocket:
         self._ws_domestic = None
         self._ws_overseas = None
         self._running = False
-        self._subscriptions: set[str] = set()
+        self._requested_subscriptions: set[tuple[str, str]] = set()
+        self._confirmed_subscriptions: set[tuple[str, str]] = set()
         self._on_price_callback: Callable[[dict], Coroutine[Any, Any, None]] | None = None
         self._reconnect_delay = 5
         self._approval_key: str | None = None
+        self._last_system_message_at: datetime | None = None
+        self._last_business_error: str | None = None
+        self._last_business_error_code: str | None = None
+        self._fatal_error: str | None = None
 
     def set_on_price(self, callback: Callable[[dict], Coroutine[Any, Any, None]]) -> None:
         self._on_price_callback = callback
@@ -45,6 +52,9 @@ class KISWebSocket:
         """WebSocket 연결 시작"""
         self._running = True
         self._approval_key = None
+        self._last_business_error = None
+        self._last_business_error_code = None
+        self._fatal_error = None
         await self._get_approval_key()
         if not self._approval_key:
             self._running = False
@@ -61,7 +71,12 @@ class KISWebSocket:
                 except Exception:
                     pass
             setattr(self, attr_name, None)
-        self._subscriptions.clear()
+        self._requested_subscriptions.clear()
+        self._confirmed_subscriptions.clear()
+        self._last_system_message_at = None
+        self._last_business_error = None
+        self._last_business_error_code = None
+        self._fatal_error = None
 
     async def disconnect(self) -> None:
         """WebSocket 연결 종료"""
@@ -71,7 +86,12 @@ class KISWebSocket:
                 await ws.close()
         self._ws_domestic = None
         self._ws_overseas = None
-        self._subscriptions.clear()
+        self._requested_subscriptions.clear()
+        self._confirmed_subscriptions.clear()
+        self._last_system_message_at = None
+        self._last_business_error = None
+        self._last_business_error_code = None
+        self._fatal_error = None
         logger.info("KIS WebSocket 연결 종료")
 
     async def _get_approval_key(self) -> None:
@@ -115,13 +135,13 @@ class KISWebSocket:
 
     async def subscribe(self, symbol: str, market: str = "KRX") -> bool:
         """종목 실시간 시세 구독"""
-        if len(self._subscriptions) >= 41:
+        if len(self._requested_subscriptions) >= 41:
             logger.warning("WebSocket 구독 한도 초과 (최대 41종목)")
             return False
 
         market_code = normalize_market(market)
-        key = f"{market_code}:{symbol.upper()}"
-        if key in self._subscriptions:
+        key = (market_code, symbol.upper())
+        if key in self._requested_subscriptions:
             return True
 
         ws = await self._get_ws(market_code)
@@ -131,18 +151,20 @@ class KISWebSocket:
         try:
             sub_msg = self._build_subscribe_msg(symbol, market_code)
             await ws.send(json.dumps(sub_msg))
-            self._subscriptions.add(key)
-            logger.debug("종목 구독: {}", key)
+            self._requested_subscriptions.add(key)
+            self._confirmed_subscriptions.discard(key)
+            self._fatal_error = None
+            logger.debug("종목 구독 요청: {}:{}", market_code, symbol.upper())
             return True
         except Exception as e:
-            logger.error("구독 실패: {} - {}", key, str(e))
+            logger.error("구독 요청 실패: {}:{} - {}", market_code, symbol.upper(), str(e))
             return False
 
     async def unsubscribe(self, symbol: str, market: str = "KRX") -> None:
         """종목 구독 해제"""
         market_code = normalize_market(market)
-        key = f"{market_code}:{symbol.upper()}"
-        if key not in self._subscriptions:
+        key = (market_code, symbol.upper())
+        if key not in self._requested_subscriptions and key not in self._confirmed_subscriptions:
             return
 
         ws = await self._get_ws(market_code)
@@ -152,8 +174,9 @@ class KISWebSocket:
                 await ws.send(json.dumps(unsub_msg))
             except Exception:
                 pass
-        self._subscriptions.discard(key)
-        logger.debug("종목 구독 해제: {}", key)
+        self._requested_subscriptions.discard(key)
+        self._confirmed_subscriptions.discard(key)
+        logger.debug("종목 구독 해제 요청: {}:{}", market_code, symbol.upper())
 
     async def _get_ws(self, market: str):
         """시장별 WebSocket 연결 반환 (없으면 생성)"""
@@ -271,26 +294,132 @@ class KISWebSocket:
             await ws.send("PINGPONG")
             return
 
+        # KIS WebSocket은 '|' 구분자로 데이터를 보냄
+        if "|" in raw_msg:
+            parts = raw_msg.split("|")
+            if len(parts) < 4:
+                logger.warning("실시간 payload 구조 오류: parts={} sample={}", len(parts), raw_msg[:120])
+                return
+            try:
+                data_count = int(parts[2])
+            except ValueError:
+                logger.warning("실시간 payload count 파싱 실패: raw={}", raw_msg[:120])
+                return
+            tr_id = parts[1]
+            data_str = parts[3]
+            price_rows = self._parse_price_rows(tr_id, data_str, data_count)
+            if price_rows and self._on_price_callback:
+                for price_data in price_rows:
+                    await self._on_price_callback(price_data)
+            return
+
         try:
-            # KIS WebSocket은 '|' 구분자로 데이터를 보냄
-            if "|" in raw_msg:
-                parts = raw_msg.split("|")
-                if len(parts) >= 4:
-                    tr_id = parts[1]
-                    data_count = int(parts[2])
-                    data_str = parts[3]
-                    price_rows = self._parse_price_rows(tr_id, data_str, data_count)
-                    if price_rows and self._on_price_callback:
-                        for price_data in price_rows:
-                            await self._on_price_callback(price_data)
-            else:
-                # JSON 형태 응답 (구독 확인 등)
-                data = json.loads(raw_msg)
-                header = data.get("header", {})
-                if header.get("tr_id") == "PINGPONG":
-                    await ws.send(raw_msg)
+            data = json.loads(raw_msg)
         except Exception as e:
-            logger.debug("메시지 파싱 오류 (무시): {}", str(e))
+            logger.warning("WebSocket JSON 파싱 실패: {}", str(e))
+            return
+
+        system_message = self._parse_system_message(data, ws_type)
+        if system_message is None:
+            logger.warning("알 수 없는 WebSocket JSON 응답: {}", raw_msg[:200])
+            return
+        if system_message.get("is_pingpong"):
+            await ws.send(raw_msg)
+            return
+        await self._handle_system_message(system_message)
+
+    def _parse_system_message(self, data: dict, ws_type: str) -> dict | None:
+        header = data.get("header") or {}
+        body = data.get("body") or {}
+        tr_id = str(header.get("tr_id") or "")
+        tr_key = str(header.get("tr_key") or "")
+
+        if tr_id == "PINGPONG":
+            return {"is_pingpong": True}
+        if not body:
+            return None
+
+        msg1 = str(body.get("msg1") or "")
+        action = "UNSUBSCRIBE" if msg1.upper().startswith("UNSUB") else "SUBSCRIBE"
+        return {
+            "is_pingpong": False,
+            "tr_id": tr_id,
+            "tr_key": tr_key,
+            "key": self._system_message_key(tr_id, tr_key, ws_type),
+            "rt_cd": str(body.get("rt_cd") or ""),
+            "msg_cd": str(body.get("msg_cd") or ""),
+            "msg1": msg1,
+            "action": action,
+        }
+
+    def _system_message_key(
+        self,
+        tr_id: str,
+        tr_key: str,
+        ws_type: str,
+    ) -> tuple[str, str] | None:
+        normalized_tr_key = (tr_key or "").strip().upper()
+        if not normalized_tr_key:
+            return None
+        if tr_id == "H0STCNT0" or ws_type == "domestic":
+            return ("KRX", normalized_tr_key)
+        if tr_id == "HDFSCNT0" or ws_type == "overseas":
+            market_code, symbol, _session = self._parse_overseas_symbol(normalized_tr_key)
+            return (market_code, symbol.upper())
+        return None
+
+    async def _handle_system_message(self, system_message: dict) -> None:
+        self._last_system_message_at = now_kst()
+        rt_cd = system_message["rt_cd"]
+        msg_cd = system_message["msg_cd"]
+        msg1 = system_message["msg1"]
+        tr_id = system_message["tr_id"]
+        tr_key = system_message["tr_key"]
+        key = system_message["key"]
+        action = system_message["action"]
+
+        if rt_cd == "0":
+            if action == "UNSUBSCRIBE":
+                if key is not None:
+                    self._requested_subscriptions.discard(key)
+                    self._confirmed_subscriptions.discard(key)
+                    logger.info("[WS] 구독 해제 확인: {}:{} ({})", key[0], key[1], tr_id)
+            elif key is not None:
+                self._requested_subscriptions.add(key)
+                self._confirmed_subscriptions.add(key)
+                logger.info("[WS] 구독 확인: {}:{} ({})", key[0], key[1], tr_id)
+            if self._requested_subscriptions.issubset(self._confirmed_subscriptions):
+                self._last_business_error = None
+                self._last_business_error_code = None
+                self._fatal_error = None
+            return
+
+        error_message = msg1 or msg_cd or f"KIS WebSocket business error (rt_cd={rt_cd})"
+        if msg_cd:
+            error_message = f"{msg_cd}: {error_message}"
+        self._last_business_error = error_message
+        self._last_business_error_code = msg_cd or rt_cd
+        if key is not None:
+            self._confirmed_subscriptions.discard(key)
+        logger.warning(
+            "[WS] 시스템 응답 오류: tr_id={} tr_key={} action={} rt_cd={} msg_cd={} msg={}",
+            tr_id,
+            tr_key,
+            action,
+            rt_cd,
+            msg_cd,
+            msg1,
+        )
+        if self._is_fatal_business_error(msg_cd, msg1):
+            self._fatal_error = error_message
+            logger.error("[WS] 치명적 WebSocket 오류: {}", error_message)
+            raise ConnectionError(error_message)
+
+    @staticmethod
+    def _is_fatal_business_error(msg_cd: str, msg1: str) -> bool:
+        normalized_code = str(msg_cd or "").upper()
+        normalized_msg = str(msg1 or "").upper()
+        return normalized_code == "OPSP8996" or "ALREADY IN USE APPKEY" in normalized_msg
 
     def _parse_price_rows(self, tr_id: str, data_str: str, data_count: int) -> list[dict]:
         """TR별 실시간 payload를 레코드 단위로 분리 후 파싱"""
@@ -300,7 +429,7 @@ class KISWebSocket:
             try:
                 parsed = self._parse_price_fields(tr_id, fields)
             except Exception as e:
-                logger.debug("실시간 레코드 파싱 오류 (무시): tr_id={} err={}", tr_id, str(e))
+                logger.warning("실시간 레코드 파싱 오류: tr_id={} err={}", tr_id, str(e))
                 continue
             if parsed:
                 parsed_rows.append(parsed)
@@ -324,7 +453,7 @@ class KISWebSocket:
                     for index in range(0, total_fields, record_size)
                 ]
 
-        logger.debug(
+        logger.warning(
             "실시간 payload 필드 수 불일치: tr_id={} count={} fields={} candidates={}",
             tr_id,
             data_count,
@@ -414,7 +543,31 @@ class KISWebSocket:
 
     @property
     def subscription_count(self) -> int:
-        return len(self._subscriptions)
+        return len(self._confirmed_subscriptions)
+
+    @property
+    def requested_subscription_count(self) -> int:
+        return len(self._requested_subscriptions)
+
+    @property
+    def requested_subscription_keys(self) -> set[tuple[str, str]]:
+        return set(self._requested_subscriptions)
+
+    @property
+    def confirmed_subscription_keys(self) -> set[tuple[str, str]]:
+        return set(self._confirmed_subscriptions)
+
+    @property
+    def last_system_message_at(self) -> datetime | None:
+        return self._last_system_message_at
+
+    @property
+    def last_business_error(self) -> str | None:
+        return self._last_business_error
+
+    @property
+    def fatal_error(self) -> str | None:
+        return self._fatal_error
 
     @property
     def is_connected(self) -> bool:

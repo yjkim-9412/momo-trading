@@ -119,11 +119,18 @@ class AIRiskTuner:
                     "실제 종목별 주문가능금액은 개별 분석 단계에서 inquire-psamount로 다시 확인합니다."
                 )
 
-            # 5. LLM에게 한도 요청
+            # 5. 매수가능 금액 계산
+            purchase_amount = balance.purchase_amount
+            base_asset = balance.net_asset if balance.net_asset > 0 else balance.total_asset
+            buyable_amount = max(0, base_asset - balance.stock_value)
+
+            # 6. LLM에게 한도 요청
             prompt = RISK_TUNING_PROMPT.format(
                 total_asset=balance.total_asset,
                 cash=effective_cash,
+                purchase_amount=purchase_amount,
                 stock_value=balance.stock_value,
+                buyable_amount=buyable_amount,
                 cash_ratio=cash_ratio,
                 total_pnl=balance.total_pnl,
                 total_pnl_rate=balance.total_pnl_rate,

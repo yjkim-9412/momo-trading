@@ -69,6 +69,11 @@ export function renderBalance(data, market) {
   var exchangeRate = Number(data.exchange_rate_to_krw || 0);
   var effectiveCash = Number(data.effective_cash != null ? data.effective_cash : (data.cash != null ? data.cash : 0));
   var rawCash = Number(data.raw_cash != null ? data.raw_cash : (data.cash != null ? data.cash : 0));
+  var operatingCash = Number(
+    data.operating_cash != null
+      ? data.operating_cash
+      : Math.max(Number(data.total_asset || 0) - Number(data.stock_value || 0), 0)
+  );
   var totalPnl = Number(data.total_pnl != null ? data.total_pnl : 0);
   var totalPnlRate = Number(data.total_pnl_rate != null ? data.total_pnl_rate : 0);
   var rawTotalPnl = Number(data.raw_total_pnl != null ? data.raw_total_pnl : totalPnl);
@@ -88,22 +93,25 @@ export function renderBalance(data, market) {
   }
   el.replaceChildren();
   if (isUS) {
-    _renderBalanceUS(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor, exchangeRate);
+    _renderBalanceUS(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor, exchangeRate);
   } else {
-    _renderBalanceKRX(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor);
+    _renderBalanceKRX(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor);
   }
 }
 
-function _renderBalanceUS(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor, exchangeRate) {
+function _renderBalanceUS(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor, exchangeRate) {
   var totalAssetUsd = convertKrwToUsd(data.total_asset, exchangeRate);
   var effectiveCashUsd = convertKrwToUsd(effectiveCash, exchangeRate);
   var rawCashUsd = convertKrwToUsd(rawCash, exchangeRate);
+  var operatingCashUsd = convertKrwToUsd(operatingCash, exchangeRate);
   var stockValueUsd = convertKrwToUsd(data.stock_value, exchangeRate);
   var rows = [];
   rows.push(_dualRow('\uCD1D\uC790\uC0B0', formatAmount(totalAssetUsd, 'USD'), formatAmount(data.total_asset, 'KRW'), 'text-white font-medium'));
   rows.push(_dualRow('\uC2E4\uC8FC\uBB38 \uAE30\uC900 \uD604\uAE08', formatAmount(effectiveCashUsd, 'USD'), formatAmount(effectiveCash, 'KRW'), 'text-sky-300 font-medium'));
   if (Math.abs(effectiveCash - rawCash) >= 1)
     rows.push(_dualRow('\uBE0C\uB85C\uCEE4 \uD604\uAE08', formatAmount(rawCashUsd, 'USD'), formatAmount(rawCash, 'KRW'), 'text-gray-300'));
+  if (Math.abs(operatingCash - effectiveCash) >= 1)
+    rows.push(_dualRow('\uC8FC\uC2DD \uC81C\uC678 \uD604\uAE08', formatAmount(operatingCashUsd, 'USD'), formatAmount(operatingCash, 'KRW'), 'text-gray-300'));
   rows.push(_dualRow('\uC8FC\uC2DD \uD3C9\uAC00', formatAmount(stockValueUsd, 'USD'), formatAmount(data.stock_value, 'KRW'), 'text-gray-200'));
   rows.push(_dualRow('\uC190\uC775', formatSignedAmount(totalPnlRate, 'PCT'), formatSignedAmount(totalPnl, 'KRW'), pnlColor));
   if (shouldShowRawPnl(data))
@@ -114,7 +122,7 @@ function _renderBalanceUS(el, data, effectiveCash, rawCash, totalPnl, totalPnlRa
   rows.forEach(function (r) { el.appendChild(r); });
 }
 
-function _renderBalanceKRX(el, data, effectiveCash, rawCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor) {
+function _renderBalanceKRX(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor) {
   var cashLabels = getKrxCashLabels(data);
 
   // Hero: 총자산
@@ -141,6 +149,7 @@ function _renderBalanceKRX(el, data, effectiveCash, rawCash, totalPnl, totalPnlR
   }
   el.appendChild(_singleRow(cashLabel, cashText));
   if (Math.abs(effectiveCash - rawCash) >= 1) el.appendChild(_singleRow(cashLabels.secondary, formatKRWFull(rawCash), 'text-gray-500'));
+  el.appendChild(_singleRow('\uC6B4\uC601\uAC00\uB2A5 \uD604\uAE08', formatKRWFull(operatingCash), 'text-sky-300'));
   if (data.purchase_amount > 0) el.appendChild(_singleRow('\uB9E4\uC785\uAE08\uC561', formatKRWFull(data.purchase_amount), 'text-gray-500'));
   el.appendChild(_singleRow('\uC8FC\uC2DD\uD3C9\uAC00', formatKRWFull(data.stock_value)));
 
@@ -157,6 +166,7 @@ function _renderBalanceKRX(el, data, effectiveCash, rawCash, totalPnl, totalPnlR
 
   // Notes
   if (data.cash_source === 'BROKER_ORDERABLE') el.appendChild(_noteRow('\uAC00\uC6A9\uD604\uAE08\uC740 \uBE0C\uB85C\uCEE4 \uC8FC\uBB38\uAC00\uB2A5\uAE08\uC561 \uAE30\uC900\uC785\uB2C8\uB2E4.'));
+  if (data.operating_cash != null) el.appendChild(_noteRow('\uC6B4\uC601\uAC00\uB2A5 \uD604\uAE08\uC740 \uCD1D\uC790\uC0B0 - \uC8FC\uC2DD\uD3C9\uAC00 \uAE30\uC900\uC785\uB2C8\uB2E4.'));
   if (data.cash_source === 'TOTAL_ASSET_PROXY') el.appendChild(_noteRow('\uCD1D\uC790\uC0B0 - \uC8FC\uC2DD\uD3C9\uAC00\uC561\uC73C\uB85C \uC8FC\uBB38\uAC00\uB2A5 \uD604\uAE08\uC744 \uCD94\uC815\uD569\uB2C8\uB2E4.'));
   if (data.pnl_source === 'HOLDINGS_SUM') el.appendChild(_noteRow('\uC190\uC775\uC740 \uBCF4\uC720\uC885\uBAA9 \uAE30\uC900\uC73C\uB85C \uC7AC\uACC4\uC0B0\uD569\uB2C8\uB2E4.'));
   if (data.status_message) el.appendChild(_noteRow(data.status_message, 'text-gray-500'));
@@ -466,6 +476,32 @@ export async function loadWatchlist() {
   }
 }
 
+function getStreamHealthMeta(stream) {
+  var health = String((stream && stream.health) || '').toUpperCase();
+  if (health === 'CONNECTED') {
+    return {
+      dotClass: 'w-1.5 h-1.5 rounded-full bg-green-400 status-dot',
+      label: '\uC815\uC0C1',
+    };
+  }
+  if (health === 'DEGRADED') {
+    return {
+      dotClass: 'w-1.5 h-1.5 rounded-full bg-amber-400 status-dot',
+      label: '\uC800\uD558',
+    };
+  }
+  if (health === 'ERROR') {
+    return {
+      dotClass: 'w-1.5 h-1.5 rounded-full bg-red-400',
+      label: '\uC624\uB958',
+    };
+  }
+  return {
+    dotClass: 'w-1.5 h-1.5 rounded-full bg-gray-500',
+    label: '\uBBF8\uC5F0\uACB0',
+  };
+}
+
 export function renderWatchlist(data) {
   var el = document.getElementById('watchlist-info');
   var countEl = document.getElementById('watchlist-count');
@@ -486,19 +522,21 @@ export function renderWatchlist(data) {
   if (sectionEl) sectionEl.style.display = '';
   if (countEl) countEl.textContent = symbols.length + '\uC885\uBAA9';
   if (dotEl && stream) {
-    dotEl.className = stream.connected
-      ? 'w-1.5 h-1.5 rounded-full bg-green-400 status-dot'
-      : 'w-1.5 h-1.5 rounded-full bg-red-400';
+    dotEl.className = getStreamHealthMeta(stream).dotClass;
   }
 
   el.replaceChildren();
 
   // WS gauge bar
   if (stream) {
+    var healthMeta = getStreamHealthMeta(stream);
+    var desiredCount = Number(stream.desired_count || 0);
+    var confirmedCount = Number(stream.subscription_count || 0);
+    var gaugeBase = desiredCount > 0 ? desiredCount : Number(stream.subscription_limit || 0);
     var bar = document.createElement('div');
     bar.className = 'watchlist-stream-bar';
-    var pct = stream.subscription_limit > 0
-      ? Math.round((stream.subscription_count / stream.subscription_limit) * 100) : 0;
+    var pct = gaugeBase > 0
+      ? Math.round((confirmedCount / gaugeBase) * 100) : 0;
     var gaugeTrack = document.createElement('span');
     gaugeTrack.className = 'ws-gauge';
     gaugeTrack.textContent = '';
@@ -512,15 +550,24 @@ export function renderWatchlist(data) {
     fillEl.style.width = pct + '%';
     trackEl.appendChild(fillEl);
     var countSpan = document.createElement('span');
-    countSpan.textContent = stream.subscription_count + '/' + stream.subscription_limit;
+    countSpan.textContent = confirmedCount + '/' + desiredCount;
     gaugeTrack.appendChild(wsLabel);
     gaugeTrack.appendChild(trackEl);
     gaugeTrack.appendChild(countSpan);
     var statusSpan = document.createElement('span');
-    statusSpan.textContent = stream.connected ? '\uC5F0\uACB0\uB428' : '\uB04A\uAE40';
+    statusSpan.textContent = healthMeta.label;
     bar.appendChild(gaugeTrack);
     bar.appendChild(statusSpan);
     el.appendChild(bar);
+
+    var statusReason = stream.status_reason || stream.last_business_error || stream.last_connect_error || '';
+    if (statusReason) {
+      var reasonEl = document.createElement('div');
+      reasonEl.className = 'text-[11px] text-gray-500 mt-1';
+      reasonEl.textContent = statusReason;
+      reasonEl.title = statusReason;
+      el.appendChild(reasonEl);
+    }
   }
 
   var isUS = state.currentMarket !== 'KRX';
