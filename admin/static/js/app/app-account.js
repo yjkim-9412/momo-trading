@@ -97,6 +97,36 @@ export function renderBalance(data, market) {
   } else {
     _renderBalanceKRX(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor);
   }
+  refreshIcons();
+}
+
+function _balanceDetailWrapper() {
+  var isCollapsed = localStorage.getItem('momo-balance-detail-collapsed') !== '0';
+  var toggle = document.createElement('div');
+  toggle.className = 'balance-detail-toggle';
+  var arrow = document.createElement('span');
+  arrow.className = 'section-toggle-icon' + (isCollapsed ? ' collapsed-icon' : '');
+  arrow.id = 'balance-detail-arrow';
+  var chevron = document.createElement('i');
+  chevron.setAttribute('data-lucide', 'chevron-down');
+  chevron.className = 'w-3 h-3';
+  arrow.appendChild(chevron);
+  var label = document.createElement('span');
+  label.textContent = '\uC0C1\uC138';
+  toggle.appendChild(arrow);
+  toggle.appendChild(label);
+  var body = document.createElement('div');
+  body.id = 'balance-detail-body';
+  body.className = 'account-section-body text-xs space-y-0.5' + (isCollapsed ? ' collapsed-section' : '');
+  body.style.maxHeight = isCollapsed ? '0' : '200px';
+  toggle.addEventListener('click', function () {
+    var collapsed = body.classList.toggle('collapsed-section');
+    body.style.maxHeight = collapsed ? '0' : '200px';
+    var arrowEl = document.getElementById('balance-detail-arrow');
+    if (arrowEl) arrowEl.classList.toggle('collapsed-icon', collapsed);
+    localStorage.setItem('momo-balance-detail-collapsed', collapsed ? '1' : '0');
+  });
+  return { toggle: toggle, body: body };
 }
 
 function _renderBalanceUS(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor, exchangeRate) {
@@ -105,27 +135,27 @@ function _renderBalanceUS(el, data, effectiveCash, rawCash, operatingCash, total
   var rawCashUsd = convertKrwToUsd(rawCash, exchangeRate);
   var operatingCashUsd = convertKrwToUsd(operatingCash, exchangeRate);
   var stockValueUsd = convertKrwToUsd(data.stock_value, exchangeRate);
-  var rows = [];
-  rows.push(_dualRow('\uCD1D\uC790\uC0B0', formatAmount(totalAssetUsd, 'USD'), formatAmount(data.total_asset, 'KRW'), 'text-white font-medium'));
-  rows.push(_dualRow('\uC2E4\uC8FC\uBB38 \uAE30\uC900 \uD604\uAE08', formatAmount(effectiveCashUsd, 'USD'), formatAmount(effectiveCash, 'KRW'), 'text-sky-300 font-medium'));
+  el.appendChild(_dualRow('\uCD1D\uC790\uC0B0', formatAmount(totalAssetUsd, 'USD'), formatAmount(data.total_asset, 'KRW'), 'text-white font-medium'));
+  el.appendChild(_dualRow('\uC190\uC775', formatSignedAmount(totalPnlRate, 'PCT'), formatSignedAmount(totalPnl, 'KRW'), pnlColor));
+  var detail = _balanceDetailWrapper();
+  el.appendChild(detail.toggle);
+  var bd = detail.body;
+  bd.appendChild(_dualRow('\uC2E4\uC8FC\uBB38 \uAE30\uC900 \uD604\uAE08', formatAmount(effectiveCashUsd, 'USD'), formatAmount(effectiveCash, 'KRW'), 'text-sky-300 font-medium'));
   if (Math.abs(effectiveCash - rawCash) >= 1)
-    rows.push(_dualRow('\uBE0C\uB85C\uCEE4 \uD604\uAE08', formatAmount(rawCashUsd, 'USD'), formatAmount(rawCash, 'KRW'), 'text-gray-300'));
+    bd.appendChild(_dualRow('\uBE0C\uB85C\uCEE4 \uD604\uAE08', formatAmount(rawCashUsd, 'USD'), formatAmount(rawCash, 'KRW'), 'text-gray-300'));
   if (Math.abs(operatingCash - effectiveCash) >= 1)
-    rows.push(_dualRow('\uC8FC\uC2DD \uC81C\uC678 \uD604\uAE08', formatAmount(operatingCashUsd, 'USD'), formatAmount(operatingCash, 'KRW'), 'text-gray-300'));
-  rows.push(_dualRow('\uC8FC\uC2DD \uD3C9\uAC00', formatAmount(stockValueUsd, 'USD'), formatAmount(data.stock_value, 'KRW'), 'text-gray-200'));
-  rows.push(_dualRow('\uC190\uC775', formatSignedAmount(totalPnlRate, 'PCT'), formatSignedAmount(totalPnl, 'KRW'), pnlColor));
+    bd.appendChild(_dualRow('\uC8FC\uC2DD \uC81C\uC678 \uD604\uAE08', formatAmount(operatingCashUsd, 'USD'), formatAmount(operatingCash, 'KRW'), 'text-gray-300'));
+  bd.appendChild(_dualRow('\uC8FC\uC2DD \uD3C9\uAC00', formatAmount(stockValueUsd, 'USD'), formatAmount(data.stock_value, 'KRW'), 'text-gray-200'));
   if (shouldShowRawPnl(data))
-    rows.push(_dualRow('\uBE0C\uB85C\uCEE4 \uC694\uC57D \uC190\uC775', formatSignedAmount(rawTotalPnlRate, 'PCT'), formatSignedAmount(rawTotalPnl, 'KRW'), 'text-gray-400'));
-  rows.push(_noteRow('\uD658\uC728 ' + (exchangeRate ? exchangeRate.toFixed(2) : '-') + ' KRW/USD'));
-  if (data.pnl_source === 'HOLDINGS_SUM') rows.push(_noteRow('\uBAA8\uC758\uD22C\uC790 \uC190\uC775\uC740 \uBCF4\uC720\uC885\uBAA9 \uAE30\uC900\uC73C\uB85C \uC7AC\uACC4\uC0B0\uD569\uB2C8\uB2E4.'));
-  if (data.status_message) rows.push(_noteRow(data.status_message, 'text-gray-500'));
-  rows.forEach(function (r) { el.appendChild(r); });
+    bd.appendChild(_dualRow('\uBE0C\uB85C\uCEE4 \uC694\uC57D \uC190\uC775', formatSignedAmount(rawTotalPnlRate, 'PCT'), formatSignedAmount(rawTotalPnl, 'KRW'), 'text-gray-400'));
+  bd.appendChild(_noteRow('\uD658\uC728 ' + (exchangeRate ? exchangeRate.toFixed(2) : '-') + ' KRW/USD'));
+  if (data.pnl_source === 'HOLDINGS_SUM') bd.appendChild(_noteRow('\uBAA8\uC758\uD22C\uC790 \uC190\uC775\uC740 \uBCF4\uC720\uC885\uBAA9 \uAE30\uC900\uC73C\uB85C \uC7AC\uACC4\uC0B0\uD569\uB2C8\uB2E4.'));
+  if (data.status_message) bd.appendChild(_noteRow(data.status_message, 'text-gray-500'));
+  el.appendChild(bd);
 }
 
 function _renderBalanceKRX(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor) {
   var cashLabels = getKrxCashLabels(data);
-
-  // Hero: 총자산
   var hero = document.createElement('div');
   hero.className = 'mb-1';
   var heroLabel = document.createElement('div');
@@ -137,8 +167,14 @@ function _renderBalanceKRX(el, data, effectiveCash, rawCash, operatingCash, tota
   hero.appendChild(heroLabel);
   hero.appendChild(heroValue);
   el.appendChild(hero);
-
-  // Key metrics
+  var sep = document.createElement('div');
+  sep.className = 'border-t border-gray-700/50 my-1';
+  el.appendChild(sep);
+  var pnlText = (totalPnl >= 0 ? '+' : '') + formatKRWFull(totalPnl) + ' (' + (totalPnlRate >= 0 ? '+' : '') + totalPnlRate.toFixed(2) + '%)';
+  el.appendChild(_singleRow('\uC190\uC775', pnlText, pnlColor));
+  var detail = _balanceDetailWrapper();
+  el.appendChild(detail.toggle);
+  var bd = detail.body;
   var cashText = formatKRWFull(effectiveCash);
   var cashLabel = cashLabels.primary;
   if (effectiveCash > data.total_asset) {
@@ -147,29 +183,19 @@ function _renderBalanceKRX(el, data, effectiveCash, rawCash, operatingCash, tota
     var cashRatio = (effectiveCash / data.total_asset * 100).toFixed(1);
     cashText += ' (' + cashRatio + '%)';
   }
-  el.appendChild(_singleRow(cashLabel, cashText));
-  if (Math.abs(effectiveCash - rawCash) >= 1) el.appendChild(_singleRow(cashLabels.secondary, formatKRWFull(rawCash), 'text-gray-500'));
-  el.appendChild(_singleRow('\uC6B4\uC601\uAC00\uB2A5 \uD604\uAE08', formatKRWFull(operatingCash), 'text-sky-300'));
-  if (data.purchase_amount > 0) el.appendChild(_singleRow('\uB9E4\uC785\uAE08\uC561', formatKRWFull(data.purchase_amount), 'text-gray-500'));
-  el.appendChild(_singleRow('\uC8FC\uC2DD\uD3C9\uAC00', formatKRWFull(data.stock_value)));
-
-  // Separator
-  var sep = document.createElement('div');
-  sep.className = 'border-t border-gray-700/50 my-1';
-  el.appendChild(sep);
-
-  // P&L
-  var pnlText = (totalPnl >= 0 ? '+' : '') + formatKRWFull(totalPnl) + ' (' + (totalPnlRate >= 0 ? '+' : '') + totalPnlRate.toFixed(2) + '%)';
-  el.appendChild(_singleRow('\uC190\uC775', pnlText, pnlColor));
+  bd.appendChild(_singleRow(cashLabel, cashText));
+  if (Math.abs(effectiveCash - rawCash) >= 1) bd.appendChild(_singleRow(cashLabels.secondary, formatKRWFull(rawCash), 'text-gray-500'));
+  bd.appendChild(_singleRow('\uC6B4\uC601\uAC00\uB2A5 \uD604\uAE08', formatKRWFull(operatingCash), 'text-sky-300'));
+  if (data.purchase_amount > 0) bd.appendChild(_singleRow('\uB9E4\uC785\uAE08\uC561', formatKRWFull(data.purchase_amount), 'text-gray-500'));
+  bd.appendChild(_singleRow('\uC8FC\uC2DD\uD3C9\uAC00', formatKRWFull(data.stock_value)));
   if (shouldShowRawPnl(data))
-    el.appendChild(_singleRow('\uBE0C\uB85C\uCEE4 \uC694\uC57D \uC190\uC775', formatSignedAmount(rawTotalPnl, 'KRW') + ' (' + formatSignedAmount(rawTotalPnlRate, 'PCT') + ')', 'text-gray-500'));
-
-  // Notes
-  if (data.cash_source === 'BROKER_ORDERABLE') el.appendChild(_noteRow('\uAC00\uC6A9\uD604\uAE08\uC740 \uBE0C\uB85C\uCEE4 \uC8FC\uBB38\uAC00\uB2A5\uAE08\uC561 \uAE30\uC900\uC785\uB2C8\uB2E4.'));
-  if (data.operating_cash != null) el.appendChild(_noteRow('\uC6B4\uC601\uAC00\uB2A5 \uD604\uAE08\uC740 \uCD1D\uC790\uC0B0 - \uC8FC\uC2DD\uD3C9\uAC00 \uAE30\uC900\uC785\uB2C8\uB2E4.'));
-  if (data.cash_source === 'TOTAL_ASSET_PROXY') el.appendChild(_noteRow('\uCD1D\uC790\uC0B0 - \uC8FC\uC2DD\uD3C9\uAC00\uC561\uC73C\uB85C \uC8FC\uBB38\uAC00\uB2A5 \uD604\uAE08\uC744 \uCD94\uC815\uD569\uB2C8\uB2E4.'));
-  if (data.pnl_source === 'HOLDINGS_SUM') el.appendChild(_noteRow('\uC190\uC775\uC740 \uBCF4\uC720\uC885\uBAA9 \uAE30\uC900\uC73C\uB85C \uC7AC\uACC4\uC0B0\uD569\uB2C8\uB2E4.'));
-  if (data.status_message) el.appendChild(_noteRow(data.status_message, 'text-gray-500'));
+    bd.appendChild(_singleRow('\uBE0C\uB85C\uCEE4 \uC694\uC57D \uC190\uC775', formatSignedAmount(rawTotalPnl, 'KRW') + ' (' + formatSignedAmount(rawTotalPnlRate, 'PCT') + ')', 'text-gray-500'));
+  if (data.cash_source === 'BROKER_ORDERABLE') bd.appendChild(_noteRow('\uAC00\uC6A9\uD604\uAE08\uC740 \uBE0C\uB85C\uCEE4 \uC8FC\uBB38\uAC00\uB2A5\uAE08\uC561 \uAE30\uC900\uC785\uB2C8\uB2E4.'));
+  if (data.operating_cash != null) bd.appendChild(_noteRow('\uC6B4\uC601\uAC00\uB2A5 \uD604\uAE08\uC740 \uCD1D\uC790\uC0B0 - \uC8FC\uC2DD\uD3C9\uAC00 \uAE30\uC900\uC785\uB2C8\uB2E4.'));
+  if (data.cash_source === 'TOTAL_ASSET_PROXY') bd.appendChild(_noteRow('\uCD1D\uC790\uC0B0 - \uC8FC\uC2DD\uD3C9\uAC00\uC561\uC73C\uB85C \uC8FC\uBB38\uAC00\uB2A5 \uD604\uAE08\uC744 \uCD94\uC815\uD569\uB2C8\uB2E4.'));
+  if (data.pnl_source === 'HOLDINGS_SUM') bd.appendChild(_noteRow('\uC190\uC775\uC740 \uBCF4\uC720\uC885\uBAA9 \uAE30\uC900\uC73C\uB85C \uC7AC\uACC4\uC0B0\uD569\uB2C8\uB2E4.'));
+  if (data.status_message) bd.appendChild(_noteRow(data.status_message, 'text-gray-500'));
+  el.appendChild(bd);
 }
 
 function _singleRow(label, value, valueClass) {

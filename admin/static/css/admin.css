@@ -212,6 +212,74 @@ body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, 
 
 .holdings-summary { background: rgba(55,65,81,0.3); border-radius: 6px; padding: 6px 8px; margin-bottom: 6px; border: 1px solid rgba(75,85,99,0.4); }
 
+/* ── Responsive Sidebar ── */
+:root {
+  --sidebar-left-w: 256px;
+  --sidebar-right-w: 384px;
+  --sidebar-collapsed-w: 48px;
+  --sidebar-z: 40;
+  --backdrop-z: 35;
+  --header-h: 0px;
+}
+
+.sidebar-backdrop {
+  display: none; position: fixed; inset: 0;
+  background: rgba(0,0,0,0.5); z-index: var(--backdrop-z);
+  backdrop-filter: blur(2px); -webkit-backdrop-filter: blur(2px);
+  transition: opacity 0.3s ease; opacity: 0;
+}
+.sidebar-backdrop.visible { display: block; opacity: 1; }
+
+.sidebar-mobile-trigger { display: none; }
+
+/* Medium: narrow left sidebar, auto-collapse right */
+@media (max-width: 1279px) {
+  body.stock-layout .sidebar-left:not(.collapsed) { width: 224px; min-width: 224px; }
+}
+
+/* Overlay: both sidebars become fixed drawers */
+@media (max-width: 1023px) {
+  body.stock-layout .sidebar-left,
+  body.stock-layout .sidebar-right {
+    position: fixed; top: var(--header-h); bottom: 0;
+    z-index: var(--sidebar-z);
+    transition: transform 0.3s cubic-bezier(0.4,0,0.2,1);
+  }
+  body.stock-layout .sidebar-left {
+    left: 0; width: var(--sidebar-left-w) !important; min-width: var(--sidebar-left-w) !important;
+  }
+  body.stock-layout .sidebar-left.collapsed { transform: translateX(-100%); }
+  body.stock-layout .sidebar-left.collapsed .sidebar-content { opacity: 1; pointer-events: auto; }
+  body.stock-layout .sidebar-right {
+    right: 0; width: var(--sidebar-right-w) !important; min-width: var(--sidebar-right-w) !important;
+  }
+  body.stock-layout .sidebar-right.collapsed { transform: translateX(100%); }
+  body.stock-layout .sidebar-right.collapsed .sidebar-content { opacity: 1; pointer-events: auto; }
+  body.stock-layout .sidebar-toggle-left { right: 8px; }
+  body.stock-layout .sidebar-toggle-right { left: 8px; }
+  .sidebar-mobile-trigger {
+    display: flex; align-items: center; justify-content: center;
+    width: 32px; height: 32px; border-radius: 6px;
+    background: transparent; border: 1px solid #374151;
+    color: #9ca3af; cursor: pointer; transition: background 0.15s, color 0.15s;
+  }
+  .sidebar-mobile-trigger:hover { background: #374151; color: #e5e7eb; }
+}
+
+/* Mobile: wider drawers */
+@media (max-width: 767px) {
+  body.stock-layout .sidebar-left { width: 85vw !important; min-width: 85vw !important; }
+  body.stock-layout .sidebar-right { width: 85vw !important; min-width: 85vw !important; }
+}
+
+/* ── Balance / System detail toggle ── */
+.balance-detail-toggle {
+  display: flex; align-items: center; gap: 3px;
+  font-size: 11px; color: #6b7280; cursor: pointer;
+  padding: 2px 0; transition: color 0.15s;
+}
+.balance-detail-toggle:hover { color: #9ca3af; }
+
 /* ── LLM Agent Guide ── */
 .agent-summary-row {
   border: 1px solid #30344f;

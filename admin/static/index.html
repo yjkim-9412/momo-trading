@@ -21,10 +21,13 @@
   </script>
   <link rel="stylesheet" href="/admin/static/css/admin.css">
 </head>
-<body class="dark bg-dark-900 text-gray-200 h-screen flex flex-col overflow-hidden">
+<body class="dark bg-dark-900 text-gray-200 h-screen flex flex-col overflow-hidden stock-layout">
   <!-- Header -->
   <header class="bg-dark-800 border-b border-gray-700 px-4 py-2 flex items-center justify-between shrink-0">
     <div class="flex items-center gap-3">
+      <button id="mobile-sidebar-trigger" class="sidebar-mobile-trigger" onclick="toggleLeftSidebar()" aria-label="메뉴">
+        <i data-lucide="menu" class="w-4 h-4"></i>
+      </button>
       <h1 class="text-lg font-bold text-white">MOMO Trading Admin</h1>
       <span id="version" class="text-xs text-gray-500">v0.1.0</span>
     </div>
@@ -184,8 +187,13 @@
 
       <!-- System Status & Actions -->
       <div class="p-3 space-y-2 shrink-0">
-        <div class="text-xs text-gray-500 font-medium">&#xc2dc;&#xc2a4;&#xd15c;</div>
-        <div id="sys-status" class="text-xs space-y-1"></div>
+        <div class="balance-detail-toggle" onclick="toggleSysDetail()" style="padding:0">
+          <span class="section-toggle-icon collapsed-icon" id="sys-detail-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+          <span class="text-xs text-gray-500 font-medium">시스템</span>
+        </div>
+        <div id="sys-detail-body" class="account-section-body collapsed-section" style="max-height:0">
+          <div id="sys-status" class="text-xs space-y-1"></div>
+        </div>
         <button onclick="triggerCycle()"
           class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg py-2 transition flex items-center justify-center gap-2">
           <i data-lucide="play" class="w-4 h-4 fill-current"></i> 수동 사이클 실행
@@ -344,6 +352,9 @@
       </div><!-- /sidebar-content -->
     </aside>
   </div>
+
+  <!-- Sidebar backdrop (overlay mode) -->
+  <div id="sidebar-backdrop" class="sidebar-backdrop" onclick="closeSidebarOverlay()"></div>
 
   <!-- Toast Container -->
   <div id="toast-container" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2" style="max-width:360px"></div>

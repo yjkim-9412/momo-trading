@@ -434,19 +434,97 @@ export function toggleSettings() {
   if (toggleBtn) toggleBtn.setAttribute('aria-expanded', String(isHidden));
 }
 
+// ── Responsive Sidebar ──
+var BREAKPOINT_OVERLAY = 1024;
+var BREAKPOINT_NARROW = 1280;
+var _responsiveMode = 'desktop';
+
+function _updateOverlayBackdrop() {
+  var backdrop = document.getElementById('sidebar-backdrop');
+  if (!backdrop) return;
+  var leftOpen = !document.getElementById('left-sidebar')?.classList.contains('collapsed');
+  var rightOpen = !document.getElementById('right-sidebar')?.classList.contains('collapsed');
+  backdrop.classList.toggle('visible', leftOpen || rightOpen);
+}
+
+function _restoreSidebarFromStorage() {
+  var ls = document.getElementById('left-sidebar');
+  var rs = document.getElementById('right-sidebar');
+  if (ls) {
+    if (localStorage.getItem('momo-left-sidebar-collapsed') === '1') ls.classList.add('collapsed');
+    else ls.classList.remove('collapsed');
+  }
+  if (rs) {
+    if (localStorage.getItem('momo-right-sidebar-collapsed') === '1') rs.classList.add('collapsed');
+    else rs.classList.remove('collapsed');
+  }
+}
+
+export function updateResponsiveMode() {
+  var w = window.innerWidth;
+  var newMode = w >= BREAKPOINT_NARROW ? 'desktop' : w >= BREAKPOINT_OVERLAY ? 'medium' : 'overlay';
+  if (newMode === _responsiveMode) return;
+  _responsiveMode = newMode;
+  var ls = document.getElementById('left-sidebar');
+  var rs = document.getElementById('right-sidebar');
+  var bd = document.getElementById('sidebar-backdrop');
+  if (newMode === 'desktop') {
+    if (bd) bd.classList.remove('visible');
+    _restoreSidebarFromStorage();
+  } else if (newMode === 'medium') {
+    if (bd) bd.classList.remove('visible');
+    if (ls) {
+      if (localStorage.getItem('momo-left-sidebar-collapsed') === '1') ls.classList.add('collapsed');
+      else ls.classList.remove('collapsed');
+    }
+    if (rs && !rs.classList.contains('collapsed')) rs.classList.add('collapsed');
+  } else {
+    if (ls) ls.classList.add('collapsed');
+    if (rs) rs.classList.add('collapsed');
+    if (bd) bd.classList.remove('visible');
+  }
+}
+
+export function closeSidebarOverlay() {
+  var ls = document.getElementById('left-sidebar');
+  var rs = document.getElementById('right-sidebar');
+  var bd = document.getElementById('sidebar-backdrop');
+  if (ls && !ls.classList.contains('collapsed')) ls.classList.add('collapsed');
+  if (rs && !rs.classList.contains('collapsed')) rs.classList.add('collapsed');
+  if (bd) bd.classList.remove('visible');
+}
+
+export function toggleSysDetail() {
+  var body = document.getElementById('sys-detail-body');
+  var arrow = document.getElementById('sys-detail-arrow');
+  if (!body) return;
+  var collapsed = body.classList.toggle('collapsed-section');
+  body.style.maxHeight = collapsed ? '0' : '150px';
+  if (arrow) arrow.classList.toggle('collapsed-icon', collapsed);
+  localStorage.setItem('momo-sys-detail-collapsed', collapsed ? '1' : '0');
+}
+
 // ── Sidebar Toggles ──
 export function toggleLeftSidebar() {
   var sidebar = document.getElementById('left-sidebar');
   if (!sidebar) return;
   sidebar.classList.toggle('collapsed');
-  localStorage.setItem('momo-left-sidebar-collapsed', sidebar.classList.contains('collapsed') ? '1' : '');
+  if (_responsiveMode !== 'overlay') {
+    localStorage.setItem('momo-left-sidebar-collapsed', sidebar.classList.contains('collapsed') ? '1' : '');
+  } else {
+    _updateOverlayBackdrop();
+  }
 }
 
 export function toggleRightSidebar() {
   var sidebar = document.getElementById('right-sidebar');
   if (!sidebar) return;
   sidebar.classList.toggle('collapsed');
-  localStorage.setItem('momo-right-sidebar-collapsed', sidebar.classList.contains('collapsed') ? '1' : '');
+  if (_responsiveMode !== 'overlay') {
+    localStorage.setItem('momo-right-sidebar-collapsed', sidebar.classList.contains('collapsed') ? '1' : '');
+  } else {
+    _updateOverlayBackdrop();
+  }
 }
 
 export function toggleAccountSection(section) {
@@ -559,13 +637,23 @@ export async function generateReport() {
 // ══════════════════════════════════════════════════════════
 
 (function restoreSidebarState() {
-  if (localStorage.getItem('momo-left-sidebar-collapsed') === '1') {
+  if (window.innerWidth >= BREAKPOINT_NARROW) {
+    _restoreSidebarFromStorage();
+  } else {
     var ls = document.getElementById('left-sidebar');
-    if (ls) ls.classList.add('collapsed');
-  }
-  if (localStorage.getItem('momo-right-sidebar-collapsed') === '1') {
     var rs = document.getElementById('right-sidebar');
+    if (ls) ls.classList.add('collapsed');
     if (rs) rs.classList.add('collapsed');
+  }
+})();
+
+// Restore system detail collapse state (default: collapsed)
+(function restoreSysDetail() {
+  if (localStorage.getItem('momo-sys-detail-collapsed') === '0') {
+    var sb = document.getElementById('sys-detail-body');
+    var sa = document.getElementById('sys-detail-arrow');
+    if (sb) { sb.classList.remove('collapsed-section'); sb.style.maxHeight = '150px'; }
+    if (sa) sa.classList.remove('collapsed-icon');
   }
 })();
 
@@ -617,6 +705,19 @@ document.addEventListener('DOMContentLoaded', async function () {
   setInterval(loadWatchlist, 30000);
   setInterval(loadLLMUsage, 60000);
   setInterval(loadScheduleTimeline, 15000);
+
+  // Responsive sidebar: measure header height and init
+  var hdr = document.querySelector('header');
+  if (hdr) document.documentElement.style.setProperty('--header-h', hdr.offsetHeight + 'px');
+  updateResponsiveMode();
+  var _resizeTimer = null;
+  window.addEventListener('resize', function () {
+    if (_resizeTimer) clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(function () {
+      if (hdr) document.documentElement.style.setProperty('--header-h', hdr.offsetHeight + 'px');
+      updateResponsiveMode();
+    }, 150);
+  });
 });
 
 // ══════════════════════════════════════════════════════════
@@ -639,3 +740,10 @@ window.scrollToBottom = function () { Feed.scrollToBottom(); };
 window.clearChat = function () { clearChat(); };
 window.loadTodayActivities = function () { loadTodayActivities(); };
 window.toggleDetail = function (id) { Feed.toggleDetail(id); };
+window.closeSidebarOverlay = function () { closeSidebarOverlay(); };
+window.toggleSysDetail = function () { toggleSysDetail(); };
+
+// ── Escape key closes overlay sidebar ──
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape' && _responsiveMode === 'overlay') closeSidebarOverlay();
+});
