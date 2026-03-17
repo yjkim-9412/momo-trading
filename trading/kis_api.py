@@ -171,8 +171,8 @@ async def _request_paged_json(
         if not header_tr_cont:
             header_tr_cont = str(page.get("tr_cont", ""))
 
-        next_fk = str(page.get("ctx_area_fk200", ""))
-        next_nk = str(page.get("ctx_area_nk200", ""))
+        next_fk = str(page.get(ctx_fk_key.lower(), ""))
+        next_nk = str(page.get(ctx_nk_key.lower(), ""))
         if header_tr_cont not in {"M", "F"} or (not next_fk and not next_nk) or index >= 9:
             break
         tr_cont = "N"
@@ -633,6 +633,133 @@ async def get_overseas_balance(market: str = "NASDAQ") -> dict:
     except Exception as e:
         logger.error("해외 잔고 조회 오류 ({}): {}", market_code, str(e))
         return {"success": False, "error": str(e), "output1": [], "output2": []}
+
+
+async def get_domestic_price(symbol: str) -> dict:
+    """국내주식 현재가 조회"""
+    try:
+        result = await _request_json(
+            "/uapi/domestic-stock/v1/quotations/inquire-price",
+            "FHKST01010100",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("국내 현재가 조회 오류 ({}): {}", symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
+
+
+async def get_domestic_balance() -> dict:
+    """국내주식 잔고 조회 (연속조회 자동 처리)"""
+    tr_id = "VTTC8434R" if settings.is_paper_trading else "TTTC8434R"
+    cano, acnt_prdt_cd = _get_account_parts()
+    try:
+        result = await _request_paged_json(
+            "/uapi/domestic-stock/v1/trading/inquire-balance",
+            tr_id,
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "AFHR_FLPR_YN": "N",
+                "INQR_DVSN": "02",
+                "UNPR_DVSN": "01",
+                "FUND_STTL_ICLD_YN": "N",
+                "FNCG_AMT_AUTO_RDPT_YN": "N",
+                "PRCS_DVSN": "00",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            },
+            output_keys=("output1", "output2"),
+            ctx_fk_key="CTX_AREA_FK100",
+            ctx_nk_key="CTX_AREA_NK100",
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("국내 잔고 조회 오류: {}", str(e))
+        return {"success": False, "error": str(e), "output1": [], "output2": []}
+
+
+async def get_domestic_daily_price(symbol: str) -> dict:
+    """국내주식 일별 시세 조회"""
+    try:
+        result = await _request_json(
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-price",
+            "FHKST01010400",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+                "FID_PERIOD_DIV_CODE": "D",
+                "FID_ORG_ADJ_PRC": "1",
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("국내 일별시세 조회 오류 ({}): {}", symbol, str(e))
+        return {"success": False, "error": str(e), "output": []}
+
+
+async def place_domestic_order(
+    symbol: str,
+    side: str,
+    quantity: int,
+    price: float | None = None,
+) -> dict:
+    """국내주식 주문 실행"""
+    cano, acnt_prdt_cd = _get_account_parts()
+    is_buy = str(side).upper() == "BUY"
+    tr_id = (
+        "VTTC0012U" if settings.is_paper_trading and is_buy
+        else "VTTC0011U" if settings.is_paper_trading and not is_buy
+        else "TTTC0012U" if is_buy
+        else "TTTC0011U"
+    )
+    # 00=지정가, 01=시장가
+    ord_dvsn = "00" if price else "01"
+    ord_unpr = str(int(price)) if price else "0"
+    try:
+        result = await _request_json(
+            "/uapi/domestic-stock/v1/trading/order-cash",
+            tr_id,
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": acnt_prdt_cd,
+                "PDNO": symbol,
+                "ORD_DVSN": ord_dvsn,
+                "ORD_QTY": str(quantity),
+                "ORD_UNPR": ord_unpr,
+            },
+            method="POST",
+            use_trading_domain=True,
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("국내 주문 오류 ({} {}): {}", side, symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
+
+
+async def get_domestic_asking_price(symbol: str) -> dict:
+    """국내주식 호가 조회"""
+    try:
+        result = await _request_json(
+            "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+            "FHKST01010200",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": symbol,
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("국내 호가 조회 오류 ({}): {}", symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
 
 
 async def get_domestic_order_list(start_date: str, end_date: str) -> dict:

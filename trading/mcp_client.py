@@ -1040,7 +1040,14 @@ class MCPClient:
 
             return await bithumb_client.get_current_price(symbol, market=market_code)
         if is_domestic_market(market_code):
-            resp = await self.call_tool("inquery-stock-price", {"symbol": symbol})
+            from trading.kis_api import get_domestic_price
+
+            result = await get_domestic_price(symbol)
+            resp = MCPResponse(
+                success=result.get("rt_cd") == "0",
+                data=result,
+                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            )
         else:
             from trading.kis_api import get_overseas_price
 
@@ -1104,7 +1111,14 @@ class MCPClient:
 
             return await bithumb_client.get_account_balance(market=market_code)
         if is_domestic_market(market_code):
-            return await self.call_tool("inquery-balance")
+            from trading.kis_api import get_domestic_balance
+
+            result = await get_domestic_balance()
+            return MCPResponse(
+                success=result.get("rt_cd") == "0",
+                data=result,
+                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            )
         from trading.kis_api import get_overseas_balance, get_overseas_present_balance
 
         summary_response = await self._call_overseas_balance(
@@ -1299,9 +1313,14 @@ class MCPClient:
             return resp
 
         if is_domestic_market(market_code):
-            resp = await self.call_tool("inquery-stock-info", {
-                "symbol": symbol, "start_date": start_date, "end_date": end_date,
-            })
+            from trading.kis_api import get_domestic_daily_price
+
+            result = await get_domestic_daily_price(symbol)
+            resp = MCPResponse(
+                success=result.get("rt_cd") == "0",
+                data=result,
+                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            )
         else:
             from trading.kis_api import get_overseas_daily_price
 
@@ -1357,12 +1376,19 @@ class MCPClient:
                 price=price, market=market_code,
             )
         if is_domestic_market(market_code):
-            resp = await self.call_tool("order-stock", {
-                "symbol": symbol,
-                "quantity": quantity,
-                "price": int(price) if price else 0,
-                "order_type": order_type,
-            })
+            from trading.kis_api import place_domestic_order
+
+            result = await place_domestic_order(
+                symbol=symbol,
+                side=side,
+                quantity=int(quantity),
+                price=price,
+            )
+            resp = MCPResponse(
+                success=result.get("rt_cd") == "0",
+                data=result,
+                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            )
         else:
             from trading.kis_api import place_overseas_order
 
@@ -1582,7 +1608,14 @@ class MCPClient:
         """호가 조회"""
         market_code = normalize_market(market)
         if is_domestic_market(market_code):
-            return await self.call_tool("inquery-stock-ask", {"symbol": symbol})
+            from trading.kis_api import get_domestic_asking_price
+
+            result = await get_domestic_asking_price(symbol)
+            return MCPResponse(
+                success=result.get("rt_cd") == "0",
+                data=result,
+                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            )
         return await self.call_any_tool([
             ("inquire_asking_price", {
                 "auth": "",
