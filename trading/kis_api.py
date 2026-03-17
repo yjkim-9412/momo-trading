@@ -635,6 +635,39 @@ async def get_overseas_balance(market: str = "NASDAQ") -> dict:
         return {"success": False, "error": str(e), "output1": [], "output2": []}
 
 
+async def get_domestic_order_list(start_date: str, end_date: str) -> dict:
+    """국내주식 일별 체결 조회 (신 API: TTTC0081R/VTTC0081R)"""
+    tr_id = "VTTC0081R" if settings.is_paper_trading else "TTTC0081R"
+    cano, prod = _get_account_parts()
+    try:
+        result = await _request_json(
+            "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            tr_id=tr_id,
+            params={
+                "CANO": cano,
+                "ACNT_PRDT_CD": prod,
+                "INQR_STRT_DT": start_date,
+                "INQR_END_DT": end_date,
+                "SLL_BUY_DVSN_CD": "00",
+                "INQR_DVSN": "01",
+                "PDNO": "",
+                "CCLD_DVSN": "00",
+                "ORD_GNO_BRNO": "",
+                "ODNO": "",
+                "INQR_DVSN_3": "00",
+                "INQR_DVSN_1": "",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            },
+            use_trading_domain=True,
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("국내 주문내역 조회 오류: {}", str(e))
+        return {"success": False, "error": str(e), "output1": [], "output2": {}}
+
+
 async def get_overseas_order_list(market: str = "NASDAQ") -> dict:
     """해외주식 주문/체결 내역 조회"""
     market_code = normalize_market(market)

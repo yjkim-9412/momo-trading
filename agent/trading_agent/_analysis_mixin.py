@@ -1135,7 +1135,11 @@ class AnalysisMixin:
         """장 마감 리뷰 AI 결과를 DailyReport에 저장"""
         from models.daily_report import DailyReport
         from repositories.daily_report_repository import DailyReportRepository
+        from repositories.trade_result_repository import TradeResultRepository
+        from trading.account_manager import account_manager
+        from trading.market_profile import market_scope as resolve_market_scope
 
+        scope = normalize_market_scope(market_scope)
         feedback = parsed.get("feedback_for_tomorrow", {})
         trade_eval = parsed.get("trade_evaluation", {})
 
@@ -1147,17 +1151,52 @@ class AnalysisMixin:
             "trade_evaluation": trade_eval,
         }
 
+        # 계좌 스냅샷 조회 (MCP 호출 — DB 세션 밖에서)
+        unrealized_pnl = 0.0
+        open_position_count = 0
+        representative_market = "NASDAQ" if scope == "US" else scope
+        try:
+            balance, holdings = await account_manager.get_account_snapshot(representative_market)
+            scoped_holdings = [h for h in holdings if resolve_market_scope(h.market) == scope]
+            unrealized_pnl = sum(h.pnl for h in scoped_holdings)
+            open_position_count = len(scoped_holdings)
+        except Exception as e:
+            logger.warning("일일 리포트 계좌 스냅샷 조회 실패 (계속): {}", str(e))
+
         async with AsyncSessionLocal() as session:
             async with session.begin():
                 repo = DailyReportRepository(session)
-                report = await repo.get_by_date(report_date, market_scope=market_scope)
+                report = await repo.get_by_date(report_date, market_scope=scope)
+
+                # TradeResult 기반 거래 통계 집계
+                trade_result_repo = TradeResultRepository(session)
+                opened_trades = await trade_result_repo.get_opened_by_date(report_date, market_scope=scope)
+                completed_trades = await trade_result_repo.get_completed_by_date(report_date, market_scope=scope)
+
+                buy_count = len(opened_trades)
+                sell_count = len(completed_trades)
+                win_count = sum(1 for t in completed_trades if t.is_win)
+                loss_count = sum(1 for t in completed_trades if not t.is_win)
+                total_pnl = sum(t.pnl for t in completed_trades)
+
+                if open_position_count == 0:
+                    all_open = await trade_result_repo.get_all_open(market_scope=scope)
+                    if all_open:
+                        open_position_count = len(all_open)
 
                 report_data = {
-                    "market_scope": normalize_market_scope(market_scope),
+                    "market_scope": scope,
                     "total_cycles": today_cycles,
                     "total_analyses": today_analyses,
                     "total_recommendations": today_recommendations,
                     "total_orders": today_orders,
+                    "buy_count": buy_count,
+                    "sell_count": sell_count,
+                    "win_count": win_count,
+                    "loss_count": loss_count,
+                    "total_pnl": total_pnl,
+                    "unrealized_pnl": unrealized_pnl,
+                    "open_position_count": open_position_count,
                     "market_summary": parsed.get("today_review", ""),
                     "performance_review": json.dumps(trade_eval, ensure_ascii=False),
                     "lessons_learned": feedback.get("system_improvement", ""),

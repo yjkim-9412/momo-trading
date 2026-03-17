@@ -30,7 +30,7 @@ from trading.enums import (
     RecommendationStatus,
     SignalAction,
 )
-from trading.market_profile import is_crypto_market, is_us_market, normalize_market, normalize_market_scope
+from trading.market_profile import is_crypto_market, is_domestic_market, is_us_market, normalize_market, normalize_market_scope
 from trading.mcp_client import mcp_client
 from trading.models import coin_side_label
 from trading.product_policy import build_product_context

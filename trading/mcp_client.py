@@ -1603,10 +1603,14 @@ class MCPClient:
             return MCPResponse(success=True, data={"output": []})
 
         if is_domestic_market(market_code):
-            return await self.call_tool("inquery-order-list", {
-                "start_date": today,
-                "end_date": today,
-            })
+            from trading.kis_api import get_domestic_order_list
+
+            result = await get_domestic_order_list(today, today)
+            return MCPResponse(
+                success=result.get("rt_cd") == "0",
+                data=result,
+                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            )
 
         from trading.kis_api import get_overseas_order_list
 
