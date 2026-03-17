@@ -2,11 +2,12 @@
 
 ## 증권사 API 참조
 
-KIS Open API 구현, 디버깅, 새 API 연동 시 반드시 `/kis-api-ref` 스킬을 사용하여 공식 샘플코드를 참조할 것.
+KIS Open API 구현, 디버깅, 새 API 연동 시 반드시 `/kis-api-ref` 스킬을 사용하여 로컬 레퍼런스를 참조할 것.
 
-- 공식 레포: https://github.com/koreainvestment/open-trading-api
+- 로컬 레퍼런스: `docs/kis-api/` (국내 11개 + 해외 22개 = 33개 API 문서)
+- 인덱스: `docs/kis-api/README.md` (전체 API 목록 + tr_id 매핑표)
 - 스킬 사용법: `/kis-api-ref {검색어}` (예: `/kis-api-ref 주문`, `/kis-api-ref volume_rank`)
-- LLM용 샘플은 `examples_llm/` 폴더에, 사용자용 통합 예제는 `examples_user/` 폴더에 위치
+- 공식 레포: https://github.com/koreainvestment/open-trading-api (로컬 문서 부족 시 참조)
 
 ## 빗썸 API 참조
 
@@ -18,11 +19,12 @@ Bithumb API 구현, 디버깅, 새 API 연동 시 `/bithumb-api-ref` 스킬을 �
 
 ## Codex CLI 참조
 
-Codex CLI 관련 개발·디버깅 시 `/codex-ref` 스킬을 사용하여 공식 레포와 프로젝트 내 구현을 참조할 것.
+Codex CLI 관련 개발·디버깅 시 `/codex-ref` 스킬을 사용하여 로컬 레퍼런스와 프로젝트 내 구현을 참조할 것.
 
-- 공식 레포: https://github.com/openai/codex
+- 로컬 레퍼런스: `docs/codex-cli/` (exec, session, events, models 등 5개 문서)
 - 스킬 사용법: `/codex-ref {검색어}` (예: `/codex-ref session`, `/codex-ref reasoning_effort`)
 - 프로젝트 내 구현: `analysis/llm/codex_cli_provider.py`, `core/config.py`
+- 공식 레포: https://github.com/openai/codex (로컬 문서 부족 시 참조)
 
 ## TradingAgent 구조
 

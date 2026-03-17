@@ -1,88 +1,75 @@
 # KIS Open API 레퍼런스 조회
 
-증권사 API 참조가 필요할 때 `gh` CLI로 한국투자증권 공식 샘플코드 레포를 조회한다.
-
-**레포:** `koreainvestment/open-trading-api`
+KIS API 구현, 디버깅, 새 API 연동 시 로컬 레퍼런스를 참조한다.
 
 ## 사용자 인자
 
-$ARGUMENTS — 검색할 API 기능 키워드 (예: 주문, 잔고조회, 시세, volume_rank 등)
+$ARGUMENTS — 검색할 API 기능 키워드 (예: 주문, 잔고조회, 시세, volume_rank, 체결 등)
 
-## 레포 구조 레퍼런스
+## 로컬 레퍼런스
 
-```
-koreainvestment/open-trading-api
-├── examples_llm/              # LLM용 기능 단위 샘플 (1 API = 1 폴더)
-│   ├── kis_auth.py             # 인증 공통 함수 (_url_fetch, 토큰 관리)
-│   ├── auth/                   # 토큰(auth_token) · 웹소켓 접속키(auth_ws_token)
-│   ├── domestic_stock/         # 국내주식 — 100+개 API
-│   ├── overseas_stock/         # 해외주식 (NASDAQ, NYSE, AMEX, 홍콩, 일본 등)
-│   ├── domestic_bond/          # 국내채권
-│   ├── domestic_futureoption/  # 국내선물옵션
-│   ├── overseas_futureoption/  # 해외선물옵션
-│   ├── etfetn/                 # ETF/ETN
-│   └── elw/                    # ELW
-├── examples_user/              # 사용자용 통합 예제 (상품별 함수 모음)
-├── docs/convention.md          # 코딩 컨벤션 가이드
-├── strategy_builder/           # 전략 설계 UI
-├── backtester/                 # 백테스팅 엔진
-├── stocks_info/                # 종목정보 마스터 파일
-├── MCP/                        # MCP 서버 연동 가이드
-└── kis_devlp.yaml              # API 설정 템플릿 (앱키, 도메인, 계좌번호)
-```
+- 인덱스: `docs/kis-api/README.md` (전체 API 목록 + tr_id 매핑표)
+- 국내주식 주문/계좌: `docs/kis-api/domestic/trading/*.md`
+- 국내주식 시세: `docs/kis-api/domestic/quotations/*.md`
+- 해외주식 주문/계좌: `docs/kis-api/overseas/trading/*.md`
+- 해외주식 시세: `docs/kis-api/overseas/quotations/*.md`
 
-## 주요 API 카테고리
+## 도메인
 
-| 카테고리 | 폴더 경로 | 핵심 API |
-|---------|----------|---------|
-| 국내주식 주문/계좌 | `examples_llm/domestic_stock/` | `order_cash`(현금주문), `inquire_balance`(잔고), `inquire_daily_ccld`(일별체결), `inquire_psbl_order`(주문가능) |
-| 국내주식 시세 | `examples_llm/domestic_stock/` | `inquire_price`(현재가), `inquire_daily_price`(일별시세), `volume_rank`(거래량순위), `fluctuation`(등락률) |
-| 해외주식 | `examples_llm/overseas_stock/` | `order`(주문), `inquire_balance`(잔고), `price`(시세), `inquire_ccnl`(체결) |
-| 인증 | `examples_llm/auth/` | `auth_token`(REST 토큰), `auth_ws_token`(WebSocket 접속키) |
+| 구분 | URL |
+|------|-----|
+| 실전 | `https://openapi.koreainvestment.com:9443` |
+| 모의 | `https://openapivts.koreainvestment.com:29443` |
 
-## API 파일 패턴
+## tr_id 규칙
 
-- `{api_name}/{api_name}.py` — 한줄호출 함수 (API_URL, tr_id, 파라미터, docstring)
-- `{api_name}/chk_{api_name}.py` — 테스트/검증 파일
+- 주문/계좌 API: 실전 `T` / 모의 `V` 접두사
+- 시세 API: 실전/모의 동일 tr_id
 
-## 엔드포인트 & tr_id 패턴
+## 핵심 tr_id 매핑
 
-- 국내주식 주문: `/uapi/domestic-stock/v1/trading/{기능}`
-- 국내주식 시세: `/uapi/domestic-stock/v1/quotations/{기능}`
-- 해외주식: `/uapi/overseas-stock/v1/trading/{기능}`
-- 실전 도메인: `https://openapi.koreainvestment.com:9443`
-- 모의 도메인: `https://openapivts.koreainvestment.com:29443`
-- tr_id 규칙: `T`(실전) / `V`(모의) 접두사
-
-| 기능 | 실전 tr_id | 모의 tr_id |
-|------|-----------|-----------|
+| 기능 | 실전 | 모의 |
+|------|------|------|
 | 국내 매수 | TTTC0012U | VTTC0012U |
 | 국내 매도 | TTTC0011U | VTTC0011U |
+| 국내 정정/취소 | TTTC0013U | VTTC0013U |
+| 국내 체결조회 (3개월이내) | TTTC0081R | VTTC0081R |
+| 국내 체결조회 (3개월이전) | CTSC9215R | VTSC9215R |
 | 국내 잔고 | TTTC8434R | VTTC8434R |
+| 국내 매수가능 | TTTC8908R | VTTC8908R |
+| 해외 체결조회 | TTTS3035R | VTTS3035R |
+| 해외 잔고 | TTTS3012R | VTTS3012R |
+| 해외 매수가능 | TTTS3007R | VTTS3007R |
 
-- 해외 거래소코드: `NASD`(나스닥), `NYSE`(뉴욕), `AMEX`, `SEHK`(홍콩), `TKSE`(일본), `HASE`(베트남 하노이), `VNSE`(베트남 호치민)
+## 프로젝트 내 KIS API 구현
+
+| 파일 | 역할 |
+|------|------|
+| `trading/kis_api.py` | KIS REST API 직접 호출 (해외주식 주문/조회, 국내 체결조회) |
+| `trading/mcp_client.py` | MCP 도구 호출 + 국내 직접 호출 래퍼 |
+| `trading/account_manager.py` | 계좌/잔고 관리 상위 레이어 |
 
 ## 실행 절차
 
-사용자 인자 "$ARGUMENTS"에 대해 아래 순서로 조회:
+"$ARGUMENTS" 키워드에 대해:
 
-### Step 1: 키워드로 코드 검색
+### Step 1: 로컬 레퍼런스에서 검색
 ```bash
-gh search code --repo koreainvestment/open-trading-api "$ARGUMENTS" --limit 10
-```
+# 파일명으로 검색
+find docs/kis-api -name "*.md" | xargs grep -li "$ARGUMENTS"
 
-### Step 2: 관련 폴더 탐색 (검색 결과에서 경로 확인 후)
+# 또는 Grep 도구로 내용 검색
+```
+`docs/kis-api/README.md` 인덱스 테이블에서 해당 API를 찾아 상세 문서를 읽는다.
+
+### Step 2: 상세 문서 조회
+해당 API의 마크다운 문서를 Read 도구로 읽어 tr_id, 파라미터, 주의사항을 확인한다.
+
+### Step 3: 프로젝트 코드와 대조
+`trading/kis_api.py`, `trading/mcp_client.py`에서 해당 API 사용처를 확인하고 일치 여부를 검증한다.
+
+### Step 4: (필요시) 공식 레포 최신 확인
+로컬 문서로 부족할 경우에만 GitHub 레포를 직접 조회:
 ```bash
-gh api repos/koreainvestment/open-trading-api/contents/examples_llm/{카테고리}/{api_name} --jq '.[] | "\(.type) \(.name)"'
+gh api repos/koreainvestment/open-trading-api/contents/examples_llm/{카테고리}/{api_name}/{api_name}.py --jq '.content' | base64 -d
 ```
-
-### Step 3: 샘플코드 조회
-```bash
-gh api repos/koreainvestment/open-trading-api/contents/{파일경로} --jq '.content' | base64 -d
-```
-
-### Step 4: 결과 정리
-조회한 내용을 바탕으로:
-- API URL, tr_id, 필수 파라미터 정리
-- 요청/응답 구조 설명
-- 현재 프로젝트(MOMO Trading) 코드와의 연관성 안내
