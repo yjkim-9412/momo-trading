@@ -1459,23 +1459,16 @@ class MCPClient:
             discovery_stocks: list[dict[str, Any]] = []
 
             if settings.US_DYNAMIC_DISCOVERY_ENABLED:
+                from trading.kis_api import get_overseas_volume_surge, get_overseas_trade_growth
+
                 exchange = kis_exchange_code(market_code)
-                response = await self.call_any_tool([
-                    ("volume_surge", {
-                        "excd": exchange,
-                        "mixn": "0",
-                        "vol_range": "0",
-                    }),
-                    ("trade_growth", {
-                        "excd": exchange,
-                        "nday": "0",
-                        "vol_range": "0",
-                    }),
-                ])
-                if response.success and response.data:
+                result = await get_overseas_volume_surge(exchange)
+                if not result.get("success"):
+                    result = await get_overseas_trade_growth(exchange)
+                if result.get("success"):
                     items = (
-                        self._extract_records(response.data, "output1", "output", "dataframe1")
-                        or self._extract_records(response.data, "output2", "dataframe2")
+                        self._extract_records(result, "output1", "output", "dataframe1")
+                        or self._extract_records(result, "output2", "dataframe2")
                     )
                     discovery_stocks = [self._normalize_stock_item(item, market_code) for item in items]
 
@@ -1571,19 +1564,14 @@ class MCPClient:
             discovery_stocks: list[dict[str, Any]] = []
 
             if settings.US_DYNAMIC_DISCOVERY_ENABLED:
+                from trading.kis_api import get_overseas_price_fluct
+
                 exchange = kis_exchange_code(market_code)
-                response = await self.call_any_tool([
-                    ("price_fluct", {
-                        "excd": exchange,
-                        "gubn": "0",
-                        "mixn": "0",
-                        "vol_range": "0",
-                    }),
-                ])
-                if response.success and response.data:
+                result = await get_overseas_price_fluct(exchange)
+                if result.get("success"):
                     items = (
-                        self._extract_records(response.data, "output1", "output", "dataframe1")
-                        or self._extract_records(response.data, "output2", "dataframe2")
+                        self._extract_records(result, "output1", "output", "dataframe1")
+                        or self._extract_records(result, "output2", "dataframe2")
                     )
                     discovery_stocks = [self._normalize_stock_item(item, market_code) for item in items]
 
@@ -1616,13 +1604,14 @@ class MCPClient:
                 data=result,
                 error=result.get("msg1") if result.get("rt_cd") != "0" else None,
             )
-        return await self.call_any_tool([
-            ("inquire_asking_price", {
-                "auth": "",
-                "excd": kis_exchange_code(market_code),
-                "symb": symbol,
-            }),
-        ])
+        from trading.kis_api import get_overseas_asking_price
+
+        result = await get_overseas_asking_price(symbol, kis_exchange_code(market_code))
+        return MCPResponse(
+            success=result.get("rt_cd") == "0",
+            data=result,
+            error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+        )
 
     async def get_order_list(self, market: str = "KRX") -> MCPResponse:
         """주문 체결/미체결 내역 조회"""

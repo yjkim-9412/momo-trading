@@ -635,6 +635,89 @@ async def get_overseas_balance(market: str = "NASDAQ") -> dict:
         return {"success": False, "error": str(e), "output1": [], "output2": []}
 
 
+async def get_overseas_volume_surge(exchange: str = "NAS") -> dict:
+    """해외주식 거래량급증 조회"""
+    try:
+        result = await _request_json(
+            "/uapi/overseas-stock/v1/ranking/volume-surge",
+            "HHDFS76270000",
+            params={
+                "AUTH": "",
+                "EXCD": exchange,
+                "MINX": "0",
+                "VOL_RANG": "0",
+                "KEYB": "",
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("해외 거래량급증 조회 오류 ({}): {}", exchange, str(e))
+        return {"success": False, "error": str(e), "output": []}
+
+
+async def get_overseas_trade_growth(exchange: str = "NAS") -> dict:
+    """해외주식 거래증가율순위 조회"""
+    try:
+        result = await _request_json(
+            "/uapi/overseas-stock/v1/ranking/trade-growth",
+            "HHDFS76330000",
+            params={
+                "AUTH": "",
+                "EXCD": exchange,
+                "NDAY": "0",
+                "VOL_RANG": "0",
+                "KEYB": "",
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("해외 거래증가율 조회 오류 ({}): {}", exchange, str(e))
+        return {"success": False, "error": str(e), "output": []}
+
+
+async def get_overseas_price_fluct(exchange: str = "NAS") -> dict:
+    """해외주식 가격급등락 조회"""
+    try:
+        result = await _request_json(
+            "/uapi/overseas-stock/v1/ranking/price-fluct",
+            "HHDFS76260000",
+            params={
+                "AUTH": "",
+                "EXCD": exchange,
+                "GUBN": "0",
+                "MINX": "0",
+                "VOL_RANG": "0",
+                "KEYB": "",
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("해외 가격급등락 조회 오류 ({}): {}", exchange, str(e))
+        return {"success": False, "error": str(e), "output": []}
+
+
+async def get_overseas_asking_price(symbol: str, exchange: str = "NAS") -> dict:
+    """해외주식 현재가 1호가 조회"""
+    try:
+        result = await _request_json(
+            "/uapi/overseas-price/v1/quotations/inquire-asking-price",
+            "HHDFS76200100",
+            params={
+                "AUTH": "",
+                "EXCD": exchange,
+                "SYMB": symbol,
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        return result
+    except Exception as e:
+        logger.error("해외 호가 조회 오류 ({}/{}): {}", exchange, symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
+
+
 async def get_domestic_price(symbol: str) -> dict:
     """국내주식 현재가 조회"""
     try:
