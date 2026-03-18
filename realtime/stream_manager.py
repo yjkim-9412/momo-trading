@@ -170,10 +170,9 @@ class StreamManager:
         self._sync_runtime_status_from_ws()
         if self._requested_symbols or self._active_symbols:
             return
-        if kis_websocket.is_connected:
-            await kis_websocket.disconnect()
-            self._last_business_error = None
-            self._last_connect_error = None
+        # 구독 0개여도 연결 유지 — disconnect는 앱 종료 시 main.py에서 처리
+        self._last_business_error = None
+        self._last_connect_error = None
 
     async def _deactivate_scope_subscriptions(self, scope: str) -> None:
         self._sync_runtime_status_from_ws()
