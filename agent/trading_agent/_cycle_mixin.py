@@ -472,7 +472,7 @@ class CycleMixin:
                     # 스크리닝 맥락은 state.market_context로 프롬프트에 전달됨
                     paused_sid = llm_factory.pause_session(scope=scope, phase="cycle")
 
-                    semaphore = asyncio.Semaphore(2)
+                    semaphore = asyncio.Semaphore(3)
                     executed_count = 0
 
                     # 최소 주문 금액 (사전 차단용)
