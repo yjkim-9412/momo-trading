@@ -52,6 +52,11 @@ class DecisionMaker:
 
     def __init__(self):
         self._pending_tasks: set[asyncio.Task] = set()
+        self._pending_order_events: dict[str, asyncio.Event] = {}
+        self._pending_order_data: dict[str, dict] = {}
+
+        from trading.kis_websocket import kis_websocket
+        kis_websocket.set_on_order(self.on_order_notification)
 
     @staticmethod
     def _price_display(price: float, currency: str, price_krw: float) -> str:
@@ -969,6 +974,20 @@ class DecisionMaker:
 
         return result
 
+    async def on_order_notification(self, notification: dict) -> None:
+        """WebSocket 체결통보 콜백 — 대기 중인 주문에 이벤트 전달"""
+        order_id = str(notification.get("order_id", ""))
+        if order_id in self._pending_order_events:
+            self._pending_order_data[order_id] = notification
+            self._pending_order_events[order_id].set()
+            logger.info(
+                "[{}] WebSocket 체결통보 수신: {} {}주 @{}",
+                notification.get("symbol"),
+                notification.get("side"),
+                notification.get("filled_qty"),
+                notification.get("filled_price"),
+            )
+
     async def confirm_and_record(
         self,
         symbol: str,
@@ -1004,6 +1023,28 @@ class DecisionMaker:
                 )
                 if broker_filled_qty > 0:
                     matched_order = broker_snapshot
+
+            # WebSocket 체결통보 대기 (최대 5초) — 코인은 별도 체결 확인
+            if matched_order is None and not is_crypto_market(market_code):
+                ws_event = asyncio.Event()
+                self._pending_order_events[str(order_id)] = ws_event
+                try:
+                    await asyncio.wait_for(ws_event.wait(), timeout=5.0)
+                    ws_notification = self._pending_order_data.pop(str(order_id), None)
+                    if ws_notification and ws_notification.get("is_filled"):
+                        matched_order = {
+                            "order_id": order_id,
+                            "filled_qty": ws_notification["filled_qty"],
+                            "filled_price": ws_notification["filled_price"],
+                            "status": "FILLED",
+                            "currency": ws_notification.get("currency", currency),
+                        }
+                        logger.info("[{}] 주문 {} WebSocket 체결통보로 확인", symbol, order_id)
+                except asyncio.TimeoutError:
+                    logger.debug("[{}] 주문 {} WebSocket 체결통보 타임아웃 → REST polling", symbol, order_id)
+                finally:
+                    self._pending_order_events.pop(str(order_id), None)
+                    self._pending_order_data.pop(str(order_id), None)
 
             for delay_seconds in _OVERSEAS_CONFIRM_DELAYS_SECONDS:
                 if matched_order is not None:

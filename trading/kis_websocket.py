@@ -15,7 +15,11 @@ from util.time_util import now_kst
 _WS_RECORD_SIZES: dict[str, tuple[int, ...]] = {
     "H0STCNT0": (46,),
     "HDFSCNT0": (26, 25),
+    "H0STCNI0": (26,), "H0STCNI9": (26,),  # 국내 체결통보 (실전/모의)
+    "H0GSCNI0": (31,), "H0GSCNI9": (31,),  # 해외 체결통보 (실전/모의)
 }
+
+_ORDER_NOTIFICATION_TR_IDS = {"H0STCNI0", "H0STCNI9", "H0GSCNI0", "H0GSCNI9"}
 
 
 def _ws_is_closed(ws) -> bool:
@@ -38,6 +42,9 @@ class KISWebSocket:
         self._requested_subscriptions: set[tuple[str, str]] = set()
         self._confirmed_subscriptions: set[tuple[str, str]] = set()
         self._on_price_callback: Callable[[dict], Coroutine[Any, Any, None]] | None = None
+        self._on_order_callback: Callable[..., Coroutine] | None = None
+        self._aes_key: str = ""
+        self._aes_iv: str = ""
         self._reconnect_delay = 5
         self._approval_key: str | None = None
         self._last_system_message_at: datetime | None = None
@@ -47,6 +54,9 @@ class KISWebSocket:
 
     def set_on_price(self, callback: Callable[[dict], Coroutine[Any, Any, None]]) -> None:
         self._on_price_callback = callback
+
+    def set_on_order(self, callback: Callable[..., Coroutine]) -> None:
+        self._on_order_callback = callback
 
     async def connect(self) -> None:
         """WebSocket 연결 시작"""
@@ -178,6 +188,53 @@ class KISWebSocket:
         self._confirmed_subscriptions.discard(key)
         logger.debug("종목 구독 해제 요청: {}:{}", market_code, symbol.upper())
 
+    async def subscribe_order_notification(self) -> bool:
+        """체결통보 구독 (국내 + 해외)
+
+        HTS ID를 tr_key로 사용하여 체결통보를 구독한다.
+        """
+        hts_id = settings.KIS_HTS_ID
+        if not hts_id:
+            logger.warning("KIS_HTS_ID 미설정 — 체결통보 구독 불가")
+            return False
+
+        if settings.is_paper_trading:
+            domestic_tr_id = "H0STCNI9"
+            overseas_tr_id = "H0GSCNI9"
+        else:
+            domestic_tr_id = "H0STCNI0"
+            overseas_tr_id = "H0GSCNI0"
+
+        success = True
+        for market_code, tr_id in [("KRX", domestic_tr_id), ("NASDAQ", overseas_tr_id)]:
+            ws = await self._get_ws(market_code)
+            if not ws:
+                logger.warning("체결통보 구독 실패: {} WebSocket 미연결", market_code)
+                success = False
+                continue
+            msg = {
+                "header": {
+                    "approval_key": self._approval_key or "",
+                    "custtype": "P",
+                    "tr_type": "1",
+                    "content-type": "utf-8",
+                },
+                "body": {
+                    "input": {
+                        "tr_id": tr_id,
+                        "tr_key": hts_id,
+                    }
+                },
+            }
+            try:
+                await ws.send(json.dumps(msg))
+                logger.info("체결통보 구독 요청: {} ({})", tr_id, market_code)
+            except Exception as e:
+                logger.error("체결통보 구독 요청 실패: {} - {}", tr_id, str(e))
+                success = False
+
+        return success
+
     async def _get_ws(self, market: str):
         """시장별 WebSocket 연결 반환 (없으면 생성)"""
         market_code = normalize_market(market)
@@ -305,8 +362,15 @@ class KISWebSocket:
             except ValueError:
                 logger.warning("실시간 payload count 파싱 실패: raw={}", raw_msg[:120])
                 return
+            encrypt_flag = parts[0]
             tr_id = parts[1]
             data_str = parts[3]
+
+            # 체결통보 처리
+            if tr_id in _ORDER_NOTIFICATION_TR_IDS:
+                await self._handle_order_notification(encrypt_flag, tr_id, data_str)
+                return
+
             price_rows = self._parse_price_rows(tr_id, data_str, data_count)
             if price_rows and self._on_price_callback:
                 for price_data in price_rows:
@@ -339,6 +403,16 @@ class KISWebSocket:
         if not body:
             return None
 
+        # 체결통보 구독 응답에서 AES key/iv 추출
+        if tr_id in _ORDER_NOTIFICATION_TR_IDS:
+            output = body.get("output") or {}
+            iv = output.get("iv") or ""
+            key = output.get("key") or ""
+            if iv and key:
+                self._aes_iv = iv
+                self._aes_key = key
+                logger.info("체결통보 AES 키 수신 완료 (tr_id={})", tr_id)
+
         msg1 = str(body.get("msg1") or "")
         action = "UNSUBSCRIBE" if msg1.upper().startswith("UNSUB") else "SUBSCRIBE"
         return {
@@ -360,6 +434,9 @@ class KISWebSocket:
     ) -> tuple[str, str] | None:
         normalized_tr_key = (tr_key or "").strip().upper()
         if not normalized_tr_key:
+            return None
+        # 체결통보는 HTS ID가 tr_key — 구독 키 매칭에서 제외
+        if tr_id in _ORDER_NOTIFICATION_TR_IDS:
             return None
         if tr_id == "H0STCNT0" or ws_type == "domestic":
             return ("KRX", normalized_tr_key)
@@ -574,6 +651,93 @@ class KISWebSocket:
         domestic_ok = self._ws_domestic and not _ws_is_closed(self._ws_domestic)
         overseas_ok = self._ws_overseas and not _ws_is_closed(self._ws_overseas)
         return bool(domestic_ok or overseas_ok)
+
+    # ── 체결통보 처리 ──
+
+    def _decrypt_aes256(self, data: str) -> str:
+        """AES-256-CBC 복호화 (KIS 체결통보 암호화 데이터)"""
+        try:
+            from Crypto.Cipher import AES
+            from Crypto.Util.Padding import unpad
+            import base64
+        except ImportError:
+            logger.error("pycryptodome 미설치 — 암호화된 체결통보 복호화 불가")
+            raise
+
+        cipher = AES.new(
+            self._aes_key.encode("utf-8"),
+            AES.MODE_CBC,
+            self._aes_iv.encode("utf-8"),
+        )
+        return unpad(
+            cipher.decrypt(base64.b64decode(data)),
+            AES.block_size,
+        ).decode("utf-8")
+
+    async def _handle_order_notification(
+        self, encrypt_flag: str, tr_id: str, data_str: str
+    ) -> None:
+        """체결통보 메시지 처리 (암호화/평문 분기)"""
+        try:
+            if encrypt_flag == "1":
+                if not self._aes_key or not self._aes_iv:
+                    logger.warning("AES 키 미수신 상태에서 암호화된 체결통보 수신 — 무시")
+                    return
+                data_str = self._decrypt_aes256(data_str)
+
+            fields = data_str.split("^")
+            notification = self._parse_order_notification(tr_id, fields)
+            if notification is None:
+                return
+
+            if notification.get("is_filled"):
+                logger.info(
+                    "[체결통보] {} {} {} {}주 @{}",
+                    notification["market"],
+                    notification["symbol"],
+                    notification["side"],
+                    notification["filled_qty"],
+                    notification["filled_price"],
+                )
+                if self._on_order_callback:
+                    await self._on_order_callback(notification)
+            else:
+                logger.debug(
+                    "[체결통보] 접수: {} {} 주문번호={}",
+                    notification["symbol"],
+                    notification["side"],
+                    notification["order_id"],
+                )
+        except Exception as e:
+            logger.error("체결통보 처리 오류: tr_id={} err={}", tr_id, str(e))
+
+    def _parse_order_notification(
+        self, tr_id: str, fields: list[str]
+    ) -> dict | None:
+        """체결통보 필드 파싱"""
+        is_domestic = "STCNI" in tr_id
+        expected_fields = 26 if is_domestic else 31
+        if len(fields) < expected_fields:
+            logger.warning(
+                "체결통보 필드 수 부족: tr_id={} expected={} got={}",
+                tr_id, expected_fields, len(fields),
+            )
+            return None
+
+        return {
+            "order_id": fields[2],                                      # ODER_NO
+            "original_order_id": fields[3],                             # OODER_NO
+            "side": "SELL" if fields[4] == "01" else "BUY",
+            "symbol": fields[8],                                        # STCK_SHRN_ISCD
+            "filled_qty": int(fields[9] or 0),                          # CNTG_QTY
+            "filled_price": float(fields[10] or 0),                     # CNTG_UNPR
+            "filled_time": fields[11],                                  # STCK_CNTG_HOUR
+            "is_rejected": fields[12] == "1",                           # RFUS_YN
+            "is_filled": fields[13] == "2",                             # CNTG_YN (2=체결, 1=접수)
+            "order_qty": int(fields[16] or 0),                          # ODER_QTY
+            "market": "KRX" if is_domestic else "US",
+            "currency": "KRW" if is_domestic else "USD",
+        }
 
 
 # 싱글톤
