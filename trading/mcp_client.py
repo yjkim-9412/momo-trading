@@ -26,7 +26,7 @@ _SSE_MAX_RECONNECT_ATTEMPTS = 50  # 최대 재연결 시도 횟수
 # KIS API rate limit: 모의투자 초당 ~10건 (공식 20건이지만 실제 더 엄격)
 _RATE_LIMIT_PER_SEC = 5
 _RATE_LIMIT_WINDOW = 1.0  # 초
-_MAX_CONCURRENT_CALLS = 3  # 동시 MCP 호출 상한
+_MAX_CONCURRENT_CALLS = 2  # 동시 MCP 호출 상한 (burst 방지)
 _OVERSEAS_QUOTE_MIN_INTERVAL = 1.0  # 해외 시세는 더 보수적으로 직렬화
 _OVERSEAS_QUOTE_MAX_RETRIES = 2
 _OVERSEAS_BALANCE_MIN_INTERVAL = 1.0  # 해외 잔고도 계정 단위로 직렬화
