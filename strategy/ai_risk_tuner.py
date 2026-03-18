@@ -121,7 +121,7 @@ class AIRiskTuner:
 
             # 5. 매수가능 금액 계산
             purchase_amount = balance.purchase_amount
-            base_asset = balance.net_asset if balance.net_asset > 0 else balance.total_asset
+            base_asset = balance.total_asset
             buyable_amount = max(0, base_asset - balance.stock_value)
 
             # 6. LLM에게 한도 요청
