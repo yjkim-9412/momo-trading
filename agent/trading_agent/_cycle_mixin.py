@@ -192,6 +192,26 @@ class CycleMixin:
                     return review_preview
                 return await self._run_after_hours_cycle(target)
 
+    async def run_immediate_review(self, market: str) -> dict:
+        """청산 후 즉시 리뷰 (시각 제한 우회, 중복 방지 유지)"""
+        target = normalize_market(market or settings.primary_market_code)
+        scope = market_scope(target)
+        state = self._get_state(scope)
+        trading_date = self._refresh_runtime_date(state, scope)
+
+        if state.after_hours_lock.locked():
+            logger.info("[{}] 장마감 리뷰 이미 실행 중 — 즉시 리뷰 스킵", scope)
+            return self._skip_result("after_hours_already_running", scope, trading_date, mode="AFTER_HOURS")
+        if state.last_completed_review_date == trading_date:
+            logger.info("[{}] 이미 리뷰 완료 — 즉시 리뷰 스킵", scope)
+            return self._skip_result("already_reviewed", scope, trading_date, mode="AFTER_HOURS")
+        if await self._daily_report_exists(scope, trading_date):
+            state.last_completed_review_date = trading_date
+            return self._skip_result("already_reviewed", scope, trading_date, mode="AFTER_HOURS")
+
+        with activity_logger.context(market_scope=scope, trading_date=trading_date):
+            return await self._run_after_hours_cycle(target, force=True)
+
     async def _run_trading_cycle(
         self,
         market: str | None = None,
@@ -660,7 +680,7 @@ class CycleMixin:
             emit_activity=True,
         )
 
-    async def _run_after_hours_cycle(self, market: str | None = None) -> dict:
+    async def _run_after_hours_cycle(self, market: str | None = None, *, force: bool = False) -> dict:
         """장외 사이클: 오늘 데이트레이딩 성과 리뷰 (피드백 학습용)"""
         target = normalize_market(market or settings.primary_market_code)
         scope = market_scope(target)
@@ -675,6 +695,7 @@ class CycleMixin:
                 state,
                 trading_date,
                 skip_running_checks=True,
+                skip_time_check=force,
             )
             if preview.get("skipped"):
                 logger.info("[{}] 장마감 리뷰 스킵: {}", scope, preview["reason"])
