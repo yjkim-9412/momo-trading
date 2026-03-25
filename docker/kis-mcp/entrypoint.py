@@ -29,9 +29,16 @@ def _resolve_account_parts(raw: str, prod_type_override: str = "") -> tuple[str,
     raise ValueError("KIS 계좌번호는 10자리 전체 또는 CANO 8자리 + KIS_PROD_TYPE 이 필요합니다.")
 
 
+def _normalize_account_type(raw: str) -> str:
+    account_type = (raw or "VIRTUAL").strip().upper()
+    if account_type in {"VIRTUAL", "REAL"}:
+        return account_type
+    raise ValueError("KIS_ACCOUNT_TYPE 는 VIRTUAL 또는 REAL 이어야 합니다.")
+
+
 def configure_runtime_env(env: MutableMapping[str, str] | None = None) -> None:
     target = env if env is not None else os.environ
-    account_type = target.get("KIS_ACCOUNT_TYPE", "VIRTUAL").upper()
+    account_type = _normalize_account_type(target.get("KIS_ACCOUNT_TYPE", "VIRTUAL"))
 
     if account_type == "VIRTUAL":
         for real, paper in [

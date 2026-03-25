@@ -1,3 +1,5 @@
+import pytest
+
 import core.config as config_module
 from core.config import Settings
 from trading.enums import LLMProvider, LLMTier, Tier1Profile
@@ -297,3 +299,44 @@ def test_validate_on_startup_warns_for_invalid_codex_reasoning_effort(monkeypatc
     settings.validate_on_startup()
 
     assert any("CODEX_REASONING_EFFORT=invalid" in warning for warning in dummy_logger.warnings)
+
+
+def test_kis_virtual_profile_runtime_settings():
+    settings = Settings(
+        _env_file=None,
+        KIS_ACCOUNT_TYPE="VIRTUAL",
+        DATABASE_URL="sqlite:///./data/app.db",
+    )
+
+    assert settings.kis_account_type_normalized == "VIRTUAL"
+    assert settings.is_paper_trading is True
+    assert settings.is_real_trading is False
+    assert settings.kis_runtime_database_url.endswith("app.virtual.db")
+    assert settings.kis_token_file.endswith("kis_token.virtual.json")
+    assert settings.kis_default_port == 9000
+    assert settings.kis_log_suffix == "virtual"
+    assert settings.kis_rest_policy["min_interval_seconds"] == 0.8
+
+
+def test_kis_real_profile_runtime_settings():
+    settings = Settings(
+        _env_file=None,
+        KIS_ACCOUNT_TYPE="REAL",
+        DATABASE_URL="sqlite:///./data/app.db",
+    )
+
+    assert settings.kis_account_type_normalized == "REAL"
+    assert settings.is_paper_trading is False
+    assert settings.is_real_trading is True
+    assert settings.kis_runtime_database_url.endswith("app.real.db")
+    assert settings.kis_token_file.endswith("kis_token.real.json")
+    assert settings.kis_default_port == 9100
+    assert settings.kis_log_suffix == "real"
+    assert settings.kis_rest_policy["min_interval_seconds"] == 0.15
+
+
+def test_invalid_kis_account_type_raises():
+    settings = Settings(_env_file=None, KIS_ACCOUNT_TYPE="paper")
+
+    with pytest.raises(ValueError, match="KIS_ACCOUNT_TYPE"):
+        _ = settings.kis_account_type_normalized

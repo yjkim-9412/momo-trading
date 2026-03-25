@@ -2,6 +2,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from core.config import settings
 from trading.mcp_client import MCPClient
 from trading.models import MCPResponse
 
@@ -256,6 +257,36 @@ class MCPClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["side"], "BUY")
 
 
+class MCPClientPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self._original_account_type = settings.KIS_ACCOUNT_TYPE
+
+    def tearDown(self):
+        settings.KIS_ACCOUNT_TYPE = self._original_account_type
+
+    def test_virtual_account_uses_paper_governor_policy(self):
+        settings.KIS_ACCOUNT_TYPE = "VIRTUAL"
+
+        client = MCPClient()
+
+        self.assertEqual(client._rate_limit_per_sec, 2)
+        self.assertEqual(client._max_concurrent_calls, 1)
+        self.assertEqual(client._min_interval_seconds, 0.8)
+        self.assertEqual(client._overseas_quote_min_interval, 1.0)
+        self.assertEqual(client._overseas_balance_min_interval, 1.0)
+
+    def test_real_account_uses_real_governor_policy(self):
+        settings.KIS_ACCOUNT_TYPE = "REAL"
+
+        client = MCPClient()
+
+        self.assertEqual(client._rate_limit_per_sec, 20)
+        self.assertEqual(client._max_concurrent_calls, 1)
+        self.assertEqual(client._min_interval_seconds, 0.15)
+        self.assertEqual(client._overseas_quote_min_interval, 0.2)
+        self.assertEqual(client._overseas_balance_min_interval, 0.2)
+
+
 class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
     """US discovery 우선 + fallback seed 테스트"""
 
@@ -281,14 +312,13 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         watchlist_stocks = [self._make_stock("SOFI", volume=500)]
 
         with (
-            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
-                success=True,
-                data={"output1": discovery_items},
-            ))),
+            patch(
+                "trading.kis_api.get_overseas_volume_surge",
+                new=AsyncMock(return_value={"success": True, "output1": discovery_items}),
+            ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
-            patch("trading.mcp_client.settings") as mock_settings,
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
         ):
-            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
             response = await client.get_volume_rank(market="NASDAQ")
 
         self.assertTrue(response.success)
@@ -303,14 +333,17 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         watchlist_stocks = [self._make_stock("PLTR", volume=300)]
 
         with (
-            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
-                success=False,
-                error="MCP 도구 실패",
-            ))),
+            patch(
+                "trading.kis_api.get_overseas_volume_surge",
+                new=AsyncMock(return_value={"success": False, "error": "volume surge failed"}),
+            ),
+            patch(
+                "trading.kis_api.get_overseas_trade_growth",
+                new=AsyncMock(return_value={"success": False, "error": "trade growth failed"}),
+            ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
-            patch("trading.mcp_client.settings") as mock_settings,
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
         ):
-            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
             response = await client.get_volume_rank(market="NASDAQ")
 
         self.assertTrue(response.success)
@@ -324,14 +357,15 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         watchlist_stocks = [self._make_stock("NIO", volume=200)]
 
         with (
-            patch.object(client, "call_any_tool", new=AsyncMock()) as mcp_mock,
+            patch("trading.kis_api.get_overseas_volume_surge", new=AsyncMock()) as volume_mock,
+            patch("trading.kis_api.get_overseas_trade_growth", new=AsyncMock()) as growth_mock,
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)),
-            patch("trading.mcp_client.settings") as mock_settings,
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", False),
         ):
-            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = False
             response = await client.get_volume_rank(market="NASDAQ")
 
-        mcp_mock.assert_not_awaited()
+        volume_mock.assert_not_awaited()
+        growth_mock.assert_not_awaited()
         self.assertTrue(response.success)
         self.assertEqual(response.data["stocks"][0]["symbol"], "NIO")
 
@@ -362,14 +396,13 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         watchlist_stocks = [self._make_stock("SOFI", volume=9999)]
 
         with (
-            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
-                success=True,
-                data={"output1": discovery_items},
-            ))),
+            patch(
+                "trading.kis_api.get_overseas_volume_surge",
+                new=AsyncMock(return_value={"success": True, "output1": discovery_items}),
+            ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
-            patch("trading.mcp_client.settings") as mock_settings,
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
         ):
-            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
             response = await client.get_volume_rank(market="NASDAQ")
 
         self.assertTrue(response.success)
@@ -387,14 +420,13 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         watchlist_stocks = [self._make_stock("RIOT", volume=300, change_rate=8.0)]
 
         with (
-            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
-                success=True,
-                data={"output1": discovery_items},
-            ))),
+            patch(
+                "trading.kis_api.get_overseas_price_fluct",
+                new=AsyncMock(return_value={"success": True, "output1": discovery_items}),
+            ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
-            patch("trading.mcp_client.settings") as mock_settings,
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
         ):
-            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
             response = await client.get_fluctuation_rank(market="NASDAQ", sort="top")
 
         self.assertTrue(response.success)
@@ -412,14 +444,13 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         watchlist_stocks = [self._make_stock("AAPL", volume=1200, change_rate=99.0)]
 
         with (
-            patch.object(client, "call_any_tool", new=AsyncMock(return_value=MCPResponse(
-                success=True,
-                data={"output1": discovery_items},
-            ))),
+            patch(
+                "trading.kis_api.get_overseas_price_fluct",
+                new=AsyncMock(return_value={"success": True, "output1": discovery_items}),
+            ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
-            patch("trading.mcp_client.settings") as mock_settings,
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
         ):
-            mock_settings.US_DYNAMIC_DISCOVERY_ENABLED = True
             response = await client.get_fluctuation_rank(market="NASDAQ", sort="top")
 
         self.assertTrue(response.success)

@@ -23,13 +23,9 @@ _SSE_RECONNECT_DELAY = 2.0  # 재연결 대기 초
 _SSE_MAX_RECONNECT_DELAY = 30.0  # 최대 재연결 대기 초
 _SSE_MAX_RECONNECT_ATTEMPTS = 50  # 최대 재연결 시도 횟수
 
-# KIS API rate limit: 모의투자 초당 ~10건 (공식 20건이지만 실제 더 엄격)
-_RATE_LIMIT_PER_SEC = 5
+# KIS REST rate limit 기본 윈도우/재시도 설정
 _RATE_LIMIT_WINDOW = 1.0  # 초
-_MAX_CONCURRENT_CALLS = 3  # 동시 MCP 호출 상한
-_OVERSEAS_QUOTE_MIN_INTERVAL = 1.0  # 해외 시세는 더 보수적으로 직렬화
 _OVERSEAS_QUOTE_MAX_RETRIES = 2
-_OVERSEAS_BALANCE_MIN_INTERVAL = 1.0  # 해외 잔고도 계정 단위로 직렬화
 _OVERSEAS_BALANCE_MAX_RETRIES = 2
 _US_SCAN_RESULT_LIMIT = 30
 
@@ -46,6 +42,7 @@ class MCPClient:
     """
 
     def __init__(self):
+        policy = settings.kis_rest_policy
         self._base_url = settings.KIS_MCP_URL.rstrip("/sse").rstrip("/")
         self._post_client: httpx.AsyncClient | None = None
         self._sse_client: httpx.AsyncClient | None = None
@@ -55,10 +52,23 @@ class MCPClient:
         self._sse_task: asyncio.Task | None = None
         self._shutting_down = False
         self._reconnect_count = 0
-        # Rate limiter: 초당 요청 타임스탬프 + 동시 호출 세마포어
+        # KIS REST governor: 계좌 타입별 글로벌 rate limit + 시장별 보조 limiter
+        self._rate_limit_per_sec = max(1, int(policy.get("rate_limit_per_sec", 1)))
+        self._rate_limit_window = _RATE_LIMIT_WINDOW
+        self._min_interval_seconds = max(0.0, float(policy.get("min_interval_seconds", 0.0)))
+        self._max_concurrent_calls = max(1, int(policy.get("max_concurrent_calls", 1)))
+        self._overseas_quote_min_interval = max(
+            self._min_interval_seconds,
+            float(policy.get("overseas_quote_min_interval_seconds", self._min_interval_seconds)),
+        )
+        self._overseas_balance_min_interval = max(
+            self._min_interval_seconds,
+            float(policy.get("overseas_balance_min_interval_seconds", self._min_interval_seconds)),
+        )
         self._call_timestamps: list[float] = []
+        self._last_call_at = 0.0
         self._rate_lock = asyncio.Lock()
-        self._call_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
+        self._call_semaphore = asyncio.Semaphore(self._max_concurrent_calls)
         self._fx_cache: dict[str, tuple[float, float]] = {}
         self._overseas_quote_semaphore = asyncio.Semaphore(1)
         self._overseas_quote_rate_lock = asyncio.Lock()
@@ -425,27 +435,47 @@ class MCPClient:
         return self._session_id is not None
 
     async def _rate_limit(self) -> None:
-        """KIS API 초당 요청 한도 준수 — 초과 시 대기"""
-        async with self._rate_lock:
-            now = time.monotonic()
-            # 1초 이전 타임스탬프 제거
-            self._call_timestamps = [
-                t for t in self._call_timestamps
-                if now - t < _RATE_LIMIT_WINDOW
-            ]
-            if len(self._call_timestamps) >= _RATE_LIMIT_PER_SEC:
-                # 가장 오래된 요청이 1초 지날 때까지 대기
-                wait = _RATE_LIMIT_WINDOW - (now - self._call_timestamps[0]) + 0.05
-                if wait > 0:
-                    logger.debug("KIS rate limit 대기: {:.2f}초", wait)
-                    await asyncio.sleep(wait)
-            self._call_timestamps.append(time.monotonic())
+        """KIS API 글로벌 요청 한도 준수 — 계좌 타입별 min interval + 초당 한도"""
+        while True:
+            wait = 0.0
+            async with self._rate_lock:
+                now = time.monotonic()
+                self._call_timestamps = [
+                    t for t in self._call_timestamps
+                    if now - t < self._rate_limit_window
+                ]
+
+                min_interval_wait = 0.0
+                if self._last_call_at > 0 and self._min_interval_seconds > 0:
+                    min_interval_wait = self._min_interval_seconds - (now - self._last_call_at)
+
+                per_second_wait = 0.0
+                if len(self._call_timestamps) >= self._rate_limit_per_sec:
+                    per_second_wait = (
+                        self._rate_limit_window - (now - self._call_timestamps[0]) + 0.05
+                    )
+
+                wait = max(min_interval_wait, per_second_wait, 0.0)
+                if wait <= 0:
+                    stamp = time.monotonic()
+                    self._call_timestamps.append(stamp)
+                    self._last_call_at = stamp
+                    return
+
+            logger.debug(
+                "KIS rate limit 대기: {:.2f}초 (account_type={}, qps={}, min_interval={:.2f})",
+                wait,
+                settings.kis_account_type_normalized,
+                self._rate_limit_per_sec,
+                self._min_interval_seconds,
+            )
+            await asyncio.sleep(wait)
 
     async def _rate_limit_overseas_quote(self) -> None:
         """해외 시세 REST 호출은 계정 단위 한도가 엄격해 보수적으로 직렬화"""
         async with self._overseas_quote_rate_lock:
             now = time.monotonic()
-            wait = _OVERSEAS_QUOTE_MIN_INTERVAL - (now - self._overseas_quote_last_call_at)
+            wait = self._overseas_quote_min_interval - (now - self._overseas_quote_last_call_at)
             if wait > 0:
                 logger.debug("해외 시세 rate limit 대기: {:.2f}초", wait)
                 await asyncio.sleep(wait)
@@ -455,11 +485,57 @@ class MCPClient:
         """해외 잔고 REST 호출은 계정 단위 burst를 피하도록 직렬화한다."""
         async with self._overseas_balance_rate_lock:
             now = time.monotonic()
-            wait = _OVERSEAS_BALANCE_MIN_INTERVAL - (now - self._overseas_balance_last_call_at)
+            wait = self._overseas_balance_min_interval - (now - self._overseas_balance_last_call_at)
             if wait > 0:
                 logger.debug("해외 잔고 rate limit 대기: {:.2f}초", wait)
                 await asyncio.sleep(wait)
             self._overseas_balance_last_call_at = time.monotonic()
+
+    async def _call_kis_rest_request(
+        self,
+        request_name: str,
+        request_factory: Callable[[], Awaitable[dict[str, Any]]],
+        _retry: int = 0,
+    ) -> MCPResponse:
+        """국내/공용 KIS REST 호출 공통 게이트: 글로벌 semaphore + rate limit + 재시도"""
+        async with self._call_semaphore:
+            await self._rate_limit()
+            try:
+                result = await request_factory()
+            except Exception as e:
+                logger.error("KIS REST 호출 오류 ({}): {}", request_name, str(e))
+                return MCPResponse(success=False, error=str(e))
+
+        if not isinstance(result, dict):
+            return MCPResponse(success=False, error=f"잘못된 KIS 응답: {request_name}")
+
+        rt_cd, error_msg = self._extract_business_error(result)
+        if rt_cd is not None:
+            if "초당 거래건수" in error_msg and _retry < 2:
+                wait = max(self._min_interval_seconds, 1.0 + _retry * 0.5)
+                logger.warning(
+                    "KIS rate limit ({}) → {:.1f}초 대기 후 재시도 ({}/2)",
+                    request_name,
+                    wait,
+                    _retry + 1,
+                )
+                await asyncio.sleep(wait)
+                return await self._call_kis_rest_request(
+                    request_name,
+                    request_factory,
+                    _retry=_retry + 1,
+                )
+            return MCPResponse(success=False, error=error_msg[:200], data=result)
+
+        success = result.get("success")
+        if success is None:
+            success = result.get("rt_cd") == "0"
+
+        error = None
+        if not success:
+            error = str(result.get("error") or result.get("msg1") or f"KIS 요청 실패: {request_name}")
+
+        return MCPResponse(success=bool(success), data=result, error=error)
 
     async def _call_overseas_quote(
         self,
@@ -468,13 +544,15 @@ class MCPClient:
         _retry: int = 0,
     ) -> MCPResponse:
         """해외 시세 REST 호출 공통 게이트: 직렬화 + 간격 제한 + rate-limit 재시도"""
-        async with self._overseas_quote_semaphore:
-            await self._rate_limit_overseas_quote()
-            try:
-                result = await request_factory()
-            except Exception as e:
-                logger.error("해외 시세 호출 오류 ({}): {}", request_name, str(e))
-                return MCPResponse(success=False, error=str(e))
+        async with self._call_semaphore:
+            async with self._overseas_quote_semaphore:
+                await self._rate_limit()
+                await self._rate_limit_overseas_quote()
+                try:
+                    result = await request_factory()
+                except Exception as e:
+                    logger.error("해외 시세 호출 오류 ({}): {}", request_name, str(e))
+                    return MCPResponse(success=False, error=str(e))
 
         if not isinstance(result, dict):
             return MCPResponse(success=False, error=f"잘못된 해외 시세 응답: {request_name}")
@@ -482,7 +560,7 @@ class MCPClient:
         rt_cd, error_msg = self._extract_business_error(result)
         if rt_cd is not None:
             if "초당 거래건수" in error_msg and _retry < _OVERSEAS_QUOTE_MAX_RETRIES:
-                wait = max(_OVERSEAS_QUOTE_MIN_INTERVAL, 1.0 + _retry * 0.5)
+                wait = max(self._overseas_quote_min_interval, 1.0 + _retry * 0.5)
                 logger.warning(
                     "해외 시세 rate limit ({}) → {:.1f}초 대기 후 재시도 ({}/{})",
                     request_name,
@@ -511,13 +589,15 @@ class MCPClient:
         _retry: int = 0,
     ) -> MCPResponse:
         """해외 잔고 REST 호출 공통 게이트: 직렬화 + 간격 제한 + rate-limit 재시도"""
-        async with self._overseas_balance_semaphore:
-            await self._rate_limit_overseas_balance()
-            try:
-                result = await request_factory()
-            except Exception as e:
-                logger.error("해외 잔고 호출 오류 ({}): {}", request_name, str(e))
-                return MCPResponse(success=False, error=str(e))
+        async with self._call_semaphore:
+            async with self._overseas_balance_semaphore:
+                await self._rate_limit()
+                await self._rate_limit_overseas_balance()
+                try:
+                    result = await request_factory()
+                except Exception as e:
+                    logger.error("해외 잔고 호출 오류 ({}): {}", request_name, str(e))
+                    return MCPResponse(success=False, error=str(e))
 
         if not isinstance(result, dict):
             return MCPResponse(success=False, error=f"잘못된 해외 잔고 응답: {request_name}")
@@ -535,7 +615,7 @@ class MCPClient:
                 self._summarize_overseas_balance_payload(result),
             )
             if "초당 거래건수" in error_msg and _retry < _OVERSEAS_BALANCE_MAX_RETRIES:
-                wait = max(_OVERSEAS_BALANCE_MIN_INTERVAL, 1.0 + _retry * 0.5)
+                wait = max(self._overseas_balance_min_interval, 1.0 + _retry * 0.5)
                 logger.warning(
                     "해외 잔고 rate limit ({}) → {:.1f}초 대기 후 재시도 ({}/{})",
                     request_name,
@@ -665,7 +745,7 @@ class MCPClient:
     ) -> MCPResponse:
         """rate limit 에러면 1초 대기 후 재시도, 아니면 그대로 실패"""
         if "초당 거래건수" in error_msg and _retry < 2:
-            wait = 1.0 + _retry * 0.5
+            wait = max(self._min_interval_seconds, 1.0 + _retry * 0.5)
             logger.warning("KIS rate limit ({}) → {:.1f}초 대기 후 재시도 ({}/2)",
                            tool_name, wait, _retry + 1)
             await asyncio.sleep(wait)
@@ -1042,12 +1122,9 @@ class MCPClient:
         if is_domestic_market(market_code):
             from trading.kis_api import get_domestic_price
 
-            await self._rate_limit()
-            result = await get_domestic_price(symbol)
-            resp = MCPResponse(
-                success=result.get("rt_cd") == "0",
-                data=result,
-                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            resp = await self._call_kis_rest_request(
+                f"{market_code}:{symbol}:price",
+                lambda: get_domestic_price(symbol),
             )
         else:
             from trading.kis_api import get_overseas_price
@@ -1114,11 +1191,9 @@ class MCPClient:
         if is_domestic_market(market_code):
             from trading.kis_api import get_domestic_balance
 
-            result = await get_domestic_balance()
-            return MCPResponse(
-                success=result.get("rt_cd") == "0",
-                data=result,
-                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            return await self._call_kis_rest_request(
+                f"{market_code}:balance",
+                get_domestic_balance,
             )
         from trading.kis_api import get_overseas_balance, get_overseas_present_balance
 
@@ -1316,12 +1391,9 @@ class MCPClient:
         if is_domestic_market(market_code):
             from trading.kis_api import get_domestic_daily_price
 
-            await self._rate_limit()
-            result = await get_domestic_daily_price(symbol)
-            resp = MCPResponse(
-                success=result.get("rt_cd") == "0",
-                data=result,
-                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            resp = await self._call_kis_rest_request(
+                f"{market_code}:{symbol}:daily",
+                lambda: get_domestic_daily_price(symbol),
             )
         else:
             from trading.kis_api import get_overseas_daily_price
@@ -1464,10 +1536,17 @@ class MCPClient:
                 from trading.kis_api import get_overseas_volume_surge, get_overseas_trade_growth
 
                 exchange = kis_exchange_code(market_code)
-                result = await get_overseas_volume_surge(exchange)
-                if not result.get("success"):
-                    result = await get_overseas_trade_growth(exchange)
-                if result.get("success"):
+                response = await self._call_overseas_quote(
+                    f"{market_code}:volume-surge",
+                    lambda: get_overseas_volume_surge(exchange),
+                )
+                if not response.success:
+                    response = await self._call_overseas_quote(
+                        f"{market_code}:trade-growth",
+                        lambda: get_overseas_trade_growth(exchange),
+                    )
+                result = response.data or {}
+                if response.success:
                     items = (
                         self._extract_records(result, "output1", "output", "dataframe1")
                         or self._extract_records(result, "output2", "dataframe2")
@@ -1485,8 +1564,10 @@ class MCPClient:
 
         market_code = "J" if market_code in ("KOSPI", "KOSDAQ", "KRX") else market_code
         try:
-            result = await get_volume_rank(market=market_code)
-            return MCPResponse(success=result.get("success", False), data=result)
+            return await self._call_kis_rest_request(
+                f"{market_code}:volume-rank",
+                lambda: get_volume_rank(market=market_code),
+            )
         except Exception as e:
             logger.error("거래량순위 조회 실패: {}", str(e))
             return MCPResponse(success=False, error=str(e))
@@ -1550,13 +1631,10 @@ class MCPClient:
                 }
             return response
 
-        try:
-            await self._rate_limit()
-            result = await get_minute_chart(symbol, period)
-            return MCPResponse(success=result.get("success", False), data=result)
-        except Exception as e:
-            logger.error("분봉 조회 실패 ({}): {}", symbol, str(e))
-            return MCPResponse(success=False, error=str(e))
+        return await self._call_kis_rest_request(
+            f"{market_code}:{symbol}:minute:{period}",
+            lambda: get_minute_chart(symbol, period),
+        )
 
     async def get_fluctuation_rank(self, market: str = "KRX", sort: str = "top") -> MCPResponse:
         """등락률 상위/하위 종목 조회"""
@@ -1570,8 +1648,12 @@ class MCPClient:
                 from trading.kis_api import get_overseas_price_fluct
 
                 exchange = kis_exchange_code(market_code)
-                result = await get_overseas_price_fluct(exchange)
-                if result.get("success"):
+                response = await self._call_overseas_quote(
+                    f"{market_code}:price-fluct:{sort}",
+                    lambda: get_overseas_price_fluct(exchange),
+                )
+                result = response.data or {}
+                if response.success:
                     items = (
                         self._extract_records(result, "output1", "output", "dataframe1")
                         or self._extract_records(result, "output2", "dataframe2")
@@ -1589,8 +1671,10 @@ class MCPClient:
 
         market_code = "J" if market_code in ("KOSPI", "KOSDAQ", "KRX") else market_code
         try:
-            result = await get_fluctuation_rank(sort=sort, market=market_code)
-            return MCPResponse(success=result.get("success", False), data=result)
+            return await self._call_kis_rest_request(
+                f"{market_code}:fluctuation-rank:{sort}",
+                lambda: get_fluctuation_rank(sort=sort, market=market_code),
+            )
         except Exception as e:
             logger.error("등락률순위 조회 실패: {}", str(e))
             return MCPResponse(success=False, error=str(e))
@@ -1601,19 +1685,15 @@ class MCPClient:
         if is_domestic_market(market_code):
             from trading.kis_api import get_domestic_asking_price
 
-            result = await get_domestic_asking_price(symbol)
-            return MCPResponse(
-                success=result.get("rt_cd") == "0",
-                data=result,
-                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            return await self._call_kis_rest_request(
+                f"{market_code}:{symbol}:ask",
+                lambda: get_domestic_asking_price(symbol),
             )
         from trading.kis_api import get_overseas_asking_price
 
-        result = await get_overseas_asking_price(symbol, kis_exchange_code(market_code))
-        return MCPResponse(
-            success=result.get("rt_cd") == "0",
-            data=result,
-            error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+        return await self._call_overseas_quote(
+            f"{market_code}:{symbol}:ask",
+            lambda: get_overseas_asking_price(symbol, kis_exchange_code(market_code)),
         )
 
     async def get_order_list(self, market: str = "KRX") -> MCPResponse:
@@ -1630,20 +1710,16 @@ class MCPClient:
         if is_domestic_market(market_code):
             from trading.kis_api import get_domestic_order_list
 
-            result = await get_domestic_order_list(today, today)
-            return MCPResponse(
-                success=result.get("rt_cd") == "0",
-                data=result,
-                error=result.get("msg1") if result.get("rt_cd") != "0" else None,
+            return await self._call_kis_rest_request(
+                f"{market_code}:order-list",
+                lambda: get_domestic_order_list(today, today),
             )
 
         from trading.kis_api import get_overseas_order_list
 
-        result = await get_overseas_order_list(market_code)
-        response = MCPResponse(
-            success=result.get("success", False),
-            data=result,
-            error=result.get("error"),
+        response = await self._call_overseas_balance(
+            f"{market_code}:order-list",
+            lambda: get_overseas_order_list(market_code),
         )
         if response.success and response.data:
             records = (

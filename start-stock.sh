@@ -14,13 +14,17 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$APP_DIR/venv"
-PID_FILE="$APP_DIR/.momo-stock.pid"
 LOG_DIR="$APP_DIR/logs"
-LOG_FILE="$APP_DIR/logs/momo-stock.log"
 DATA_DIR="$APP_DIR/data"
 HOST="${MOMO_HOST:-0.0.0.0}"
-PORT="${MOMO_PORT:-9000}"
 DOCKER_STATUS_MSG=""
+ACCOUNT_TYPE=""
+ACCOUNT_SUFFIX=""
+DEFAULT_PORT=""
+PORT=""
+PID_FILE=""
+LEGACY_PID_FILE="$APP_DIR/.momo-stock.pid"
+LOG_FILE=""
 
 # 주식 전용: 코인 시스템 비활성화 (.env에 CRYPTO_ENABLED=true여도 오버라이드)
 export CRYPTO_ENABLED=false
@@ -43,14 +47,70 @@ check_env() {
     fi
 }
 
+read_env_file_value() {
+    local key="$1"
+    if [ ! -f "$APP_DIR/.env" ]; then
+        return 0
+    fi
+    grep -E "^${key}=" "$APP_DIR/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '\r'
+}
+
+resolve_config_value() {
+    local key="$1"
+    local shell_value="${!key-}"
+    if [ -n "${shell_value:-}" ]; then
+        printf '%s\n' "$shell_value"
+        return 0
+    fi
+    read_env_file_value "$key"
+}
+
+normalize_account_type() {
+    local raw="$1"
+    raw="$(printf '%s' "${raw:-VIRTUAL}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+    case "$raw" in
+        VIRTUAL|REAL)
+            printf '%s\n' "$raw"
+            ;;
+        *)
+            echo "❌ KIS_ACCOUNT_TYPE 는 VIRTUAL 또는 REAL 이어야 합니다: ${raw:-<empty>}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+resolve_runtime_profile() {
+    ACCOUNT_TYPE="$(normalize_account_type "$(resolve_config_value KIS_ACCOUNT_TYPE)")"
+    if [ "$ACCOUNT_TYPE" = "VIRTUAL" ]; then
+        ACCOUNT_SUFFIX="virtual"
+        DEFAULT_PORT="9000"
+    else
+        ACCOUNT_SUFFIX="real"
+        DEFAULT_PORT="9100"
+    fi
+    PORT="${MOMO_PORT:-$DEFAULT_PORT}"
+    PID_FILE="$APP_DIR/.momo-stock.$ACCOUNT_SUFFIX.pid"
+    LOG_FILE="$LOG_DIR/momo-stock.$ACCOUNT_SUFFIX.log"
+}
+
 check_kis_env() {
     local app_key paper_key
-    app_key=$(grep -E '^KIS_APP_KEY=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
-    paper_key=$(grep -E '^KIS_PAPER_APP_KEY=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+    app_key="$(resolve_config_value KIS_APP_KEY | tr -d '[:space:]')"
+    paper_key="$(resolve_config_value KIS_PAPER_APP_KEY | tr -d '[:space:]')"
 
-    if [ -z "$app_key" ] && [ -z "$paper_key" ]; then
-        echo "⚠️  KIS API 키가 모두 비어있습니다."
-        echo "   KIS_APP_KEY 또는 KIS_PAPER_APP_KEY를 .env에 설정하세요."
+    if [ "$ACCOUNT_TYPE" = "VIRTUAL" ]; then
+        if [ -z "$paper_key" ] && [ -z "$app_key" ]; then
+            echo "⚠️  KIS 모의투자 키가 비어있습니다."
+            echo "   KIS_PAPER_APP_KEY 또는 KIS_APP_KEY를 설정하세요."
+        elif [ -z "$paper_key" ] && [ -n "$app_key" ]; then
+            echo "⚠️  KIS_PAPER_APP_KEY 미설정 → VIRTUAL에서 KIS_APP_KEY fallback 사용"
+        fi
+        return
+    fi
+
+    if [ -z "$app_key" ]; then
+        echo "⚠️  KIS 실전투자 키가 비어있습니다."
+        echo "   KIS_APP_KEY를 설정하세요."
     fi
 }
 
@@ -141,6 +201,7 @@ print_banner() {
     local mode="$1"
     echo ""
     echo "📈 momo-trading 주식 전용 시작 ($mode)"
+    echo "   Account:   $ACCOUNT_TYPE"
     echo "   Host:      $HOST:$PORT"
     echo "   Admin:     http://localhost:$PORT/admin"
     echo "   Crypto:    비활성화"
@@ -171,6 +232,7 @@ launch_daemon() {
         echo "   최근 로그:"
         sed -n '1,200p' "$LOG_FILE"
         rm -f "$PID_FILE"
+        rm -f "$LEGACY_PID_FILE"
         exit 1
     fi
 }
@@ -191,6 +253,7 @@ do_stop() {
             echo "ℹ️  프로세스 이미 종료됨 (stale PID: $pid)"
         fi
         rm -f "$PID_FILE"
+        rm -f "$LEGACY_PID_FILE"
     else
         echo "ℹ️  실행 중인 주식 서버 없음"
     fi
@@ -207,6 +270,7 @@ do_stop() {
 # ── 명령 분기 ──
 
 cd "$APP_DIR"
+resolve_runtime_profile
 ensure_runtime_dirs
 
 case "${1:-}" in

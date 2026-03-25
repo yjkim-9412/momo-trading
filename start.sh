@@ -14,13 +14,17 @@ set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$APP_DIR/venv"
-PID_FILE="$APP_DIR/.momo.pid"
 LOG_DIR="$APP_DIR/logs"
-LOG_FILE="$APP_DIR/logs/momo-trading.log"
 DATA_DIR="$APP_DIR/data"
 HOST="${MOMO_HOST:-0.0.0.0}"
-PORT="${MOMO_PORT:-9000}"
 DOCKER_STATUS_MSG=""
+ACCOUNT_TYPE=""
+ACCOUNT_SUFFIX=""
+DEFAULT_PORT=""
+PORT=""
+PID_FILE=""
+LEGACY_PID_FILE="$APP_DIR/.momo.pid"
+LOG_FILE=""
 
 # ── 공통 함수 ──
 
@@ -38,6 +42,52 @@ check_env() {
     if [ ! -f "$APP_DIR/.env" ]; then
         echo "⚠️  .env 파일이 없습니다. .env.example을 참고하세요."
     fi
+}
+
+read_env_file_value() {
+    local key="$1"
+    if [ ! -f "$APP_DIR/.env" ]; then
+        return 0
+    fi
+    grep -E "^${key}=" "$APP_DIR/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '\r'
+}
+
+resolve_config_value() {
+    local key="$1"
+    local shell_value="${!key-}"
+    if [ -n "${shell_value:-}" ]; then
+        printf '%s\n' "$shell_value"
+        return 0
+    fi
+    read_env_file_value "$key"
+}
+
+normalize_account_type() {
+    local raw="$1"
+    raw="$(printf '%s' "${raw:-VIRTUAL}" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+    case "$raw" in
+        VIRTUAL|REAL)
+            printf '%s\n' "$raw"
+            ;;
+        *)
+            echo "❌ KIS_ACCOUNT_TYPE 는 VIRTUAL 또는 REAL 이어야 합니다: ${raw:-<empty>}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+resolve_runtime_profile() {
+    ACCOUNT_TYPE="$(normalize_account_type "$(resolve_config_value KIS_ACCOUNT_TYPE)")"
+    if [ "$ACCOUNT_TYPE" = "VIRTUAL" ]; then
+        ACCOUNT_SUFFIX="virtual"
+        DEFAULT_PORT="9000"
+    else
+        ACCOUNT_SUFFIX="real"
+        DEFAULT_PORT="9100"
+    fi
+    PORT="${MOMO_PORT:-$DEFAULT_PORT}"
+    PID_FILE="$APP_DIR/.momo.$ACCOUNT_SUFFIX.pid"
+    LOG_FILE="$LOG_DIR/momo-trading.$ACCOUNT_SUFFIX.log"
 }
 
 ensure_runtime_dirs() {
@@ -129,8 +179,9 @@ print_banner() {
     local mode="$1"
     echo ""
     echo "🚀 momo-trading 시작 ($mode)"
-    echo "   Host:  $HOST:$PORT"
-    echo "   Admin: http://localhost:$PORT/admin"
+    echo "   Account: $ACCOUNT_TYPE"
+    echo "   Host:    $HOST:$PORT"
+    echo "   Admin:   http://localhost:$PORT/admin"
 }
 
 launch_daemon() {
@@ -158,6 +209,7 @@ launch_daemon() {
         echo "   최근 로그:"
         sed -n '1,200p' "$LOG_FILE"
         rm -f "$PID_FILE"
+        rm -f "$LEGACY_PID_FILE"
         exit 1
     fi
 }
@@ -165,6 +217,7 @@ launch_daemon() {
 # ── 명령 분기 ──
 
 cd "$APP_DIR"
+resolve_runtime_profile
 ensure_runtime_dirs
 
 case "${1:-}" in

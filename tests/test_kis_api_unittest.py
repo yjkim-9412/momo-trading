@@ -2,7 +2,15 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from core.config import settings
-from trading.kis_api import _get_account_parts, get_overseas_daily_price, get_overseas_order_list
+from trading.kis_api import (
+    DOMAIN,
+    VIRTUAL_DOMAIN,
+    _get_account_parts,
+    _get_token_file,
+    _get_trading_domain,
+    get_overseas_daily_price,
+    get_overseas_order_list,
+)
 
 
 class AccountPartsTest(unittest.TestCase):
@@ -73,6 +81,26 @@ class OverseasOrderListTest(unittest.IsolatedAsyncioTestCase):
 
         params = mock_request.await_args.kwargs["params"]
         self.assertEqual(params["MODP"], "0")
+
+
+class TradingProfileConfigTest(unittest.TestCase):
+    def setUp(self):
+        self._original_account_type = settings.KIS_ACCOUNT_TYPE
+
+    def tearDown(self):
+        settings.KIS_ACCOUNT_TYPE = self._original_account_type
+
+    def test_virtual_account_uses_virtual_token_file_and_domain(self):
+        settings.KIS_ACCOUNT_TYPE = "VIRTUAL"
+
+        self.assertEqual(str(_get_token_file()), "data/kis_token.virtual.json")
+        self.assertEqual(_get_trading_domain(), VIRTUAL_DOMAIN)
+
+    def test_real_account_uses_real_token_file_and_domain(self):
+        settings.KIS_ACCOUNT_TYPE = "REAL"
+
+        self.assertEqual(str(_get_token_file()), "data/kis_token.real.json")
+        self.assertEqual(_get_trading_domain(), DOMAIN)
 
 
 if __name__ == "__main__":

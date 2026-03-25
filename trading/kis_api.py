@@ -23,12 +23,10 @@ from trading.market_profile import (
 
 DOMAIN = "https://openapi.koreainvestment.com:9443"
 VIRTUAL_DOMAIN = "https://openapivts.koreainvestment.com:29443"
-TOKEN_FILE = Path("data/kis_token.json")
 
 # 토큰 동시 발급 방지용 Lock + 메모리 캐시
 _token_lock = asyncio.Lock()
-_cached_token: str | None = None
-_cached_expires_at: datetime | None = None
+_token_cache: dict[str, tuple[str, datetime]] = {}
 
 
 def _get_domain() -> str:
@@ -38,21 +36,31 @@ def _get_domain() -> str:
 
 def _get_trading_domain() -> str:
     """주문/계좌 API용 도메인 반환"""
-    if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
+    if settings.is_paper_trading:
         return VIRTUAL_DOMAIN
     return DOMAIN
 
 
 def _get_app_key() -> str:
-    if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
+    if settings.is_paper_trading:
         return settings.KIS_PAPER_APP_KEY or settings.KIS_APP_KEY
     return settings.KIS_APP_KEY
 
 
 def _get_app_secret() -> str:
-    if settings.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL":
+    if settings.is_paper_trading:
         return settings.KIS_PAPER_APP_SECRET or settings.KIS_APP_SECRET
     return settings.KIS_APP_SECRET
+
+
+def _get_account_type_key() -> str:
+    """활성 KIS 계좌 타입 키."""
+    return settings.kis_account_type_normalized
+
+
+def _get_token_file() -> Path:
+    """활성 KIS 계좌 타입별 토큰 캐시 파일."""
+    return Path(settings.kis_token_file)
 
 
 def _resolve_account_parts(raw: str, prod_type_override: str = "") -> tuple[str, str]:
@@ -189,28 +197,31 @@ async def _get_access_token(client: httpx.AsyncClient) -> str:
     KIS 1분당 1회 토큰 발급 제한(EGW00133) 에러를 방지한다.
     EGW00133 시 Lock을 해제한 뒤 60초 대기 → 재시도 (Lock 점유 최소화).
     """
-    global _cached_token, _cached_expires_at
+    account_type = _get_account_type_key()
+    cached_entry = _token_cache.get(account_type)
 
     # 빠른 경로: 메모리 캐시에 유효한 토큰이 있으면 즉시 반환 (Lock 불필요)
-    if _cached_token and _cached_expires_at and datetime.now() < _cached_expires_at:
-        return _cached_token
+    if cached_entry and datetime.now() < cached_entry[1]:
+        return cached_entry[0]
 
     for attempt in range(2):
         async with _token_lock:
             # Double-check: 다른 태스크가 Lock 대기 중 이미 발급했을 수 있음
-            if _cached_token and _cached_expires_at and datetime.now() < _cached_expires_at:
-                return _cached_token
+            cached_entry = _token_cache.get(account_type)
+            if cached_entry and datetime.now() < cached_entry[1]:
+                return cached_entry[0]
 
             # 파일 캐시 확인
-            if TOKEN_FILE.exists():
+            token_file = _get_token_file()
+            if token_file.exists():
                 try:
-                    token_data = json.loads(TOKEN_FILE.read_text())
+                    token_data = json.loads(token_file.read_text())
                     expires_at = datetime.fromisoformat(token_data["expires_at"])
                     if datetime.now() < expires_at:
-                        _cached_token = token_data["token"]
-                        _cached_expires_at = expires_at
-                        logger.debug("KIS 토큰: 파일 캐시에서 로드")
-                        return _cached_token
+                        token = token_data["token"]
+                        _token_cache[account_type] = (token, expires_at)
+                        logger.debug("KIS 토큰: 파일 캐시에서 로드 ({})", account_type)
+                        return token
                 except Exception:
                     pass
 
@@ -232,10 +243,11 @@ async def _issue_new_token(client: httpx.AsyncClient) -> str | None:
 
     성공 시 토큰 반환, EGW00133 시 None 반환 (호출자가 Lock 해제 후 재시도).
     """
-    global _cached_token, _cached_expires_at
+    account_type = _get_account_type_key()
+    token_file = _get_token_file()
 
     resp = await client.post(
-        f"{DOMAIN}/oauth2/tokenP",
+        f"{_get_trading_domain()}/oauth2/tokenP",
         headers={"content-type": "application/json"},
         json={
             "grant_type": "client_credentials",
@@ -255,17 +267,16 @@ async def _issue_new_token(client: httpx.AsyncClient) -> str | None:
     expires_at = datetime.now() + timedelta(hours=23)
 
     # 메모리 캐시 갱신
-    _cached_token = token
-    _cached_expires_at = expires_at
+    _token_cache[account_type] = (token, expires_at)
 
     # 파일 캐시 저장
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps({
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    token_file.write_text(json.dumps({
         "token": token,
         "expires_at": expires_at.isoformat(),
     }))
 
-    logger.info("KIS 토큰 신규 발급 완료")
+    logger.info("KIS 토큰 신규 발급 완료 ({})", account_type)
     return token
 
 

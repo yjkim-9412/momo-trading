@@ -10,7 +10,14 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
-PID_FILE="$APP_DIR/.momo.pid"
+PID_FILES=(
+    "$APP_DIR/.momo.pid"
+    "$APP_DIR/.momo.virtual.pid"
+    "$APP_DIR/.momo.real.pid"
+    "$APP_DIR/.momo-stock.pid"
+    "$APP_DIR/.momo-stock.virtual.pid"
+    "$APP_DIR/.momo-stock.real.pid"
+)
 
 wait_for_exit() {
     local pid="$1"
@@ -82,17 +89,20 @@ stop_server() {
     local stopped=false
     local pid
     local parent_pid
+    local pid_file
 
     # PID 파일 기반 종료
-    if [ -f "$PID_FILE" ]; then
-        pid=$(cat "$PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "🛑 momo-trading 서버 종료 (PID: $pid)"
-            stop_process_group "$pid"
-            stopped=true
+    for pid_file in "${PID_FILES[@]}"; do
+        if [ -f "$pid_file" ]; then
+            pid=$(cat "$pid_file")
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "🛑 momo-trading 서버 종료 (PID: $pid)"
+                stop_process_group "$pid"
+                stopped=true
+            fi
+            rm -f "$pid_file"
         fi
-        rm -f "$PID_FILE"
-    fi
+    done
 
     # uvicorn 프로세스 직접 종료 (포그라운드 실행 대응)
     for parent_pid in $(pgrep -f "uvicorn main:app" || true); do

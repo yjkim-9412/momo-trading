@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 import shutil
+from pathlib import Path
 
 from loguru import logger
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 from trading.enums import LLMProvider, LLMTier, Tier1Profile
 
@@ -177,9 +180,101 @@ class Settings(BaseSettings):
     AI_DYNAMIC_RESCAN_DEFAULT_INTERVAL_MINUTES: int = 60
 
     @property
+    def kis_account_type_normalized(self) -> str:
+        """KIS 계좌 타입을 VIRTUAL/REAL로 정규화한다."""
+        normalized = (self.KIS_ACCOUNT_TYPE or "VIRTUAL").strip().upper()
+        if normalized in {"VIRTUAL", "REAL"}:
+            return normalized
+        raise ValueError("KIS_ACCOUNT_TYPE 는 VIRTUAL 또는 REAL 이어야 합니다.")
+
+    @property
+    def kis_profile_suffix(self) -> str:
+        """계좌 타입 기반 런타임 suffix."""
+        return "virtual" if self.is_paper_trading else "real"
+
+    @property
+    def kis_log_suffix(self) -> str:
+        """로그 파일 suffix."""
+        return self.kis_profile_suffix
+
+    @property
+    def kis_default_port(self) -> int:
+        """계좌 타입별 기본 포트."""
+        return 9000 if self.is_paper_trading else 9100
+
+    @staticmethod
+    def _append_database_suffix(database_url: str, suffix: str) -> str:
+        """DB URL에 계좌 타입 suffix를 주입한다."""
+        try:
+            parsed = make_url(database_url)
+        except ArgumentError:
+            logger.warning("DATABASE_URL 파싱 실패 → 원본 URL 유지: {}", database_url)
+            return database_url
+
+        database = parsed.database or ""
+        if not database:
+            return database_url
+
+        if database.endswith((".virtual.db", ".real.db", "_virtual", "_real")):
+            return database_url
+
+        backend = parsed.get_backend_name()
+        if backend == "sqlite":
+            db_path = Path(database)
+            if db_path.suffix:
+                updated = db_path.with_name(f"{db_path.stem}.{suffix}{db_path.suffix}")
+            else:
+                updated = db_path.with_name(f"{db_path.name}.{suffix}")
+            return parsed.set(database=str(updated)).render_as_string(hide_password=False)
+
+        return parsed.set(database=f"{database}_{suffix}").render_as_string(hide_password=False)
+
+    @staticmethod
+    def _mask_database_url(database_url: str) -> str:
+        """표시용 DB URL에서 민감정보를 마스킹한다."""
+        try:
+            return make_url(database_url).render_as_string(hide_password=True)
+        except ArgumentError:
+            return database_url
+
+    @property
+    def kis_runtime_database_url(self) -> str:
+        """KIS 계좌 타입 기준 런타임 DB URL."""
+        return self._append_database_suffix(self.DATABASE_URL, self.kis_profile_suffix)
+
+    @property
+    def database_url_for_display(self) -> str:
+        """표시용 런타임 DB URL."""
+        return self._mask_database_url(self.kis_runtime_database_url)
+
+    @property
+    def kis_token_file(self) -> str:
+        """KIS 토큰 캐시 파일 경로."""
+        return str(Path("data") / f"kis_token.{self.kis_profile_suffix}.json")
+
+    @property
+    def kis_rest_policy(self) -> dict[str, float | int]:
+        """계좌 타입별 KIS REST 호출 정책."""
+        if self.is_paper_trading:
+            return {
+                "rate_limit_per_sec": 2,
+                "min_interval_seconds": 0.8,
+                "max_concurrent_calls": 1,
+                "overseas_quote_min_interval_seconds": 1.0,
+                "overseas_balance_min_interval_seconds": 1.0,
+            }
+        return {
+            "rate_limit_per_sec": 20,
+            "min_interval_seconds": 0.15,
+            "max_concurrent_calls": 1,
+            "overseas_quote_min_interval_seconds": 0.2,
+            "overseas_balance_min_interval_seconds": 0.2,
+        }
+
+    @property
     def async_database_url(self) -> str:
-        """Sync URL에서 async 드라이버 URL을 자동 생성"""
-        url = self.DATABASE_URL
+        """Runtime DB URL에서 async 드라이버 URL을 자동 생성"""
+        url = self.kis_runtime_database_url
         if url.startswith("sqlite:///"):
             return url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
         if url.startswith("postgresql://"):
@@ -194,7 +289,11 @@ class Settings(BaseSettings):
 
     @property
     def is_paper_trading(self) -> bool:
-        return self.KIS_ACCOUNT_TYPE.upper() == "VIRTUAL"
+        return self.kis_account_type_normalized == "VIRTUAL"
+
+    @property
+    def is_real_trading(self) -> bool:
+        return not self.is_paper_trading
 
     @staticmethod
     def _parse_csv(raw_value: str, *, upper: bool = False) -> list[str]:
@@ -764,6 +863,7 @@ class Settings(BaseSettings):
 
     def validate_on_startup(self) -> None:
         """시작 시 필수 설정 검증 — 누락된 키에 대해 경고 로그"""
+        account_type = self.kis_account_type_normalized
         provider = self.llm_provider
         cli_path = self.get_llm_cli_path(provider)
         if cli_path:
@@ -781,11 +881,25 @@ class Settings(BaseSettings):
 
         self._validate_codex_reasoning_efforts()
 
-        if self.has_stock_markets and not self.KIS_APP_KEY and not self.KIS_PAPER_APP_KEY:
-            logger.warning(
-                "KIS API 키 미설정: KIS_APP_KEY, KIS_PAPER_APP_KEY 모두 비어있음. "
-                "실매매/모의투자 모두 불가합니다."
-            )
+        logger.info(
+            "KIS 런타임 설정: account_type={}, runtime_db={}, token_file={}",
+            account_type,
+            self.database_url_for_display,
+            self.kis_token_file,
+        )
+
+        if self.has_stock_markets:
+            if self.is_paper_trading:
+                if not self.KIS_PAPER_APP_KEY and not self.KIS_APP_KEY:
+                    logger.warning(
+                        "KIS 모의투자 키 미설정: KIS_PAPER_APP_KEY, KIS_APP_KEY 모두 비어있음."
+                    )
+                elif not self.KIS_PAPER_APP_KEY and self.KIS_APP_KEY:
+                    logger.warning(
+                        "KIS_PAPER_APP_KEY 미설정 → VIRTUAL에서 KIS_APP_KEY fallback 사용"
+                    )
+            elif not self.KIS_APP_KEY:
+                logger.warning("KIS 실전투자 키 미설정: KIS_APP_KEY가 비어있음.")
 
         if not self.TRADING_ENABLED:
             logger.info("TRADING_ENABLED=false: 매매 기능이 비활성화 상태입니다.")

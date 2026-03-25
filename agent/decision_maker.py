@@ -121,7 +121,7 @@ class DecisionMaker:
             "market": market_code,
             "session": session,
             "session_label": session_label,
-            "account_type": settings.KIS_ACCOUNT_TYPE,
+            "account_type": settings.kis_account_type_normalized,
             "currency": signal.metadata.get("currency", "USD"),
         }
 

@@ -26,7 +26,12 @@ async def lifespan(app: FastAPI):
     settings.validate_on_startup()
     await validate_database_schema()
     # DB 스키마는 Alembic으로 관리: python -m alembic upgrade head
-    logger.info("애플리케이션 시작 (ENVIRONMENT={})", settings.ENVIRONMENT)
+    logger.info(
+        "애플리케이션 시작 (ENVIRONMENT={}, ACCOUNT_TYPE={}, DB={})",
+        settings.ENVIRONMENT,
+        settings.kis_account_type_normalized,
+        settings.database_url_for_display,
+    )
 
     # 이벤트 버스 시작
     await event_bus.start()

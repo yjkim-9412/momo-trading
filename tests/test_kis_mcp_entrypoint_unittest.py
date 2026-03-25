@@ -48,3 +48,13 @@ def test_configure_runtime_env_accepts_cano_with_explicit_prod_type():
 
     assert env["KIS_CANO"] == "12345678"
     assert env["KIS_PROD_TYPE"] == "02"
+
+
+def test_configure_runtime_env_rejects_invalid_account_type():
+    env = {
+        "KIS_ACCOUNT_TYPE": "paper",
+        "KIS_ACCT_STOCK": "1234567801",
+    }
+
+    with pytest.raises(ValueError, match="KIS_ACCOUNT_TYPE"):
+        ENTRYPOINT.configure_runtime_env(env)
