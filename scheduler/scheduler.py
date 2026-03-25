@@ -1668,15 +1668,9 @@ class TradingScheduler:
             ]
             await _cleanup_after_close(retained_symbols)
 
-            # 청산 완료 플래그 설정 → 이벤트 기반 분석 차단
-            try:
-                from agent.trading_agent import trading_agent as _ta
-                from trading.market_profile import market_scope as _ms
-                _state = _ta._get_state(_ms(market))
-                _state.liquidation_complete = True
-                logger.info("[{}] 청산 완료 — 이벤트 분석 차단 플래그 설정", market)
-            except Exception as flag_err:
-                logger.warning("[{}] 청산 플래그 설정 실패: {}", market, str(flag_err))
+            # 청산 매도 성공 종목 → TradeResult 청산 기록
+            if sold_count > 0:
+                await self._close_trade_results(market, to_sell, failed_holdings)
 
         except Exception as e:
             logger.error("[{}] 청산 오류: {}", market, str(e))
@@ -1686,6 +1680,16 @@ class TradingScheduler:
                 f"\u274c [{market}] 청산 오류: {str(e)[:100]}",
             )
         finally:
+            # 청산 완료 플래그 설정 → 이벤트 기반 분석 차단 (모든 경로에서 설정)
+            try:
+                from agent.trading_agent import trading_agent as _ta
+                from trading.market_profile import market_scope as _ms
+                _state = _ta._get_state(_ms(market))
+                _state.liquidation_complete = True
+                logger.info("[{}] 청산 완료 — 이벤트 분석 차단 플래그 설정", market)
+            except Exception as flag_err:
+                logger.warning("[{}] 청산 플래그 설정 실패: {}", market, str(flag_err))
+
             if after_hours_disabled:
                 try:
                     await self._trigger_immediate_review(market)
@@ -1702,6 +1706,53 @@ class TradingScheduler:
         if is_domestic_market(market_code):
             return not settings.KRX_NXT_AFTER_ENABLED
         return False
+
+    async def _close_trade_results(
+        self,
+        market: str,
+        to_sell: list,
+        failed_holdings: list,
+    ) -> None:
+        """청산 매도 성공 종목의 TradeResult를 close 처리 (exit_at, pnl 기록)"""
+        from core.database import AsyncSessionLocal
+        from repositories.trade_result_repository import TradeResultRepository
+        from util.time_util import now_kst
+
+        failed_symbols = {h.symbol for h in failed_holdings}
+        sold_holdings = [h for h in to_sell if h.symbol not in failed_symbols]
+        if not sold_holdings:
+            return
+
+        exit_time = now_kst()
+        try:
+            async with AsyncSessionLocal() as session:
+                async with session.begin():
+                    repo = TradeResultRepository(session)
+                    closed = 0
+                    for h in sold_holdings:
+                        open_trade = await repo.get_open_buy(h.symbol, market=h.market)
+                        if not open_trade:
+                            continue
+                        open_trade.exit_at = exit_time
+                        open_trade.exit_price = float(h.current_price or 0)
+                        if open_trade.currency != "KRW" and h.exchange_rate_to_krw > 0:
+                            open_trade.exit_price_krw = open_trade.exit_price * h.exchange_rate_to_krw
+                        else:
+                            open_trade.exit_price_krw = open_trade.exit_price
+                        open_trade.pnl = float(h.pnl or 0)
+                        if open_trade.entry_price and open_trade.entry_price > 0:
+                            open_trade.return_pct = float(h.pnl_rate or 0)
+                        open_trade.raw_pnl = open_trade.pnl
+                        open_trade.is_win = open_trade.pnl > 0
+                        open_trade.exit_reason = "FORCE_LIQUIDATION"
+                        open_trade.hold_days = max(
+                            1, (exit_time.date() - open_trade.entry_at.date()).days
+                        ) if open_trade.entry_at else 1
+                        closed += 1
+            if closed:
+                logger.info("[{}] 청산 TradeResult {} 건 close 완료", market, closed)
+        except Exception as e:
+            logger.warning("[{}] TradeResult close 처리 실패: {}", market, str(e))
 
     async def _trigger_immediate_review(self, market: str) -> None:
         """장후 비활성 시 즉시 리뷰 트리거"""
