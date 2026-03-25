@@ -794,7 +794,7 @@ class CycleMixin:
                                 entry_p = f"{tr.entry_price:,.0f}" if tr.entry_price else "?"
                                 exit_p = f"{tr.exit_price:,.0f}" if tr.exit_price else "?"
                                 pnl_text = (
-                                    f"{tr.pnl:+,.0f}원 ({tr.pnl_rate:+.1f}%)"
+                                    f"{tr.pnl:+,.0f}원 ({tr.return_pct:+.1f}%)"
                                     if tr.pnl is not None else "?"
                                 )
                                 lines.append(
