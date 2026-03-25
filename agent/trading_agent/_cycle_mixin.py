@@ -763,6 +763,49 @@ class CycleMixin:
                 except Exception as e:
                     logger.warning("활동 집계 실패: {}", str(e))
 
+                # 3-1. 오늘 매매 상세 (TradeResult)
+                today_trades_detail = "매매 기록 없음"
+                try:
+                    async with AsyncSessionLocal() as session:
+                        from repositories.trade_result_repository import TradeResultRepository
+                        trade_repo = TradeResultRepository(session)
+                        opened = await trade_repo.get_opened_by_date(today_date, market_scope=scope)
+                        completed = await trade_repo.get_completed_by_date(today_date, market_scope=scope)
+
+                        lines = []
+                        if opened:
+                            lines.append(f"[신규 진입] {len(opened)}건")
+                            for tr in opened:
+                                entry_p = f"{tr.entry_price:,.0f}" if tr.entry_price else "?"
+                                conf = f", 신뢰도 {tr.ai_confidence:.2f}" if tr.ai_confidence else ""
+                                lines.append(
+                                    f"  - {tr.stock_name}({tr.stock_symbol}): "
+                                    f"매수 {entry_p}원, 전략 {tr.strategy_type or '?'}{conf}"
+                                )
+                        if completed:
+                            wins = sum(1 for t in completed if t.is_win)
+                            losses = len(completed) - wins
+                            total_pnl_trades = sum(t.pnl for t in completed if t.pnl)
+                            lines.append(
+                                f"[청산 완료] {len(completed)}건 "
+                                f"(수익 {wins}, 손실 {losses}, 합산 {total_pnl_trades:+,.0f}원)"
+                            )
+                            for tr in completed:
+                                entry_p = f"{tr.entry_price:,.0f}" if tr.entry_price else "?"
+                                exit_p = f"{tr.exit_price:,.0f}" if tr.exit_price else "?"
+                                pnl_text = (
+                                    f"{tr.pnl:+,.0f}원 ({tr.pnl_rate:+.1f}%)"
+                                    if tr.pnl is not None else "?"
+                                )
+                                lines.append(
+                                    f"  - {tr.stock_name}({tr.stock_symbol}): "
+                                    f"매수 {entry_p} → 매도 {exit_p}, 손익 {pnl_text}"
+                                )
+                        if lines:
+                            today_trades_detail = "\n".join(lines)
+                except Exception as e:
+                    logger.warning("오늘 매매 상세 조회 실패: {}", str(e))
+
                 # 4. 과거 매매 성과
                 performance_summary = "매매 이력 없음"
                 try:
@@ -833,6 +876,7 @@ class CycleMixin:
                     today_analyses=today_analyses,
                     today_recommendations=today_recommendations,
                     today_orders=today_orders,
+                    today_trades_detail=today_trades_detail,
                     activity_summary=activity_summary,
                     performance_summary=performance_summary,
                     overnight_holdings_text=overnight_holdings_text,

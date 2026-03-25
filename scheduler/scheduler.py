@@ -1668,6 +1668,16 @@ class TradingScheduler:
             ]
             await _cleanup_after_close(retained_symbols)
 
+            # 청산 완료 플래그 설정 → 이벤트 기반 분석 차단
+            try:
+                from agent.trading_agent import trading_agent as _ta
+                from trading.market_profile import market_scope as _ms
+                _state = _ta._get_state(_ms(market))
+                _state.liquidation_complete = True
+                logger.info("[{}] 청산 완료 — 이벤트 분석 차단 플래그 설정", market)
+            except Exception as flag_err:
+                logger.warning("[{}] 청산 플래그 설정 실패: {}", market, str(flag_err))
+
         except Exception as e:
             logger.error("[{}] 청산 오류: {}", market, str(e))
             await self._log_schedule(

@@ -46,6 +46,9 @@ DAILY_PLAN_PROMPT = """## 장 마감 데이트레이딩 성과 리뷰
 - 매매 추천: {today_recommendations}건
 - 주문 체결: {today_orders}건
 
+### 오늘 매매 상세 (실제 체결 기록)
+{today_trades_detail}
+
 ### 오늘 활동 로그 (주요)
 {activity_summary}
 

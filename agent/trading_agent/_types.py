@@ -51,6 +51,7 @@ class MarketState:
     last_schedule_hint: dict = field(default_factory=dict)
     last_selected_watchlist: list[dict[str, object]] = field(default_factory=list)
     _pipeline_snapshot: dict = field(default_factory=dict)
+    liquidation_complete: bool = False
     last_cycle_attempt_at: datetime | None = None
     last_cycle_status: str | None = None
     last_cycle_error: str | None = None

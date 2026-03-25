@@ -28,6 +28,10 @@ class EventMixin:
         event_state = self._get_state(scope)
         trading_date = self._refresh_runtime_date(event_state, scope)
 
+        # 장마감 청산 완료 후 이벤트 분석 차단
+        if event_state.liquidation_complete:
+            return
+
         # 데이트레이딩: 매수 마감 시간 이후 신규 매수 이벤트 무시
         if settings.DAY_TRADING_ONLY and settings.market_has_buy_cutoff(market_code):
             from datetime import time as _dt_time

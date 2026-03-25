@@ -54,6 +54,7 @@ class StateMixin:
         trading_date = market_calendar.market_date(market=market)
         if runtime.trading_date != trading_date:
             runtime.trading_date = trading_date
+            runtime.liquidation_complete = False
             runtime.daily_start_balance = 0.0
             runtime.available_cash = 0.0
             runtime.market_context = ""
