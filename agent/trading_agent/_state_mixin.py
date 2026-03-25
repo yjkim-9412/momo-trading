@@ -250,6 +250,7 @@ class StateMixin:
         trading_date: date,
         *,
         skip_running_checks: bool = False,
+        skip_time_check: bool = False,
     ) -> dict:
         scope = runtime.scope
 
@@ -261,7 +262,7 @@ class StateMixin:
                 mode="AFTER_HOURS",
             )
 
-        if not market_calendar.is_post_market_review_time(market):
+        if not skip_time_check and not market_calendar.is_post_market_review_time(market):
             return self._skip_result(
                 "review_window_not_open",
                 scope,

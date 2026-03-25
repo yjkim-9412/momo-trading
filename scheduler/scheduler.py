@@ -1509,6 +1509,10 @@ class TradingScheduler:
 
         DAY_TRADING_ONLY=True: 보유종목 전량 시장가 매도 (기존 동작)
         DAY_TRADING_ONLY=False: 종목별 스마트 판정 (HOLD/SELL)
+
+        프리/애프터마켓 비활성 시:
+        - 보유 유지 종목 포함 전체 WebSocket 구독 해제 (AI 비용 절감)
+        - 즉시 성과 리포트 생성 (기존 30분 대기 제거)
         """
         import asyncio
         from scheduler.market_calendar import market_calendar
@@ -1523,16 +1527,19 @@ class TradingScheduler:
             logger.info("[{}] 매매 비활성 — 청산 스킵", market)
             return
 
+        after_hours_disabled = self._is_after_hours_disabled(market)
+
         try:
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
             from services.watchlist_sync import cleanup_post_market_stock_watchlist
 
             async def _cleanup_after_close(retained_symbols: list[tuple[str, str]]) -> None:
+                effective_retained = [] if after_hours_disabled else retained_symbols
                 try:
                     await cleanup_post_market_stock_watchlist(
                         market,
-                        retained_symbols=retained_symbols,
+                        retained_symbols=effective_retained,
                     )
                 except Exception as cleanup_error:
                     logger.warning("[{}] 장후 감시 정리 실패: {}", market, str(cleanup_error))
@@ -1668,6 +1675,41 @@ class TradingScheduler:
                 ActivityPhase.ERROR,
                 f"\u274c [{market}] 청산 오류: {str(e)[:100]}",
             )
+        finally:
+            if after_hours_disabled:
+                try:
+                    await self._trigger_immediate_review(market)
+                except Exception as review_err:
+                    logger.error("[{}] 즉시 리뷰 트리거 실패: {}", market, str(review_err))
+
+    def _is_after_hours_disabled(self, market: str) -> bool:
+        """장후/시간외 매매 비활성 여부"""
+        from trading.market_profile import is_domestic_market, is_us_market, normalize_market
+
+        market_code = normalize_market(market)
+        if is_us_market(market_code):
+            return not settings.US_AFTERMARKET_ENABLED
+        if is_domestic_market(market_code):
+            return not settings.KRX_NXT_AFTER_ENABLED
+        return False
+
+    async def _trigger_immediate_review(self, market: str) -> None:
+        """장후 비활성 시 즉시 리뷰 트리거"""
+        from agent.trading_agent import trading_agent
+        from services.activity_logger import activity_logger
+
+        logger.info("[{}] 장후 비활성 — 즉시 리뷰 트리거", market)
+        await self._log_schedule(
+            market,
+            ActivityPhase.PROGRESS,
+            f"\U0001f4cb [{market}] 장후 비활성 — 즉시 성과 리뷰 시작",
+        )
+        try:
+            result = await trading_agent.run_immediate_review(market=market)
+            if result.get("skipped"):
+                logger.info("[{}] 즉시 리뷰 스킵: {}", market, result.get("reason"))
+        except Exception as e:
+            logger.error("[{}] 즉시 리뷰 오류: {}", market, str(e))
 
     async def _smart_liquidation(self, sellable: list, market: str) -> tuple[list, list]:
         """스윙 모드: 종목별 HOLD/SELL 판정 (코드 룰 기반)

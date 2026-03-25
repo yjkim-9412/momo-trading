@@ -14,26 +14,26 @@ class AggressiveShortStrategy:
     공격형 단기 매매 전략 (AGGRESSIVE_SHORT)
     - 대상: 모멘텀 급등주, 거래량 급증 종목
     - 보유 기간: 수시간~3일
-    - 손절: -4%, 익절: +8% (기본값, 시장 국면별 동적 조정)
+    - 손절: -3%, 익절: +6% (기본값, 시장 국면별 동적 조정)
     - 판단: AI recommendation + confidence 기반
     """
 
     strategy_type = "AGGRESSIVE_SHORT"
 
     REGIME_PARAMS = {
-        "BULL":  {"stop_loss_pct": -4.0, "take_profit_pct": 10.0},
-        "BULL_RUN": {"stop_loss_pct": -4.0, "take_profit_pct": 10.0},
-        "ALTSEASON": {"stop_loss_pct": -5.0, "take_profit_pct": 12.0},
-        "THEME": {"stop_loss_pct": -5.0, "take_profit_pct": 12.0},
-        "BEAR":  {"stop_loss_pct": -3.0, "take_profit_pct": 6.0},
-        "BEAR_MARKET": {"stop_loss_pct": -3.0, "take_profit_pct": 6.0},
-        "CONSOLIDATION": {"stop_loss_pct": -3.0, "take_profit_pct": 6.0},
+        "BULL":  {"stop_loss_pct": -3.0, "take_profit_pct": 7.0},
+        "BULL_RUN": {"stop_loss_pct": -3.0, "take_profit_pct": 7.0},
+        "ALTSEASON": {"stop_loss_pct": -3.5, "take_profit_pct": 8.0},
+        "THEME": {"stop_loss_pct": -3.5, "take_profit_pct": 8.0},
+        "BEAR":  {"stop_loss_pct": -2.5, "take_profit_pct": 5.0},
+        "BEAR_MARKET": {"stop_loss_pct": -2.5, "take_profit_pct": 5.0},
+        "CONSOLIDATION": {"stop_loss_pct": -2.5, "take_profit_pct": 5.0},
     }
 
     def __init__(
         self,
-        stop_loss_pct: float = -4.0,
-        take_profit_pct: float = 8.0,
+        stop_loss_pct: float = -3.0,
+        take_profit_pct: float = 6.0,
         min_confidence: float = 0.55,
     ):
         self.stop_loss_pct = stop_loss_pct

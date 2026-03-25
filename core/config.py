@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     US_LEVERAGE_KEYWORDS: str = "2X,3X,ULTRA,ULTRAPRO,LEVERAGED"
     US_INVERSE_KEYWORDS: str = "INVERSE,SHORT,BEAR"
 
+    # === KRX NXT 시간외 ===
+    KRX_NXT_AFTER_ENABLED: bool = False  # NXT 시간외 후장 매매 활성화
+
     # === Bithumb API 인증 (주식 KIS와 완전 별도) ===
     BITHUMB_API_KEY: str = ""
     BITHUMB_API_SECRET: str = ""
