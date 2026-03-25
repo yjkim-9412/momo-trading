@@ -1668,10 +1668,6 @@ class TradingScheduler:
             ]
             await _cleanup_after_close(retained_symbols)
 
-            # 청산 매도 성공 종목 → TradeResult 청산 기록
-            if sold_count > 0:
-                await self._close_trade_results(market, to_sell, failed_holdings)
-
         except Exception as e:
             logger.error("[{}] 청산 오류: {}", market, str(e))
             await self._log_schedule(
@@ -1690,6 +1686,12 @@ class TradingScheduler:
             except Exception as flag_err:
                 logger.warning("[{}] 청산 플래그 설정 실패: {}", market, str(flag_err))
 
+            # KIS 체결조회 기반 TradeResult 보정 (fallback: holding 스냅샷)
+            try:
+                await self._reconcile_from_kis(market)
+            except Exception as reconcile_err:
+                logger.warning("[{}] KIS 체결 보정 실패 → holding fallback: {}", market, str(reconcile_err))
+
             if after_hours_disabled:
                 try:
                     await self._trigger_immediate_review(market)
@@ -1706,6 +1708,180 @@ class TradingScheduler:
         if is_domestic_market(market_code):
             return not settings.KRX_NXT_AFTER_ENABLED
         return False
+
+    async def _reconcile_from_kis(self, market: str) -> None:
+        """KIS 일별 체결조회 API로 TradeResult를 실제 체결가 기반으로 보정"""
+        from collections import defaultdict
+        from datetime import datetime
+
+        from core.database import AsyncSessionLocal
+        from models.trade_result import TradeResult
+        from repositories.trade_result_repository import TradeResultRepository
+        from scheduler.market_calendar import market_calendar
+        from trading.kis_api import get_domestic_order_list
+        from trading.market_profile import normalize_market
+        from uuid import uuid4
+
+        market_code = normalize_market(market)
+        today = market_calendar.market_date(market=market_code)
+        today_str = today.strftime("%Y%m%d")
+
+        result = await get_domestic_order_list(today_str, today_str)
+        if not result.get("success"):
+            logger.warning("[{}] KIS 체결내역 조회 실패 — 보정 스킵", market)
+            return
+
+        orders = result.get("output1", [])
+        if not orders:
+            logger.info("[{}] KIS 체결내역 0건 — 보정 불필요", market)
+            return
+
+        # 시간순 정렬 + 종목별 매수/매도 큐
+        orders.sort(key=lambda o: o.get("ord_tmd", ""))
+        buys_queue: dict[str, list[dict]] = defaultdict(list)
+        sells_queue: dict[str, list[dict]] = defaultdict(list)
+
+        for o in orders:
+            symbol = o.get("pdno", "")
+            side = o.get("sll_buy_dvsn_cd")
+            qty = int(o.get("tot_ccld_qty", 0))
+            if qty == 0 or not symbol:
+                continue
+            entry = {
+                "symbol": symbol,
+                "name": o.get("prdt_name", ""),
+                "price": float(o.get("avg_prvs", 0)),
+                "qty": qty,
+                "time": o.get("ord_tmd", ""),
+                "order_id": o.get("odno", ""),
+            }
+            if side == "02":
+                buys_queue[symbol].append(entry)
+            elif side == "01":
+                sells_queue[symbol].append(entry)
+
+        # FIFO 페어링
+        pairs = []
+        all_symbols = set(list(buys_queue.keys()) + list(sells_queue.keys()))
+        for symbol in all_symbols:
+            buy_list = buys_queue.get(symbol, [])
+            sell_list = sells_queue.get(symbol, [])
+            for i, buy in enumerate(buy_list):
+                sell = sell_list[i] if i < len(sell_list) else None
+                pairs.append({"symbol": symbol, "name": buy["name"], "buy": buy, "sell": sell})
+            # 매도만 있고 매수 없는 경우 (어제 진입 종목)
+            for j in range(len(buy_list), len(sell_list)):
+                pairs.append({"symbol": symbol, "name": sell_list[j]["name"], "buy": None, "sell": sell_list[j]})
+
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                repo = TradeResultRepository(session)
+                updated = 0
+                created = 0
+
+                for p in pairs:
+                    buy = p["buy"]
+                    sell = p["sell"]
+
+                    if buy:
+                        # order_id로 기존 TradeResult 매칭
+                        from sqlalchemy import select
+                        stmt = select(TradeResult).where(
+                            TradeResult.order_id == buy["order_id"],
+                        ).limit(1)
+                        res = await session.execute(stmt)
+                        tr = res.scalar_one_or_none()
+
+                        if tr:
+                            # 매수가 보정
+                            if buy["price"] > 0 and (tr.entry_price == 0 or tr.entry_price is None):
+                                tr.entry_price = buy["price"]
+                                tr.entry_price_krw = buy["price"]
+                            # 매도 보정
+                            if sell:
+                                sell_time = sell["time"]
+                                tr.exit_at = datetime(
+                                    today.year, today.month, today.day,
+                                    int(sell_time[:2]), int(sell_time[2:4]), int(sell_time[4:6]),
+                                )
+                                tr.exit_price = sell["price"]
+                                tr.exit_price_krw = sell["price"]
+                                entry_p = tr.entry_price or buy["price"]
+                                tr.pnl = (sell["price"] - entry_p) * buy["qty"] if entry_p > 0 else 0
+                                tr.raw_pnl = tr.pnl
+                                tr.return_pct = ((sell["price"] - entry_p) / entry_p * 100) if entry_p > 0 else 0
+                                tr.is_win = tr.pnl > 0
+                                tr.exit_reason = "FORCE_LIQUIDATION" if sell_time >= "150000" else "SIGNAL"
+                                tr.hold_days = max(1, (today - tr.entry_at.date()).days) if tr.entry_at else 1
+                            updated += 1
+                        else:
+                            # 새 TradeResult 생성
+                            buy_time = buy["time"]
+                            buy_dt = datetime(
+                                today.year, today.month, today.day,
+                                int(buy_time[:2]), int(buy_time[2:4]), int(buy_time[4:6]),
+                            )
+                            sell_dt = None
+                            exit_price = 0.0
+                            pnl = 0.0
+                            pnl_rate = 0.0
+                            exit_reason = ""
+                            if sell:
+                                sell_time = sell["time"]
+                                sell_dt = datetime(
+                                    today.year, today.month, today.day,
+                                    int(sell_time[:2]), int(sell_time[2:4]), int(sell_time[4:6]),
+                                )
+                                exit_price = sell["price"]
+                                pnl = (sell["price"] - buy["price"]) * buy["qty"] if buy["price"] > 0 else 0
+                                pnl_rate = ((sell["price"] - buy["price"]) / buy["price"] * 100) if buy["price"] > 0 else 0
+                                exit_reason = "FORCE_LIQUIDATION" if sell_time >= "150000" else "SIGNAL"
+                            session.add(TradeResult(
+                                id=str(uuid4()),
+                                order_id=buy["order_id"],
+                                stock_symbol=p["symbol"],
+                                stock_name=p["name"],
+                                currency="KRW",
+                                side="BUY",
+                                strategy_type="",
+                                entry_price=buy["price"],
+                                entry_price_krw=buy["price"],
+                                exit_price=exit_price,
+                                exit_price_krw=exit_price,
+                                quantity=buy["qty"],
+                                pnl=pnl,
+                                raw_pnl=pnl,
+                                return_pct=pnl_rate,
+                                is_win=pnl > 0,
+                                hold_days=1,
+                                exit_reason=exit_reason,
+                                market=market_code,
+                                entry_at=buy_dt,
+                                exit_at=sell_dt,
+                            ))
+                            created += 1
+
+                    elif sell:
+                        # 매도만 있는 경우 (어제 진입 종목)
+                        open_tr = await repo.get_open_buy(p["symbol"], market=market_code)
+                        if open_tr:
+                            sell_time = sell["time"]
+                            open_tr.exit_at = datetime(
+                                today.year, today.month, today.day,
+                                int(sell_time[:2]), int(sell_time[2:4]), int(sell_time[4:6]),
+                            )
+                            open_tr.exit_price = sell["price"]
+                            open_tr.exit_price_krw = sell["price"]
+                            if open_tr.entry_price and open_tr.entry_price > 0:
+                                open_tr.pnl = (sell["price"] - open_tr.entry_price) * (open_tr.quantity or sell["qty"])
+                                open_tr.return_pct = (sell["price"] - open_tr.entry_price) / open_tr.entry_price * 100
+                            open_tr.raw_pnl = open_tr.pnl
+                            open_tr.is_win = open_tr.pnl > 0
+                            open_tr.exit_reason = "FORCE_LIQUIDATION"
+                            open_tr.hold_days = max(1, (today - open_tr.entry_at.date()).days) if open_tr.entry_at else 1
+                            updated += 1
+
+        logger.info("[{}] KIS 체결 보정 완료: {}건 업데이트, {}건 신규 생성", market, updated, created)
 
     async def _close_trade_results(
         self,
