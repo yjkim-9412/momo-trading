@@ -23,6 +23,7 @@ class TradeResultCreate(BaseModel):
     ai_confidence: float = 0.0
     ai_target_price: Optional[float] = None
     ai_stop_loss_price: Optional[float] = None
+    ai_take_profit_price: Optional[float] = None
     entry_rsi: Optional[float] = None
     entry_macd_hist: Optional[float] = None
     entry_bb_position: Optional[str] = None
@@ -49,6 +50,9 @@ class TradeResultResponse(BaseModel):
     exit_reason: str
     ai_recommendation: str
     ai_confidence: float
+    ai_target_price: Optional[float] = None
+    ai_stop_loss_price: Optional[float] = None
+    ai_take_profit_price: Optional[float] = None
     market: str
     currency: str = "KRW"
     entry_rsi: Optional[float] = None

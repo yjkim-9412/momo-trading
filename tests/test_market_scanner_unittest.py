@@ -42,21 +42,25 @@ class MarketScannerPolicyTest(unittest.TestCase):
 
 
 class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
-    async def test_scan_uses_effective_cash_for_available_cash(self):
-        scanner = MarketScanner()
-        balance = AccountBalance(
+    @staticmethod
+    def _balance(market: str = "NASDAQ", effective_cash: float = 700000) -> AccountBalance:
+        return AccountBalance(
             total_asset=1000000,
             cash=0,
             raw_cash=0,
-            effective_cash=700000,
+            effective_cash=effective_cash,
             cash_source="TOTAL_ASSET_PROXY",
             stock_value=300000,
             total_pnl=0,
             total_pnl_rate=0,
-            market="NASDAQ",
+            market=market,
             currency="KRW",
             exchange_rate_to_krw=1450.0,
         )
+
+    async def test_scan_uses_effective_cash_for_available_cash(self):
+        scanner = MarketScanner()
+        balance = self._balance()
 
         with patch("agent.market_scanner.account_manager.get_account_snapshot", AsyncMock(return_value=(balance, []))), \
                 patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[])), \
@@ -73,19 +77,7 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_scan_uses_prefetched_account_snapshot_when_provided(self):
         scanner = MarketScanner()
-        balance = AccountBalance(
-            total_asset=1000000,
-            cash=0,
-            raw_cash=0,
-            effective_cash=700000,
-            cash_source="TOTAL_ASSET_PROXY",
-            stock_value=300000,
-            total_pnl=0,
-            total_pnl_rate=0,
-            market="NASDAQ",
-            currency="KRW",
-            exchange_rate_to_krw=1450.0,
-        )
+        balance = self._balance()
 
         with patch("agent.market_scanner.account_manager.get_account_snapshot", AsyncMock()) as snapshot_mock, \
                 patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[])), \
@@ -104,6 +96,106 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
 
         snapshot_mock.assert_not_awaited()
         self.assertEqual(result["available_cash"], 700000)
+
+    async def test_scan_skips_llm_when_no_affordable_candidates_remain(self):
+        scanner = MarketScanner()
+        balance = self._balance(market="KRX", effective_cash=1000)
+        llm_mock = AsyncMock(return_value=(
+            '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
+            "TEST",
+        ))
+
+        with patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[
+            {"symbol": "005930", "name": "삼성전자", "market": "KRX", "currency": "KRW", "price": 1500},
+        ])), \
+                patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
+                patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
+                patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock), \
+                patch("agent.market_scanner.activity_logger.log", AsyncMock()):
+            result = await scanner.scan(
+                market="KRX",
+                cycle_id="cycle-1",
+                account_snapshot=(balance, []),
+            )
+
+        llm_mock.assert_not_awaited()
+        self.assertEqual(result["selected"], [])
+        self.assertEqual(result["market_summary"], "가용 현금 기준 1주 매수 가능 후보 없음")
+
+    async def test_scan_keeps_affordable_stock_even_if_max_per_stock_is_lower(self):
+        scanner = MarketScanner()
+        balance = self._balance(market="KRX", effective_cash=100000)
+        llm_mock = AsyncMock(return_value=(
+            '{"selected": [{"symbol": "005930", "name": "삼성전자", "strategy_type": "STABLE_SHORT", "reason": "현금 내 매수 가능"}], "market_analysis": "기회", "market_regime": "BULL"}',
+            "TEST",
+        ))
+
+        with patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[
+            {"symbol": "005930", "name": "삼성전자", "market": "KRX", "currency": "KRW", "price": 50000},
+        ])), \
+                patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
+                patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
+                patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock), \
+                patch("agent.market_scanner.activity_logger.log", AsyncMock()):
+            result = await scanner.scan(
+                market="KRX",
+                cycle_id="cycle-1",
+                dynamic_limits={"max_position_pct": 10.0},
+                account_snapshot=(balance, []),
+            )
+
+        llm_mock.assert_awaited()
+        self.assertEqual(result["max_per_stock"], 10000)
+        self.assertEqual([item["symbol"] for item in result["selected"]], ["005930"])
+
+    async def test_scan_filters_unaffordable_selected_symbol_from_llm(self):
+        scanner = MarketScanner()
+        balance = self._balance(market="KRX", effective_cash=60000)
+
+        with patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[
+            {"symbol": "005930", "name": "삼성전자", "market": "KRX", "currency": "KRW", "price": 50000},
+            {"symbol": "000660", "name": "SK하이닉스", "market": "KRX", "currency": "KRW", "price": 120000},
+        ])), \
+                patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
+                patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
+                patch("agent.market_scanner.llm_factory.generate_tier1", AsyncMock(return_value=(
+                    '{"selected": [{"symbol": "005930", "name": "삼성전자", "strategy_type": "STABLE_SHORT", "reason": "가능"}, {"symbol": "000660", "name": "SK하이닉스", "strategy_type": "STABLE_SHORT", "reason": "비쌈"}], "market_analysis": "기회", "market_regime": "BULL"}',
+                    "TEST",
+                ))), \
+                patch("agent.market_scanner.activity_logger.log", AsyncMock()):
+            result = await scanner.scan(
+                market="KRX",
+                cycle_id="cycle-1",
+                account_snapshot=(balance, []),
+            )
+
+        self.assertEqual([item["symbol"] for item in result["selected"]], ["005930"])
+
+    async def test_scan_filters_us_candidates_using_fx_converted_cash(self):
+        scanner = MarketScanner()
+        balance = self._balance(market="NASDAQ", effective_cash=100000)
+        llm_mock = AsyncMock(return_value=(
+            '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
+            "TEST",
+        ))
+
+        with patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[
+            {"symbol": "AAPL", "name": "Apple", "market": "NASDAQ", "currency": "USD", "price": 100.0},
+        ])), \
+                patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
+                patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
+                patch("agent.market_scanner.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1400.0)), \
+                patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock), \
+                patch("agent.market_scanner.activity_logger.log", AsyncMock()):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-1",
+                account_snapshot=(balance, []),
+            )
+
+        llm_mock.assert_not_awaited()
+        self.assertEqual(result["selected"], [])
+        self.assertEqual(result["market_summary"], "가용 현금 기준 1주 매수 가능 후보 없음")
 
 
 class MarketScannerRankTest(unittest.IsolatedAsyncioTestCase):

@@ -56,6 +56,13 @@ class TradingRuleEngine:
     """일일 리뷰 피드백 → 코드 강제 규칙 생성 + 적용"""
 
     @staticmethod
+    def _allowed_param_names(market_scope: str) -> set[str]:
+        scope = normalize_market_scope(market_scope)
+        if scope == MARKET_SCOPE_CRYPTO:
+            return {"min_confidence", "stop_loss_pct", "take_profit_pct", "rr_floor"}
+        return {"min_confidence", "rr_floor"}
+
+    @staticmethod
     def _normalize_scope_value(raw_value: str | None, fallback: str = "ALL") -> str:
         value = str(raw_value or fallback).strip().upper()
         return value or fallback
@@ -112,11 +119,12 @@ class TradingRuleEngine:
         rule_model = self._rule_model(scope)
         now = now_kst()
         rules: list[TradingRule | CoinTradingRule] = []
+        allowed_param_names = self._allowed_param_names(scope)
 
         for item in action_items:
             param_name = item.get("param_name", "")
-            if param_name not in SAFETY_BOUNDS:
-                logger.warning("[TradingRule] 미지원 파라미터: {}", param_name)
+            if param_name not in allowed_param_names:
+                logger.warning("[TradingRule] {} scope 미지원 파라미터: {}", scope, param_name)
                 continue
 
             raw_scope = (
@@ -263,6 +271,7 @@ class TradingRuleEngine:
         param_overrides: dict[str, dict] = {}
         validation_flags: dict[str, bool] = {}
         rr_floor_overrides: dict[str, float] = {}
+        allowed_param_names = self._allowed_param_names(scope)
 
         for r in rules:
             if r.rule_type == "VALIDATION_TOGGLE":
@@ -271,8 +280,15 @@ class TradingRuleEngine:
                 # strategy_type 컬럼을 rr_floor 적용 국면(BULL/THEME/...) 저장용으로 재사용
                 rr_floor_overrides[r.strategy_type] = r.param_value
             else:
-                scope = r.strategy_type or "ALL"
-                param_overrides.setdefault(scope, {})[r.param_name] = r.param_value
+                if r.param_name not in allowed_param_names:
+                    logger.info(
+                        "[TradingRule] {} scope에서 무시된 파라미터: {}",
+                        scope,
+                        r.param_name,
+                    )
+                    continue
+                rule_scope = r.strategy_type or "ALL"
+                param_overrides.setdefault(rule_scope, {})[r.param_name] = r.param_value
 
         return {
             "param_overrides": param_overrides,

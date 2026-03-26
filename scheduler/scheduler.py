@@ -35,6 +35,7 @@ KRX와 US 등을 동시에 자동 매매할 수 있다.
 ※ DAY_TRADING_ONLY=false: 스윙 모드 — 유망 종목 오버나이트 보유 (스마트 청산)
 """
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
@@ -133,7 +134,7 @@ class TradingScheduler:
 
     @staticmethod
     def _market_now(market: str, dt: datetime | None = None) -> datetime:
-        from trading.market_profile import market_timezone
+        from trading.market_profile import is_crypto_market, market_timezone
         from util.time_util import now_kst
         from zoneinfo import ZoneInfo
 
@@ -646,6 +647,9 @@ class TradingScheduler:
         for market_group in settings.enabled_market_groups:
             market = normalize_market(market_group)
             await self._seed_startup_holdings_watchlist(market)
+            restored = await self._restore_open_position_thresholds(market)
+            if restored:
+                logger.info("[{}] 서버 기동 open position 임계값 복원: {}건", market, restored)
             await self._restore_adaptive_count(market)
             try:
                 repaired = await decision_maker.repair_recent_broker_orders(
@@ -697,6 +701,137 @@ class TradingScheduler:
                 logger.info("[{}] 서버 기동 보유종목 감시 복원: {}종목", market, len(symbols))
         except Exception as e:
             logger.warning("[{}] 서버 기동 보유종목 감시 복원 실패: {}", market, str(e))
+
+    @staticmethod
+    def _parse_trade_notes(notes: str | None) -> dict:
+        """TradeResult.notes JSON을 안전하게 파싱"""
+        if not notes or not isinstance(notes, str):
+            return {}
+
+        try:
+            parsed = json.loads(notes)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _coerce_int(value, *, default: int = 0, minimum: int = 0) -> int:
+        try:
+            normalized = int(float(value))
+        except (TypeError, ValueError):
+            normalized = default
+        return max(minimum, normalized)
+
+    @classmethod
+    def _resolve_open_position_hold_plan(cls, trade_result) -> dict[str, int | str | None]:
+        notes = cls._parse_trade_notes(getattr(trade_result, "notes", None))
+        planned_hold_days = cls._coerce_int(notes.get("planned_hold_days"), default=1, minimum=1)
+        close_review_count = cls._coerce_int(notes.get("close_review_count"), default=0, minimum=0)
+        last_close_review_date = notes.get("last_close_review_date")
+        if last_close_review_date in ("", None):
+            last_close_review_date = None
+        return {
+            "notes": notes,
+            "planned_hold_days": planned_hold_days,
+            "close_review_count": close_review_count,
+            "last_close_review_date": last_close_review_date,
+        }
+
+    @classmethod
+    def _apply_close_review_hold_update(
+        cls,
+        trade_result,
+        review: dict,
+        *,
+        review_date: str,
+    ) -> dict:
+        hold_plan = cls._resolve_open_position_hold_plan(trade_result)
+        notes = dict(hold_plan["notes"])
+        close_review_count = int(hold_plan["close_review_count"])
+        if hold_plan["last_close_review_date"] != review_date:
+            close_review_count += 1
+
+        planned_hold_days = cls._coerce_int(
+            review.get("planned_hold_days"),
+            default=close_review_count,
+            minimum=close_review_count,
+        )
+        trailing_stop_pct = float(review.get("trailing_stop_pct") or 0.0)
+
+        trade_result.ai_confidence = float(review.get("confidence") or trade_result.ai_confidence or 0.0)
+        trade_result.ai_stop_loss_price = float(review.get("stop_loss_price") or 0.0)
+        trade_result.ai_take_profit_price = float(review.get("take_profit_price") or 0.0)
+        trade_result.ai_target_price = trade_result.ai_take_profit_price
+
+        notes["planned_hold_days"] = planned_hold_days
+        notes["close_review_count"] = close_review_count
+        notes["last_close_review_date"] = review_date
+        notes["trailing_stop_pct"] = trailing_stop_pct
+        trade_result.notes = json.dumps(notes, ensure_ascii=False, default=str)
+        return notes
+
+    @classmethod
+    def _build_open_position_threshold_kwargs(cls, trade_result) -> dict[str, float]:
+        """미청산 포지션에서 복원할 TP/SL/트레일링 값을 추출"""
+        kwargs: dict[str, float] = {}
+        stop_loss_price = getattr(trade_result, "ai_stop_loss_price", None)
+        take_profit_price = (
+            getattr(trade_result, "ai_take_profit_price", None)
+            or getattr(trade_result, "ai_target_price", None)
+        )
+        notes = cls._parse_trade_notes(getattr(trade_result, "notes", None))
+        trailing_stop_pct = notes.get("trailing_stop_pct")
+
+        try:
+            if stop_loss_price and float(stop_loss_price) > 0:
+                kwargs["stop_loss"] = float(stop_loss_price)
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            if take_profit_price and float(take_profit_price) > 0:
+                kwargs["take_profit"] = float(take_profit_price)
+        except (TypeError, ValueError):
+            pass
+
+        try:
+            if trailing_stop_pct and float(trailing_stop_pct) > 0:
+                kwargs["trailing_stop_pct"] = float(trailing_stop_pct)
+        except (TypeError, ValueError):
+            pass
+
+        return kwargs
+
+    async def _restore_open_position_thresholds(
+        self,
+        market: str,
+        open_positions: list | None = None,
+    ) -> int:
+        """DB의 미청산 포지션 기준으로 event_detector 임계값 복원"""
+        from core.database import AsyncSessionLocal
+        from realtime.event_detector import event_detector
+        from repositories.trade_result_repository import TradeResultRepository
+        from trading.market_profile import market_scope
+
+        positions = open_positions
+        if positions is None:
+            async with AsyncSessionLocal() as session:
+                repo = TradeResultRepository(session)
+                positions = await repo.get_all_open(market_scope=market_scope(market))
+
+        restored = 0
+        for trade_result in positions or []:
+            kwargs = self._build_open_position_threshold_kwargs(trade_result)
+            if not kwargs:
+                continue
+            event_detector.set_thresholds(
+                trade_result.stock_symbol,
+                market=trade_result.market,
+                **kwargs,
+            )
+            restored += 1
+
+        return restored
 
     async def _pre_market(self, market: str) -> None:
         """장 시작 전 준비 — 어제 리뷰 피드백 확인"""
@@ -911,7 +1046,7 @@ class TradingScheduler:
         """AI가 예약한 one-shot 장중 재스캔"""
         from scheduler.market_calendar import market_calendar
         from util.time_util import now_kst
-        from trading.market_profile import market_timezone
+        from trading.market_profile import is_crypto_market, market_timezone
         from zoneinfo import ZoneInfo
 
         if not settings.should_use_adaptive_rescan(market):
@@ -1045,22 +1180,28 @@ class TradingScheduler:
                 should_sell = False
                 reason = ""
 
-                # AI가 설정한 임계값이 있으면 우선 사용, 없으면 기본값
+                # AI가 설정한 임계값이 있을 때만 가격 기반 익절/손절을 수행한다.
                 from realtime.event_detector import event_detector
                 th = event_detector.get_thresholds(h.symbol, market=h.market)
 
-                stop_loss_pct = -3.0  # 기본값
-                take_profit_pct = 5.0
+                stop_loss_pct: float | None = None
+                take_profit_pct: float | None = None
                 if th.stop_loss > 0 and h.avg_buy_price > 0:
                     stop_loss_pct = ((th.stop_loss - h.avg_buy_price) / h.avg_buy_price) * 100
                 if th.take_profit > 0 and h.avg_buy_price > 0:
                     take_profit_pct = ((th.take_profit - h.avg_buy_price) / h.avg_buy_price) * 100
+                if (
+                    stop_loss_pct is None
+                    and take_profit_pct is None
+                    and not is_crypto_market(h.market)
+                ):
+                    logger.warning("[{}] 손절/익절 임계값 미설정: {}", h.market, h.symbol)
 
                 # 손절/익절
-                if pnl_rate <= stop_loss_pct:
+                if stop_loss_pct is not None and pnl_rate <= stop_loss_pct:
                     should_sell = True
                     reason = f"손절 도달 ({pnl_rate:+.1f}%, 기준 {stop_loss_pct:+.1f}%)"
-                elif pnl_rate >= take_profit_pct:
+                elif take_profit_pct is not None and pnl_rate >= take_profit_pct:
                     should_sell = True
                     reason = f"익절 도달 ({pnl_rate:+.1f}%, 기준 {take_profit_pct:+.1f}%)"
                 # 시간 기반 조건 (데이트레이딩 전용)
@@ -1949,100 +2090,183 @@ class TradingScheduler:
             logger.error("[{}] 즉시 리뷰 오류: {}", market, str(e))
 
     async def _smart_liquidation(self, sellable: list, market: str) -> tuple[list, list]:
-        """스윙 모드: 종목별 HOLD/SELL 판정 (코드 룰 기반)
+        """스윙 모드: 장마감 AI 재리뷰 기반 HOLD/SELL 판정
 
         Returns:
             (to_sell, to_hold) 두 리스트
         """
+        from agent.trading_agent import trading_agent
         from core.database import AsyncSessionLocal
+        from realtime.event_detector import event_detector
         from repositories.trade_result_repository import TradeResultRepository
-        from strategy.holding_policy import evaluate_overnight_hold
+        from scheduler.market_calendar import market_calendar
         from trading.mcp_client import mcp_client as _mcp
 
         to_sell = []
         to_hold = []
+        review_date = market_calendar.market_date(market=market).isoformat()
 
-        async with AsyncSessionLocal() as session:
-            repo = TradeResultRepository(session)
+        for h in sellable:
+            try:
+                resp = await _mcp.get_current_price(h.symbol, market=h.market)
+                current_price = 0.0
+                if resp.success and resp.data:
+                    current_price = float(resp.data.get("price", 0))
 
-            for h in sellable:
-                try:
-                    # 현재가 조회
-                    resp = await _mcp.get_current_price(h.symbol, market=h.market)
-                    current_price = 0.0
-                    if resp.success and resp.data:
-                        current_price = float(resp.data.get("price", 0))
+                if current_price <= 0:
+                    to_sell.append(h)
+                    logger.warning("[{}] 현재가 조회 실패 {} → SELL", market, h.symbol)
+                    continue
 
-                    if current_price <= 0:
-                        to_sell.append(h)
-                        logger.warning("[{}] 현재가 조회 실패 {} → SELL", market, h.symbol)
-                        continue
-
-                    # TradeResult (미청산 매수)
+                async with AsyncSessionLocal() as session:
+                    repo = TradeResultRepository(session)
                     trade_result = await repo.get_open_buy(h.symbol, market=h.market)
 
-                    decision = evaluate_overnight_hold(
-                        h, trade_result, current_price, settings,
-                    )
+                if not trade_result:
+                    to_sell.append(h)
+                    logger.warning("[{}] 미청산 TradeResult 없음 {} → SELL", market, h.symbol)
+                    continue
 
-                    if decision.action == "HOLD":
+                hold_plan = self._resolve_open_position_hold_plan(trade_result)
+                decision = await trading_agent.review_close_hold_position(
+                    holding=h,
+                    trade_result=trade_result,
+                    current_price=current_price,
+                    market=h.market,
+                )
+
+                if decision is None:
+                    if int(hold_plan["close_review_count"]) < int(hold_plan["planned_hold_days"]):
+                        async with AsyncSessionLocal() as session:
+                            async with session.begin():
+                                repo = TradeResultRepository(session)
+                                open_trade = await repo.get_open_buy(h.symbol, market=h.market)
+                                if open_trade:
+                                    notes = self._apply_close_review_hold_update(
+                                        open_trade,
+                                        {
+                                            "planned_hold_days": hold_plan["planned_hold_days"],
+                                            "confidence": getattr(open_trade, "ai_confidence", 0.0),
+                                            "stop_loss_price": getattr(open_trade, "ai_stop_loss_price", 0.0),
+                                            "take_profit_price": (
+                                                getattr(open_trade, "ai_take_profit_price", None)
+                                                or getattr(open_trade, "ai_target_price", 0.0)
+                                            ),
+                                            "trailing_stop_pct": hold_plan["notes"].get("trailing_stop_pct") or 0.0,
+                                        },
+                                        review_date=review_date,
+                                    )
+                                else:
+                                    notes = hold_plan["notes"]
+                        trailing_stop_pct = float(notes.get("trailing_stop_pct") or 0.0)
+                        event_detector.set_thresholds(
+                            h.symbol,
+                            market=h.market,
+                            stop_loss=float(getattr(trade_result, "ai_stop_loss_price", 0.0) or 0.0),
+                            take_profit=float(
+                                getattr(trade_result, "ai_take_profit_price", None)
+                                or getattr(trade_result, "ai_target_price", 0.0)
+                                or 0.0
+                            ),
+                            trailing_stop_pct=trailing_stop_pct,
+                            highest_price=current_price if trailing_stop_pct > 0 else 0.0,
+                        )
                         to_hold.append(h)
-                        logger.info("[{}] 스마트 청산 HOLD: {} — {}", market, h.symbol, decision.reason)
+                        logger.warning(
+                            "[{}] 장마감 AI 재리뷰 실패 {} → 기존 계획 유지 HOLD ({}/{})",
+                            market,
+                            h.symbol,
+                            notes.get("close_review_count", hold_plan["close_review_count"]),
+                            hold_plan["planned_hold_days"],
+                        )
                     else:
                         to_sell.append(h)
-                        logger.info("[{}] 스마트 청산 SELL: {} — {}", market, h.symbol, decision.reason)
-                except Exception as e:
+                        logger.warning(
+                            "[{}] 장마감 AI 재리뷰 실패 {} → 계획 보유일 도달로 SELL ({}/{})",
+                            market,
+                            h.symbol,
+                            hold_plan["close_review_count"],
+                            hold_plan["planned_hold_days"],
+                        )
+                    continue
+
+                action = str(decision.get("action") or "").upper()
+                reason = str(decision.get("reason") or "").strip() or "사유 없음"
+                if action == "HOLD":
+                    async with AsyncSessionLocal() as session:
+                        async with session.begin():
+                            repo = TradeResultRepository(session)
+                            open_trade = await repo.get_open_buy(h.symbol, market=h.market)
+                            if not open_trade:
+                                to_sell.append(h)
+                                logger.warning("[{}] HOLD 반영 중 TradeResult 유실 {} → SELL", market, h.symbol)
+                                continue
+                            notes = self._apply_close_review_hold_update(
+                                open_trade,
+                                decision,
+                                review_date=review_date,
+                            )
+
+                    trailing_stop_pct = float(notes.get("trailing_stop_pct") or 0.0)
+                    threshold_kwargs = {
+                        "stop_loss": float(decision.get("stop_loss_price") or 0.0),
+                        "take_profit": float(decision.get("take_profit_price") or 0.0),
+                        "trailing_stop_pct": trailing_stop_pct,
+                        "highest_price": current_price if trailing_stop_pct > 0 else 0.0,
+                    }
+                    event_detector.set_thresholds(h.symbol, market=h.market, **threshold_kwargs)
+                    to_hold.append(h)
+                    logger.info(
+                        "[{}] 스마트 청산 HOLD: {} — {} | planned {}일, review {}회",
+                        market,
+                        h.symbol,
+                        reason,
+                        notes.get("planned_hold_days"),
+                        notes.get("close_review_count"),
+                    )
+                else:
                     to_sell.append(h)
-                    logger.warning("[{}] 스마트 청산 판정 오류 {} → SELL: {}", market, h.symbol, str(e))
+                    logger.info("[{}] 스마트 청산 SELL: {} — {}", market, h.symbol, reason)
+            except Exception as e:
+                to_sell.append(h)
+                logger.warning("[{}] 스마트 청산 판정 오류 {} → SELL: {}", market, h.symbol, str(e))
 
         return to_sell, to_hold
 
     async def _check_overnight_positions(self, market: str) -> None:
         """오버나이트 포지션 프리마켓 점검
 
-        서버 재시작 대비 event_detector 임계값 재설정 + 보유일 경고.
+        서버 재시작 대비 event_detector 임계값 재설정 + 계획 보유 상태 요약.
         """
         from services.activity_logger import activity_logger
 
         try:
             from core.database import AsyncSessionLocal
-            from realtime.event_detector import event_detector
             from repositories.trade_result_repository import TradeResultRepository
+            from trading.market_profile import market_scope
 
             async with AsyncSessionLocal() as session:
                 repo = TradeResultRepository(session)
-                open_positions = await repo.get_all_open()
+                open_positions = await repo.get_all_open(market_scope=market_scope(market))
 
             if not open_positions:
                 return
 
-            restored = 0
+            restored = await self._restore_open_position_thresholds(market, open_positions=open_positions)
             warnings = []
             for tr in open_positions:
-                # event_detector 임계값 재설정
-                kwargs = {}
-                if tr.ai_stop_loss_price and tr.ai_stop_loss_price > 0:
-                    kwargs["stop_loss"] = tr.ai_stop_loss_price
-                if tr.ai_target_price and tr.ai_target_price > 0:
-                    kwargs["take_profit"] = tr.ai_target_price
-                if kwargs:
-                    event_detector.set_thresholds(tr.stock_symbol, market=tr.market, **kwargs)
-                    restored += 1
-
-                # 최대 보유일 경고
-                from strategy.holding_policy import _calc_hold_days, _get_max_hold_days
-                hold_days = _calc_hold_days(tr)
-                max_days = _get_max_hold_days(tr.strategy_type, settings)
-                if hold_days >= max_days:
+                hold_plan = self._resolve_open_position_hold_plan(tr)
+                if int(hold_plan["close_review_count"]) >= int(hold_plan["planned_hold_days"]):
                     warnings.append(
-                        f"{tr.stock_name}({tr.stock_symbol}): 보유 {hold_days}일 ≥ 최대 {max_days}일"
+                        f"{tr.stock_name}({tr.stock_symbol}): planned {hold_plan['planned_hold_days']}일, "
+                        f"review {hold_plan['close_review_count']}회"
                     )
 
             msg = f"\U0001f30d [{market}] 오버나이트 포지션 {len(open_positions)}건 점검"
             if restored:
                 msg += f" | 임계값 복원 {restored}건"
             if warnings:
-                msg += f" | ⚠️ 초과보유: {', '.join(warnings)}"
+                msg += f" | ⚠️ 재리뷰 기준 도달: {', '.join(warnings)}"
 
             logger.info(msg)
             await self._log_schedule(market, ActivityPhase.PROGRESS, msg)
@@ -2087,6 +2311,7 @@ class TradingScheduler:
 
                 should_sell = False
                 reason = ""
+                take_profit_price = getattr(tr, "ai_take_profit_price", None) or tr.ai_target_price
 
                 # 갭 하락 → 손절가 이하
                 if tr.ai_stop_loss_price and current <= tr.ai_stop_loss_price:
@@ -2094,9 +2319,9 @@ class TradingScheduler:
                     reason = f"갭 하락 손절 (현재 {current:,.0f} ≤ 손절 {tr.ai_stop_loss_price:,.0f})"
 
                 # 갭 상승 → 익절가 이상
-                elif tr.ai_target_price and current >= tr.ai_target_price:
+                elif take_profit_price and current >= take_profit_price:
                     should_sell = True
-                    reason = f"갭 상승 익절 (현재 {current:,.0f} ≥ 목표 {tr.ai_target_price:,.0f})"
+                    reason = f"갭 상승 익절 (현재 {current:,.0f} ≥ 익절 {take_profit_price:,.0f})"
 
                 if should_sell and settings.TRADING_ENABLED:
                     sell_resp = await _mcp.place_order(

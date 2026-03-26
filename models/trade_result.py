@@ -45,6 +45,7 @@ class TradeResult(Base, TimestampMixin):
     ai_confidence: Mapped[float] = mapped_column(Float, default=0.0)
     ai_target_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     ai_stop_loss_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ai_take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # 진입 시 기술 지표 (패턴 학습용)
     entry_rsi: Mapped[float | None] = mapped_column(Float, nullable=True)

@@ -13,6 +13,8 @@ from analysis.feedback.context_builder import FeedbackContextBuilder
 from analysis.llm.llm_factory import llm_factory
 from analysis.llm.prompts.final_review import (
     FINAL_REVIEW_PROMPT, FINAL_REVIEW_SYSTEM,
+    STOCK_CLOSE_REVIEW_PROMPT,
+    STOCK_CLOSE_REVIEW_SYSTEM,
     get_final_review_prompt, get_final_review_system,
 )
 from analysis.llm.prompts.stock_analysis import (
@@ -72,6 +74,242 @@ class AnalysisMixin:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _try_int(value) -> int | None:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _normalize_planned_hold_days(
+        cls,
+        value,
+        *,
+        default: int = 1,
+        minimum: int = 1,
+    ) -> int:
+        normalized = cls._try_int(value)
+        if normalized is None:
+            normalized = default
+        return max(minimum, normalized)
+
+    @staticmethod
+    def _parse_trade_notes(notes: str | None) -> dict:
+        if not notes or not isinstance(notes, str):
+            return {}
+
+        try:
+            parsed = json.loads(notes)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _resolve_trade_hold_plan(cls, trade_result) -> dict[str, int | str | None]:
+        notes = cls._parse_trade_notes(getattr(trade_result, "notes", None))
+        planned_hold_days = cls._normalize_planned_hold_days(notes.get("planned_hold_days"), default=1)
+        close_review_count = cls._try_int(notes.get("close_review_count"))
+        if close_review_count is None or close_review_count < 0:
+            close_review_count = 0
+        last_close_review_date = notes.get("last_close_review_date")
+        if last_close_review_date in ("", None):
+            last_close_review_date = None
+        return {
+            "planned_hold_days": planned_hold_days,
+            "close_review_count": close_review_count,
+            "last_close_review_date": last_close_review_date,
+            "notes": notes,
+        }
+
+    @staticmethod
+    def _empty_existing_hold_plan_metadata() -> dict[str, object | None]:
+        return {
+            "existing_hold_plan_tracking_status": "none",
+            "existing_planned_hold_days": None,
+            "existing_close_review_count": None,
+            "existing_last_close_review_date": None,
+            "existing_calendar_hold_days": None,
+            "existing_hold_plan_stop_loss_price": None,
+            "existing_hold_plan_take_profit_price": None,
+            "existing_hold_plan_trailing_stop_pct": None,
+        }
+
+    def _build_existing_hold_plan_context(
+        self,
+        *,
+        symbol: str,
+        market_code: str,
+        current_position: dict | None,
+        trade_result=None,
+    ) -> tuple[str, dict[str, object | None]]:
+        """Tier2 전용 보유 계획 컨텍스트를 구성한다."""
+        has_current_position = bool(
+            current_position and has_quantity(current_position.get("quantity") or 0, market_code)
+        )
+        if not has_current_position:
+            return "보유 계획 없음 (신규 진입 후보)", self._empty_existing_hold_plan_metadata()
+
+        currency = str(
+            (current_position or {}).get("currency")
+            or getattr(trade_result, "currency", None)
+            or market_currency(market_code)
+        )
+
+        def _format_price_text(value: float | None) -> str:
+            if value and value > 0:
+                return f"{value:,.2f}{'원' if currency == 'KRW' else currency}"
+            return "미기록"
+
+        if not trade_result:
+            legacy_metadata = self._empty_existing_hold_plan_metadata()
+            legacy_metadata["existing_hold_plan_tracking_status"] = "legacy"
+            legacy_lines = [
+                "- 보유 계획 추적 상태: 레거시/미기록 포지션",
+                "- planned_hold_days: 미기록",
+                "- close_review_count: 미기록",
+                "- last_close_review_date: 미기록",
+                "- 참고: 이 보유 계획 정보는 참고용입니다. 장중 stop_loss / take_profit / trailing stop은 별도로 살아 있으며 우선 실행됩니다.",
+            ]
+            return "\n".join(legacy_lines), legacy_metadata
+
+        trade_plan = self._resolve_trade_hold_plan(trade_result)
+        plan_notes = trade_plan["notes"]
+        has_tracked_plan = any(
+            key in plan_notes
+            for key in ("planned_hold_days", "close_review_count", "last_close_review_date")
+        )
+        entry_at = getattr(trade_result, "entry_at", None) or getattr(trade_result, "created_at", None)
+        calendar_hold_days = None
+        if entry_at:
+            calendar_hold_days = max(0, (market_calendar.market_date(market=market_code) - entry_at.date()).days)
+
+        stop_loss_price = self._try_float(getattr(trade_result, "ai_stop_loss_price", None))
+        take_profit_price = (
+            self._try_float(getattr(trade_result, "ai_take_profit_price", None))
+            or self._try_float(getattr(trade_result, "ai_target_price", None))
+        )
+        trailing_stop_pct = self._try_float(plan_notes.get("trailing_stop_pct"))
+        tracking_status = "tracked" if has_tracked_plan else "legacy"
+
+        metadata = self._empty_existing_hold_plan_metadata()
+        metadata.update({
+            "existing_hold_plan_tracking_status": tracking_status,
+            "existing_planned_hold_days": (
+                trade_plan["planned_hold_days"] if has_tracked_plan else None
+            ),
+            "existing_close_review_count": (
+                trade_plan["close_review_count"] if has_tracked_plan else None
+            ),
+            "existing_last_close_review_date": (
+                trade_plan["last_close_review_date"] if has_tracked_plan else None
+            ),
+            "existing_calendar_hold_days": calendar_hold_days,
+            "existing_hold_plan_stop_loss_price": stop_loss_price,
+            "existing_hold_plan_take_profit_price": take_profit_price,
+            "existing_hold_plan_trailing_stop_pct": trailing_stop_pct,
+        })
+
+        lines = [
+            f"- 보유 계획 추적 상태: {'활성' if tracking_status == 'tracked' else '레거시/미기록'}",
+            (
+                f"- planned_hold_days: {trade_plan['planned_hold_days']}일"
+                if has_tracked_plan
+                else "- planned_hold_days: 미기록"
+            ),
+            (
+                f"- close_review_count: {trade_plan['close_review_count']}회"
+                if has_tracked_plan
+                else "- close_review_count: 미기록"
+            ),
+            (
+                f"- last_close_review_date: {trade_plan['last_close_review_date']}"
+                if has_tracked_plan and trade_plan["last_close_review_date"]
+                else "- last_close_review_date: 미기록"
+            ),
+            (
+                f"- 실제 보유일(달력 기준): {calendar_hold_days}일"
+                if calendar_hold_days is not None
+                else "- 실제 보유일(달력 기준): 미확인"
+            ),
+            f"- 현재 stop_loss_price: {_format_price_text(stop_loss_price)}",
+            f"- 현재 take_profit_price: {_format_price_text(take_profit_price)}",
+            (
+                f"- 현재 trailing_stop_pct: {float(trailing_stop_pct):.2f}%"
+                if trailing_stop_pct and trailing_stop_pct > 0
+                else "- 현재 trailing_stop_pct: 미사용"
+            ),
+            "- 참고: 이 보유 계획 정보는 참고용입니다. 장중 stop_loss / take_profit / trailing stop은 별도로 살아 있으며 우선 실행됩니다.",
+        ]
+        return "\n".join(lines), metadata
+
+    async def _load_existing_hold_plan_context(
+        self,
+        *,
+        symbol: str,
+        market_code: str,
+        current_position: dict | None,
+    ) -> tuple[str, dict[str, object | None]]:
+        """Tier2 직전에 미청산 포지션의 보유 계획을 조회한다."""
+        if market_scope(market_code) == "CRYPTO":
+            return "보유 계획 없음 (신규 진입 후보)", self._empty_existing_hold_plan_metadata()
+
+        trade_result = None
+        if current_position and has_quantity(current_position.get("quantity") or 0, market_code):
+            try:
+                from repositories.trade_result_repository import TradeResultRepository
+
+                async with AsyncSessionLocal() as session:
+                    trade_result = await TradeResultRepository(session).get_open_buy(
+                        symbol,
+                        market=market_code,
+                    )
+            except Exception as e:
+                logger.warning("[{}] 기존 보유 계획 조회 실패 {}: {}", market_code, symbol, str(e))
+
+        return self._build_existing_hold_plan_context(
+            symbol=symbol,
+            market_code=market_code,
+            current_position=current_position,
+            trade_result=trade_result,
+        )
+
+    @classmethod
+    def _validate_stock_tier2_buy_prices(
+        cls,
+        final: dict | None,
+        *,
+        market_code: str,
+    ) -> str | None:
+        """주식 BUY는 Tier2가 동적 진입/목표/손절/익절 가격을 모두 확정해야 한다."""
+        if not final or market_scope(market_code) == "CRYPTO":
+            return None
+
+        action = str(final.get("action") or "").upper()
+        if action != "BUY":
+            return None
+
+        required_prices: dict[str, float] = {}
+        for key in ("entry_price", "target_price", "stop_loss_price", "take_profit_price"):
+            numeric = cls._try_float(final.get(key))
+            if numeric is None or numeric <= 0:
+                return f"Tier2 {key} 누락 또는 비정상 값"
+            final[key] = round(numeric, 4)
+            required_prices[key] = numeric
+
+        planned_hold_days = cls._try_int(final.get("planned_hold_days"))
+        if planned_hold_days is None or planned_hold_days <= 0:
+            return "Tier2 planned_hold_days 누락 또는 비정상 값"
+        final["planned_hold_days"] = planned_hold_days
+
+        if required_prices["stop_loss_price"] >= required_prices["entry_price"]:
+            return "Tier2 손절가가 진입가 이상으로 설정됨"
+        if required_prices["take_profit_price"] <= required_prices["entry_price"]:
+            return "Tier2 익절가가 진입가 이하로 설정됨"
+        if required_prices["take_profit_price"] > required_prices["target_price"]:
+            return "Tier2 익절가가 목표가를 초과함"
+        return None
 
     @classmethod
     def _resolve_crypto_buy_plan(
@@ -172,6 +410,8 @@ class AnalysisMixin:
         analysis_source = str(stock_info.get("analysis_source") or "cycle")
         event_type = str(stock_info.get("event_type") or stock_info.get("trigger") or "").upper()
         analysis_trading_context = mkt_state.trading_context
+        hold_plan_context = "보유 계획 없음 (신규 진입 후보)"
+        existing_hold_plan_metadata = self._empty_existing_hold_plan_metadata()
         if analysis_source == "event":
             event_price = stock_info.get("event_price")
             event_change_rate = stock_info.get("event_change_rate")
@@ -619,6 +859,7 @@ class AnalysisMixin:
 
         # 3d. Tier 2 최종 검토 (또는 fast-path 스킵)
         skip_tier2 = self._should_skip_tier2(
+            market_scope=scope,
             is_restricted_product=classification.is_restricted,
             tier1_confidence=tier1_confidence,
             market_regime=mkt_state.market_regime,
@@ -637,6 +878,7 @@ class AnalysisMixin:
                 "target_price": analysis.get("target_price"),
                 "stop_loss_price": analysis.get("stop_loss_price"),
                 "trailing_stop_pct": analysis.get("trailing_stop_pct", 0),
+                "planned_hold_days": 1,
                 "reason": f"Tier2 fast-path: Tier1 신뢰도 {tier1_confidence:.0%} + {mkt_state.market_regime} 국면",
                 "provider": "fast-path",
             }
@@ -652,6 +894,11 @@ class AnalysisMixin:
                 llm_tier="TIER2",
             )
         else:
+            hold_plan_context, existing_hold_plan_metadata = await self._load_existing_hold_plan_context(
+                symbol=symbol,
+                market_code=market_code,
+                current_position=current_position,
+            )
             t2_timer = activity_logger.timer()
             await activity_logger.log(
                 ActivityType.TIER2_REVIEW, ActivityPhase.START,
@@ -673,6 +920,7 @@ class AnalysisMixin:
                 trading_context=analysis_trading_context,
                 portfolio_snapshot=snap,
                 orderable_amount_context=orderable_amount_context,
+                hold_plan_context=hold_plan_context,
                 cycle_id=cycle_id,
             )
             t2_elapsed = activity_logger.elapsed_ms(t2_timer)
@@ -696,6 +944,33 @@ class AnalysisMixin:
                     execution_time_ms=t2_elapsed,
                 )
                 logger.info("Tier 2 검토 미승인: {} - {}", symbol, reason)
+                return result
+
+            stock_tier2_issue = self._validate_stock_tier2_buy_prices(final, market_code=market_code)
+            if stock_tier2_issue:
+                await activity_logger.log(
+                    ActivityType.TIER2_REVIEW,
+                    ActivityPhase.COMPLETE,
+                    f"🧠 [{name}] Tier2: 동적 가격 검증 실패 - {stock_tier2_issue}",
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    detail=self._enrich_activity_detail(
+                        {
+                            "approved": False,
+                            "reason": stock_tier2_issue,
+                            "entry_price": final.get("entry_price"),
+                            "target_price": final.get("target_price"),
+                            "stop_loss_price": final.get("stop_loss_price"),
+                            "take_profit_price": final.get("take_profit_price"),
+                            **orderable_detail,
+                        },
+                        product_context,
+                    ),
+                    llm_provider=final.get("provider"),
+                    llm_tier="TIER2",
+                    execution_time_ms=t2_elapsed,
+                )
+                logger.info("Tier 2 동적 가격 검증 실패: {} - {}", symbol, stock_tier2_issue)
                 return result
 
             crypto_buy_plan = (
@@ -733,6 +1008,10 @@ class AnalysisMixin:
                         "target_price": final.get("target_price"),
                         "target_price_currency": currency,
                         "target_price_krw": final.get("target_price_krw"),
+                        "stop_loss_price": final.get("stop_loss_price"),
+                        "stop_loss_price_krw": final.get("stop_loss_price_krw"),
+                        "take_profit_price": final.get("take_profit_price"),
+                        "take_profit_price_krw": final.get("take_profit_price_krw"),
                         "normalized_price_fields": final.get("normalized_price_fields"),
                         **orderable_detail,
                     },
@@ -787,16 +1066,10 @@ class AnalysisMixin:
                 )
                 return result
             action = SignalAction.BUY if t2_action == "BUY" else SignalAction.SELL
-
+            final_confidence = float(final.get("confidence") or analysis.get("confidence") or 0.7)
             stop_loss_price = final.get("stop_loss_price")
-            if not stop_loss_price and strategy:
-                sl_pct = getattr(strategy, "stop_loss_pct", None) or -3
-                stop_loss_price = final["entry_price"] * (1 + sl_pct / 100)
-
             target_price = final.get("target_price")
-            if not target_price and strategy:
-                tp_pct = getattr(strategy, "take_profit_pct", None) or 5
-                target_price = final["entry_price"] * (1 + tp_pct / 100)
+            take_profit_price = final.get("take_profit_price") or target_price
 
             signal_quantity = (
                 crypto_buy_plan.get("suggested_quantity")
@@ -813,16 +1086,17 @@ class AnalysisMixin:
                 symbol=symbol,
                 stock_id=stock_info.get("stock_id", ""),
                 action=action,
-                strength=analysis.get("confidence", 0.7),
+                strength=final_confidence,
                 suggested_price=final["entry_price"],
                 suggested_quantity=signal_quantity,
                 suggested_amount_krw=signal_amount_krw,
                 target_price=target_price,
                 stop_loss_price=stop_loss_price,
+                take_profit_price=take_profit_price,
                 urgency=SignalUrgency.IMMEDIATE,
                 strategy_type=strategy_type,
                 reason=final.get("reason", "Tier2 승인"),
-                confidence=analysis.get("confidence", 0.7),
+                confidence=final_confidence,
                 metadata={
                     "market": market_code,
                     "currency": currency,
@@ -833,6 +1107,7 @@ class AnalysisMixin:
                     "entry_price_krw": final.get("entry_price_krw") or (final["entry_price"] * exchange_rate_to_krw),
                     "target_price_krw": final.get("target_price_krw"),
                     "stop_loss_price_krw": final.get("stop_loss_price_krw"),
+                    "take_profit_price_krw": final.get("take_profit_price_krw"),
                     "entry_mode": entry_mode,
                     "current_position": dict(current_position or {}),
                     "analysis_source": analysis_source,
@@ -934,6 +1209,10 @@ class AnalysisMixin:
                 signal.target_price = final["target_price"]
             if final.get("stop_loss_price"):
                 signal.stop_loss_price = final["stop_loss_price"]
+            if final.get("take_profit_price"):
+                signal.take_profit_price = final["take_profit_price"]
+            elif final.get("target_price"):
+                signal.take_profit_price = final["target_price"]
 
             signal.metadata = {
                 **(signal.metadata or {}),
@@ -942,6 +1221,10 @@ class AnalysisMixin:
                 "exchange_rate_to_krw": exchange_rate_to_krw,
                 "live_price": current_price,
                 "live_price_krw": price_krw or (current_price * exchange_rate_to_krw),
+                "entry_price_krw": final.get("entry_price_krw"),
+                "target_price_krw": final.get("target_price_krw"),
+                "stop_loss_price_krw": final.get("stop_loss_price_krw"),
+                "take_profit_price_krw": final.get("take_profit_price_krw"),
                 "entry_mode": entry_mode,
                 "current_position": dict(current_position or {}),
                 "analysis_source": analysis_source,
@@ -981,6 +1264,23 @@ class AnalysisMixin:
 
         # AI가 결정한 손절/익절/트레일링 스탑을 event_detector에 설정
         self._apply_trade_thresholds(symbol, analysis, final, market=market_code)
+        applied_thresholds = self._resolve_applied_trade_thresholds(
+            symbol,
+            signal,
+            market=market_code,
+            fallback_trailing_pct=(
+                final.get("trailing_stop_pct") or analysis.get("trailing_stop_pct")
+            ),
+        )
+        signal.stop_loss_price = applied_thresholds["stop_loss_price"]
+        signal.take_profit_price = applied_thresholds["take_profit_price"]
+        signal.metadata["trailing_stop_pct"] = applied_thresholds["trailing_stop_pct"]
+        if signal.action == SignalAction.BUY and market_scope(market_code) != "CRYPTO":
+            signal.metadata["planned_hold_days"] = self._normalize_planned_hold_days(
+                final.get("planned_hold_days"),
+                default=1,
+            )
+        signal.metadata.update(existing_hold_plan_metadata)
 
         # 4.5 매도 시 보유 여부 확인
         if signal.action == SignalAction.SELL:
@@ -1060,10 +1360,14 @@ class AnalysisMixin:
 
         # 6. 매매 결정 (자율/반자율)
         analysis_context = {
-            "ai_recommendation": analysis.get("recommendation"),
-            "ai_confidence": analysis.get("confidence"),
-            "ai_target_price": analysis.get("target_price"),
-            "ai_stop_loss_price": analysis.get("stop_loss_price"),
+            "ai_recommendation": signal.action.value,
+            "ai_confidence": signal.confidence or final.get("confidence") or analysis.get("confidence"),
+            "ai_target_price": signal.target_price,
+            "ai_stop_loss_price": signal.stop_loss_price,
+            "ai_take_profit_price": signal.take_profit_price or signal.target_price,
+            "trailing_stop_pct": signal.metadata.get("trailing_stop_pct"),
+            "planned_hold_days": signal.metadata.get("planned_hold_days"),
+            **existing_hold_plan_metadata,
             "entry_rsi": indicators.get("rsi_14"),
             "entry_macd_hist": indicators.get("macd_histogram"),
             "market_regime": mkt_state.market_regime,
@@ -1283,8 +1587,7 @@ class AnalysisMixin:
             )
         elif not settings.DAY_TRADING_ONLY:
             context += (
-                f"\n모드: 스윙 (STABLE {settings.MAX_HOLD_DAYS_STABLE}일, "
-                f"AGGRESSIVE {settings.MAX_HOLD_DAYS_AGGRESSIVE}일)"
+                "\n모드: 스윙 (종목별 planned_hold_days 설정 + 매일 장마감 AI 재리뷰)"
             )
 
         if scope == "CRYPTO":
@@ -1397,6 +1700,45 @@ class AnalysisMixin:
                 ", ".join(f"{k}={v}" for k, v in kwargs.items()),
             )
 
+    def _resolve_applied_trade_thresholds(
+        self,
+        symbol: str,
+        signal: TradeSignal,
+        *,
+        market: str | None = None,
+        fallback_trailing_pct: float | None = None,
+    ) -> dict[str, float | None]:
+        """event_detector 기준 최종 적용값을 DB 저장 컨텍스트용으로 정규화"""
+        thresholds = event_detector.get_thresholds(symbol, market=market)
+
+        stop_loss_price = self._try_float(getattr(thresholds, "stop_loss", None))
+        if stop_loss_price is None or stop_loss_price <= 0:
+            stop_loss_price = self._try_float(signal.stop_loss_price)
+
+        take_profit_price = self._try_float(getattr(thresholds, "take_profit", None))
+        if take_profit_price is None or take_profit_price <= 0:
+            take_profit_price = self._try_float(signal.take_profit_price)
+        if take_profit_price is None or take_profit_price <= 0:
+            take_profit_price = self._try_float(signal.target_price)
+
+        trailing_stop_pct = self._try_float(getattr(thresholds, "trailing_stop_pct", None))
+        if trailing_stop_pct is None or trailing_stop_pct <= 0:
+            trailing_stop_pct = self._try_float(fallback_trailing_pct)
+
+        return {
+            "stop_loss_price": round(stop_loss_price, 4) if stop_loss_price and stop_loss_price > 0 else None,
+            "take_profit_price": (
+                round(take_profit_price, 4)
+                if take_profit_price and take_profit_price > 0
+                else None
+            ),
+            "trailing_stop_pct": (
+                round(trailing_stop_pct, 4)
+                if trailing_stop_pct and trailing_stop_pct > 0
+                else None
+            ),
+        }
+
     # ── Tier1 / Tier2 ──
 
     async def _tier1_analysis(
@@ -1498,6 +1840,7 @@ class AnalysisMixin:
         market: str | None = None,
         product_context: dict | None = None,
         current_position_context: str = "현재 포지션 없음 (신규 진입 후보)",
+        hold_plan_context: str = "보유 계획 없음 (신규 진입 후보)",
         current_position: dict | None = None,
         chart_result: ChartAnalysisResult | None = None,
         dynamic_limits: dict | None = None,
@@ -1556,12 +1899,7 @@ class AnalysisMixin:
         if scope == "CRYPTO":
             max_hold_window = f"{settings.crypto_timebox_hours}시간 (만료 시 자동 청산)"
         else:
-            max_hold_days = (
-                settings.MAX_HOLD_DAYS_AGGRESSIVE
-                if strategy_type == "AGGRESSIVE_SHORT"
-                else settings.MAX_HOLD_DAYS_STABLE
-            )
-            max_hold_window = f"{max_hold_days}일"
+            max_hold_window = "장마감 AI 재리뷰 기반 동적 보유"
 
         review_prompt_template = get_final_review_prompt(
             market_code,
@@ -1574,6 +1912,7 @@ class AnalysisMixin:
             market=market_code,
             currency=currency,
             current_position_context=current_position_context,
+            hold_plan_context=hold_plan_context,
             account_context=str(account_context["text"]),
             chart_snapshot=chart_snapshot,
             product_context=self._format_product_context_for_prompt(product_context),
@@ -1631,3 +1970,312 @@ class AnalysisMixin:
         except Exception as e:
             logger.error("Tier 2 검토 실패 ({}): {}", symbol, str(e))
             return None
+
+    @classmethod
+    def _validate_close_hold_review(
+        cls,
+        review: dict | None,
+        *,
+        current_price: float,
+    ) -> str | None:
+        if not review:
+            return "응답 없음"
+
+        action = str(review.get("action") or "").upper()
+        if action not in {"HOLD", "SELL"}:
+            return "action은 HOLD 또는 SELL만 허용"
+        review["action"] = action
+
+        confidence = cls._try_float(review.get("confidence"))
+        review["confidence"] = round(confidence, 4) if confidence is not None else 0.0
+
+        trailing_stop_pct = cls._try_float(review.get("trailing_stop_pct"))
+        review["trailing_stop_pct"] = (
+            round(trailing_stop_pct, 4)
+            if trailing_stop_pct and trailing_stop_pct > 0
+            else 0.0
+        )
+
+        if action == "SELL":
+            planned_hold_days = review.get("planned_hold_days")
+            if planned_hold_days is not None:
+                review["planned_hold_days"] = cls._normalize_planned_hold_days(planned_hold_days, default=1)
+            return None
+
+        stop_loss_price = cls._try_float(review.get("stop_loss_price"))
+        take_profit_price = cls._try_float(review.get("take_profit_price"))
+        if stop_loss_price is None or stop_loss_price <= 0:
+            return "HOLD 응답 stop_loss_price 누락 또는 비정상 값"
+        if take_profit_price is None or take_profit_price <= 0:
+            return "HOLD 응답 take_profit_price 누락 또는 비정상 값"
+        if stop_loss_price >= current_price:
+            return "HOLD 응답 손절가가 현재가 이상으로 설정됨"
+        if take_profit_price <= current_price:
+            return "HOLD 응답 익절가가 현재가 이하로 설정됨"
+
+        review["stop_loss_price"] = round(stop_loss_price, 4)
+        review["take_profit_price"] = round(take_profit_price, 4)
+        review["planned_hold_days"] = cls._normalize_planned_hold_days(review.get("planned_hold_days"), default=1)
+        return None
+
+    async def review_close_hold_position(
+        self,
+        *,
+        holding,
+        trade_result,
+        current_price: float,
+        market: str | None = None,
+        cycle_id: str | None = None,
+    ) -> dict | None:
+        """장마감 보유 포지션을 AI로 재리뷰해 HOLD/SELL 판단을 반환한다."""
+        from trading.account_manager import account_manager
+
+        market_code = normalize_market(
+            market
+            or getattr(holding, "market", None)
+            or getattr(trade_result, "market", None)
+            or settings.primary_market_code
+        )
+        scope = market_scope(market_code)
+        if scope == "CRYPTO":
+            return {
+                "action": "SELL",
+                "reason": "주식 장마감 보유 재리뷰 전용 경로",
+                "provider": "system-guard",
+            }
+
+        symbol = str(
+            getattr(holding, "symbol", None)
+            or getattr(trade_result, "stock_symbol", "")
+            or ""
+        ).upper()
+        name = str(
+            getattr(holding, "name", None)
+            or getattr(trade_result, "stock_name", None)
+            or symbol
+        )
+        currency = str(
+            getattr(holding, "currency", None)
+            or getattr(trade_result, "currency", None)
+            or market_currency(market_code)
+        )
+        exchange_rate_to_krw = float(
+            getattr(holding, "exchange_rate_to_krw", None)
+            or getattr(trade_result, "exchange_rate_to_krw", None)
+            or 1.0
+        )
+
+        if not symbol or current_price <= 0:
+            return {
+                "action": "SELL",
+                "reason": "장마감 재리뷰 입력값 부족",
+                "provider": "system-guard",
+            }
+
+        trade_plan = self._resolve_trade_hold_plan(trade_result)
+        market_date = market_calendar.market_date(market=market_code)
+        entry_at = getattr(trade_result, "entry_at", None) or getattr(trade_result, "created_at", None)
+        calendar_hold_days = 0
+        if entry_at:
+            calendar_hold_days = max(0, (market_date - entry_at.date()).days)
+
+        try:
+            balance, holdings = await account_manager.get_account_snapshot(market_code)
+            holding_symbols, holding_positions = self._build_holding_snapshot(holdings, balance.total_asset)
+            portfolio_snapshot = {
+                "cash": balance.cash,
+                "total_asset": balance.total_asset,
+                "holding_count": len(holdings),
+                "holding_symbols": holding_symbols,
+                "holding_positions": holding_positions,
+            }
+            current_position = self._get_existing_position(portfolio_snapshot, symbol, market_code)
+        except Exception as e:
+            logger.warning("[{}] 장마감 계좌 스냅샷 조회 실패 {}: {}", market_code, symbol, str(e))
+            return {
+                "action": "SELL",
+                "reason": f"장마감 계좌 스냅샷 조회 실패: {str(e)[:80]}",
+                "provider": "system-guard",
+            }
+
+        if not current_position:
+            _, fallback_positions = self._build_holding_snapshot([holding], 0.0)
+            current_position = fallback_positions.get(self._instrument_key(symbol, market_code))
+        if not current_position:
+            return {
+                "action": "SELL",
+                "reason": "장마감 포지션 스냅샷 불일치",
+                "provider": "system-guard",
+            }
+
+        try:
+            daily_resp = await mcp_client.get_daily_price(symbol, market=market_code)
+            minute_resp = await mcp_client.get_minute_price(symbol, market=market_code)
+        except Exception as e:
+            logger.warning("[{}] 장마감 차트 데이터 조회 실패 {}: {}", market_code, symbol, str(e))
+            return {
+                "action": "SELL",
+                "reason": f"장마감 차트 데이터 조회 실패: {str(e)[:80]}",
+                "provider": "system-guard",
+            }
+
+        if not daily_resp.success or not daily_resp.data:
+            return {
+                "action": "SELL",
+                "reason": "장마감 일봉 데이터 조회 실패",
+                "provider": "system-guard",
+            }
+        if not minute_resp.success or not minute_resp.data:
+            return {
+                "action": "SELL",
+                "reason": "장마감 분봉 데이터 조회 실패",
+                "provider": "system-guard",
+            }
+
+        daily_df = self._sort_market_data_frame(pd.DataFrame(daily_resp.data.get("prices") or []), "date")
+        minute_df = self._sort_market_data_frame(pd.DataFrame(minute_resp.data.get("prices") or []), "time")
+        consistency_issue = self._detect_price_consistency_issue(current_price, daily_df, minute_df)
+        if consistency_issue:
+            logger.warning(
+                "[{}] 장마감 데이터 정합성 실패 {}: {}",
+                market_code,
+                symbol,
+                consistency_issue,
+            )
+            return {
+                "action": "SELL",
+                "reason": "장마감 데이터 정합성 실패",
+                "provider": "system-guard",
+                "risk_warnings": [json.dumps(consistency_issue, ensure_ascii=False)],
+            }
+
+        chart_result = chart_analyzer.analyze(daily_df, minute_df)
+        current_position_context = self._format_current_position_for_prompt(current_position)
+        runtime = self._get_state(scope)
+        market_context = runtime.market_context or "시장 컨텍스트 없음"
+        trading_context = runtime.trading_context or await self._build_trading_context(market_code)
+
+        feedback_context = "매매 이력 없음"
+        try:
+            async with AsyncSessionLocal() as session:
+                feedback_context = await FeedbackContextBuilder(
+                    session,
+                    market_scope=scope,
+                ).build_full_context(
+                    trade_result.strategy_type or "",
+                    symbol,
+                    current_regime=runtime.market_regime or "",
+                    current_rsi=chart_result.indicators.get("rsi_14"),
+                    market_scope=scope,
+                )
+        except Exception as e:
+            logger.warning("[{}] 장마감 피드백 컨텍스트 생성 실패 {}: {}", market_code, symbol, str(e))
+
+        product_metadata = self._get_product_metadata(symbol, market_code)
+        if not product_metadata:
+            product_metadata = {"name": name}
+        product_context = build_product_context(symbol, market_code, product_metadata)
+
+        entry_price = float(getattr(trade_result, "entry_price", 0.0) or 0.0)
+        target_price = self._try_float(getattr(trade_result, "ai_target_price", None))
+        stop_loss_price = self._try_float(getattr(trade_result, "ai_stop_loss_price", None))
+        take_profit_price = self._try_float(getattr(trade_result, "ai_take_profit_price", None))
+        trailing_stop_pct = trade_plan["notes"].get("trailing_stop_pct")
+        chart_snapshot = chart_result.prompt_text if chart_result and chart_result.prompt_text else "차트 요약 없음"
+        entry_snapshot_lines = [
+            f"- entry_at: {entry_at.isoformat() if entry_at else '없음'}",
+            f"- entry_price: {entry_price:,.2f}{currency}" if entry_price > 0 else "- entry_price: 없음",
+            f"- ai_confidence: {float(getattr(trade_result, 'ai_confidence', 0.0) or 0.0):.2f}",
+            f"- ai_target_price: {target_price:,.2f}{currency}" if target_price else "- ai_target_price: 없음",
+            f"- ai_stop_loss_price: {stop_loss_price:,.2f}{currency}" if stop_loss_price else "- ai_stop_loss_price: 없음",
+            (
+                f"- ai_take_profit_price: {take_profit_price:,.2f}{currency}"
+                if take_profit_price
+                else "- ai_take_profit_price: 없음"
+            ),
+            f"- 진입 사유: {getattr(trade_result, 'ai_recommendation', '') or '기록 없음'}",
+        ]
+
+        prompt = STOCK_CLOSE_REVIEW_PROMPT.format(
+            market_context=market_context,
+            trading_context=trading_context,
+            current_position_context=current_position_context,
+            account_context=self._build_account_context(
+                market=market_code,
+                portfolio_snapshot=portfolio_snapshot,
+                current_position=current_position,
+                dynamic_limits=None,
+                current_price=current_price,
+                currency=currency,
+                exchange_rate_to_krw=exchange_rate_to_krw,
+                orderable_amount_context=None,
+            )["text"],
+            entry_snapshot="\n".join(entry_snapshot_lines),
+            chart_snapshot=chart_snapshot,
+            product_context=self._format_product_context_for_prompt(product_context),
+            stock_name=name,
+            symbol=symbol,
+            market=market_code,
+            currency=currency,
+            current_price_text=(
+                f"{current_price:,.2f}원" if currency == "KRW" else f"{current_price:,.2f}{currency}"
+            ),
+            exchange_rate_to_krw=exchange_rate_to_krw,
+            strategy_type=getattr(trade_result, "strategy_type", "") or "",
+            planned_hold_days=trade_plan["planned_hold_days"],
+            close_review_count=trade_plan["close_review_count"],
+            last_close_review_date=trade_plan["last_close_review_date"] or "없음",
+            calendar_hold_days=calendar_hold_days,
+            existing_stop_loss_text=(
+                f"{stop_loss_price:,.2f}{currency}" if stop_loss_price else "없음"
+            ),
+            existing_take_profit_text=(
+                f"{take_profit_price:,.2f}{currency}" if take_profit_price else "없음"
+            ),
+            existing_trailing_text=(
+                f"{float(trailing_stop_pct):.2f}%"
+                if self._try_float(trailing_stop_pct) and float(trailing_stop_pct) > 0
+                else "미사용"
+            ),
+            feedback_context=feedback_context or "매매 이력 없음",
+        )
+
+        try:
+            result_text, provider = await llm_factory.generate_tier2(
+                prompt,
+                system_prompt=STOCK_CLOSE_REVIEW_SYSTEM,
+                scope=scope,
+                phase="close_review",
+                symbol=symbol,
+                cycle_id=cycle_id,
+            )
+        except Exception as e:
+            logger.error("장마감 보유 재리뷰 실패 ({}): {}", symbol, str(e))
+            return None
+
+        parsed = self._parse_json(result_text)
+        if not parsed:
+            return None
+
+        parsed["provider"] = provider
+        parsed["market"] = market_code
+        parsed["currency"] = currency
+        parsed = self._normalize_tier2_price_fields(
+            parsed,
+            current_price=current_price,
+            currency=currency,
+            exchange_rate_to_krw=exchange_rate_to_krw,
+        )
+
+        validation_issue = self._validate_close_hold_review(parsed, current_price=current_price)
+        if validation_issue:
+            logger.warning("[{}] 장마감 보유 재리뷰 응답 검증 실패 {}: {}", market_code, symbol, validation_issue)
+            return None
+
+        if parsed.get("action") == "HOLD":
+            parsed["planned_hold_days"] = max(
+                int(parsed["planned_hold_days"]),
+                int(trade_plan["close_review_count"]) + 1,
+            )
+
+        return parsed

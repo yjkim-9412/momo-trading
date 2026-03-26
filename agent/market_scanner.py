@@ -118,6 +118,109 @@ class MarketScanner:
         return filtered
 
     @staticmethod
+    def _to_float(value: object, default: float = 0.0) -> float:
+        """숫자 변환 실패 시 기본값 반환"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    async def _build_affordability_fx_rates(self, stocks: list[dict]) -> dict[str, float]:
+        """해외 종목 KRW 환산에 필요한 환율 캐시 조회"""
+        markets = {
+            normalize_market(item.get("market", settings.primary_market_code))
+            for item in stocks
+            if is_us_market(item.get("market", settings.primary_market_code))
+        }
+        rates: dict[str, float] = {}
+        for market_code in sorted(markets):
+            rates[market_code] = float(await mcp_client._get_exchange_rate_to_krw(market_code) or 1.0)
+        return rates
+
+    def _resolve_price_krw(self, item: dict, fx_rates: dict[str, float]) -> float:
+        """종목 현재가를 KRW 기준으로 정규화"""
+        price = self._to_float(item.get("price", item.get("current_price", 0.0)))
+        if price <= 0:
+            return 0.0
+
+        market_code = normalize_market(item.get("market", settings.primary_market_code))
+        currency = str(item.get("currency") or ("USD" if is_us_market(market_code) else "KRW")).upper()
+        if currency == "KRW":
+            return price
+
+        exchange_rate = self._to_float(item.get("exchange_rate_to_krw"), 0.0)
+        if exchange_rate <= 0:
+            exchange_rate = self._to_float(fx_rates.get(market_code), 0.0)
+        if exchange_rate <= 0:
+            return 0.0
+        return price * exchange_rate
+
+    def _filter_affordable_stocks(
+        self,
+        stocks: list[dict],
+        available_cash: float,
+        fx_rates: dict[str, float],
+    ) -> tuple[list[dict], int]:
+        """현재 가용 현금으로 1주 매수 가능한 후보만 남긴다."""
+        filtered: list[dict] = []
+        dropped = 0
+
+        for item in stocks:
+            price_krw = self._resolve_price_krw(item, fx_rates)
+            if price_krw <= 0 or price_krw > available_cash:
+                dropped += 1
+                continue
+            filtered.append({**item, "price_krw": price_krw})
+
+        return filtered, dropped
+
+    def _build_stock_lookup(self, *groups: list[dict]) -> dict[tuple[str, str], dict]:
+        """시장/심볼 기준 후보 종목 역참조 인덱스 생성"""
+        lookup: dict[tuple[str, str], dict] = {}
+        for stocks in groups:
+            for item in stocks:
+                symbol = str(item.get("symbol", "")).strip()
+                if not symbol:
+                    continue
+                market_code = normalize_market(item.get("market", settings.primary_market_code))
+                lookup[(market_code, symbol.upper())] = item
+        return lookup
+
+    def _filter_selected_by_available_cash(
+        self,
+        selected: list[dict],
+        stock_lookup: dict[tuple[str, str], dict],
+        available_cash: float,
+        fx_rates: dict[str, float],
+        default_market: str,
+    ) -> tuple[list[dict], int]:
+        """LLM 선택 결과를 원천 시세와 대조해 1주 매수 가능 후보만 유지"""
+        filtered: list[dict] = []
+        dropped = 0
+
+        for item in selected:
+            symbol = str(item.get("symbol", "")).strip()
+            market_code = normalize_market(item.get("market", default_market), default=default_market)
+            source = stock_lookup.get((market_code, symbol.upper()))
+            if source is None and symbol:
+                matches = [
+                    candidate
+                    for (_, candidate_symbol), candidate in stock_lookup.items()
+                    if candidate_symbol == symbol.upper()
+                ]
+                if len(matches) == 1:
+                    source = matches[0]
+                    market_code = normalize_market(source.get("market", market_code), default=market_code)
+            candidate = {**(source or {}), **item, "market": market_code}
+            price_krw = self._resolve_price_krw(candidate, fx_rates)
+            if not symbol or price_krw <= 0 or price_krw > available_cash:
+                dropped += 1
+                continue
+            filtered.append(candidate)
+
+        return filtered, dropped
+
+    @staticmethod
     def _selection_target_range(
         market: str,
         session: str,
@@ -189,9 +292,63 @@ class MarketScanner:
         if dynamic_limits:
             max_pos_pct = dynamic_limits.get("max_position_pct", 20.0) / 100
         max_per_stock = available_cash * max_pos_pct
+        all_candidates = [*volume_rank, *surge_data, *drop_data]
+        fx_rates = await self._build_affordability_fx_rates(all_candidates)
+        affordability_stats = {
+            "volume_rank": {"before": len(volume_rank), "after": 0, "dropped": 0},
+            "surge_data": {"before": len(surge_data), "after": 0, "dropped": 0},
+            "drop_data": {"before": len(drop_data), "after": 0, "dropped": 0},
+        }
+        volume_rank, volume_dropped = self._filter_affordable_stocks(volume_rank, available_cash, fx_rates)
+        surge_data, surge_dropped = self._filter_affordable_stocks(surge_data, available_cash, fx_rates)
+        drop_data, drop_dropped = self._filter_affordable_stocks(drop_data, available_cash, fx_rates)
+        affordability_stats["volume_rank"]["after"] = len(volume_rank)
+        affordability_stats["volume_rank"]["dropped"] = volume_dropped
+        affordability_stats["surge_data"]["after"] = len(surge_data)
+        affordability_stats["surge_data"]["dropped"] = surge_dropped
+        affordability_stats["drop_data"]["after"] = len(drop_data)
+        affordability_stats["drop_data"]["dropped"] = drop_dropped
 
         data_elapsed = activity_logger.elapsed_ms(timer)
         logger.info("MCP 데이터 수집 완료: {}ms", data_elapsed)
+        if volume_dropped or surge_dropped or drop_dropped:
+            logger.info(
+                "가용 현금 기준 후보 필터 적용: 거래량 {}→{}, 급등 {}→{}, 급락 {}→{} (현금 {:,.0f}원)",
+                affordability_stats["volume_rank"]["before"],
+                affordability_stats["volume_rank"]["after"],
+                affordability_stats["surge_data"]["before"],
+                affordability_stats["surge_data"]["after"],
+                affordability_stats["drop_data"]["before"],
+                affordability_stats["drop_data"]["after"],
+                available_cash,
+            )
+        if not volume_rank and not surge_data and not drop_data:
+            elapsed = activity_logger.elapsed_ms(timer)
+            market_summary = "가용 현금 기준 1주 매수 가능 후보 없음"
+            await activity_logger.log(
+                ActivityType.SCAN, ActivityPhase.COMPLETE,
+                f"\U0001f4e1 시장 스캔 완료: {market_summary}",
+                cycle_id=cycle_id,
+                detail={
+                    "selected_count": 0,
+                    "selected": [],
+                    "market_analysis": market_summary,
+                    "available_cash": available_cash,
+                    "markets": scan_markets,
+                    "affordability_filter": affordability_stats,
+                },
+                execution_time_ms=elapsed,
+            )
+            return {
+                "selected": [],
+                "market_summary": market_summary,
+                "market_regime": "",
+                "market_analysis": market_summary,
+                "leading_sectors": [],
+                "available_cash": available_cash,
+                "max_per_stock": max_per_stock,
+                "markets": scan_markets,
+            }
 
         # 2. AI 시장 분석 + 종목 선별 (통합 1회 호출)
         from util.time_util import now_kst
@@ -241,8 +398,16 @@ class MarketScanner:
             )
             parsed = self._parse_json_response(result_text)
             selected = parsed.get("selected", [])
+            stock_lookup = self._build_stock_lookup(volume_rank, surge_data, drop_data)
             for item in selected:
                 item["market"] = normalize_market(item.get("market", primary_market), default=primary_market)
+            selected, selected_affordability_dropped = self._filter_selected_by_available_cash(
+                selected,
+                stock_lookup,
+                available_cash,
+                fx_rates,
+                primary_market,
+            )
             selected = self._apply_product_policy(selected)
             elapsed = activity_logger.elapsed_ms(timer)
 
@@ -280,6 +445,10 @@ class MarketScanner:
                     "market_analysis": market_analysis,
                     "available_cash": available_cash,
                     "markets": scan_markets,
+                    "affordability_filter": {
+                        **affordability_stats,
+                        "selected_dropped": selected_affordability_dropped,
+                    },
                 },
                 llm_provider=provider,
                 llm_tier="TIER1",

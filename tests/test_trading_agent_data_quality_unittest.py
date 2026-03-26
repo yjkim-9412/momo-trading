@@ -15,6 +15,8 @@ from analysis.llm.prompts.final_review import (
     CRYPTO_REVIEW_SYSTEM,
     FINAL_REVIEW_PROMPT,
     FINAL_REVIEW_SYSTEM,
+    STOCK_CLOSE_REVIEW_PROMPT,
+    STOCK_CLOSE_REVIEW_SYSTEM,
     get_crypto_review_prompt,
     get_crypto_review_system,
 )
@@ -101,6 +103,8 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("### 상품 특성", STOCK_ANALYSIS_PROMPT)
         self.assertIn("{product_context}", STOCK_ANALYSIS_PROMPT)
         self.assertIn("### 트레이딩 상황", STOCK_ANALYSIS_PROMPT)
+        self.assertNotIn("### 기존 보유 계획 상태", STOCK_ANALYSIS_PROMPT)
+        self.assertNotIn("planned_hold_days", STOCK_ANALYSIS_SYSTEM)
         self.assertIn(f"BULL/THEME 국면: {BULL_THEME_RR_FLOOR:.1f}:1 이상이면 적정", STOCK_ANALYSIS_SYSTEM)
         self.assertIn(f"SIDEWAYS/BEAR 국면: 최소 {DEFENSIVE_RR_FLOOR:.1f}:1", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("recommendation은 BUY 또는 HOLD만 사용", STOCK_ANALYSIS_SYSTEM)
@@ -128,20 +132,38 @@ class TradingAgentDataQualityTest(unittest.TestCase):
     def test_final_review_prompt_requires_market_currency_for_price_fields(self):
         self.assertIn("### 원본 차트 요약", FINAL_REVIEW_PROMPT)
         self.assertIn("### 상품 특성", FINAL_REVIEW_PROMPT)
+        self.assertIn("### 기존 보유 계획 상태", FINAL_REVIEW_PROMPT)
+        self.assertIn("{hold_plan_context}", FINAL_REVIEW_PROMPT)
         self.assertIn("배수(1x/2x/3x)", FINAL_REVIEW_PROMPT)
         self.assertIn("환산 참고: 1{currency}", FINAL_REVIEW_PROMPT)
         self.assertIn("stop_loss_price: 손절 기준가 ({currency})", FINAL_REVIEW_PROMPT)
         self.assertIn("가격 필드에 넣지 마세요", FINAL_REVIEW_PROMPT)
         self.assertIn(f"RR비율: {BULL_THEME_RR_FLOOR:.1f}:1 이상이면 허용", FINAL_REVIEW_SYSTEM)
         self.assertIn(f"RR비율: 최소 {DEFENSIVE_RR_FLOOR:.1f}:1", FINAL_REVIEW_SYSTEM)
+        self.assertIn("기존 보유 계획 정보는 참고용", FINAL_REVIEW_SYSTEM)
         self.assertIn(
             f"THEME/BULL: {BULL_THEME_RR_FLOOR:.1f}:1 이상, SIDEWAYS/BEAR: {DEFENSIVE_RR_FLOOR:.1f}:1 이상",
             FINAL_REVIEW_PROMPT,
         )
+        self.assertIn("take_profit_price", FINAL_REVIEW_PROMPT)
+        self.assertIn("planned_hold_days", FINAL_REVIEW_PROMPT)
+        self.assertIn("stop_loss_price < entry_price < take_profit_price <= target_price", FINAL_REVIEW_PROMPT)
+        self.assertNotIn("- 손절: {stop_loss_pct}%", FINAL_REVIEW_PROMPT)
+        self.assertNotIn("- 익절: {take_profit_pct}%", FINAL_REVIEW_PROMPT)
         self.assertIn("confidence: 이 매매가 손절 전에 목표가에 도달할 확률", FINAL_REVIEW_PROMPT)
         self.assertNotIn("기타: 1.5:1 이상", FINAL_REVIEW_PROMPT)
         self.assertNotIn("checklist_pass", FINAL_REVIEW_PROMPT)
         self.assertNotIn("partial_exit_plan", FINAL_REVIEW_PROMPT)
+
+    def test_stock_close_review_prompt_requires_hold_day_reapproval_contract(self):
+        self.assertIn("action은 HOLD 또는 SELL만 사용하세요", STOCK_CLOSE_REVIEW_SYSTEM)
+        self.assertIn("`planned_hold_days`는 참고용 계획값", STOCK_CLOSE_REVIEW_SYSTEM)
+        self.assertIn("planned_hold_days", STOCK_CLOSE_REVIEW_PROMPT)
+        self.assertIn("close_review_count", STOCK_CLOSE_REVIEW_PROMPT)
+        self.assertIn("내일 장중 stop_loss / take_profit / trailing stop은 별도로 우선 실행됩니다", STOCK_CLOSE_REVIEW_PROMPT)
+        self.assertIn('"action": "HOLD/SELL"', STOCK_CLOSE_REVIEW_PROMPT)
+        self.assertIn("stop_loss_price", STOCK_CLOSE_REVIEW_PROMPT)
+        self.assertIn("take_profit_price", STOCK_CLOSE_REVIEW_PROMPT)
 
     def test_crypto_final_review_prompt_enforces_buy_hold_and_canonical_regimes(self):
         self.assertIn("BULL_RUN/ALTSEASON/THEME 국면", CRYPTO_REVIEW_SYSTEM)
@@ -226,6 +248,8 @@ class TradingAgentDataQualityTest(unittest.TestCase):
 
     def test_daily_plan_prompt_limits_action_items_to_top_changes(self):
         self.assertIn("action_items는 가장 중요한 3~5개만 제안하세요", DAILY_PLAN_PROMPT)
+        self.assertNotIn("stop_loss_pct", DAILY_PLAN_PROMPT)
+        self.assertNotIn("take_profit_pct", DAILY_PLAN_PROMPT)
 
     def test_crypto_cycle_review_prompt_targets_next_settlement_window_feedback(self):
         self.assertIn("다음 정산 윈도우", CRYPTO_CYCLE_REVIEW_SYSTEM)
@@ -237,12 +261,75 @@ class TradingAgentDataQualityTest(unittest.TestCase):
     def test_should_skip_tier2_blocks_restricted_products(self):
         self.assertFalse(
             TradingAgent._should_skip_tier2(
+                market_scope="KRX",
                 is_restricted_product=True,
                 tier1_confidence=0.95,
                 market_regime="BULL",
                 recommendation="BUY",
             )
         )
+
+    def test_should_skip_tier2_is_crypto_only_fast_path(self):
+        self.assertFalse(
+            TradingAgent._should_skip_tier2(
+                market_scope="KRX",
+                is_restricted_product=False,
+                tier1_confidence=0.95,
+                market_regime="BULL",
+                recommendation="BUY",
+            )
+        )
+        self.assertTrue(
+            TradingAgent._should_skip_tier2(
+                market_scope="CRYPTO",
+                is_restricted_product=False,
+                tier1_confidence=0.95,
+                market_regime="BULL_RUN",
+                recommendation="BUY",
+            )
+        )
+
+    def test_validate_stock_tier2_buy_prices_requires_explicit_take_profit(self):
+        issue = TradingAgent._validate_stock_tier2_buy_prices(
+            {
+                "action": "BUY",
+                "entry_price": 200.0,
+                "target_price": 220.0,
+                "stop_loss_price": 190.0,
+            },
+            market_code="NASDAQ",
+        )
+
+        self.assertIn("take_profit_price", issue)
+
+    def test_validate_stock_tier2_buy_prices_requires_planned_hold_days(self):
+        issue = TradingAgent._validate_stock_tier2_buy_prices(
+            {
+                "action": "BUY",
+                "entry_price": 200.0,
+                "target_price": 220.0,
+                "stop_loss_price": 190.0,
+                "take_profit_price": 215.0,
+            },
+            market_code="NASDAQ",
+        )
+
+        self.assertIn("planned_hold_days", issue)
+
+    def test_validate_stock_tier2_buy_prices_rejects_inverted_price_ladder(self):
+        issue = TradingAgent._validate_stock_tier2_buy_prices(
+            {
+                "action": "BUY",
+                "entry_price": 200.0,
+                "target_price": 220.0,
+                "stop_loss_price": 190.0,
+                "take_profit_price": 225.0,
+                "planned_hold_days": 3,
+            },
+            market_code="NASDAQ",
+        )
+
+        self.assertEqual(issue, "Tier2 익절가가 목표가를 초과함")
 
     def test_apply_trade_thresholds_prefers_explicit_take_profit_price(self):
         captured = {}
@@ -272,14 +359,6 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertEqual(captured["kwargs"]["take_profit"], 210.0)
         self.assertEqual(captured["kwargs"]["stop_loss"], 190.0)
         self.assertEqual(captured["kwargs"]["trailing_stop_pct"], 2.0)
-        self.assertTrue(
-            TradingAgent._should_skip_tier2(
-                is_restricted_product=False,
-                tier1_confidence=0.95,
-                market_regime="BULL",
-                recommendation="BUY",
-            )
-        )
 
 
 class TradingAgentCryptoFallbackTest(unittest.IsolatedAsyncioTestCase):

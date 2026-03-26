@@ -131,6 +131,67 @@ class DecisionMaker:
         market_code = normalize_market(metadata.get("market", "KRX"))
         return build_product_context(signal.symbol, market_code, metadata)
 
+    @staticmethod
+    def _parse_trade_notes(notes: str | None) -> dict:
+        if not notes or not isinstance(notes, str):
+            return {}
+        try:
+            parsed = json.loads(notes)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _coerce_int(value) -> int | None:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _build_trade_notes(
+        cls,
+        *,
+        analysis_context: dict | None,
+        market: str,
+        existing_notes: str | None = None,
+    ) -> dict:
+        ctx = analysis_context or {}
+        trade_notes = cls._parse_trade_notes(existing_notes)
+
+        updates = {
+            "entry_mode": ctx.get("entry_mode"),
+            "combined_position_pct": ctx.get("combined_position_pct"),
+            "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
+            "analysis_source": ctx.get("analysis_source"),
+            "event_type": ctx.get("event_type"),
+            "trailing_stop_pct": ctx.get("trailing_stop_pct"),
+            "broker_cash_krw": ctx.get("broker_cash_krw"),
+            "symbol_orderable_amount_krw": ctx.get("symbol_orderable_amount_krw"),
+            "symbol_orderable_amount_foreign": ctx.get("symbol_orderable_amount_foreign"),
+            "symbol_orderable_qty": ctx.get("symbol_orderable_qty"),
+            "orderable_amount_source": ctx.get("orderable_amount_source"),
+            "market": market,
+        }
+        for key, value in updates.items():
+            if value is not None:
+                trade_notes[key] = value
+
+        planned_hold_days = cls._coerce_int(ctx.get("planned_hold_days"))
+        if planned_hold_days is not None and planned_hold_days > 0:
+            trade_notes["planned_hold_days"] = planned_hold_days
+            trade_notes.setdefault("close_review_count", 0)
+            trade_notes.setdefault("last_close_review_date", None)
+
+        close_review_count = cls._coerce_int(ctx.get("close_review_count"))
+        if close_review_count is not None and close_review_count >= 0:
+            trade_notes["close_review_count"] = close_review_count
+
+        if "last_close_review_date" in ctx:
+            trade_notes["last_close_review_date"] = ctx.get("last_close_review_date")
+
+        return trade_notes
+
     @classmethod
     def _enrich_detail(cls, signal: TradeSignal, detail: dict | None = None) -> dict:
         enriched = dict(detail or {})
@@ -1308,6 +1369,7 @@ class DecisionMaker:
             "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
             "analysis_source": ctx.get("analysis_source"),
             "event_type": ctx.get("event_type"),
+            "trailing_stop_pct": ctx.get("trailing_stop_pct"),
             "broker_cash_krw": ctx.get("broker_cash_krw"),
             "symbol_orderable_amount_krw": ctx.get("symbol_orderable_amount_krw"),
             "symbol_orderable_amount_foreign": ctx.get("symbol_orderable_amount_foreign"),
@@ -1538,24 +1600,20 @@ class DecisionMaker:
             async with AsyncSessionLocal() as session:
                 async with session.begin():
                     repo = TradeResultRepository(session)
-                    trade_notes = {
-                        "entry_mode": ctx.get("entry_mode", ""),
-                        "combined_position_pct": ctx.get("combined_position_pct"),
-                        "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
-                        "analysis_source": ctx.get("analysis_source"),
-                        "event_type": ctx.get("event_type"),
-                        "broker_cash_krw": ctx.get("broker_cash_krw"),
-                        "symbol_orderable_amount_krw": ctx.get("symbol_orderable_amount_krw"),
-                        "symbol_orderable_amount_foreign": ctx.get("symbol_orderable_amount_foreign"),
-                        "symbol_orderable_qty": ctx.get("symbol_orderable_qty"),
-                        "orderable_amount_source": ctx.get("orderable_amount_source"),
-                        "market": market,
-                    }
+                    trade_notes = self._build_trade_notes(
+                        analysis_context=ctx,
+                        market=market,
+                    )
 
                     if side == "BUY":
                         open_buy = await repo.get_open_buy(symbol, market=market)
                         is_add_on = open_buy is not None
                         if open_buy:
+                            trade_notes = self._build_trade_notes(
+                                analysis_context=ctx,
+                                market=market,
+                                existing_notes=getattr(open_buy, "notes", None),
+                            )
                             previous_qty = int(open_buy.quantity or 0)
                             combined_qty = previous_qty + filled_qty
                             combined_price = (
@@ -1577,6 +1635,7 @@ class DecisionMaker:
                             open_buy.ai_confidence = ctx.get("ai_confidence", 0.0)
                             open_buy.ai_target_price = ctx.get("ai_target_price")
                             open_buy.ai_stop_loss_price = ctx.get("ai_stop_loss_price")
+                            open_buy.ai_take_profit_price = ctx.get("ai_take_profit_price")
                             open_buy.entry_rsi = ctx.get("entry_rsi")
                             open_buy.entry_macd_hist = ctx.get("entry_macd_hist")
                             open_buy.market_regime = ctx.get("market_regime", "")
@@ -1614,6 +1673,7 @@ class DecisionMaker:
                                 ai_confidence=ctx.get("ai_confidence", 0.0),
                                 ai_target_price=ctx.get("ai_target_price"),
                                 ai_stop_loss_price=ctx.get("ai_stop_loss_price"),
+                                ai_take_profit_price=ctx.get("ai_take_profit_price"),
                                 entry_rsi=ctx.get("entry_rsi"),
                                 entry_macd_hist=ctx.get("entry_macd_hist"),
                                 market_regime=ctx.get("market_regime", ""),
@@ -1647,6 +1707,7 @@ class DecisionMaker:
                                 "analysis_source": ctx.get("analysis_source"),
                                 "event_type": ctx.get("event_type"),
                                 "broker_cash_krw": ctx.get("broker_cash_krw"),
+                                "planned_hold_days": ctx.get("planned_hold_days"),
                                 "symbol_orderable_amount_krw": ctx.get("symbol_orderable_amount_krw"),
                                 "symbol_orderable_amount_foreign": ctx.get("symbol_orderable_amount_foreign"),
                                 "symbol_orderable_qty": ctx.get("symbol_orderable_qty"),
@@ -1688,6 +1749,11 @@ class DecisionMaker:
                             return
 
                         # 손익 계산
+                        trade_notes = self._build_trade_notes(
+                            analysis_context=ctx,
+                            market=market,
+                            existing_notes=getattr(open_buy, "notes", None),
+                        )
                         entry_price = open_buy.entry_price
                         entry_exchange_rate = float(open_buy.exchange_rate_to_krw or exchange_rate_to_krw or 1.0)
                         raw_pnl = (filled_price - entry_price) * open_buy.quantity
@@ -1704,6 +1770,7 @@ class DecisionMaker:
                         open_buy.is_win = is_win
                         open_buy.hold_days = hold_days
                         open_buy.exit_reason = exit_reason or "SIGNAL"
+                        open_buy.notes = json.dumps(trade_notes, ensure_ascii=False, default=str)
                         open_buy.exit_at = now
 
                         pnl_sign = "+" if pnl >= 0 else ""

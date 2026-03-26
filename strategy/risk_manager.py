@@ -264,7 +264,7 @@ class RiskManager:
 
         # 리스크:보상 비율 검사 (다른 조정 전에 먼저 확인)
         entry = signal.suggested_price or 0
-        target = signal.target_price or 0
+        target = signal.take_profit_price or signal.target_price or 0
         stop = signal.stop_loss_price or 0
 
         if entry > 0 and target > 0 and stop > 0:

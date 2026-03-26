@@ -1,11 +1,12 @@
 import unittest
-from datetime import date
-from unittest.mock import AsyncMock, patch
+from datetime import date, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from agent.trading_agent import TradingAgent
 from analysis.chart_analyzer import ChartAnalysisResult
 from core.config import settings
 from core.events import Event, EventType
+from scheduler.market_calendar import market_calendar
 from trading.models import AccountBalance, HoldingInfo, MCPResponse
 
 
@@ -120,6 +121,7 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("브로커 잔고 현금", prompt)
         self.assertIn("이 종목 기준 주문가능금액", prompt)
         self.assertIn("현재 이 종목 비중: 73.8%", prompt)
+        self.assertNotIn("### 기존 보유 계획 상태", prompt)
 
     async def test_crypto_tier1_analysis_falls_back_to_change_price_when_change_is_direction_string(self):
         chart_result = ChartAnalysisResult(
@@ -271,8 +273,38 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, exc_type, exc, tb):
                 return False
 
+        detector = MagicMock()
+        detector.get_thresholds.return_value = type(
+            "Thresholds",
+            (),
+            {
+                "stop_loss": 144.0,
+                "take_profit": 156.5,
+                "trailing_stop_pct": 3.25,
+            },
+        )()
+        repo = MagicMock()
+        repo.get_open_buy = AsyncMock(return_value=type(
+            "TradeResult",
+            (),
+            {
+                "currency": "USD",
+                "entry_at": datetime(2026, 3, 13, 9, 31, 0),
+                "created_at": datetime(2026, 3, 13, 9, 31, 0),
+                "ai_stop_loss_price": 145.0,
+                "ai_take_profit_price": 157.0,
+                "ai_target_price": 160.0,
+                "notes": (
+                    '{"planned_hold_days": 4, "close_review_count": 1, '
+                    '"last_close_review_date": "2026-03-13", "trailing_stop_pct": 3.25}'
+                ),
+            },
+        )())
+        expected_hold_days = max(0, (market_calendar.market_date(market="NASDAQ") - date(2026, 3, 13)).days)
+
         with patch("agent.trading_agent.activity_logger.log", AsyncMock()), \
                 patch("agent.trading_agent.AsyncSessionLocal", return_value=DummySession()), \
+                patch("repositories.trade_result_repository.TradeResultRepository", return_value=repo), \
                 patch(
                     "analysis.feedback.performance_tracker.PerformanceTracker.get_consecutive_losses",
                     AsyncMock(return_value=0),
@@ -298,9 +330,12 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
                     "entry_price": 151.0,
                     "target_price": 160.0,
                     "stop_loss_price": 145.0,
+                    "take_profit_price": 157.0,
+                    "planned_hold_days": 4,
                     "reason": "수익 구간 불타기",
                     "provider": "CODEX_CLI",
                 })) as tier2_mock, \
+                patch("agent.trading_agent._analysis_mixin.event_detector", detector), \
                 patch("agent.trading_agent.risk_manager.check", AsyncMock(return_value={
                     "approved": True,
                     "adjusted_quantity": None,
@@ -331,6 +366,16 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         tier2_mock.assert_awaited_once()
         self.assertEqual(risk_mock.await_args.kwargs["orderable_cash_krw"], 6_500_000)
         decision_mock.assert_awaited_once()
+        hold_plan_context = tier2_mock.await_args.kwargs["hold_plan_context"]
+        self.assertIn("- 보유 계획 추적 상태: 활성", hold_plan_context)
+        self.assertIn("- planned_hold_days: 4일", hold_plan_context)
+        self.assertIn("- close_review_count: 1회", hold_plan_context)
+        self.assertIn("- last_close_review_date: 2026-03-13", hold_plan_context)
+        self.assertIn(f"- 실제 보유일(달력 기준): {expected_hold_days}일", hold_plan_context)
+        self.assertIn("- 현재 stop_loss_price: 145.00USD", hold_plan_context)
+        self.assertIn("- 현재 take_profit_price: 157.00USD", hold_plan_context)
+        self.assertIn("- 현재 trailing_stop_pct: 3.25%", hold_plan_context)
+        self.assertIn("장중 stop_loss / take_profit / trailing stop은 별도로 살아 있으며 우선 실행됩니다.", hold_plan_context)
         signal = decision_mock.await_args.args[0]
         analysis_context = decision_mock.await_args.kwargs["analysis_context"]
         self.assertEqual(signal.metadata["entry_mode"], "ADD_ON_PYRAMID")
@@ -340,12 +385,37 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(signal.metadata["symbol_orderable_amount_krw"], 6_500_000)
         self.assertEqual(signal.metadata["symbol_orderable_qty"], 43)
         self.assertEqual(signal.metadata["orderable_amount_source"], "INQUIRE_PSAMOUNT")
+        self.assertEqual(signal.stop_loss_price, 144.0)
+        self.assertEqual(signal.take_profit_price, 156.5)
+        self.assertEqual(signal.metadata["trailing_stop_pct"], 3.25)
+        self.assertEqual(signal.metadata["planned_hold_days"], 4)
+        self.assertEqual(signal.metadata["existing_hold_plan_tracking_status"], "tracked")
+        self.assertEqual(signal.metadata["existing_planned_hold_days"], 4)
+        self.assertEqual(signal.metadata["existing_close_review_count"], 1)
+        self.assertEqual(signal.metadata["existing_last_close_review_date"], "2026-03-13")
+        self.assertEqual(signal.metadata["existing_calendar_hold_days"], expected_hold_days)
+        self.assertEqual(signal.metadata["existing_hold_plan_stop_loss_price"], 145.0)
+        self.assertEqual(signal.metadata["existing_hold_plan_take_profit_price"], 157.0)
+        self.assertEqual(signal.metadata["existing_hold_plan_trailing_stop_pct"], 3.25)
         self.assertEqual(analysis_context["entry_mode"], "ADD_ON_PYRAMID")
         self.assertEqual(analysis_context["analysis_source"], "event")
         self.assertEqual(analysis_context["event_type"], "PRICE_SURGE")
         self.assertEqual(analysis_context["broker_cash_krw"], 100_000_000)
         self.assertEqual(analysis_context["symbol_orderable_amount_krw"], 6_500_000)
         self.assertEqual(analysis_context["symbol_orderable_qty"], 43)
+        self.assertEqual(analysis_context["ai_target_price"], 160.0)
+        self.assertEqual(analysis_context["ai_stop_loss_price"], 144.0)
+        self.assertEqual(analysis_context["ai_take_profit_price"], 156.5)
+        self.assertEqual(analysis_context["trailing_stop_pct"], 3.25)
+        self.assertEqual(analysis_context["planned_hold_days"], 4)
+        self.assertEqual(analysis_context["existing_hold_plan_tracking_status"], "tracked")
+        self.assertEqual(analysis_context["existing_planned_hold_days"], 4)
+        self.assertEqual(analysis_context["existing_close_review_count"], 1)
+        self.assertEqual(analysis_context["existing_last_close_review_date"], "2026-03-13")
+        self.assertEqual(analysis_context["existing_calendar_hold_days"], expected_hold_days)
+        self.assertEqual(analysis_context["existing_hold_plan_stop_loss_price"], 145.0)
+        self.assertEqual(analysis_context["existing_hold_plan_take_profit_price"], 157.0)
+        self.assertEqual(analysis_context["existing_hold_plan_trailing_stop_pct"], 3.25)
 
     async def test_evaluate_position_intent_blocks_second_average_down_same_day(self):
         chart_result = ChartAnalysisResult(

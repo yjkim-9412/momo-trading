@@ -352,6 +352,41 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["approved"])
         self.assertNotIn("리스크:보상 비율 부족", result["reason"])
 
+    async def test_stock_rr_uses_take_profit_price_before_target_price(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="AAPL",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=100.0,
+            suggested_quantity=10,
+            target_price=140.0,
+            stop_loss_price=90.0,
+            take_profit_price=110.0,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="STABLE_SHORT",
+            metadata={
+                "market": "NASDAQ",
+                "price_krw": 100.0,
+                "session": "US_REGULAR",
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50000,
+                portfolio_budget=100000,
+                today_trade_count=0,
+                current_holding_count=0,
+                orderable_cash_krw=50000,
+                market_regime="SIDEWAYS",
+            )
+
+        self.assertFalse(result["approved"])
+        self.assertIn("리스크:보상 비율 부족", result["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -829,21 +829,26 @@ class CycleMixin:
                     try:
                         async with AsyncSessionLocal() as session:
                             from repositories.trade_result_repository import TradeResultRepository
-                            from strategy.holding_policy import _calc_hold_days, _get_max_hold_days
                             repo = TradeResultRepository(session)
                             open_positions = await repo.get_all_open(market_scope=scope)
                             if open_positions:
                                 lines = []
                                 for tr in open_positions:
-                                    hold_days = _calc_hold_days(tr)
-                                    max_days = _get_max_hold_days(tr.strategy_type, settings)
+                                    notes = self._parse_trade_notes(getattr(tr, "notes", None))
+                                    planned_hold_days = self._normalize_planned_hold_days(
+                                        notes.get("planned_hold_days"),
+                                        default=1,
+                                    )
+                                    close_review_count = self._try_int(notes.get("close_review_count"))
+                                    if close_review_count is None or close_review_count < 0:
+                                        close_review_count = 0
                                     conf = tr.ai_confidence or 0.0
                                     target_pct = ""
                                     if tr.ai_target_price and tr.entry_price > 0:
                                         target_pct = f", 목표 도달률 {(tr.entry_price / tr.ai_target_price) * 100:.0f}%"
                                     lines.append(
                                         f"- {tr.stock_name}({tr.stock_symbol}): "
-                                        f"보유 {hold_days}/{max_days}일, "
+                                        f"planned {planned_hold_days}일, review {close_review_count}회, "
                                         f"신뢰도 {conf:.2f}, "
                                         f"전략 {tr.strategy_type}"
                                         f"{target_pct}"

@@ -46,6 +46,7 @@ Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매
 - 현재 종목 포지션이 이미 크면 추가매수 정당성이 명확하지 않은 한 승인하지 마세요
 - 보유 종목 BUY는 반드시 `position_intent`를 `ADD_ON_PYRAMID` 또는 `ADD_ON_AVERAGE_DOWN`으로 명시하세요
 - `ADD_ON_AVERAGE_DOWN`은 손실 구간 반등 확인형 추가매수일 때만 허용하세요
+- `planned_hold_days` 같은 기존 보유 계획 정보는 참고용입니다. 장중 stop_loss / take_profit / trailing stop은 별도로 살아 있으며 우선 실행된다고 가정하세요
 
 반드시 한국어로 답변"""
 FINAL_REVIEW_SYSTEM = (
@@ -64,6 +65,9 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 
 ### 현재 종목 포지션
 {current_position_context}
+
+### 기존 보유 계획 상태
+{hold_plan_context}
 
 ### 계좌 상태
 {account_context}
@@ -92,9 +96,7 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 - 현재 이 종목 비중: {current_position_pct:.1f}%
 - 하드 가드 기준 최대 집행 시 예상 합산 비중: {position_pct:.1f}%
 
-### 전략 파라미터
-- 손절: {stop_loss_pct}%
-- 익절: {take_profit_pct}%
+### 운영 제약
 - 최대 보유: {max_hold_window}
 - 최대 비중: {max_position_pct}%
 
@@ -134,6 +136,9 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 - stop_loss_price: 손절 기준가 ({currency})
 - take_profit_price: 익절 기준가 ({currency}) = target_price와 동일하거나 별도 설정
 - trailing_stop_pct: 고점 대비 자동 손절 % (0이면 미사용)
+- planned_hold_days: 총 계획 보유일 (장마감 AI 재리뷰 횟수 기준, 최소 1일)
+- BUY 승인 시 `entry_price`, `target_price`, `stop_loss_price`, `take_profit_price`, `planned_hold_days`를 모두 반드시 채우세요
+- Long 기준 가격 관계는 `stop_loss_price < entry_price < take_profit_price <= target_price` 를 지키세요
 
 **주의**: 아래 JSON은 필드 구조 설명입니다. entry_price/target_price/stop_loss_price/take_profit_price는 반드시 `{currency}` 기준으로 작성하세요. 원화는 투자금 한도와 환산 참고용이며 가격 필드에 넣지 마세요.
 - confidence: 이 매매가 손절 전에 목표가에 도달할 확률 (0.00~1.00)
@@ -156,6 +161,7 @@ JSON 형식으로 답변:
   "stop_loss_price": 0,
   "take_profit_price": 0,
   "trailing_stop_pct": 0.0,
+  "planned_hold_days": 0,
   "suggested_quantity": 0,
   "reason": "위 체크리스트와 스트레스 테스트 기반 최종 판단 이유",
   "risk_warnings": ["위 분석에서 도출한 리스크"]
@@ -166,6 +172,94 @@ FINAL_REVIEW_PROMPT = (
     .replace("__BULL_THEME_RR__", f"{BULL_THEME_RR_FLOOR:.1f}")
     .replace("__DEFENSIVE_RR__", f"{DEFENSIVE_RR_FLOOR:.1f}")
 )
+
+# ---------------------------------------------------------------------------
+# 주식 장종료 보유 재리뷰 프롬프트
+# ---------------------------------------------------------------------------
+
+STOCK_CLOSE_REVIEW_SYSTEM = """당신은 최고 수준의 주식 포지션 리스크 매니저입니다.
+현재 보유 중인 종목을 장마감 시점에 재검토해, 내일 장까지 보유를 연장할지 지금 청산할지 결정합니다.
+
+## 핵심 역할
+1. 기존 진입 논리를 오늘 종가 기준으로 다시 검증
+2. 추세 지속 가능성과 리스크 확대 가능성을 동시에 평가
+3. 보유 연장 시 stop_loss / take_profit / trailing_stop_pct / planned_hold_days를 다시 설정
+4. 근거가 약하면 막연한 기대보다 SELL을 선택
+
+## 출력 원칙
+- action은 HOLD 또는 SELL만 사용하세요
+- HOLD면 `planned_hold_days`, `stop_loss_price`, `take_profit_price`, `trailing_stop_pct`를 모두 다시 제시하세요
+- `planned_hold_days`는 남은 일수가 아니라 **총 계획 보유일**입니다
+- `planned_hold_days`는 장마감 AI 재리뷰 횟수 기준 총량이며, 이미 지난 `close_review_count`를 고려해 최소 `close_review_count + 1` 이상이어야 합니다
+- Long 보유 연장 시 가격 관계는 `stop_loss_price < 현재가 < take_profit_price`를 지키세요
+- `planned_hold_days`는 참고용 계획값이며, 내일 장중 stop_loss / take_profit / trailing stop 우선 실행 원칙을 무효화하지 않습니다
+- 이미 기대 수익보다 하방 리스크가 크거나, 내일 장까지 보유할 논리가 약하면 HOLD가 아니라 SELL로 답하세요
+
+반드시 한국어로 답변"""
+
+STOCK_CLOSE_REVIEW_PROMPT = """## 장마감 보유 재검토 요청
+
+### 시장 전체 상황
+{market_context}
+
+### 트레이딩 상황
+{trading_context}
+
+### 현재 종목 포지션
+{current_position_context}
+
+### 계좌 상태
+{account_context}
+
+### 진입 당시 기록
+{entry_snapshot}
+
+### 원본 차트 요약
+{chart_snapshot}
+
+### 상품 특성
+{product_context}
+
+### 종목 정보
+- 종목: {stock_name} ({symbol})
+- 시장/통화: {market} / {currency}
+- 현재가: {current_price_text}
+- 환산 참고: 1{currency} ≈ {exchange_rate_to_krw:,.2f}원
+- 전략 유형: {strategy_type}
+
+### 기존 보유 계획
+- planned_hold_days: {planned_hold_days}일
+- close_review_count: {close_review_count}회
+- last_close_review_date: {last_close_review_date}
+- 실제 보유일(달력 기준): {calendar_hold_days}일
+- 현재 stop_loss_price: {existing_stop_loss_text}
+- 현재 take_profit_price: {existing_take_profit_text}
+- 현재 trailing_stop_pct: {existing_trailing_text}
+
+### 과거 매매 성과 (AI 피드백)
+{feedback_context}
+
+### 추가 판단 지침
+- 오늘 장마감 기준으로 내일 장까지 보유를 연장할 이유가 충분한지 판단하세요
+- `planned_hold_days`는 오늘 HOLD를 선택할 경우의 총 계획 보유일입니다
+- 기존 계획보다 `planned_hold_days`를 늘리거나 줄일 수 있습니다
+- `planned_hold_days`는 참고용 계획값이며, 내일 장중 stop_loss / take_profit / trailing stop은 별도로 우선 실행됩니다
+- HOLD면 내일 장에서 적용할 손절/익절/트레일링 값까지 다시 제시하세요
+- SELL이면 왜 보유 논리가 약해졌는지 명확히 설명하세요
+
+JSON 형식으로 답변:
+```json
+{{
+  "action": "HOLD/SELL",
+  "planned_hold_days": 0,
+  "confidence": 0.00,
+  "stop_loss_price": 0,
+  "take_profit_price": 0,
+  "trailing_stop_pct": 0.0,
+  "reason": "장마감 보유 연장 또는 청산 판단 이유",
+  "risk_warnings": ["내일 장 기준 주요 리스크"]
+}}
+```"""
 
 # ---------------------------------------------------------------------------
 # 크립토 Tier 2 프롬프트

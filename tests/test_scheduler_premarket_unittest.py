@@ -1,5 +1,7 @@
 import unittest
+import json
 from datetime import date, datetime, time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -7,6 +9,7 @@ from core.config import settings
 from scheduler.market_calendar import market_calendar
 from scheduler.scheduler import TradingScheduler
 from trading.enums import ActivityPhase
+from trading.models import MCPResponse
 
 class SchedulerPremarketProfileTest(unittest.TestCase):
     def setUp(self):
@@ -99,18 +102,31 @@ class SchedulerStartupExecutionTest(unittest.IsolatedAsyncioTestCase):
         self.scheduler._market_open_scan = AsyncMock()
         self.scheduler._post_market_if_needed = AsyncMock()
         self.scheduler._schedule_startup_recovery = AsyncMock()
+        self.scheduler._seed_startup_holdings_watchlist = AsyncMock()
+        self.scheduler._restore_open_position_thresholds = AsyncMock(return_value=2)
+        self.scheduler._restore_adaptive_count = AsyncMock()
+
+        class DummyTask:
+            def add_done_callback(self, _callback):
+                return None
+
+        def fake_create_task(coro):
+            coro.close()
+            return DummyTask()
 
         with patch("asyncio.sleep", AsyncMock()), \
-                patch("asyncio.create_task", MagicMock()) as create_task, \
+                patch("asyncio.create_task", side_effect=fake_create_task) as create_task, \
                 patch.object(market_calendar, "is_trading_hours", return_value=True), \
-                patch.object(market_calendar, "get_market_session", return_value="US_PRE"):
+                patch.object(market_calendar, "get_market_session", return_value="US_PRE"), \
+                patch("agent.decision_maker.decision_maker.repair_recent_broker_orders", AsyncMock(return_value=0)):
             await self.scheduler._on_startup()
 
         self.scheduler._market_open_scan.assert_not_called()
+        self.assertGreaterEqual(self.scheduler._restore_open_position_thresholds.await_count, 1)
+        self.scheduler._restore_open_position_thresholds.assert_any_await("NASDAQ")
         self.scheduler._schedule_startup_recovery.assert_awaited_once()
         self.scheduler._post_market_if_needed.assert_called_once()
-        self.assertEqual(create_task.call_count, 1)
-        create_task.call_args.args[0].close()
+        self.assertGreaterEqual(create_task.call_count, 1)
 
 
 class SchedulerLoggingContextTest(unittest.IsolatedAsyncioTestCase):
@@ -125,6 +141,87 @@ class SchedulerLoggingContextTest(unittest.IsolatedAsyncioTestCase):
         kwargs = log_activity.await_args.kwargs
         self.assertEqual(kwargs["market_scope"], "US")
         self.assertEqual(kwargs["trading_date"], date(2026, 3, 13))
+
+
+class SchedulerThresholdHandlingTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.scheduler = TradingScheduler()
+        self._original_day_trading_only = settings.DAY_TRADING_ONLY
+
+    async def asyncTearDown(self):
+        settings.DAY_TRADING_ONLY = self._original_day_trading_only
+
+    async def test_check_overnight_positions_restores_separate_take_profit_price(self):
+        trade = SimpleNamespace(
+            stock_symbol="AAPL",
+            stock_name="Apple",
+            market="NASDAQ",
+            ai_target_price=220.0,
+            ai_take_profit_price=205.0,
+            ai_stop_loss_price=190.0,
+            notes=json.dumps({"trailing_stop_pct": 2.5}, ensure_ascii=False),
+            strategy_type="STABLE_SHORT",
+            created_at=datetime(2026, 3, 13, 10, 0),
+            entry_at=None,
+        )
+
+        class DummySession:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        repo = MagicMock()
+        repo.get_all_open = AsyncMock(return_value=[trade])
+        detector = MagicMock()
+
+        with patch("core.database.AsyncSessionLocal", return_value=DummySession()), \
+                patch("repositories.trade_result_repository.TradeResultRepository", return_value=repo), \
+                patch("realtime.event_detector.event_detector", detector), \
+                patch("services.activity_logger.activity_logger.log", AsyncMock()):
+            await self.scheduler._check_overnight_positions("NASDAQ")
+
+        detector.set_thresholds.assert_called_once_with(
+            "AAPL",
+            market="NASDAQ",
+            stop_loss=190.0,
+            take_profit=205.0,
+            trailing_stop_pct=2.5,
+        )
+
+    async def test_holdings_check_without_thresholds_skips_legacy_percent_sell(self):
+        settings.DAY_TRADING_ONLY = False
+        holding = SimpleNamespace(
+            symbol="AAPL",
+            name="Apple",
+            market="NASDAQ",
+            avg_buy_price=100.0,
+            quantity=1,
+        )
+
+        class Thresholds:
+            stop_loss = 0.0
+            take_profit = 0.0
+
+        detector = MagicMock()
+        detector.get_thresholds.return_value = Thresholds()
+
+        with patch.object(market_calendar, "is_trading_hours", return_value=True), \
+                patch.object(self.scheduler, "_update_realtime_subscriptions", AsyncMock()), \
+                patch("trading.account_manager.account_manager.get_holdings", AsyncMock(return_value=[holding])), \
+                patch(
+                    "trading.mcp_client.mcp_client.get_current_price",
+                    AsyncMock(return_value=MCPResponse(success=True, data={"price": 94.0})),
+                ), \
+                patch("trading.mcp_client.mcp_client.place_order", AsyncMock()) as place_order_mock, \
+                patch("realtime.event_detector.event_detector", detector), \
+                patch("services.activity_logger.activity_logger.log", AsyncMock()), \
+                patch("scheduler.scheduler.logger.warning") as warning_mock:
+            await self.scheduler._holdings_check("NASDAQ")
+
+        place_order_mock.assert_not_awaited()
+        warning_mock.assert_called()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
+import asyncio
 import unittest
+import json
 from datetime import timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from agent.decision_maker import DecisionMaker
 from models.agent_activity import AgentActivityLog
@@ -151,36 +153,41 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_qty"], 1000)
         self.assertEqual(maker._record_trade_result.await_args.kwargs["currency"], "USD")
 
-    async def test_confirm_and_record_falls_back_to_broker_fill_sync_for_domestic_orders(self):
+    async def test_confirm_and_record_polls_domestic_order_list_until_fill_is_visible(self):
         maker = DecisionMaker()
         maker._load_broker_order = AsyncMock(return_value=None)
         maker._upsert_broker_order = AsyncMock()
         maker._record_trade_result = AsyncMock()
 
+        filled_response = MCPResponse(success=True, data={
+            "output": [{
+                "order_id": "0000012345",
+                "market": "KRX",
+                "symbol": "005930",
+                "name": "삼성전자",
+                "status": "체결",
+                "order_qty": 10,
+                "filled_qty": 10,
+                "remaining_qty": 0,
+                "order_price": 70000.0,
+                "filled_price": 70100.0,
+                "currency": "KRW",
+                "exchange_rate_to_krw": 1.0,
+            }],
+        })
+
+        async def _timeout_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
         with (
             patch("agent.decision_maker.asyncio.sleep", AsyncMock()),
+            patch("agent.decision_maker.asyncio.wait_for", AsyncMock(side_effect=_timeout_wait_for)),
             patch(
                 "agent.decision_maker.mcp_client.get_order_list",
-                AsyncMock(return_value=MCPResponse(success=True, data={"output": []})),
-            ),
+                AsyncMock(return_value=filled_response),
+            ) as order_list_mock,
             patch("agent.decision_maker.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1.0)),
-            patch(
-                "agent.decision_maker.broker_sync_service.reconcile_order_fill",
-                AsyncMock(return_value={
-                    "order_id": "0000012345",
-                    "market": "KRX",
-                    "symbol": "005930",
-                    "name": "삼성전자",
-                    "status": "FILLED",
-                    "order_qty": 10,
-                    "filled_qty": 10,
-                    "remaining_qty": 0,
-                    "order_price": 70000.0,
-                    "filled_price": 70100.0,
-                    "currency": "KRW",
-                    "exchange_rate_to_krw": 1.0,
-                }),
-            ) as reconcile_mock,
             patch("trading.account_manager.account_manager.invalidate_cache"),
         ):
             await maker.confirm_and_record(
@@ -194,7 +201,7 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
                 cycle_id="cycle-domestic",
             )
 
-        reconcile_mock.assert_awaited_once()
+        order_list_mock.assert_awaited_once()
         maker._record_trade_result.assert_awaited_once()
         self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_price"], 70100.0)
         self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_qty"], 10)
@@ -293,6 +300,76 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["quantity"], 300)
         self.assertEqual(payload["status"], "SUBMITTED")
         self.assertEqual(payload["currency"], "USD")
+
+
+class DecisionMakerTradeResultPersistenceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_record_trade_result_persists_trailing_stop_pct_in_notes(self):
+        maker = DecisionMaker()
+        repo = MagicMock()
+        repo.get_open_buy = AsyncMock(return_value=None)
+
+        class DummyTransaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class DummySession:
+            def __init__(self):
+                self.added = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def begin(self):
+                return DummyTransaction()
+
+            def add(self, obj):
+                self.added.append(obj)
+
+        session = DummySession()
+
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", return_value=session),
+            patch("agent.decision_maker.TradeResultRepository", return_value=repo),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()),
+        ):
+            await maker._record_trade_result(
+                symbol="AAPL",
+                market="NASDAQ",
+                side="BUY",
+                order_id="ord-1",
+                filled_qty=3,
+                filled_price=151.5,
+                currency="USD",
+                exchange_rate_to_krw=1450.0,
+                analysis_context={
+                    "stock_name": "Apple",
+                    "strategy_type": "STABLE_SHORT",
+                    "ai_recommendation": "BUY",
+                    "ai_confidence": 0.82,
+                    "ai_target_price": 160.0,
+                    "ai_stop_loss_price": 145.0,
+                    "ai_take_profit_price": 157.0,
+                    "trailing_stop_pct": 3.5,
+                    "planned_hold_days": 4,
+                },
+                cycle_id="cycle-tr-1",
+            )
+
+        self.assertEqual(len(session.added), 1)
+        trade_result = session.added[0]
+        notes = json.loads(trade_result.notes)
+        self.assertEqual(notes["trailing_stop_pct"], 3.5)
+        self.assertEqual(notes["planned_hold_days"], 4)
+        self.assertEqual(notes["close_review_count"], 0)
+        self.assertIsNone(notes["last_close_review_date"])
+        self.assertEqual(trade_result.ai_take_profit_price, 157.0)
+        self.assertEqual(trade_result.ai_stop_loss_price, 145.0)
 
 
 if __name__ == "__main__":

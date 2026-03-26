@@ -85,11 +85,9 @@ DAILY_PLAN_PROMPT = """## 장 마감 데이트레이딩 성과 리뷰
 - action_items는 가장 중요한 3~5개만 제안하세요. 우선순위가 낮은 세부 조정은 제외하세요.
 - 사용 가능한 param_name:
   - min_confidence: 최소 신뢰도 임계값 (0.50~0.90) — Tier1 결과가 이 값 미만이면 Tier2 진행 차단
-  - stop_loss_pct: 손절 % (음수, -8.0~-1.0)
-  - take_profit_pct: 익절 % (2.0~15.0)
   - rr_floor: 최소 리스크:보상 비율 (0.8~3.0)
 - apply_scope 규칙:
-  - min_confidence / stop_loss_pct / take_profit_pct는 `ALL`, `STABLE_SHORT`, `AGGRESSIVE_SHORT` 중 하나
+  - min_confidence는 `ALL`, `STABLE_SHORT`, `AGGRESSIVE_SHORT` 중 하나
   - rr_floor는 `ALL`, `BULL`, `BEAR`, `SIDEWAYS`, `THEME` 중 하나
 - 변경이 불필요하면 빈 배열 []로 두세요
 - 예시 1: 오늘 62% 신뢰도 종목이 손실 → {{"param_name": "min_confidence", "apply_scope": "ALL", "param_value": 0.75}}
@@ -134,7 +132,7 @@ JSON 형식으로 답변:
     {{
       "rule_type": "PARAM_OVERRIDE",
       "apply_scope": "ALL | STABLE_SHORT | AGGRESSIVE_SHORT | BULL | BEAR | SIDEWAYS | THEME",
-      "param_name": "min_confidence | stop_loss_pct | take_profit_pct | rr_floor",
+      "param_name": "min_confidence | rr_floor",
       "param_value": 0.0,
       "reason": "구체적 근거 (오늘 어떤 문제에서 이 규칙이 필요한지)",
       "priority": "HIGH/MEDIUM/LOW"

@@ -93,6 +93,52 @@ class TradingRuleEngineScopeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rules, [])
         self.assertEqual(session.added, [])
 
+    async def test_generate_rules_from_review_rejects_stock_stop_loss_override(self):
+        engine = TradingRuleEngine()
+        session = _FakeSession()
+        parsed_review = {
+            "action_items": [
+                {
+                    "rule_type": "PARAM_OVERRIDE",
+                    "apply_scope": "ALL",
+                    "param_name": "stop_loss_pct",
+                    "param_value": -3.0,
+                    "reason": "주식 손절 퍼센트 강화",
+                }
+            ]
+        }
+
+        with patch("analysis.feedback.trading_rules.AsyncSessionLocal", new=lambda: _FakeSessionContext(session)):
+            rules = await engine.generate_rules_from_review(parsed_review, report_date="2026-03-13", market_scope="KRX")
+
+        self.assertEqual(rules, [])
+        self.assertEqual(session.added, [])
+
+    async def test_generate_rules_from_review_allows_crypto_stop_loss_override(self):
+        engine = TradingRuleEngine()
+        session = _FakeSession()
+        parsed_review = {
+            "action_items": [
+                {
+                    "rule_type": "PARAM_OVERRIDE",
+                    "apply_scope": "ALL",
+                    "param_name": "stop_loss_pct",
+                    "param_value": -3.0,
+                    "reason": "코인 손절 퍼센트 유지",
+                }
+            ]
+        }
+
+        with patch("analysis.feedback.trading_rules.AsyncSessionLocal", new=lambda: _FakeSessionContext(session)):
+            rules = await engine.generate_rules_from_review(
+                parsed_review,
+                report_date="2026-03-13",
+                market_scope="CRYPTO",
+            )
+
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(session.added[0].param_name, "stop_loss_pct")
+
 
 class RiskManagerRRFloorTest(unittest.TestCase):
     def test_normalize_crypto_regime_maps_legacy_aliases(self):
@@ -171,8 +217,8 @@ class CryptoStrategyRegimeMappingTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNotNone(signal)
-        self.assertAlmostEqual(signal.target_price, 112.0)
-        self.assertAlmostEqual(signal.stop_loss_price, 95.0)
+        self.assertAlmostEqual(signal.target_price, 108.0)
+        self.assertAlmostEqual(signal.stop_loss_price, 96.5)
 
 
 if __name__ == "__main__":

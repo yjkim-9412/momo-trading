@@ -389,6 +389,7 @@ class PortfolioMixin:
     @staticmethod
     def _should_skip_tier2(
         *,
+        market_scope: str,
         is_restricted_product: bool,
         tier1_confidence: float,
         market_regime: str,
@@ -396,6 +397,8 @@ class PortfolioMixin:
         has_current_position: bool = False,
     ) -> bool:
         return (
+            market_scope == "CRYPTO"
+            and
             not has_current_position
             and
             not is_restricted_product

@@ -16,6 +16,7 @@ class TradeSignal:
     suggested_amount_krw: float | None = None
     target_price: float | None = None
     stop_loss_price: float | None = None
+    take_profit_price: float | None = None
     urgency: SignalUrgency = SignalUrgency.WAIT
     strategy_type: str = ""
     reason: str = ""

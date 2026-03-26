@@ -183,11 +183,14 @@ class PerformanceTracker:
         return list(result.scalars().all())
 
     async def get_consecutive_losses(self, market_scope: str | None = None) -> int:
-        """최근 연속 손실 횟수 (청산 완료된 거래만 대상)"""
+        """최근 연속 손실 횟수 (당일 청산 완료된 거래만 대상, 일자 변경 시 리셋)"""
+        from util.time_util import now_kst
         M = self.model
+        today_start = now_kst().replace(hour=0, minute=0, second=0, microsecond=0)
         stmt = (
             select(M)
             .where(M.exit_at.is_not(None))
+            .where(M.created_at >= today_start)
             .order_by(M.created_at.desc())
             .limit(20)
         )
