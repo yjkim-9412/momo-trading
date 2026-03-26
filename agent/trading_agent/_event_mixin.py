@@ -161,6 +161,13 @@ class EventMixin:
                                 order_amount,
                                 event_state.available_cash,
                             )
+                    if not is_crypto_market(market_code):
+                        try:
+                            from services.watchlist_sync import reconcile_market_watchlist
+
+                            await reconcile_market_watchlist(market_code)
+                        except Exception as e:
+                            logger.warning("[{}] 실시간 주문 후 감시종목 재동기화 실패: {}", market_code, str(e))
                 # 신규 매수 종목 WebSocket 구독 추가
                 await self._ensure_realtime_subscription(symbol, market=market_code)
             except Exception as e:

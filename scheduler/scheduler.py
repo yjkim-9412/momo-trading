@@ -646,11 +646,6 @@ class TradingScheduler:
 
         for market_group in settings.enabled_market_groups:
             market = normalize_market(market_group)
-            await self._seed_startup_holdings_watchlist(market)
-            restored = await self._restore_open_position_thresholds(market)
-            if restored:
-                logger.info("[{}] 서버 기동 open position 임계값 복원: {}건", market, restored)
-            await self._restore_adaptive_count(market)
             try:
                 repaired = await decision_maker.repair_recent_broker_orders(
                     market_scope=market,
@@ -664,6 +659,21 @@ class TradingScheduler:
                     )
             except Exception as e:
                 logger.warning("[{}] broker ledger startup 복구 실패: {}", market, str(e))
+            try:
+                repaired_open = await decision_maker.repair_stale_open_trade_results(market_scope=market)
+                if repaired_open:
+                    await self._log_schedule(
+                        market,
+                        ActivityPhase.PROGRESS,
+                        f"🧹 [{market}] stale open trade_result {repaired_open}건 복구",
+                    )
+            except Exception as e:
+                logger.warning("[{}] stale open startup 복구 실패: {}", market, str(e))
+            await self._seed_startup_holdings_watchlist(market)
+            restored = await self._restore_open_position_thresholds(market)
+            if restored:
+                logger.info("[{}] 서버 기동 open position 임계값 복원: {}건", market, restored)
+            await self._restore_adaptive_count(market)
             startup_action = self._startup_trading_action(market)
             if settings.AI_DYNAMIC_RESCAN_ENABLED and startup_action:
                 logger.info(
@@ -1140,8 +1150,13 @@ class TradingScheduler:
         from zoneinfo import ZoneInfo
 
         try:
+            from agent.decision_maker import decision_maker
             from trading.account_manager import account_manager
             from trading.mcp_client import mcp_client as _mcp
+
+            repaired = await decision_maker.repair_stale_open_trade_results(market_scope=market)
+            if repaired:
+                logger.warning("[{}] 보유종목 점검 전 stale open {}건 복구", market, repaired)
 
             holdings = await account_manager.get_holdings(market)
             if not holdings:
@@ -1637,13 +1652,8 @@ class TradingScheduler:
             logger.debug("[{}] 장마감 리뷰 시각 이전 — startup catch-up 스킵", market)
             return
 
-        preview = await trading_agent.preview_cycle(market=market)
-        if preview.get("skipped"):
-            logger.info("[{}] 장외 리뷰 체크 결과 스킵: {}", market, preview["reason"])
-            return
-
         logger.info("[{}] 오늘 리뷰 미완료 — 장외 리뷰 실행", market)
-        await trading_agent.run_cycle(market=market)
+        await trading_agent.run_immediate_review(market=market)
 
     async def _force_liquidation(self, market: str) -> None:
         """장 마감 전 청산
@@ -2241,9 +2251,14 @@ class TradingScheduler:
         from services.activity_logger import activity_logger
 
         try:
+            from agent.decision_maker import decision_maker
             from core.database import AsyncSessionLocal
             from repositories.trade_result_repository import TradeResultRepository
             from trading.market_profile import market_scope
+
+            repaired = await decision_maker.repair_stale_open_trade_results(market_scope=market)
+            if repaired:
+                logger.warning("[{}] 오버나이트 점검 전 stale open {}건 복구", market, repaired)
 
             async with AsyncSessionLocal() as session:
                 repo = TradeResultRepository(session)

@@ -36,7 +36,7 @@ from trading.models import coin_side_label
 from trading.product_policy import build_product_context
 from trading.quantity_policy import format_quantity, format_quantity_with_unit, normalize_quantity
 from scheduler.market_calendar import market_calendar
-from util.time_util import now_kst
+from util.time_util import ensure_kst, now_kst
 
 _US_ORDER_SANITY_MAX_GAP_PCT = 0.15
 _OVERSEAS_CONFIRM_DELAYS_SECONDS = (3, 6, 10)
@@ -235,6 +235,31 @@ class DecisionMaker:
     def _trade_context_value(ctx: dict, key: str, fallback=0.0):
         value = ctx.get(key)
         return fallback if value in (None, "") else value
+
+    @staticmethod
+    def _position_key(symbol: str, market: str) -> tuple[str, str]:
+        return normalize_market(market), str(symbol or "").upper().strip()
+
+    @classmethod
+    def _mark_broker_reconciled_trade_notes(
+        cls,
+        existing_notes: str | None,
+        *,
+        broker_order: BrokerOrder,
+    ) -> str:
+        trade_notes = cls._parse_trade_notes(existing_notes)
+        trade_notes["reconciled_from_broker_order_id"] = broker_order.id
+        trade_notes["reconciled_from_kis_order_id"] = broker_order.kis_order_id
+        trade_notes["reconciled_at"] = now_kst().isoformat()
+        trade_notes["reconcile_source"] = "broker_order"
+        return json.dumps(trade_notes, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _broker_order_filled_at(order: BrokerOrder):
+        for value in (order.filled_at, order.submitted_at, getattr(order, "created_at", None)):
+            if value:
+                return ensure_kst(value)
+        return None
 
     @staticmethod
     def _order_quantity(value: object, market: str) -> float:
@@ -803,6 +828,132 @@ class DecisionMaker:
         if repaired:
             logger.warning(
                 "[BrokerOrder] activity log 기반 누락 주문 {}건 복구 (market_scope={})",
+                repaired,
+                target_scope or "ALL",
+            )
+        return repaired
+
+    async def repair_stale_open_trade_results(
+        self,
+        *,
+        market_scope: str | None = None,
+    ) -> int:
+        """실보유가 없는 stale open BUY를 broker_orders FILLED 기준으로 close 처리"""
+        from realtime.event_detector import event_detector
+        from trading.account_manager import account_manager
+        from trading.market_profile import markets_for_scope
+
+        target_scope = normalize_market_scope(market_scope) if market_scope else None
+        if target_scope == "CRYPTO":
+            return 0
+
+        representative_market = markets_for_scope(target_scope or settings.primary_market_code)[0]
+        try:
+            holdings = await account_manager.get_holdings(representative_market)
+        except Exception as e:
+            logger.warning(
+                "[TradeResult] stale open 복구 스킵 — holdings 조회 실패 (market_scope={}): {}",
+                target_scope or "ALL",
+                str(e),
+            )
+            return 0
+
+        holding_keys = {
+            self._position_key(
+                getattr(holding, "symbol", ""),
+                getattr(holding, "market", None) or representative_market,
+            )
+            for holding in holdings
+            if getattr(holding, "symbol", None) and float(getattr(holding, "quantity", 0) or 0) > 0
+        }
+
+        repaired = 0
+        repaired_symbols: list[tuple[str, str]] = []
+
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                repo = TradeResultRepository(session)
+                open_positions = await repo.get_all_open(market_scope=target_scope)
+
+                for open_trade in open_positions:
+                    position_key = self._position_key(open_trade.stock_symbol, open_trade.market)
+                    if position_key in holding_keys:
+                        continue
+
+                    entry_at = ensure_kst(open_trade.entry_at) if open_trade.entry_at else None
+                    sell_orders = list(
+                        (
+                            await session.execute(
+                                select(BrokerOrder)
+                                .where(BrokerOrder.market == open_trade.market)
+                                .where(BrokerOrder.symbol == open_trade.stock_symbol)
+                                .where(BrokerOrder.side == "SELL")
+                                .where(BrokerOrder.status == "FILLED")
+                                .order_by(BrokerOrder.filled_at.desc(), BrokerOrder.created_at.desc())
+                            )
+                        ).scalars().all()
+                    )
+
+                    matched_order = None
+                    for sell_order in sell_orders:
+                        filled_at = self._broker_order_filled_at(sell_order)
+                        if entry_at and filled_at and filled_at < entry_at:
+                            continue
+                        matched_order = sell_order
+                        break
+
+                    if matched_order is None:
+                        logger.warning(
+                            "[TradeResult] stale open 유지: {} {} 실보유 없음 + SELL FILLED 부재",
+                            open_trade.market,
+                            open_trade.stock_symbol,
+                        )
+                        continue
+
+                    exit_at = self._broker_order_filled_at(matched_order) or now_kst()
+                    exit_price = float(matched_order.filled_price or 0.0)
+                    exit_exchange_rate = float(
+                        matched_order.exchange_rate_to_krw
+                        or open_trade.exchange_rate_to_krw
+                        or 1.0
+                    )
+                    exit_price_krw = float(
+                        matched_order.filled_price_krw
+                        or self._to_trade_krw(
+                            exit_price,
+                            matched_order.currency or open_trade.currency,
+                            exit_exchange_rate,
+                        )
+                    )
+                    quantity = int(open_trade.quantity or 0)
+                    entry_price = float(open_trade.entry_price or 0.0)
+                    raw_pnl = (exit_price - entry_price) * quantity if entry_price > 0 else 0.0
+                    pnl = self._to_trade_krw(raw_pnl, open_trade.currency, exit_exchange_rate)
+                    return_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+                    hold_days = max(0, (exit_at - entry_at).days) if entry_at else 0
+
+                    open_trade.exit_at = exit_at
+                    open_trade.exit_price = exit_price
+                    open_trade.exit_price_krw = exit_price_krw
+                    open_trade.raw_pnl = raw_pnl
+                    open_trade.pnl = pnl
+                    open_trade.return_pct = round(return_pct, 2)
+                    open_trade.is_win = pnl > 0
+                    open_trade.hold_days = hold_days
+                    open_trade.exit_reason = "BROKER_RECONCILE"
+                    open_trade.notes = self._mark_broker_reconciled_trade_notes(
+                        getattr(open_trade, "notes", None),
+                        broker_order=matched_order,
+                    )
+                    repaired += 1
+                    repaired_symbols.append(position_key)
+
+        for market_code, symbol in repaired_symbols:
+            event_detector.remove_levels(symbol, market=market_code)
+
+        if repaired:
+            logger.warning(
+                "[TradeResult] stale open {}건 broker_orders 기준 자동 복구 (market_scope={})",
                 repaired,
                 target_scope or "ALL",
             )
@@ -1760,7 +1911,8 @@ class DecisionMaker:
                         pnl = self._to_trade_krw(raw_pnl, open_buy.currency, entry_exchange_rate)
                         return_pct = ((filled_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
                         is_win = pnl > 0
-                        hold_days = (now - open_buy.entry_at).days if open_buy.entry_at else 0
+                        entry_at = ensure_kst(open_buy.entry_at) if open_buy.entry_at else None
+                        hold_days = (now - entry_at).days if entry_at else 0
 
                         open_buy.exit_price = filled_price
                         open_buy.exit_price_krw = filled_price_krw

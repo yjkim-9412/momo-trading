@@ -199,6 +199,38 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
             any("기보유 종목 이벤트 감지" in call.args[2] for call in log_mock.await_args_list),
         )
 
+    async def test_on_market_event_reconciles_watchlist_after_execution(self):
+        self.agent._running = True
+        event = Event(
+            type=EventType.VOLUME_SPIKE,
+            data={
+                "symbol": "PLTR",
+                "market": "NASDAQ",
+                "price": 149.18,
+                "change_rate": -2.81,
+                "currency": "USD",
+            },
+            source="test",
+        )
+
+        with patch.object(self.agent, "_build_trading_context", AsyncMock(return_value="ctx")), \
+                patch.object(self.agent, "_get_today_trade_count", AsyncMock(return_value=0)), \
+                patch("agent.trading_agent._event_mixin.settings.AI_RISK_TUNING_ENABLED", False), \
+                patch("trading.account_manager.account_manager.get_account_snapshot", AsyncMock(return_value=(self._balance(), [self._holding()]))), \
+                patch("agent.trading_agent.activity_logger.log", AsyncMock()), \
+                patch("services.watchlist_sync.reconcile_market_watchlist", AsyncMock(return_value=[("PLTR", "NASDAQ")])) as reconcile_mock, \
+                patch.object(self.agent, "_ensure_realtime_subscription", AsyncMock()) as subscribe_mock, \
+                patch.object(
+                    self.agent,
+                    "_analyze_and_trade",
+                    AsyncMock(return_value={"executed": True, "order_amount": 25_000}),
+                ):
+            await self.agent._on_market_event(event)
+
+        self.assertEqual(self.agent.get_runtime("NASDAQ").available_cash, self._balance().effective_cash - 25_000)
+        reconcile_mock.assert_awaited_once_with("NASDAQ")
+        subscribe_mock.assert_awaited_once_with("PLTR", market="NASDAQ")
+
     async def test_analyze_and_trade_runs_cycle_for_held_symbol_when_tier2_approves_add_on(self):
         holding_symbols, holding_positions = self.agent._build_holding_snapshot(
             [self._holding(current_price=159.63, pnl=5950.0, pnl_rate=3.87)],

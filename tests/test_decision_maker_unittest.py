@@ -1,15 +1,22 @@
 import asyncio
 import unittest
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from sqlalchemy import delete, select
 
 from agent.decision_maker import DecisionMaker
 from models.agent_activity import AgentActivityLog
+from models.base import Base
+from models.broker_order import BrokerOrder
+from models.trade_result import TradeResult
+from realtime.event_detector import event_detector
 from strategy.signal import TradeSignal
 from trading.enums import SignalAction, SignalUrgency
-from trading.models import MCPResponse
-from util.time_util import now_kst
+from trading.models import HoldingInfo, MCPResponse
+from tests.conftest import TestAsyncSessionLocal, test_async_engine
+from util.time_util import KST, now_kst
 
 
 class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
@@ -370,6 +377,235 @@ class DecisionMakerTradeResultPersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(notes["last_close_review_date"])
         self.assertEqual(trade_result.ai_take_profit_price, 157.0)
         self.assertEqual(trade_result.ai_stop_loss_price, 145.0)
+
+
+class DecisionMakerStaleRepairTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        event_detector.clear_all()
+        async with test_async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                await session.execute(delete(BrokerOrder))
+                await session.execute(delete(TradeResult))
+
+    async def asyncTearDown(self):
+        event_detector.clear_all()
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                await session.execute(delete(BrokerOrder))
+                await session.execute(delete(TradeResult))
+
+    @staticmethod
+    async def _get_trade(symbol: str) -> TradeResult | None:
+        async with TestAsyncSessionLocal() as session:
+            return await session.scalar(
+                select(TradeResult)
+                .where(TradeResult.stock_symbol == symbol)
+                .limit(1)
+            )
+
+    async def test_record_trade_result_sell_normalizes_naive_entry_at(self):
+        maker = DecisionMaker()
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    TradeResult(
+                        order_id="buy-042660",
+                        stock_symbol="042660",
+                        stock_name="한화오션",
+                        currency="KRW",
+                        exchange_rate_to_krw=1.0,
+                        market="KRX",
+                        side="BUY",
+                        strategy_type="STABLE_SHORT",
+                        entry_price=128500.0,
+                        entry_price_krw=128500.0,
+                        quantity=1,
+                        raw_pnl=0.0,
+                        pnl=0.0,
+                        return_pct=0.0,
+                        is_win=False,
+                        hold_days=0,
+                        entry_at=datetime(2026, 3, 26, 10, 9, 37, 62402),
+                    )
+                )
+
+        fixed_now = datetime(2026, 3, 26, 11, 20, 59, 757095, tzinfo=KST)
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", TestAsyncSessionLocal),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()),
+            patch("agent.decision_maker.now_kst", return_value=fixed_now),
+        ):
+            await maker._record_trade_result(
+                symbol="042660",
+                market="KRX",
+                side="SELL",
+                order_id="sell-042660",
+                filled_qty=1,
+                filled_price=125900.0,
+                currency="KRW",
+                exchange_rate_to_krw=1.0,
+                analysis_context={"stock_name": "한화오션"},
+                exit_reason="STOP_LOSS_HIT",
+                cycle_id="cycle-sell-1",
+            )
+
+        trade = await self._get_trade("042660")
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        self.assertEqual(trade.exit_reason, "STOP_LOSS_HIT")
+        self.assertEqual(trade.exit_price, 125900.0)
+        self.assertEqual(trade.exit_price_krw, 125900.0)
+        self.assertEqual(trade.hold_days, 0)
+        self.assertLess(trade.pnl, 0)
+        self.assertIsNotNone(trade.exit_at)
+
+    async def test_repair_stale_open_trade_results_closes_missing_holding_from_filled_sell(self):
+        maker = DecisionMaker()
+        event_detector.set_thresholds("042660", market="KRX", stop_loss=126100.0)
+
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    TradeResult(
+                        order_id="buy-042660",
+                        stock_symbol="042660",
+                        stock_name="한화오션",
+                        currency="KRW",
+                        exchange_rate_to_krw=1.0,
+                        market="KRX",
+                        side="BUY",
+                        strategy_type="STABLE_SHORT",
+                        entry_price=128500.0,
+                        entry_price_krw=128500.0,
+                        quantity=1,
+                        raw_pnl=0.0,
+                        pnl=0.0,
+                        return_pct=0.0,
+                        is_win=False,
+                        hold_days=0,
+                        notes=json.dumps({"planned_hold_days": 2}, ensure_ascii=False),
+                        entry_at=datetime(2026, 3, 26, 10, 9, 37, 62402),
+                    )
+                )
+                session.add(
+                    BrokerOrder(
+                        cycle_id="cycle-042660",
+                        market="KRX",
+                        symbol="042660",
+                        stock_name="한화오션",
+                        side="SELL",
+                        status="FILLED",
+                        strategy_type="STABLE_SHORT",
+                        quantity=1,
+                        requested_price=125900.0,
+                        requested_price_krw=125900.0,
+                        filled_quantity=1,
+                        filled_price=125900.0,
+                        filled_price_krw=125900.0,
+                        currency="KRW",
+                        exchange_rate_to_krw=1.0,
+                        kis_order_id="0017655400",
+                        submitted_at=datetime(2026, 3, 26, 11, 20, 55),
+                        filled_at=datetime(2026, 3, 26, 11, 20, 59, 757095),
+                    )
+                )
+
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", TestAsyncSessionLocal),
+            patch("trading.account_manager.account_manager.get_holdings", AsyncMock(return_value=[])),
+        ):
+            repaired = await maker.repair_stale_open_trade_results(market_scope="KRX")
+
+        self.assertEqual(repaired, 1)
+        trade = await self._get_trade("042660")
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        notes = json.loads(trade.notes)
+        self.assertEqual(trade.exit_reason, "BROKER_RECONCILE")
+        self.assertEqual(trade.exit_price, 125900.0)
+        self.assertEqual(notes["reconciled_from_kis_order_id"], "0017655400")
+        self.assertEqual(notes["reconcile_source"], "broker_order")
+        self.assertIsNotNone(trade.exit_at)
+        self.assertNotIn("KRX:042660", event_detector.monitored_symbols)
+
+    async def test_repair_stale_open_trade_results_skips_when_actual_holding_exists(self):
+        maker = DecisionMaker()
+        event_detector.set_thresholds("042660", market="KRX", stop_loss=126100.0)
+
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    TradeResult(
+                        order_id="buy-042660",
+                        stock_symbol="042660",
+                        stock_name="한화오션",
+                        currency="KRW",
+                        exchange_rate_to_krw=1.0,
+                        market="KRX",
+                        side="BUY",
+                        strategy_type="STABLE_SHORT",
+                        entry_price=128500.0,
+                        entry_price_krw=128500.0,
+                        quantity=1,
+                        raw_pnl=0.0,
+                        pnl=0.0,
+                        return_pct=0.0,
+                        is_win=False,
+                        hold_days=0,
+                        entry_at=datetime(2026, 3, 26, 10, 9, 37, 62402),
+                    )
+                )
+                session.add(
+                    BrokerOrder(
+                        cycle_id="cycle-042660",
+                        market="KRX",
+                        symbol="042660",
+                        stock_name="한화오션",
+                        side="SELL",
+                        status="FILLED",
+                        strategy_type="STABLE_SHORT",
+                        quantity=1,
+                        requested_price=125900.0,
+                        requested_price_krw=125900.0,
+                        filled_quantity=1,
+                        filled_price=125900.0,
+                        filled_price_krw=125900.0,
+                        currency="KRW",
+                        exchange_rate_to_krw=1.0,
+                        kis_order_id="0017655400",
+                        submitted_at=datetime(2026, 3, 26, 11, 20, 55),
+                        filled_at=datetime(2026, 3, 26, 11, 20, 59, 757095),
+                    )
+                )
+
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", TestAsyncSessionLocal),
+            patch(
+                "trading.account_manager.account_manager.get_holdings",
+                AsyncMock(return_value=[
+                    HoldingInfo(
+                        symbol="042660",
+                        name="한화오션",
+                        market="KRX",
+                        quantity=1,
+                        avg_buy_price=128500.0,
+                        current_price=125900.0,
+                        pnl=-2600.0,
+                        pnl_rate=-2.02,
+                    )
+                ]),
+            ),
+        ):
+            repaired = await maker.repair_stale_open_trade_results(market_scope="KRX")
+
+        self.assertEqual(repaired, 0)
+        trade = await self._get_trade("042660")
+        self.assertIsNotNone(trade)
+        assert trade is not None
+        self.assertIsNone(trade.exit_at)
+        self.assertIn("KRX:042660", event_detector.monitored_symbols)
 
 
 if __name__ == "__main__":
