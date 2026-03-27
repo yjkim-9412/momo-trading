@@ -149,6 +149,8 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("take_profit_price", FINAL_REVIEW_PROMPT)
         self.assertIn("planned_hold_days", FINAL_REVIEW_PROMPT)
         self.assertIn("stop_loss_price < entry_price < take_profit_price <= target_price", FINAL_REVIEW_PROMPT)
+        self.assertIn("웹 검색, 뉴스/기사 확인, 외부 사실 보강, URL/도메인/출처 인용을 금지합니다", FINAL_REVIEW_SYSTEM)
+        self.assertIn("외부 링크, 뉴스 출처, URL, 웹페이지 이름을 reason/risk_warnings에 쓰지 마세요", FINAL_REVIEW_PROMPT)
         self.assertNotIn("- 손절: {stop_loss_pct}%", FINAL_REVIEW_PROMPT)
         self.assertNotIn("- 익절: {take_profit_pct}%", FINAL_REVIEW_PROMPT)
         self.assertIn("confidence: 이 매매가 손절 전에 목표가에 도달할 확률", FINAL_REVIEW_PROMPT)
@@ -159,6 +161,7 @@ class TradingAgentDataQualityTest(unittest.TestCase):
     def test_stock_close_review_prompt_requires_hold_day_reapproval_contract(self):
         self.assertIn("action은 HOLD 또는 SELL만 사용하세요", STOCK_CLOSE_REVIEW_SYSTEM)
         self.assertIn("`planned_hold_days`는 참고용 계획값", STOCK_CLOSE_REVIEW_SYSTEM)
+        self.assertIn("웹 검색, 뉴스/기사 확인, 외부 사실 보강, URL/도메인/출처 인용을 금지합니다", STOCK_CLOSE_REVIEW_SYSTEM)
         self.assertIn("planned_hold_days", STOCK_CLOSE_REVIEW_PROMPT)
         self.assertIn("close_review_count", STOCK_CLOSE_REVIEW_PROMPT)
         self.assertIn("{exchange_rate_line}", STOCK_CLOSE_REVIEW_PROMPT)
@@ -334,6 +337,17 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         )
 
         self.assertEqual(issue, "Tier2 익절가가 목표가를 초과함")
+
+    def test_detect_external_evidence_rejects_urls_and_external_sources(self):
+        issue = TradingAgent._detect_external_evidence(
+            {
+                "reason": "https://www.reuters.com 기사 기준 모멘텀 유지",
+                "risk_warnings": ["Benzinga 기사 참고"],
+            }
+        )
+
+        self.assertEqual(issue, "Tier2 외부 링크/외부 출처 흔적 감지")
+        self.assertIsNone(TradingAgent._detect_external_evidence({"reason": "제공 데이터 기준 관망"}))
 
     def test_apply_trade_thresholds_prefers_explicit_take_profit_price(self):
         captured = {}

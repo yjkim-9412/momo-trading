@@ -70,7 +70,7 @@ class MarketScanner:
             logger.info("매매불가 종목 필터: {}건 → {}건", len(stocks), len(filtered))
         return filtered
 
-    def _apply_product_policy(self, selected: list[dict]) -> list[dict]:
+    def _apply_product_policy(self, selected: list[dict], *, log_summary: bool = True) -> list[dict]:
         """레버리지/인버스 상품 정책 적용"""
         filtered: list[dict] = []
         dropped = 0
@@ -114,7 +114,7 @@ class MarketScanner:
 
             filtered.append(enriched)
 
-        if dropped or adjusted:
+        if log_summary and (dropped or adjusted):
             logger.info(
                 "상품 정책 적용: {}건 → {}건 (제외 {}건, 전략 조정 {}건)",
                 len(selected), len(filtered), dropped, adjusted,
@@ -733,6 +733,106 @@ class MarketScanner:
         }, final_junk_stats)
 
     @staticmethod
+    def _regular_selected_floor_target(market: str, session: str) -> int:
+        """미국 정규장 최소 선정 종목 수."""
+        market_code = normalize_market(market)
+        session_code = str(session or "").upper()
+        if not is_us_market(market_code) or session_code != "US_REGULAR":
+            return 0
+        return settings.us_regular_min_selected_candidates
+
+    def _build_regular_floor_candidate_pool(self, *groups: list[dict]) -> list[dict]:
+        """정규장 최소 선정 보장용 candidate pool 생성."""
+        merged = self._merge_stock_lists(*groups)
+        if not merged:
+            return []
+
+        prepared = [
+            {
+                **item,
+                "market": normalize_market(item.get("market", settings.primary_market_code)),
+                "strategy_type": str(item.get("strategy_type") or "STABLE_SHORT").upper(),
+            }
+            for item in merged
+        ]
+        return self._apply_product_policy(prepared, log_summary=False)
+
+    async def _expand_us_regular_candidate_groups(
+        self,
+        scan_markets: list[str],
+        holdings,
+        default_market: str,
+    ) -> tuple[list[dict], list[dict], list[dict], dict[str, int]]:
+        """미국 정규장 후보 풀이 부족할 때 discovery + 시드로 확장."""
+        limit = _US_EXPANDED_SCAN_LIMIT
+        volume_rank, surge_data, drop_data = await asyncio.gather(
+            self._get_volume_rank(
+                scan_markets,
+                limit=limit,
+                include_trade_growth=True,
+            ),
+            self._get_fluctuation_rank(scan_markets, "top", limit=limit),
+            self._get_fluctuation_rank(scan_markets, "bottom", limit=limit),
+        )
+        supplemental = await self._build_us_expansion_candidates(default_market, holdings)
+        volume_rank, surge_data, drop_data = self._supplement_candidate_groups(
+            volume_rank,
+            surge_data,
+            drop_data,
+            supplemental,
+            limit=limit,
+        )
+        return volume_rank, surge_data, drop_data, {
+            "limit": limit,
+            "supplemental_count": len(supplemental),
+        }
+
+    @staticmethod
+    def _backfill_selected_candidates(
+        selected: list[dict],
+        candidate_pool: list[dict],
+        minimum_count: int,
+    ) -> tuple[list[dict], int]:
+        """LLM 선정이 부족하면 deterministic fallback으로 보강."""
+        if minimum_count <= 0 or len(selected) >= minimum_count:
+            return selected, 0
+
+        merged = list(selected)
+        seen = {
+            (
+                normalize_market(item.get("market", settings.primary_market_code)),
+                str(item.get("symbol", "")).strip().upper(),
+            )
+            for item in merged
+            if item.get("symbol")
+        }
+        backfilled = 0
+
+        for item in candidate_pool:
+            symbol = str(item.get("symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            market_code = normalize_market(item.get("market", settings.primary_market_code))
+            key = (market_code, symbol)
+            if key in seen:
+                continue
+
+            merged.append({
+                **item,
+                "symbol": symbol,
+                "market": market_code,
+                "strategy_type": str(item.get("strategy_type") or "STABLE_SHORT").upper(),
+                "reason": str(item.get("reason") or "가용 현금 기준 후보 보강"),
+                "scan_source": item.get("scan_source", "FLOOR_BACKFILL"),
+            })
+            seen.add(key)
+            backfilled += 1
+            if len(merged) >= minimum_count:
+                break
+
+        return merged, backfilled
+
+    @staticmethod
     def _empty_candidate_market_summary(junk_filter_stats: dict[str, dict[str, object]] | None) -> str:
         """후보가 모두 제거됐을 때 요약 메시지."""
         if not junk_filter_stats:
@@ -754,6 +854,15 @@ class MarketScanner:
         session_code = str(session or "").upper()
         if is_us_market(market_code) and session_code == "US_PRE":
             return "3~6"
+        if (
+            is_us_market(market_code)
+            and session_code == "US_REGULAR"
+            and minutes_until_cutoff <= 30
+            and settings.us_regular_min_selected_candidates > 0
+        ):
+            lower = settings.us_regular_min_selected_candidates
+            upper = max(lower, 4)
+            return f"{lower}~{upper}"
         if minutes_until_cutoff <= 30:
             return "0~3"
         if minutes_until_cutoff <= 90:
@@ -803,6 +912,12 @@ class MarketScanner:
             session,
             minutes_until_cutoff,
         )
+        regular_floor_target = self._regular_selected_floor_target(target, session)
+        regular_selection_floor = (
+            settings.us_regular_min_selected_candidates
+            if is_us_market(primary_market)
+            else 0
+        )
         if account_snapshot is None:
             (
                 account_snapshot,
@@ -851,6 +966,17 @@ class MarketScanner:
             "final_stage": 0,
             "stage_counts": [],
         }
+        regular_floor_stats: dict[str, object] = {
+            "target": regular_floor_target,
+            "triggered": False,
+            "base_affordable_count": 0,
+            "expanded_affordable_count": 0,
+            "candidate_pool_count": 0,
+            "supplemental_count": 0,
+            "backfilled_count": 0,
+            "unmet_floor": False,
+        }
+        regular_floor_candidate_pool: list[dict] = []
         if junk_filter_enabled:
             (
                 volume_rank,
@@ -901,6 +1027,68 @@ class MarketScanner:
             affordability_stats["drop_data"]["after"] = len(drop_data)
             affordability_stats["drop_data"]["dropped"] = drop_dropped
 
+        if regular_floor_target > 0:
+            regular_floor_candidate_pool = self._build_regular_floor_candidate_pool(
+                volume_rank,
+                surge_data,
+                drop_data,
+            )
+            regular_floor_stats["base_affordable_count"] = len(regular_floor_candidate_pool)
+            regular_floor_stats["expanded_affordable_count"] = len(regular_floor_candidate_pool)
+            regular_floor_stats["candidate_pool_count"] = len(regular_floor_candidate_pool)
+
+            if len(regular_floor_candidate_pool) < regular_floor_target:
+                regular_floor_stats["triggered"] = True
+                (
+                    volume_rank,
+                    surge_data,
+                    drop_data,
+                    regular_expansion_meta,
+                ) = await self._expand_us_regular_candidate_groups(
+                    scan_markets,
+                    holdings,
+                    scan_markets[0] if scan_markets else target,
+                )
+                regular_floor_stats["supplemental_count"] = regular_expansion_meta["supplemental_count"]
+                expanded_candidates = [*volume_rank, *surge_data, *drop_data]
+                fx_rates = await self._build_affordability_fx_rates(expanded_candidates)
+                affordability_stats = {
+                    "volume_rank": {"before": len(volume_rank), "after": 0, "dropped": 0},
+                    "surge_data": {"before": len(surge_data), "after": 0, "dropped": 0},
+                    "drop_data": {"before": len(drop_data), "after": 0, "dropped": 0},
+                }
+                volume_rank, volume_dropped = self._filter_affordable_stocks(
+                    volume_rank,
+                    available_cash,
+                    available_cash_foreign,
+                    fx_rates,
+                )
+                surge_data, surge_dropped = self._filter_affordable_stocks(
+                    surge_data,
+                    available_cash,
+                    available_cash_foreign,
+                    fx_rates,
+                )
+                drop_data, drop_dropped = self._filter_affordable_stocks(
+                    drop_data,
+                    available_cash,
+                    available_cash_foreign,
+                    fx_rates,
+                )
+                affordability_stats["volume_rank"]["after"] = len(volume_rank)
+                affordability_stats["volume_rank"]["dropped"] = volume_dropped
+                affordability_stats["surge_data"]["after"] = len(surge_data)
+                affordability_stats["surge_data"]["dropped"] = surge_dropped
+                affordability_stats["drop_data"]["after"] = len(drop_data)
+                affordability_stats["drop_data"]["dropped"] = drop_dropped
+                regular_floor_candidate_pool = self._build_regular_floor_candidate_pool(
+                    volume_rank,
+                    surge_data,
+                    drop_data,
+                )
+                regular_floor_stats["expanded_affordable_count"] = len(regular_floor_candidate_pool)
+                regular_floor_stats["candidate_pool_count"] = len(regular_floor_candidate_pool)
+
         data_elapsed = activity_logger.elapsed_ms(timer)
         logger.info("MCP 데이터 수집 완료: {}ms", data_elapsed)
         if junk_filter_enabled:
@@ -923,6 +1111,13 @@ class MarketScanner:
                     expansion_stats.get("final_stage", 0),
                     expansion_stats.get("stage_counts", []),
                 )
+        if regular_floor_stats.get("triggered"):
+            logger.info(
+                "미국 정규장 후보 floor 보강: base={} expanded={} supplemental={}",
+                regular_floor_stats.get("base_affordable_count", 0),
+                regular_floor_stats.get("expanded_affordable_count", 0),
+                regular_floor_stats.get("supplemental_count", 0),
+            )
 
         if any(int(stats["dropped"]) > 0 for stats in affordability_stats.values()):
             if available_cash_foreign is not None:
@@ -952,6 +1147,8 @@ class MarketScanner:
             market_summary = self._empty_candidate_market_summary(
                 junk_filter_stats if junk_filter_enabled else None,
             )
+            if regular_floor_target > 0:
+                regular_floor_stats["unmet_floor"] = True
             await activity_logger.log(
                 ActivityType.SCAN, ActivityPhase.COMPLETE,
                 f"\U0001f4e1 시장 스캔 완료: {market_summary}",
@@ -966,6 +1163,7 @@ class MarketScanner:
                     "affordability_filter": affordability_stats,
                     "junk_filter": junk_filter_stats,
                     "expansion": expansion_stats,
+                    "regular_floor": regular_floor_stats,
                 },
                 execution_time_ms=elapsed,
             )
@@ -980,6 +1178,7 @@ class MarketScanner:
                 "max_per_stock": max_per_stock,
                 "max_per_stock_foreign": max_per_stock_foreign,
                 "markets": scan_markets,
+                "regular_floor": regular_floor_stats,
             }
 
         prompt = get_market_scan_prompt(primary_market).format(
@@ -989,6 +1188,7 @@ class MarketScanner:
             market_session=session,
             minutes_until_cutoff=minutes_until_cutoff,
             selection_target_range=selection_target_range,
+            regular_selection_floor=regular_selection_floor,
             available_cash=available_cash,
             available_cash_foreign=available_cash_foreign or 0.0,
             max_per_stock=max_per_stock,
@@ -1023,6 +1223,19 @@ class MarketScanner:
                 primary_market,
             )
             selected = self._apply_product_policy(selected)
+            if regular_floor_target > 0:
+                desired_selected_count = min(
+                    regular_floor_target,
+                    len(regular_floor_candidate_pool),
+                )
+                selected, backfilled_count = self._backfill_selected_candidates(
+                    selected,
+                    regular_floor_candidate_pool,
+                    desired_selected_count,
+                )
+                regular_floor_stats["backfilled_count"] = backfilled_count
+                regular_floor_stats["candidate_pool_count"] = len(regular_floor_candidate_pool)
+                regular_floor_stats["unmet_floor"] = len(selected) < regular_floor_target
             elapsed = activity_logger.elapsed_ms(timer)
 
             logger.info(
@@ -1066,6 +1279,7 @@ class MarketScanner:
                     },
                     "junk_filter": junk_filter_stats,
                     "expansion": expansion_stats,
+                    "regular_floor": regular_floor_stats,
                 },
                 llm_provider=provider,
                 llm_tier="TIER1",
@@ -1084,6 +1298,7 @@ class MarketScanner:
                 "max_per_stock_foreign": max_per_stock_foreign,
                 "provider": provider,
                 "markets": scan_markets,
+                "regular_floor": regular_floor_stats,
             }
         except Exception as e:
             elapsed = activity_logger.elapsed_ms(timer)

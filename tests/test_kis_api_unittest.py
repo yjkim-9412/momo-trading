@@ -8,8 +8,10 @@ from trading.kis_api import (
     _get_account_parts,
     _get_token_file,
     _get_trading_domain,
+    cancel_overseas_order,
     get_overseas_daily_price,
     get_overseas_order_list,
+    place_overseas_order,
 )
 
 
@@ -101,6 +103,123 @@ class TradingProfileConfigTest(unittest.TestCase):
 
         self.assertEqual(str(_get_token_file()), "data/kis_token.real.json")
         self.assertEqual(_get_trading_domain(), DOMAIN)
+
+
+class OverseasOrderRoutingTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._original_account_type = settings.KIS_ACCOUNT_TYPE
+        self._original_acct_stock = settings.KIS_ACCT_STOCK
+        self._original_prod_type = settings.KIS_PROD_TYPE
+        settings.KIS_ACCOUNT_TYPE = "REAL"
+        settings.KIS_ACCT_STOCK = "1234567801"
+        settings.KIS_PROD_TYPE = ""
+
+    def tearDown(self):
+        settings.KIS_ACCOUNT_TYPE = self._original_account_type
+        settings.KIS_ACCT_STOCK = self._original_acct_stock
+        settings.KIS_PROD_TYPE = self._original_prod_type
+
+    async def test_place_overseas_order_routes_us_premarket_buy_to_regular_order(self):
+        mock_request = AsyncMock(return_value={"rt_cd": "0", "output": {}})
+
+        with patch("trading.kis_api._request_json", mock_request):
+            await place_overseas_order(
+                symbol="PLTR",
+                side="BUY",
+                quantity=2.0,
+                price=197.25,
+                market="NASDAQ",
+                session="US_PRE",
+            )
+
+        self.assertEqual(mock_request.await_args.args[0], "/uapi/overseas-stock/v1/trading/order")
+        self.assertEqual(mock_request.await_args.args[1], "TTTT1002U")
+        params = mock_request.await_args.kwargs["params"]
+        self.assertEqual(params["OVRS_EXCG_CD"], "NASD")
+        self.assertEqual(params["ORD_QTY"], "2")
+        self.assertEqual(params["OVRS_ORD_UNPR"], "197.25")
+        self.assertEqual(params["ORD_DVSN"], "00")
+        self.assertEqual(params["SLL_TYPE"], "")
+
+    async def test_place_overseas_order_keeps_daytime_order_for_explicit_us_daytime_session(self):
+        mock_request = AsyncMock(return_value={"rt_cd": "0", "output": {}})
+
+        with patch("trading.kis_api._request_json", mock_request):
+            await place_overseas_order(
+                symbol="PLTR",
+                side="BUY",
+                quantity=2.0,
+                price=197.25,
+                market="NASDAQ",
+                session="US_DAYTIME",
+            )
+
+        self.assertEqual(mock_request.await_args.args[0], "/uapi/overseas-stock/v1/trading/daytime-order")
+        self.assertEqual(mock_request.await_args.args[1], "TTTS6036U")
+        params = mock_request.await_args.kwargs["params"]
+        self.assertEqual(params["ORD_DVSN"], "00")
+        self.assertNotIn("SLL_TYPE", params)
+
+    async def test_place_overseas_order_keeps_regular_route_for_us_regular_buy(self):
+        mock_request = AsyncMock(return_value={"rt_cd": "0", "output": {}})
+
+        with patch("trading.kis_api._request_json", mock_request):
+            await place_overseas_order(
+                symbol="PLTR",
+                side="BUY",
+                quantity=1,
+                price=198.5,
+                market="NASDAQ",
+                session="US_REGULAR",
+            )
+
+        self.assertEqual(mock_request.await_args.args[0], "/uapi/overseas-stock/v1/trading/order")
+        self.assertEqual(mock_request.await_args.args[1], "TTTT1002U")
+        params = mock_request.await_args.kwargs["params"]
+        self.assertEqual(params["SLL_TYPE"], "")
+        self.assertEqual(params["ORD_DVSN"], "00")
+
+    async def test_cancel_overseas_order_routes_us_premarket_to_regular_cancel(self):
+        mock_request = AsyncMock(return_value={"rt_cd": "0", "output": {}})
+
+        with patch("trading.kis_api._request_json", mock_request):
+            await cancel_overseas_order(
+                symbol="PLTR",
+                order_id="00001234",
+                quantity=3,
+                price=197.1,
+                market="NASDAQ",
+                session="US_PRE",
+            )
+
+        self.assertEqual(
+            mock_request.await_args.args[0],
+            "/uapi/overseas-stock/v1/trading/order-rvsecncl",
+        )
+        self.assertEqual(mock_request.await_args.args[1], "TTTT1004U")
+        params = mock_request.await_args.kwargs["params"]
+        self.assertEqual(params["ORD_QTY"], "3")
+        self.assertEqual(params["OVRS_ORD_UNPR"], "197.1")
+        self.assertEqual(params["RVSE_CNCL_DVSN_CD"], "02")
+
+    async def test_cancel_overseas_order_keeps_daytime_cancel_for_explicit_us_daytime_session(self):
+        mock_request = AsyncMock(return_value={"rt_cd": "0", "output": {}})
+
+        with patch("trading.kis_api._request_json", mock_request):
+            await cancel_overseas_order(
+                symbol="PLTR",
+                order_id="00001234",
+                quantity=3,
+                price=197.1,
+                market="NASDAQ",
+                session="US_DAYTIME",
+            )
+
+        self.assertEqual(
+            mock_request.await_args.args[0],
+            "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl",
+        )
+        self.assertEqual(mock_request.await_args.args[1], "TTTS6038U")
 
 
 if __name__ == "__main__":

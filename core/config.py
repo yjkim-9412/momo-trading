@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     US_PREMARKET_MIN_MONITOR_CANDIDATES: int = 10
     US_PREMARKET_EXPANSION_ENABLED: bool = False
     US_PREMARKET_EXPANSION_MAX_STAGE: int = 3
+    US_REGULAR_MIN_SELECTED_CANDIDATES: int = 3
     US_WATCHLIST_SYMBOLS: str = ""
     US_SCAN_LIMIT: int = 12
     US_DYNAMIC_DISCOVERY_ENABLED: bool = True  # MCP 동적 발굴 우선, 실패 시 fallback seed 사용
@@ -815,6 +816,11 @@ class Settings(BaseSettings):
     def us_watchlist_symbols(self) -> list[str]:
         """미국장 discovery 실패/비활성 시 사용할 fallback seed 종목"""
         return self._parse_csv(self.US_WATCHLIST_SYMBOLS, upper=True)[: self.US_SCAN_LIMIT]
+
+    @property
+    def us_regular_min_selected_candidates(self) -> int:
+        """미국 정규장 스캔에서 확보하려는 최소 선정 종목 수."""
+        return max(0, int(self.US_REGULAR_MIN_SELECTED_CANDIDATES or 0))
 
     @property
     def us_premarket_junk_filter_profile(self) -> str:

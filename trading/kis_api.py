@@ -6,6 +6,7 @@ MCP를 거치지 않고 KIS API를 직접 호출하여
 import asyncio
 import json
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,9 @@ import httpx
 from loguru import logger
 
 from core.config import settings
+from scheduler.market_calendar import market_calendar
 from trading.market_profile import (
+    is_us_market,
     kis_balance_exchange_code,
     kis_exchange_code,
     kis_order_exchange_code,
@@ -100,6 +103,53 @@ def _request_headers(token: str, tr_id: str, tr_cont: str = "") -> dict[str, str
     if tr_cont:
         headers["tr_cont"] = tr_cont
     return headers
+
+
+def _resolve_overseas_order_session(market_code: str, session: str | None = None) -> str | None:
+    """해외 주문 세션 정규화."""
+    if session:
+        return str(session).strip().upper()
+    if is_us_market(market_code):
+        return str(market_calendar.get_market_session(market=market_code)).strip().upper()
+    return None
+
+
+def _use_us_daytime_order(market_code: str, session: str | None = None) -> bool:
+    """KIS 미국주간거래는 명시적 주간 세션일 때만 daytime-order 경로를 사용한다."""
+    return bool(
+        settings.is_real_trading
+        and is_us_market(market_code)
+        and _resolve_overseas_order_session(market_code, session) in {"US_DAYTIME", "DAYTIME"}
+    )
+
+
+def _format_overseas_order_price(price: float | None) -> str:
+    """KIS 해외 주문 단가를 문자열로 정규화."""
+    if price is None:
+        return "0"
+    try:
+        numeric = Decimal(str(price))
+    except (InvalidOperation, ValueError, TypeError):
+        return "0"
+
+    if numeric <= 0:
+        return "0"
+
+    normalized = format(numeric.normalize(), "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
+def _format_overseas_order_quantity(quantity: int | float) -> str:
+    """해외 주문 수량을 정수 문자열로 정규화."""
+    try:
+        normalized = int(float(quantity))
+    except (TypeError, ValueError):
+        normalized = 0
+    if normalized <= 0:
+        raise ValueError("해외 주문 수량은 1 이상이어야 합니다.")
+    return str(normalized)
 
 
 async def _request_json(
@@ -957,45 +1007,83 @@ async def place_overseas_order(
     quantity: int,
     price: float | None = None,
     market: str = "NASDAQ",
+    session: str | None = None,
 ) -> dict:
     """해외주식 주문 실행"""
     market_code = normalize_market(market)
     cano, acnt_prdt_cd = _get_account_parts()
     is_buy = str(side).upper() == "BUY"
+    session_code = _resolve_overseas_order_session(market_code, session)
+    use_daytime_order = _use_us_daytime_order(market_code, session_code)
+    order_route = "DAYTIME_ORDER" if use_daytime_order else "REGULAR_ORDER"
+    api_url = (
+        "/uapi/overseas-stock/v1/trading/daytime-order"
+        if use_daytime_order
+        else "/uapi/overseas-stock/v1/trading/order"
+    )
     tr_id = (
-        "VTTT1002U" if settings.is_paper_trading and is_buy
+        "TTTS6036U" if use_daytime_order and is_buy
+        else "TTTS6037U" if use_daytime_order and not is_buy
+        else "VTTT1002U" if settings.is_paper_trading and is_buy
         else "VTTT1006U" if settings.is_paper_trading and not is_buy
         else "TTTT1002U" if is_buy
         else "TTTT1006U"
     )
+    order_quantity = _format_overseas_order_quantity(quantity)
+    order_price = _format_overseas_order_price(price)
+    exchange_code = kis_order_exchange_code(market_code)
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acnt_prdt_cd,
+        "OVRS_EXCG_CD": exchange_code,
+        "PDNO": symbol,
+        "ORD_QTY": order_quantity,
+        "OVRS_ORD_UNPR": order_price,
+        "CTAC_TLNO": "",
+        "MGCO_APTM_ODNO": "",
+        "ORD_SVR_DVSN_CD": "0",
+    }
+    if use_daytime_order:
+        params["ORD_DVSN"] = "00"
+    else:
+        params["SLL_TYPE"] = "00" if not is_buy else ""
+        params["ORD_DVSN"] = "00" if price else "31"
 
     try:
         result = await _request_json(
-            "/uapi/overseas-stock/v1/trading/order",
+            api_url,
             tr_id,
-            params={
-                "CANO": cano,
-                "ACNT_PRDT_CD": acnt_prdt_cd,
-                "OVRS_EXCG_CD": kis_order_exchange_code(market_code),
-                "PDNO": symbol,
-                "ORD_QTY": str(quantity),
-                "OVRS_ORD_UNPR": f"{price or 0}",
-                "CTAC_TLNO": "",
-                "MGCO_APTM_ODNO": "",
-                "SLL_TYPE": "00",
-                "ORD_SVR_DVSN_CD": "0",
-                "ORD_DVSN": "00" if price else "31",
-            },
+            params=params,
             method="POST",
             use_trading_domain=True,
         )
         result["success"] = result.get("rt_cd") == "0"
         result["market"] = market_code
         result["currency"] = market_currency(market_code)
+        result["session"] = session_code
+        result["order_route"] = order_route
+        result["order_endpoint"] = api_url
+        result["order_tr_id"] = tr_id
+        result["exchange_code"] = exchange_code
+        result["resolved_limit_price"] = order_price
+        result["resolved_limit_quantity"] = order_quantity
         return result
     except Exception as e:
         logger.error("해외 주문 오류 ({} {}): {}", market_code, symbol, str(e))
-        return {"success": False, "error": str(e), "output": {}}
+        return {
+            "success": False,
+            "error": str(e),
+            "output": {},
+            "market": market_code,
+            "currency": market_currency(market_code),
+            "session": session_code,
+            "order_route": order_route,
+            "order_endpoint": api_url,
+            "order_tr_id": tr_id,
+            "exchange_code": exchange_code,
+            "resolved_limit_price": order_price,
+            "resolved_limit_quantity": order_quantity,
+        }
 
 
 async def cancel_overseas_order(
@@ -1004,23 +1092,35 @@ async def cancel_overseas_order(
     quantity: int,
     price: float | None = None,
     market: str = "NASDAQ",
+    session: str | None = None,
 ) -> dict:
     """해외주식 정정/취소"""
     market_code = normalize_market(market)
     cano, acnt_prdt_cd = _get_account_parts()
+    session_code = _resolve_overseas_order_session(market_code, session)
+    use_daytime_order = _use_us_daytime_order(market_code, session_code)
+    api_url = (
+        "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"
+        if use_daytime_order
+        else "/uapi/overseas-stock/v1/trading/order-rvsecncl"
+    )
+    tr_id = "TTTS6038U" if use_daytime_order else "VTTT1004U" if settings.is_paper_trading else "TTTT1004U"
+    order_quantity = _format_overseas_order_quantity(quantity)
+    order_price = _format_overseas_order_price(price)
+    exchange_code = kis_order_exchange_code(market_code)
     try:
         result = await _request_json(
-            "/uapi/overseas-stock/v1/trading/order-rvsecncl",
-            "VTTT1004U" if settings.is_paper_trading else "TTTT1004U",
+            api_url,
+            tr_id,
             params={
                 "CANO": cano,
                 "ACNT_PRDT_CD": acnt_prdt_cd,
-                "OVRS_EXCG_CD": kis_order_exchange_code(market_code),
+                "OVRS_EXCG_CD": exchange_code,
                 "PDNO": symbol,
                 "ORGN_ODNO": order_id,
                 "RVSE_CNCL_DVSN_CD": "02",
-                "ORD_QTY": str(quantity),
-                "OVRS_ORD_UNPR": f"{price or 0}",
+                "ORD_QTY": order_quantity,
+                "OVRS_ORD_UNPR": order_price,
                 "CTAC_TLNO": "",
                 "MGCO_APTM_ODNO": "",
                 "ORD_SVR_DVSN_CD": "0",
@@ -1031,7 +1131,27 @@ async def cancel_overseas_order(
         result["success"] = result.get("rt_cd") == "0"
         result["market"] = market_code
         result["currency"] = market_currency(market_code)
+        result["session"] = session_code
+        result["order_route"] = "DAYTIME_CANCEL" if use_daytime_order else "REGULAR_CANCEL"
+        result["order_endpoint"] = api_url
+        result["order_tr_id"] = tr_id
+        result["exchange_code"] = exchange_code
+        result["resolved_limit_price"] = order_price
+        result["resolved_limit_quantity"] = order_quantity
         return result
     except Exception as e:
         logger.error("해외 주문취소 오류 ({} {}): {}", market_code, symbol, str(e))
-        return {"success": False, "error": str(e), "output": {}}
+        return {
+            "success": False,
+            "error": str(e),
+            "output": {},
+            "market": market_code,
+            "currency": market_currency(market_code),
+            "session": session_code,
+            "order_route": "DAYTIME_CANCEL" if use_daytime_order else "REGULAR_CANCEL",
+            "order_endpoint": api_url,
+            "order_tr_id": tr_id,
+            "exchange_code": exchange_code,
+            "resolved_limit_price": order_price,
+            "resolved_limit_quantity": order_quantity,
+        }

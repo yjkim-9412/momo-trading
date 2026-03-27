@@ -15,11 +15,13 @@ class MarketScannerPolicyTest(unittest.TestCase):
             "US_INVERSE_PRODUCTS_ENABLED": settings.US_INVERSE_PRODUCTS_ENABLED,
             "US_LEVERAGE_ALLOWED_SESSIONS": settings.US_LEVERAGE_ALLOWED_SESSIONS,
             "US_LEVERAGE_ALLOWED_STRATEGIES": settings.US_LEVERAGE_ALLOWED_STRATEGIES,
+            "US_REGULAR_MIN_SELECTED_CANDIDATES": settings.US_REGULAR_MIN_SELECTED_CANDIDATES,
         }
         settings.US_LEVERAGED_PRODUCTS_ENABLED = True
         settings.US_INVERSE_PRODUCTS_ENABLED = True
         settings.US_LEVERAGE_ALLOWED_SESSIONS = "US_REGULAR"
         settings.US_LEVERAGE_ALLOWED_STRATEGIES = "STABLE_SHORT"
+        settings.US_REGULAR_MIN_SELECTED_CANDIDATES = 3
 
     def tearDown(self):
         for field_name, value in self._original.items():
@@ -40,6 +42,12 @@ class MarketScannerPolicyTest(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0]["strategy_type"], "STABLE_SHORT")
         self.assertTrue(filtered[0]["is_leveraged"])
+
+    def test_selection_target_range_keeps_floor_for_us_regular_late_session(self):
+        self.assertEqual(
+            MarketScanner._selection_target_range("NASDAQ", "US_REGULAR", 20),
+            "3~4",
+        )
 
 
 class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
@@ -231,6 +239,152 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["available_cash_foreign"], 100000 / 1450.0)
         detail = self._scan_complete_detail(log_mock)
         self.assertEqual(detail["affordability_filter"]["volume_rank"], {"before": 1, "after": 0, "dropped": 1})
+
+    async def test_scan_backfills_us_regular_selection_to_minimum_three(self):
+        scanner = MarketScanner()
+        balance = self._balance(
+            market="NASDAQ",
+            effective_cash=700000,
+            effective_cash_foreign=500.0,
+        )
+        affordable = [
+            {"symbol": "AAPL", "name": "Apple", "market": "NASDAQ", "currency": "USD", "price": 100.0},
+            {"symbol": "MSFT", "name": "Microsoft", "market": "NASDAQ", "currency": "USD", "price": 110.0},
+            {"symbol": "PLTR", "name": "Palantir", "market": "NASDAQ", "currency": "USD", "price": 90.0},
+            {"symbol": "SOFI", "name": "SoFi", "market": "NASDAQ", "currency": "USD", "price": 12.0},
+        ]
+        log_mock = AsyncMock()
+
+        with (
+            patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=affordable)),
+            patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])),
+            patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", False),
+            patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False),
+            patch("agent.market_scanner.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1400.0)),
+            patch(
+                "agent.market_scanner.llm_factory.generate_tier1",
+                AsyncMock(return_value=(
+                    '{"selected": [{"symbol": "MSFT", "name": "Microsoft", "market": "NASDAQ", "strategy_type": "STABLE_SHORT", "reason": "최우선"}], "market_analysis": "기회", "market_regime": "BULL"}',
+                    "TEST",
+                )),
+            ),
+            patch("agent.market_scanner.activity_logger.log", log_mock),
+        ):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-regular-floor",
+                account_snapshot=(balance, []),
+            )
+
+        self.assertEqual([item["symbol"] for item in result["selected"][:3]], ["MSFT", "AAPL", "PLTR"])
+        detail = self._scan_complete_detail(log_mock)
+        self.assertEqual(detail["regular_floor"]["target"], 3)
+        self.assertFalse(detail["regular_floor"]["triggered"])
+        self.assertEqual(detail["regular_floor"]["candidate_pool_count"], 4)
+        self.assertEqual(detail["regular_floor"]["backfilled_count"], 2)
+        self.assertFalse(detail["regular_floor"]["unmet_floor"])
+
+    async def test_scan_expands_us_regular_pool_when_affordable_candidates_are_too_few(self):
+        scanner = MarketScanner()
+        balance = self._balance(
+            market="NASDAQ",
+            effective_cash=700000,
+            effective_cash_foreign=500.0,
+        )
+        stock_map = {
+            "AAPL": {"symbol": "AAPL", "name": "Apple", "market": "NASDAQ", "currency": "USD", "price": 100.0},
+            "MSFT": {"symbol": "MSFT", "name": "Microsoft", "market": "NASDAQ", "currency": "USD", "price": 110.0},
+            "PLTR": {"symbol": "PLTR", "name": "Palantir", "market": "NASDAQ", "currency": "USD", "price": 90.0},
+        }
+        log_mock = AsyncMock()
+
+        async def volume_side_effect(markets, limit=30, include_trade_growth=False):
+            if limit == 30:
+                return [stock_map["AAPL"]]
+            return [stock_map["AAPL"], stock_map["MSFT"]]
+
+        async def fluctuation_side_effect(markets, sort, limit=30):
+            if limit == 30:
+                return []
+            return [stock_map["PLTR"]] if sort == "top" else []
+
+        with (
+            patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch.object(scanner, "_get_volume_rank", AsyncMock(side_effect=volume_side_effect)),
+            patch.object(scanner, "_get_fluctuation_rank", AsyncMock(side_effect=fluctuation_side_effect)),
+            patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),
+            patch.object(scanner, "_build_us_expansion_candidates", AsyncMock(return_value=[])),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", False),
+            patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False),
+            patch("agent.market_scanner.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1400.0)),
+            patch(
+                "agent.market_scanner.llm_factory.generate_tier1",
+                AsyncMock(return_value=(
+                    '{"selected": [{"symbol": "AAPL", "name": "Apple", "market": "NASDAQ", "strategy_type": "STABLE_SHORT", "reason": "기준"}], "market_analysis": "기회", "market_regime": "BULL"}',
+                    "TEST",
+                )),
+            ),
+            patch("agent.market_scanner.activity_logger.log", log_mock),
+        ):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-regular-expand",
+                account_snapshot=(balance, []),
+            )
+
+        self.assertEqual([item["symbol"] for item in result["selected"][:3]], ["AAPL", "MSFT", "PLTR"])
+        detail = self._scan_complete_detail(log_mock)
+        self.assertTrue(detail["regular_floor"]["triggered"])
+        self.assertEqual(detail["regular_floor"]["base_affordable_count"], 1)
+        self.assertEqual(detail["regular_floor"]["expanded_affordable_count"], 3)
+        self.assertEqual(detail["regular_floor"]["backfilled_count"], 2)
+        self.assertFalse(detail["regular_floor"]["unmet_floor"])
+
+    async def test_scan_marks_unmet_floor_when_only_two_product_allowed_candidates_exist(self):
+        scanner = MarketScanner()
+        balance = self._balance(
+            market="NASDAQ",
+            effective_cash=700000,
+            effective_cash_foreign=500.0,
+        )
+        candidates = [
+            {"symbol": "TQQQ", "name": "ProShares UltraPro QQQ", "market": "NASDAQ", "currency": "USD", "price": 50.0},
+            {"symbol": "AAPL", "name": "Apple", "market": "NASDAQ", "currency": "USD", "price": 100.0},
+            {"symbol": "MSFT", "name": "Microsoft", "market": "NASDAQ", "currency": "USD", "price": 110.0},
+        ]
+        log_mock = AsyncMock()
+
+        with (
+            patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch.object(settings, "US_LEVERAGED_PRODUCTS_ENABLED", False),
+            patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=candidates)),
+            patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])),
+            patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", False),
+            patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False),
+            patch("agent.market_scanner.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1400.0)),
+            patch(
+                "agent.market_scanner.llm_factory.generate_tier1",
+                AsyncMock(return_value=(
+                    '{"selected": [{"symbol": "AAPL", "name": "Apple", "market": "NASDAQ", "strategy_type": "STABLE_SHORT", "reason": "기준"}], "market_analysis": "기회", "market_regime": "BULL"}',
+                    "TEST",
+                )),
+            ),
+            patch("agent.market_scanner.activity_logger.log", log_mock),
+        ):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-regular-unmet",
+                account_snapshot=(balance, []),
+            )
+
+        self.assertEqual([item["symbol"] for item in result["selected"]], ["AAPL", "MSFT"])
+        detail = self._scan_complete_detail(log_mock)
+        self.assertEqual(detail["regular_floor"]["candidate_pool_count"], 2)
+        self.assertEqual(detail["regular_floor"]["backfilled_count"], 1)
+        self.assertTrue(detail["regular_floor"]["unmet_floor"])
 
 
 class MarketScannerPremarketJunkFilterTest(unittest.IsolatedAsyncioTestCase):

@@ -90,13 +90,9 @@ class OrderExecutor:
             return OrderResult(success=True, message="크립토 주문 취소 완료")
 
         if market_code in ("KOSPI", "KOSDAQ", "KRX"):
-            response = await mcp_client.call_tool("cancel_domestic_order", {
-                "order_id": order_id,
-            })
+            response = await mcp_client.cancel_order(order_id, market=market_code)
         else:
-            response = await mcp_client.call_tool("cancel_overseas_order", {
-                "order_id": order_id,
-            })
+            response = await mcp_client.cancel_order(order_id, market=market_code)
 
         if not response.success:
             return OrderResult(success=False, message=response.error or "취소 실패")

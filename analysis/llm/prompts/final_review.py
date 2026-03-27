@@ -48,6 +48,11 @@ Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매
 - `ADD_ON_AVERAGE_DOWN`은 손실 구간 반등 확인형 추가매수일 때만 허용하세요
 - `planned_hold_days` 같은 기존 보유 계획 정보는 참고용입니다. 장중 stop_loss / take_profit / trailing stop은 별도로 살아 있으며 우선 실행된다고 가정하세요
 
+## 데이터 출처 제약
+- 반드시 위에 제공된 입력 데이터만 근거로 판단하세요
+- 웹 검색, 뉴스/기사 확인, 외부 사실 보강, URL/도메인/출처 인용을 금지합니다
+- 입력 데이터만으로 판단이 부족하면 외부 추정을 하지 말고 `approved=false` 또는 `action=HOLD`로 답하세요
+
 반드시 한국어로 답변"""
 FINAL_REVIEW_SYSTEM = (
     FINAL_REVIEW_SYSTEM
@@ -139,6 +144,7 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 - planned_hold_days: 총 계획 보유일 (장마감 AI 재리뷰 횟수 기준, 최소 1일)
 - BUY 승인 시 `entry_price`, `target_price`, `stop_loss_price`, `take_profit_price`, `planned_hold_days`를 모두 반드시 채우세요
 - Long 기준 가격 관계는 `stop_loss_price < entry_price < take_profit_price <= target_price` 를 지키세요
+- 외부 링크, 뉴스 출처, URL, 웹페이지 이름을 reason/risk_warnings에 쓰지 마세요
 
 **주의**: 아래 JSON은 필드 구조 설명입니다. entry_price/target_price/stop_loss_price/take_profit_price는 반드시 `{currency}` 기준으로 작성하세요. 투자금 한도는 위 계좌 상태/투자 가능 금액 섹션을 따르며 가격 필드에 넣지 마세요.
 - confidence: 이 매매가 손절 전에 목표가에 도달할 확률 (0.00~1.00)
@@ -194,6 +200,9 @@ STOCK_CLOSE_REVIEW_SYSTEM = """당신은 최고 수준의 주식 포지션 리�
 - Long 보유 연장 시 가격 관계는 `stop_loss_price < 현재가 < take_profit_price`를 지키세요
 - `planned_hold_days`는 참고용 계획값이며, 내일 장중 stop_loss / take_profit / trailing stop 우선 실행 원칙을 무효화하지 않습니다
 - 이미 기대 수익보다 하방 리스크가 크거나, 내일 장까지 보유할 논리가 약하면 HOLD가 아니라 SELL로 답하세요
+- 반드시 위에 제공된 입력 데이터만 근거로 판단하세요
+- 웹 검색, 뉴스/기사 확인, 외부 사실 보강, URL/도메인/출처 인용을 금지합니다
+- 입력 데이터만으로 판단이 부족하면 외부 추정을 하지 말고 SELL 쪽으로 보수적으로 답하세요
 
 반드시 한국어로 답변"""
 

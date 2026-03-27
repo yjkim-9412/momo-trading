@@ -109,6 +109,7 @@ US_MARKET_SCAN_SYSTEM = """당신은 미국 주식 시장(NASDAQ/NYSE/AMEX) 전�
 - 실주문 기준 현금과 1주 매수 가능성 평가는 USD 기준으로 판단
 - 표시된 종목당 최대 금액은 USD 기준 스캔용 리스크 한도임
 - 현재 실주문 기준 현금으로 1주도 매수할 수 없는 종목은 제외
+- 정규장에서 현재 usable 후보가 {regular_selection_floor}개 이상 보이면 최소 {regular_selection_floor}개를 선정하고, 실제 usable 후보가 그보다 적으면 가능한 개수만 선정
 - 반드시 주어진 데이터 안의 종목만 선정
 - 반드시 한국어로 답변
 - JSON만 출력"""
@@ -141,6 +142,7 @@ US_MARKET_SCAN_PROMPT = """## 시장 데이터
 위 데이터를 분석하여 미국장 기준으로 **심층 분석할 종목을 {selection_target_range}개 범위에서** 직접 선정하세요.
 각 종목에 적합한 전략(STABLE_SHORT/AGGRESSIVE_SHORT)을 배정하세요.
 현재 실주문 기준 현금으로 1주도 매수할 수 없는 종목은 절대 선정하지 마세요.
+정규장에서는 usable 후보가 {regular_selection_floor}개 이상이면 최소 {regular_selection_floor}개를 선택하세요.
 
 JSON:
 ```json
@@ -285,7 +287,9 @@ def get_market_scan_system(primary_market: str, trading_style_mode: str | None =
     if is_crypto_market(market_code):
         return get_crypto_market_scan_system(trading_style_mode or settings.crypto_trading_style_mode)
     if is_us_market(market_code):
-        return US_MARKET_SCAN_SYSTEM
+        return US_MARKET_SCAN_SYSTEM.format(
+            regular_selection_floor=settings.us_regular_min_selected_candidates,
+        )
     return MARKET_SCAN_SYSTEM
 
 

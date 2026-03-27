@@ -1,6 +1,7 @@
 """AnalysisMixin: 분석 파이프라인, Tier1/2, 컨텍스트 빌더, 임계값 적용"""
 import asyncio
 import json
+import re
 from collections.abc import Callable
 
 import pandas as pd
@@ -72,6 +73,15 @@ from agent.trading_agent._types import _ENTRY_MODE_NEW
 
 class AnalysisMixin:
     """핵심 분석 파이프라인 Mixin: _analyze_and_trade, Tier1/2, 컨텍스트 빌더"""
+
+    _EXTERNAL_LINK_PATTERNS = (
+        re.compile(r"https?://", re.IGNORECASE),
+        re.compile(r"\bwww\.", re.IGNORECASE),
+        re.compile(
+            r"\b(?:reuters|bloomberg|marketwatch|benzinga|tradingview|investing\.com|yahoo(?:\s+finance)?|wsj|cnbc|seeking alpha|motley fool|fool\.com)\b",
+            re.IGNORECASE,
+        ),
+    )
 
     @staticmethod
     def _try_float(value) -> float | None:
@@ -437,6 +447,37 @@ class AnalysisMixin:
             return "Tier2 익절가가 진입가 이하로 설정됨"
         if required_prices["take_profit_price"] > required_prices["target_price"]:
             return "Tier2 익절가가 목표가를 초과함"
+        return None
+
+    @classmethod
+    def _detect_external_evidence(cls, *payloads: object) -> str | None:
+        """Tier2 응답에 외부 링크/출처 흔적이 섞였는지 검사한다."""
+        fragments: list[str] = []
+
+        def _collect(value: object) -> None:
+            if value is None:
+                return
+            if isinstance(value, str):
+                fragments.append(value)
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    _collect(item)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _collect(item)
+
+        for payload in payloads:
+            _collect(payload)
+
+        text = "\n".join(fragment for fragment in fragments if fragment)
+        if not text:
+            return None
+
+        for pattern in cls._EXTERNAL_LINK_PATTERNS:
+            if pattern.search(text):
+                return "Tier2 외부 링크/외부 출처 흔적 감지"
         return None
 
     @classmethod
@@ -2191,8 +2232,34 @@ class AnalysisMixin:
                 symbol=symbol,
                 cycle_id=cycle_id,
             )
+            provenance_issue = self._detect_external_evidence(result_text)
+            if provenance_issue:
+                logger.warning("[{}] Tier2 응답 무효화 {}: {}", market_code, symbol, provenance_issue)
+                return {
+                    "approved": False,
+                    "action": "HOLD",
+                    "reason": provenance_issue,
+                    "risk_warnings": ["외부 링크 또는 외부 출처가 포함된 응답"],
+                    "provider": provider,
+                    "market": market_code,
+                    "currency": currency,
+                    "product_context": dict(product_context or {}),
+                }
             parsed = self._parse_json(result_text)
             if parsed:
+                provenance_issue = self._detect_external_evidence(parsed)
+                if provenance_issue:
+                    logger.warning("[{}] Tier2 JSON 응답 무효화 {}: {}", market_code, symbol, provenance_issue)
+                    return {
+                        "approved": False,
+                        "action": "HOLD",
+                        "reason": provenance_issue,
+                        "risk_warnings": ["외부 링크 또는 외부 출처가 포함된 응답"],
+                        "provider": provider,
+                        "market": market_code,
+                        "currency": currency,
+                        "product_context": dict(product_context or {}),
+                    }
                 parsed["provider"] = provider
                 parsed["market"] = market_code
                 parsed["currency"] = currency
@@ -2500,6 +2567,11 @@ class AnalysisMixin:
 
         parsed = self._parse_json(result_text)
         if not parsed:
+            return None
+
+        provenance_issue = self._detect_external_evidence(result_text, parsed)
+        if provenance_issue:
+            logger.warning("[{}] 장마감 보유 재리뷰 응답 무효화 {}: {}", market_code, symbol, provenance_issue)
             return None
 
         parsed["provider"] = provider

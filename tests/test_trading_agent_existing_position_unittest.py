@@ -222,6 +222,51 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("환산 참고", prompt)
         self.assertNotIn("6,500,000원", prompt)
 
+    async def test_tier2_review_rejects_external_link_response(self):
+        with patch(
+            "agent.trading_agent.llm_factory.generate_tier2",
+            AsyncMock(return_value=('{"approved": true, "action": "BUY", "reason": "https://www.reuters.com 기사 확인", "risk_warnings": []}', "CODEX_CLI")),
+        ):
+            result = await self.agent._tier2_review(
+                symbol="PLTR",
+                name="팔란티어 테크",
+                current_price=149.63,
+                strategy_type="STABLE_SHORT",
+                tier1_analysis={
+                    "market": "NASDAQ",
+                    "currency": "USD",
+                    "exchange_rate_to_krw": 1479.8,
+                    "confidence": 0.72,
+                },
+                market="NASDAQ",
+                market_context="시장 컨텍스트 없음",
+                trading_context="현재 세션: US_REGULAR",
+                portfolio_snapshot={
+                    "cash": 100_000_000,
+                    "cash_foreign": 67_576.70,
+                    "effective_cash_foreign": 67_576.70,
+                    "total_asset": 100_000_000,
+                    "total_asset_foreign": 67_576.70,
+                    "holding_count": 0,
+                },
+                dynamic_limits={
+                    "max_single_order_krw": 30_000_000,
+                    "max_position_pct": 100.0,
+                    "min_cash_ratio": 0.0,
+                },
+                orderable_amount_context={
+                    "orderable_amount_source": "INQUIRE_PSAMOUNT",
+                    "orderable_amount_krw": 6_500_000,
+                    "orderable_amount_foreign": 4_392.0,
+                    "orderable_qty": 43,
+                },
+                cycle_id="cycle-tier2-link",
+            )
+
+        self.assertFalse(result["approved"])
+        self.assertEqual(result["action"], "HOLD")
+        self.assertIn("외부 링크", result["reason"])
+
     async def test_crypto_tier1_analysis_falls_back_to_change_price_when_change_is_direction_string(self):
         chart_result = ChartAnalysisResult(
             indicators_text="지표",

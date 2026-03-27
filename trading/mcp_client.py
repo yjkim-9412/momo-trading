@@ -9,10 +9,13 @@ import httpx
 from loguru import logger
 
 from core.config import settings
+from scheduler.market_calendar import market_calendar
 from trading.market_profile import (
     is_crypto_market,
     is_domestic_market,
+    is_us_market,
     kis_exchange_code,
+    kis_order_exchange_code,
     market_currency,
     normalize_market,
 )
@@ -862,6 +865,370 @@ class MCPClient:
                 return [records]
         return []
 
+    def _extract_overseas_best_limit_price(
+        self,
+        data: dict[str, Any] | None,
+        *,
+        side: str,
+    ) -> float:
+        """해외 호가 응답에서 프리마켓 지정가 기준이 되는 최우선 호가를 추출한다."""
+        payload = data or {}
+        records: list[dict[str, Any]] = []
+        for key in ("output1", "output2", "output", "dataframe1", "dataframe2"):
+            records.extend(self._extract_records(payload, key))
+        if not records and isinstance(payload, dict):
+            records = [payload]
+
+        ask_keys = (
+            "ovrs_askp1", "askp1", "ask_price_1", "ask_price", "best_ask",
+            "aprc", "pask1", "seln1", "ask1",
+        )
+        bid_keys = (
+            "ovrs_bidp1", "bidp1", "bid_price_1", "bid_price", "best_bid",
+            "bprc", "pbid1", "buy1", "bid1",
+        )
+        target_keys = ask_keys if str(side).upper() == "BUY" else bid_keys
+
+        for item in records:
+            price = self._to_float(self._pick_first(item, *target_keys), 0.0)
+            if price > 0:
+                return round(price, 4)
+        return 0.0
+
+    async def _resolve_us_premarket_limit_price(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        market_code: str,
+        requested_price: float | None,
+    ) -> tuple[float, str]:
+        """미국 프리마켓 주문은 지정가만 허용되므로 중앙에서 가격을 보정한다."""
+        normalized_requested = self._to_float(requested_price, 0.0)
+        if normalized_requested > 0:
+            return round(normalized_requested, 4), "REQUESTED"
+
+        side_code = str(side).upper()
+        quote_response = await self.get_stock_ask(symbol, market=market_code)
+        if quote_response.success and quote_response.data:
+            best_limit = self._extract_overseas_best_limit_price(
+                quote_response.data,
+                side=side_code,
+            )
+            if best_limit > 0:
+                return best_limit, "BEST_ASK" if side_code == "BUY" else "BEST_BID"
+            logger.warning(
+                "[{}] 미국 프리마켓 호가 응답에서 유효 {} 미발견",
+                symbol,
+                "매도호가" if side_code == "BUY" else "매수호가",
+            )
+
+        price_response = await self.get_current_price(symbol, market=market_code)
+        if price_response.success and price_response.data:
+            fallback_price = self._to_float(
+                price_response.data.get("price")
+                or price_response.data.get("current_price"),
+                0.0,
+            )
+            if fallback_price > 0:
+                logger.warning(
+                    "[{}] 미국 프리마켓 지정가를 현재가 fallback 으로 대체: {:.4f}",
+                    symbol,
+                    fallback_price,
+                )
+                return round(fallback_price, 4), "LAST_PRICE_FALLBACK"
+
+        return 0.0, "UNRESOLVED"
+
+    def _extract_order_id_from_payload(self, data: dict[str, Any] | None) -> str:
+        """주문 응답 payload 에서 주문번호를 추출한다."""
+        payload = data or {}
+        output = self._first_record(payload.get("output")) or self._first_record(payload.get("output1"))
+        return str(
+            payload.get("ODNO") or payload.get("odno")
+            or payload.get("ORDNO") or payload.get("ordno")
+            or output.get("ODNO") or output.get("odno")
+            or payload.get("order_id", "")
+        ).strip()
+
+    @staticmethod
+    def _decode_mcp_embedded_json(value: Any) -> Any:
+        """MCP wrapper 안의 JSON 문자열 payload 를 디코드한다."""
+        if isinstance(value, (dict, list)):
+            return value
+        if not isinstance(value, str):
+            return None
+
+        text = value.strip()
+        if not text or text[0] not in "{[":
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
+
+    def _should_fallback_us_premarket_order(self, result: dict[str, Any] | None) -> bool:
+        """직접 KIS 프리마켓 주문이 세션 불일치로 거절됐을 때만 MCP fallback 한다."""
+        if not isinstance(result, dict):
+            return False
+        if self._extract_order_id_from_payload(result):
+            return False
+
+        rt_cd = str(result.get("rt_cd") or "").strip()
+        if rt_cd == "0":
+            return False
+
+        msg_cd = str(result.get("msg_cd") or "").strip().upper()
+        message = str(result.get("msg1") or result.get("error") or "").strip()
+        lowered = message.lower()
+        return bool(
+            msg_cd in {"APBK2995", "IGW00007"}
+            or "장운영시간" in message
+            or "주간거래" in message
+            or "market hours" in lowered
+            or "daytime" in lowered
+        )
+
+    def _normalize_mcp_overseas_tool_response(
+        self,
+        response: MCPResponse,
+        *,
+        market_code: str,
+        session: str | None,
+        api_type: str,
+        order_route: str,
+        resolved_price: float,
+        resolved_limit_source: str,
+        fallback_reason: str,
+        quantity: float | None = None,
+    ) -> dict[str, Any]:
+        """공식 KIS Trading MCP wrapper 응답을 기존 주문 payload 형태로 맞춘다."""
+        normalized: dict[str, Any] = {
+            "success": False,
+            "market": market_code,
+            "currency": market_currency(market_code),
+            "session": session,
+            "order_route": order_route,
+            "order_endpoint": f"mcp://overseas_stock/{api_type}",
+            "order_tool": "overseas_stock",
+            "order_api_type": api_type,
+            "order_tr_id": None,
+            "exchange_code": kis_order_exchange_code(market_code),
+            "resolved_limit_price": round(self._to_float(resolved_price, 0.0), 4),
+            "resolved_limit_quantity": str(max(0, self._to_int(quantity, 0))) if quantity is not None else "",
+            "resolved_limit_source": resolved_limit_source,
+            "fallback_reason": fallback_reason,
+        }
+
+        if not response.success:
+            error_msg = str(response.error or "MCP 해외주문 호출 실패")
+            return {**normalized, "error": error_msg, "msg1": error_msg}
+
+        wrapper = response.data if isinstance(response.data, dict) else {}
+        inner = wrapper
+        if "ok" in wrapper:
+            if not wrapper.get("ok", False):
+                error_msg = str(wrapper.get("error") or response.error or "MCP 해외주문 실패")
+                return {**normalized, "error": error_msg, "msg1": error_msg}
+            inner = wrapper.get("data")
+
+        if isinstance(inner, dict) and inner.get("success") is False:
+            error_msg = str(inner.get("error") or inner.get("message") or response.error or "MCP 해외주문 실패")
+            return {**normalized, "error": error_msg, "msg1": error_msg}
+
+        parsed_payload = None
+        if isinstance(inner, dict):
+            parsed_payload = self._decode_mcp_embedded_json(inner.get("data"))
+            if parsed_payload is None and any(
+                key in inner for key in ("output", "output1", "ODNO", "odno", "ORDNO", "ordno", "rt_cd", "msg1")
+            ):
+                parsed_payload = inner
+        else:
+            parsed_payload = self._decode_mcp_embedded_json(inner)
+
+        if isinstance(parsed_payload, list):
+            payload: dict[str, Any] = {"output": [item for item in parsed_payload if isinstance(item, dict)]}
+        elif isinstance(parsed_payload, dict):
+            payload = parsed_payload
+        else:
+            payload = {}
+
+        if not payload:
+            error_msg = ""
+            if isinstance(inner, dict):
+                error_msg = str(inner.get("error") or inner.get("message") or "").strip()
+            error_msg = error_msg or str(response.error or "MCP 해외주문 응답 파싱 실패")
+            return {**normalized, "error": error_msg, "msg1": error_msg}
+
+        return {
+            **normalized,
+            **payload,
+            "success": bool(self._pick_first(payload, "success", default=True)),
+        }
+
+    async def _place_overseas_order_via_mcp(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: float,
+        resolved_price: float,
+        market_code: str,
+        session: str | None,
+        resolved_limit_source: str,
+        fallback_reason: str,
+    ) -> MCPResponse:
+        """미국 프리마켓 세션 불일치 시 공식 KIS Trading MCP order tool 로 우회한다."""
+        payload = {
+            "api_type": "order",
+            "params": {
+                "ovrs_excg_cd": kis_order_exchange_code(market_code),
+                "pdno": symbol,
+                "ord_qty": str(max(0, self._to_int(quantity, 0))),
+                "ovrs_ord_unpr": format(self._to_float(resolved_price, 0.0), ".4f").rstrip("0").rstrip(".") or "0",
+                "ord_dv": "buy" if str(side).upper() == "BUY" else "sell",
+                "ctac_tlno": "",
+                "mgco_aptm_odno": "",
+                "ord_svr_dvsn_cd": "0",
+                "ord_dvsn": "00",
+                "env_dv": self._runtime_env_value(),
+            },
+        }
+        response = await self.call_tool("overseas_stock", payload)
+        data = self._normalize_mcp_overseas_tool_response(
+            response,
+            market_code=market_code,
+            session=session,
+            api_type="order",
+            order_route="MCP_OVERSEAS_STOCK_ORDER",
+            resolved_price=resolved_price,
+            resolved_limit_source=resolved_limit_source,
+            fallback_reason=fallback_reason,
+            quantity=quantity,
+        )
+        return MCPResponse(
+            success=bool(data.get("success", False)),
+            data=data,
+            error=str(data.get("error") or data.get("msg1") or "") or None,
+        )
+
+    async def _cancel_overseas_order_via_mcp(
+        self,
+        *,
+        symbol: str,
+        order_id: str,
+        quantity: float,
+        price: float | None,
+        market_code: str,
+        session: str | None,
+        fallback_reason: str,
+    ) -> MCPResponse:
+        """미국 프리마켓 취소/정정도 공식 KIS Trading MCP tool 로 우회한다."""
+        resolved_price = round(self._to_float(price, 0.0), 4)
+        payload = {
+            "api_type": "order_rvsecncl",
+            "params": {
+                "ovrs_excg_cd": kis_order_exchange_code(market_code),
+                "pdno": symbol,
+                "orgn_odno": order_id,
+                "rvse_cncl_dvsn_cd": "02",
+                "ord_qty": str(max(0, self._to_int(quantity, 0))),
+                "ovrs_ord_unpr": format(resolved_price, ".4f").rstrip("0").rstrip(".") or "0",
+                "ctac_tlno": "",
+                "mgco_aptm_odno": "",
+                "ord_svr_dvsn_cd": "0",
+                "env_dv": self._runtime_env_value(),
+            },
+        }
+        response = await self.call_tool("overseas_stock", payload)
+        data = self._normalize_mcp_overseas_tool_response(
+            response,
+            market_code=market_code,
+            session=session,
+            api_type="order_rvsecncl",
+            order_route="MCP_OVERSEAS_STOCK_CANCEL",
+            resolved_price=resolved_price,
+            resolved_limit_source="REQUESTED" if resolved_price > 0 else "",
+            fallback_reason=fallback_reason,
+            quantity=quantity,
+        )
+        return MCPResponse(
+            success=bool(data.get("success", False)),
+            data=data,
+            error=str(data.get("error") or data.get("msg1") or "") or None,
+        )
+
+    async def _finalize_order_response(
+        self,
+        response: MCPResponse,
+        *,
+        market_code: str,
+        session: str | None,
+        order_type: str,
+        order_route: str,
+        resolved_price: float | None,
+        resolved_limit_source: str,
+    ) -> MCPResponse:
+        """주문 응답 payload 를 공통 포맷으로 정규화한다."""
+        if response.data:
+            d = response.data
+            rt_cd = str(d.get("rt_cd") or "").strip()
+            if rt_cd and rt_cd != "0":
+                error_msg = d.get("msg1", "KIS 주문 실패")
+                logger.warning("KIS 주문 거부: {}", error_msg)
+                response.success = False
+                response.error = error_msg
+
+            order_id = self._extract_order_id_from_payload(d)
+            if not order_id:
+                logger.warning("주문 응답에서 주문번호 미발견, 원본: {}", str(d)[:500])
+
+            exchange_rate = await self._get_exchange_rate_to_krw(market_code)
+            output = self._first_record(d.get("output")) or self._first_record(d.get("output1"))
+            filled_price = self._to_float(
+                d.get("exec_prc") or output.get("exec_prc") or d.get("filled_price")
+            )
+            response.data = {
+                **d,
+                "order_id": order_id,
+                "market": market_code,
+                "currency": market_currency(market_code),
+                "session": d.get("session") or session,
+                "order_type": order_type,
+                "order_route": d.get("order_route") or order_route,
+                "order_endpoint": d.get("order_endpoint"),
+                "order_tr_id": d.get("order_tr_id"),
+                "order_tool": d.get("order_tool"),
+                "order_api_type": d.get("order_api_type"),
+                "fallback_reason": d.get("fallback_reason", ""),
+                "exchange_code": d.get("exchange_code"),
+                "resolved_limit_price": self._to_float(
+                    d.get("resolved_limit_price"),
+                    self._to_float(resolved_price, 0.0),
+                ),
+                "resolved_limit_source": (
+                    d.get("resolved_limit_source")
+                    or resolved_limit_source
+                    or ("REQUESTED" if self._to_float(resolved_price, 0.0) > 0 else "")
+                ),
+                "filled_quantity": self._to_int(
+                    d.get("exec_qty") or output.get("exec_qty") or d.get("filled_quantity")
+                ),
+                "filled_price": filled_price,
+                "filled_price_krw": filled_price * exchange_rate,
+                "exchange_rate_to_krw": exchange_rate,
+            }
+
+        if not response.success:
+            if not response.error and isinstance(response.data, dict):
+                response.error = str(
+                    response.data.get("msg1")
+                    or response.data.get("msg_cd")
+                    or response.data.get("error")
+                    or "KIS 주문 실패"
+                )
+        return response
+
     def _extract_us_discovery_stocks(
         self,
         data: dict[str, Any],
@@ -1643,6 +2010,10 @@ class MCPClient:
         """주문 실행 (KIS 원본 키 → 정규화)"""
         order_type = "buy" if side == "BUY" else "sell"
         market_code = normalize_market(market)
+        session = market_calendar.get_market_session(market=market_code) if is_us_market(market_code) else None
+        resolved_price = price
+        resolved_limit_source = "REQUESTED" if self._to_float(price, 0.0) > 0 else ""
+        order_route = "REGULAR_ORDER"
         if is_crypto_market(market_code):
             from trading.bithumb_client import bithumb_client
 
@@ -1667,54 +2038,165 @@ class MCPClient:
         else:
             from trading.kis_api import place_overseas_order
 
+            is_us_premarket = settings.is_real_trading and is_us_market(market_code) and session == "US_PRE"
+            if is_us_premarket:
+                resolved_price, resolved_limit_source = await self._resolve_us_premarket_limit_price(
+                    symbol=symbol,
+                    side=side,
+                    market_code=market_code,
+                    requested_price=price,
+                )
+                if resolved_price <= 0:
+                    error_msg = "미국 프리마켓 지정가 산출 실패"
+                    logger.warning(
+                        "[{} {}] session={} route={} price_source={} — {}",
+                        market_code,
+                        symbol,
+                        session,
+                        order_route,
+                        resolved_limit_source,
+                        error_msg,
+                    )
+                    return MCPResponse(
+                        success=False,
+                        error=error_msg,
+                        data={
+                            "market": market_code,
+                            "currency": market_currency(market_code),
+                            "session": session,
+                            "order_route": order_route,
+                            "resolved_limit_price": 0.0,
+                            "resolved_limit_source": resolved_limit_source,
+                        },
+                    )
+
             result = await place_overseas_order(
                 symbol=symbol,
                 side=side,
                 quantity=quantity,
+                price=resolved_price,
+                market=market_code,
+                session=session,
+            )
+            direct_resp = MCPResponse(
+                success=result.get("success", False),
+                data=result,
+                error=result.get("error") or result.get("msg1") or result.get("msg_cd"),
+            )
+            resp = direct_resp
+            if is_us_premarket and self._should_fallback_us_premarket_order(result):
+                fallback_reason = str(
+                    result.get("msg1") or result.get("error") or result.get("msg_cd") or "US_PRE direct order rejected"
+                )
+                logger.warning(
+                    "[{} {}] 미국 프리마켓 direct 주문 거절 → MCP fallback code={} msg={}",
+                    market_code,
+                    symbol,
+                    result.get("msg_cd"),
+                    fallback_reason,
+                )
+                resp = await self._place_overseas_order_via_mcp(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    resolved_price=self._to_float(resolved_price, 0.0),
+                    market_code=market_code,
+                    session=session,
+                    resolved_limit_source=resolved_limit_source,
+                    fallback_reason=fallback_reason,
+                )
+        resp = await self._finalize_order_response(
+            resp,
+            market_code=market_code,
+            session=session,
+            order_type=order_type,
+            order_route=order_route,
+            resolved_price=resolved_price,
+            resolved_limit_source=resolved_limit_source,
+        )
+        if not resp.success:
+            if not resp.error and isinstance(resp.data, dict):
+                resp.error = str(
+                    resp.data.get("msg1")
+                    or resp.data.get("msg_cd")
+                    or "KIS 주문 실패"
+                )
+            if not is_domestic_market(market_code):
+                detail = resp.data or {}
+                logger.warning(
+                    "[{} {}] 주문 제출 실패 session={} route={} endpoint={} tr_id={} exchange={} limit={} source={} error={}",
+                    market_code,
+                    symbol,
+                    detail.get("session") or session,
+                    detail.get("order_route") or order_route,
+                    detail.get("order_endpoint"),
+                    detail.get("order_tr_id"),
+                    detail.get("exchange_code"),
+                    detail.get("resolved_limit_price"),
+                    detail.get("resolved_limit_source"),
+                    resp.error,
+                )
+        return resp
+
+    async def cancel_order(self, order_id: str, market: str = "", **kwargs: Any) -> MCPResponse:
+        """주문 취소"""
+        market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            from trading.bithumb_client import bithumb_client
+
+            return await bithumb_client.cancel_order(order_id, market=market_code)
+
+        symbol = str(kwargs.get("symbol") or "").strip()
+        quantity = kwargs.get("quantity")
+        price = kwargs.get("price")
+        session = kwargs.get("session")
+
+        if not is_domestic_market(market_code) and symbol and quantity is not None:
+            from trading.kis_api import cancel_overseas_order
+
+            result = await cancel_overseas_order(
+                symbol=symbol,
+                order_id=order_id,
+                quantity=quantity,
                 price=price,
                 market=market_code,
+                session=session,
             )
             resp = MCPResponse(
                 success=result.get("success", False),
                 data=result,
-                error=result.get("error"),
+                error=result.get("error") or result.get("msg1") or result.get("msg_cd"),
             )
-        if resp.success and resp.data:
-            d = resp.data
-            if d.get("rt_cd") == "1":
-                error_msg = d.get("msg1", "KIS 주문 실패")
-                logger.warning("KIS 주문 거부: {}", error_msg)
-                resp.success = False
-                resp.error = error_msg
-                return resp
-            output = self._first_record(d.get("output")) or self._first_record(d.get("output1"))
-            order_id = (
-                d.get("ODNO") or d.get("odno")
-                or d.get("ORDNO") or d.get("ordno")
-                or output.get("ODNO") or output.get("odno")
-                or d.get("order_id", "")
-            )
-            if not order_id:
-                logger.warning("주문 응답에서 주문번호 미발견, 원본: {}", str(d)[:500])
-            exchange_rate = await self._get_exchange_rate_to_krw(market_code)
-            filled_price = self._to_float(
-                d.get("exec_prc") or output.get("exec_prc")
-                or d.get("filled_price")
-            )
-            resp.data = {
-                **d,
-                "order_id": order_id,
-                "market": market_code,
-                "currency": market_currency(market_code),
-                "filled_quantity": self._to_int(
-                    d.get("exec_qty") or output.get("exec_qty")
-                    or d.get("filled_quantity")
-                ),
-                "filled_price": filled_price,
-                "filled_price_krw": filled_price * exchange_rate,
-                "exchange_rate_to_krw": exchange_rate,
-            }
-        return resp
+            if (
+                settings.is_real_trading
+                and is_us_market(market_code)
+                and str(session or "").upper() == "US_PRE"
+                and self._should_fallback_us_premarket_order(result)
+            ):
+                fallback_reason = str(
+                    result.get("msg1") or result.get("error") or result.get("msg_cd") or "US_PRE direct cancel rejected"
+                )
+                logger.warning(
+                    "[{} {}] 미국 프리마켓 direct 취소 거절 → MCP fallback code={} msg={}",
+                    market_code,
+                    symbol,
+                    result.get("msg_cd"),
+                    fallback_reason,
+                )
+                return await self._cancel_overseas_order_via_mcp(
+                    symbol=symbol,
+                    order_id=order_id,
+                    quantity=quantity,
+                    price=price,
+                    market_code=market_code,
+                    session=session,
+                    fallback_reason=fallback_reason,
+                )
+            return resp
+
+        tool_name = "cancel_domestic_order" if is_domestic_market(market_code) else "cancel_overseas_order"
+        payload = {"order_id": order_id}
+        return await self.call_tool(tool_name, payload)
 
     async def get_order(self, order_id: str, market: str = "KRX") -> MCPResponse:
         """단건 주문 조회"""
