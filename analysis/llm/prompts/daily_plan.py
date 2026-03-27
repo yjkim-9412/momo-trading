@@ -35,10 +35,11 @@ DAILY_PLAN_PROMPT = """## 장 마감 데이트레이딩 성과 리뷰
 {drop_data}
 
 ### 포트폴리오 현황 (장 마감 후)
-- 총 자산: {total_asset:,.0f}원
-- 현금: {cash:,.0f}원 (현금비율: {cash_ratio:.1f}%)
-- 주식 평가액: {stock_value:,.0f}원
-- 평가 손익: {total_pnl:+,.0f}원 ({total_pnl_rate:+.2f}%)
+- 기준 통화: {report_currency}
+- 총 자산: {total_asset_text}
+- 현금: {cash_text} (현금비율: {cash_ratio:.1f}%)
+- 주식 평가액: {stock_value_text}
+- 평가 손익: {portfolio_total_pnl_text} ({total_pnl_rate:+.2f}%)
 
 ### 오늘 매매 활동
 - 분석 사이클: {today_cycles}회

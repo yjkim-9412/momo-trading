@@ -26,6 +26,10 @@ from trading.product_policy import (
 
 # 모의투자 매매불가 종목 필터 키워드
 _EXCLUDE_NAME_KEYWORDS = ("ETN", "스팩", "SPAC")
+_US_BASE_SCAN_LIMIT = 30
+_US_EXPANDED_SCAN_LIMIT = 60
+_US_DETAIL_ENRICH_MIN_LIMIT = 24
+_US_DETAIL_ENRICH_MULTIPLIER = 4
 
 
 class MarketScanner:
@@ -278,6 +282,469 @@ class MarketScanner:
         return filtered, dropped
 
     @staticmethod
+    def _merge_stock_lists(*groups: list[dict]) -> list[dict]:
+        """시장/심볼 기준으로 후보군을 병합한다."""
+        merged: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for group in groups:
+            for item in group:
+                symbol = str(item.get("symbol", "")).strip().upper()
+                if not symbol:
+                    continue
+                market_code = normalize_market(item.get("market", settings.primary_market_code))
+                key = (market_code, symbol)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+        return merged
+
+    def _resolve_trade_value_usd(self, item: dict) -> float:
+        """USD 기준 거래대금을 정리한다."""
+        direct_value = self._to_float(item.get("trade_value_usd"), 0.0)
+        if direct_value > 0:
+            return direct_value
+
+        currency = str(item.get("currency") or "USD").upper()
+        trade_value = self._to_float(item.get("trade_value"), 0.0)
+        if trade_value > 0 and currency == "USD":
+            return trade_value
+
+        price = self._to_float(item.get("price", item.get("current_price", 0.0)), 0.0)
+        volume = self._to_float(item.get("volume", 0.0), 0.0)
+        if price > 0 and volume > 0:
+            return price * volume
+        return 0.0
+
+    def _resolve_junk_filter_reason(
+        self,
+        item: dict,
+        thresholds: dict[str, float],
+    ) -> str | None:
+        """미국 프리마켓 잡주 필터 제외 사유."""
+        price = self._to_float(item.get("price", item.get("current_price", 0.0)), 0.0)
+        volume = self._to_float(item.get("volume", 0.0), 0.0)
+        trade_value_usd = self._resolve_trade_value_usd(item)
+        abs_change_pct = abs(self._to_float(item.get("change_rate", 0.0), 0.0))
+
+        if price < thresholds["min_price_usd"]:
+            return "price_below_min"
+        if volume < thresholds["min_volume"]:
+            return "volume_below_min"
+        if trade_value_usd < thresholds["min_trade_value_usd"]:
+            return "trade_value_below_min"
+        if abs_change_pct > thresholds["max_abs_change_pct"]:
+            return "abs_change_above_max"
+        if (
+            price < thresholds["hot_price_ceiling_usd"]
+            and abs_change_pct >= thresholds["hot_abs_change_pct"]
+            and trade_value_usd < thresholds["hot_min_trade_value_usd"]
+        ):
+            return "hot_low_price_mover"
+        return None
+
+    def _apply_us_premarket_junk_filter(
+        self,
+        stocks: list[dict],
+        thresholds: dict[str, float],
+    ) -> tuple[list[dict], dict[str, object]]:
+        """미국 프리마켓 잡주 필터 적용."""
+        filtered: list[dict] = []
+        reasons: dict[str, int] = {}
+
+        for item in stocks:
+            reason = self._resolve_junk_filter_reason(item, thresholds)
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+                continue
+            filtered.append({
+                **item,
+                "trade_value_usd": self._resolve_trade_value_usd(item),
+            })
+
+        return filtered, {
+            "before": len(stocks),
+            "after": len(filtered),
+            "dropped": len(stocks) - len(filtered),
+            "reasons": reasons,
+        }
+
+    def _apply_us_premarket_junk_filter_groups(
+        self,
+        volume_rank: list[dict],
+        surge_data: list[dict],
+        drop_data: list[dict],
+    ) -> tuple[list[dict], list[dict], list[dict], dict[str, dict[str, object]]]:
+        """카테고리별 프리마켓 잡주 필터 적용."""
+        thresholds = settings.us_premarket_junk_filter_thresholds
+        volume_rank, volume_stats = self._apply_us_premarket_junk_filter(volume_rank, thresholds)
+        surge_data, surge_stats = self._apply_us_premarket_junk_filter(surge_data, thresholds)
+        drop_data, drop_stats = self._apply_us_premarket_junk_filter(drop_data, thresholds)
+        return volume_rank, surge_data, drop_data, {
+            "volume_rank": volume_stats,
+            "surge_data": surge_stats,
+            "drop_data": drop_stats,
+        }
+
+    @staticmethod
+    def _bucket_monitor_floor_met(
+        volume_rank: list[dict],
+        surge_data: list[dict],
+        drop_data: list[dict],
+    ) -> bool:
+        """버킷별 최소 개수 충족 여부."""
+        return min(len(volume_rank), len(surge_data), len(drop_data)) >= 2
+
+    def _has_sufficient_us_monitor_candidates(
+        self,
+        volume_rank: list[dict],
+        surge_data: list[dict],
+        drop_data: list[dict],
+    ) -> bool:
+        """미국 프리마켓 후보 풀이 충분한지 확인."""
+        unique_candidates = self._merge_stock_lists(volume_rank, surge_data, drop_data)
+        return (
+            len(unique_candidates) >= settings.us_premarket_min_monitor_candidates
+            and self._bucket_monitor_floor_met(volume_rank, surge_data, drop_data)
+        )
+
+    @staticmethod
+    def _detail_enrich_limit() -> int:
+        """상세 시세 보강 최대 건수."""
+        return max(
+            _US_DETAIL_ENRICH_MIN_LIMIT,
+            settings.us_premarket_min_monitor_candidates * _US_DETAIL_ENRICH_MULTIPLIER,
+        )
+
+    @staticmethod
+    def _merge_stock_with_detail(stock: dict, detail: dict | None) -> dict:
+        """기존 후보에 상세 시세를 합친다."""
+        if not detail:
+            return stock
+        merged = {**stock, **detail}
+        merged["name"] = stock.get("name") or detail.get("name") or stock.get("symbol", "")
+        merged["scan_source"] = stock.get("scan_source", detail.get("scan_source", "DISCOVERY"))
+        merged["market"] = normalize_market(merged.get("market", stock.get("market", settings.primary_market_code)))
+        return merged
+
+    async def _enrich_us_candidates_with_price_detail(
+        self,
+        volume_rank: list[dict],
+        surge_data: list[dict],
+        drop_data: list[dict],
+    ) -> tuple[list[dict], list[dict], list[dict], dict[str, int]]:
+        """미국장 후보 일부에 price-detail 상세 시세를 보강한다."""
+        detail_limit = self._detail_enrich_limit()
+        unique_candidates = self._merge_stock_lists(volume_rank, surge_data, drop_data)[:detail_limit]
+        if not unique_candidates:
+            return volume_rank, surge_data, drop_data, {"requested": 0, "enriched": 0}
+
+        responses = await asyncio.gather(
+            *[
+                mcp_client.get_current_price_detail(
+                    str(item.get("symbol", "")),
+                    market=str(item.get("market", settings.primary_market_code)),
+                )
+                for item in unique_candidates
+            ],
+            return_exceptions=True,
+        )
+        detail_lookup: dict[tuple[str, str], dict] = {}
+        enriched = 0
+        for item, response in zip(unique_candidates, responses, strict=False):
+            if isinstance(response, Exception) or not getattr(response, "success", False):
+                continue
+            data = response.data or {}
+            symbol = str(data.get("symbol", item.get("symbol", ""))).strip().upper()
+            market_code = normalize_market(data.get("market", item.get("market", settings.primary_market_code)))
+            if not symbol:
+                continue
+            detail_lookup[(market_code, symbol)] = data
+            enriched += 1
+
+        def apply(group: list[dict]) -> list[dict]:
+            return [
+                self._merge_stock_with_detail(
+                    stock,
+                    detail_lookup.get((
+                        normalize_market(stock.get("market", settings.primary_market_code)),
+                        str(stock.get("symbol", "")).strip().upper(),
+                    )),
+                )
+                for stock in group
+            ]
+
+        return apply(volume_rank), apply(surge_data), apply(drop_data), {
+            "requested": len(unique_candidates),
+            "enriched": enriched,
+        }
+
+    async def _build_us_expansion_candidates(
+        self,
+        default_market: str,
+        holdings,
+    ) -> list[dict]:
+        """워치리스트/보유 종목 기반 추가 미국장 후보 수집."""
+        request_items: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        for holding in holdings or []:
+            market_code = normalize_market(getattr(holding, "market", default_market), default=default_market)
+            if not is_us_market(market_code):
+                continue
+            symbol = str(getattr(holding, "symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            key = (market_code, symbol)
+            if key in seen:
+                continue
+            seen.add(key)
+            request_items.append((symbol, market_code, str(getattr(holding, "name", symbol)), "HOLDING_EXPANSION"))
+
+        for symbol in settings.us_watchlist_symbols:
+            watch_market = normalize_market(default_market, default=default_market)
+            key = (watch_market, symbol)
+            if key in seen:
+                continue
+            seen.add(key)
+            request_items.append((symbol, watch_market, symbol, "WATCHLIST_EXPANSION"))
+
+        if not request_items:
+            return []
+
+        responses = await asyncio.gather(
+            *[
+                mcp_client.get_current_price_detail(symbol, market=market)
+                for symbol, market, _, _ in request_items
+            ],
+            return_exceptions=True,
+        )
+        candidates: list[dict] = []
+        for (symbol, market_code, fallback_name, scan_source), response in zip(request_items, responses, strict=False):
+            if isinstance(response, Exception) or not getattr(response, "success", False):
+                continue
+            data = response.data or {}
+            price = self._to_float(data.get("price", data.get("current_price", 0.0)), 0.0)
+            if price <= 0:
+                continue
+            candidates.append({
+                **data,
+                "symbol": str(data.get("symbol", symbol)).strip().upper(),
+                "name": str(data.get("name") or fallback_name or symbol),
+                "market": normalize_market(data.get("market", market_code), default=market_code),
+                "scan_source": scan_source,
+                "trade_value_usd": self._resolve_trade_value_usd(data),
+            })
+        return self._filter_untradeable(candidates, market=default_market)
+
+    def _merge_rank_group(
+        self,
+        base: list[dict],
+        extra: list[dict],
+        *,
+        sort_key: str,
+        reverse: bool,
+        limit: int,
+    ) -> list[dict]:
+        """버킷별 후보를 병합 후 정렬한다."""
+        merged = self._merge_stock_lists(base, extra)
+        merged.sort(key=lambda item: self._to_float(item.get(sort_key, 0.0), 0.0), reverse=reverse)
+        return merged[:limit]
+
+    def _supplement_candidate_groups(
+        self,
+        volume_rank: list[dict],
+        surge_data: list[dict],
+        drop_data: list[dict],
+        supplemental: list[dict],
+        *,
+        limit: int,
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        """추가 후보를 카테고리별 랭킹에 배치한다."""
+        if not supplemental:
+            return volume_rank, surge_data, drop_data
+
+        volume_rank = self._merge_rank_group(
+            volume_rank,
+            supplemental,
+            sort_key="volume",
+            reverse=True,
+            limit=limit,
+        )
+        surge_candidates = [item for item in supplemental if self._to_float(item.get("change_rate", 0.0), 0.0) >= 0.0]
+        drop_candidates = [item for item in supplemental if self._to_float(item.get("change_rate", 0.0), 0.0) < 0.0]
+        surge_data = self._merge_rank_group(
+            surge_data,
+            surge_candidates,
+            sort_key="change_rate",
+            reverse=True,
+            limit=limit,
+        )
+        drop_data = self._merge_rank_group(
+            drop_data,
+            drop_candidates,
+            sort_key="change_rate",
+            reverse=False,
+            limit=limit,
+        )
+        return volume_rank, surge_data, drop_data
+
+    async def _fetch_us_rank_stage(
+        self,
+        scan_markets: list[str],
+        stage: int,
+        holdings,
+        default_market: str,
+    ) -> tuple[list[dict], list[dict], list[dict], dict[str, int]]:
+        """미국 프리마켓 확장 stage별 후보 재수집."""
+        limit = _US_EXPANDED_SCAN_LIMIT if stage >= 1 else _US_BASE_SCAN_LIMIT
+        include_trade_growth = stage >= 2
+        volume_rank, surge_data, drop_data = await asyncio.gather(
+            self._get_volume_rank(
+                scan_markets,
+                limit=limit,
+                include_trade_growth=include_trade_growth,
+            ),
+            self._get_fluctuation_rank(scan_markets, "top", limit=limit),
+            self._get_fluctuation_rank(scan_markets, "bottom", limit=limit),
+        )
+        supplemental_count = 0
+        if stage >= 3:
+            supplemental = await self._build_us_expansion_candidates(default_market, holdings)
+            supplemental_count = len(supplemental)
+            volume_rank, surge_data, drop_data = self._supplement_candidate_groups(
+                volume_rank,
+                surge_data,
+                drop_data,
+                supplemental,
+                limit=limit,
+            )
+
+        return volume_rank, surge_data, drop_data, {
+            "stage": stage,
+            "limit": limit,
+            "include_trade_growth": int(include_trade_growth),
+            "supplemental_count": supplemental_count,
+        }
+
+    async def _prepare_us_premarket_candidates(
+        self,
+        target: str,
+        scan_markets: list[str],
+        holdings,
+        available_cash: float,
+        available_cash_foreign: float | None,
+        initial_groups: tuple[list[dict], list[dict], list[dict]],
+    ) -> tuple[list[dict], list[dict], list[dict], dict[str, float], dict, dict]:
+        """미국 프리마켓 잡주 필터 + 확장 파이프라인."""
+        max_stage = settings.us_premarket_expansion_max_stage if settings.US_PREMARKET_EXPANSION_ENABLED else 0
+        final_groups = initial_groups
+        final_fx_rates: dict[str, float] = {}
+        final_affordability_stats: dict[str, dict[str, int]] = {}
+        final_junk_stats: dict[str, dict[str, object]] = {}
+        expansion_meta: dict[str, object] = {
+            "triggered": False,
+            "final_stage": 0,
+            "stage_counts": [],
+        }
+
+        for stage in range(max_stage + 1):
+            if stage == 0:
+                volume_rank, surge_data, drop_data = initial_groups
+                stage_meta = {
+                    "stage": 0,
+                    "limit": _US_BASE_SCAN_LIMIT,
+                    "include_trade_growth": 0,
+                    "supplemental_count": 0,
+                }
+            else:
+                expansion_meta["triggered"] = True
+                volume_rank, surge_data, drop_data, stage_meta = await self._fetch_us_rank_stage(
+                    scan_markets,
+                    stage,
+                    holdings,
+                    scan_markets[0] if scan_markets else target,
+                )
+
+            volume_rank, surge_data, drop_data, detail_meta = await self._enrich_us_candidates_with_price_detail(
+                volume_rank,
+                surge_data,
+                drop_data,
+            )
+            volume_rank, surge_data, drop_data, junk_stats = self._apply_us_premarket_junk_filter_groups(
+                volume_rank,
+                surge_data,
+                drop_data,
+            )
+            unique_after_junk = len(self._merge_stock_lists(volume_rank, surge_data, drop_data))
+            fx_rates = await self._build_affordability_fx_rates(
+                self._merge_stock_lists(volume_rank, surge_data, drop_data),
+            )
+            affordability_stats = {
+                "volume_rank": {"before": len(volume_rank), "after": 0, "dropped": 0},
+                "surge_data": {"before": len(surge_data), "after": 0, "dropped": 0},
+                "drop_data": {"before": len(drop_data), "after": 0, "dropped": 0},
+            }
+            volume_rank, volume_dropped = self._filter_affordable_stocks(
+                volume_rank,
+                available_cash,
+                available_cash_foreign,
+                fx_rates,
+            )
+            surge_data, surge_dropped = self._filter_affordable_stocks(
+                surge_data,
+                available_cash,
+                available_cash_foreign,
+                fx_rates,
+            )
+            drop_data, drop_dropped = self._filter_affordable_stocks(
+                drop_data,
+                available_cash,
+                available_cash_foreign,
+                fx_rates,
+            )
+            affordability_stats["volume_rank"]["after"] = len(volume_rank)
+            affordability_stats["volume_rank"]["dropped"] = volume_dropped
+            affordability_stats["surge_data"]["after"] = len(surge_data)
+            affordability_stats["surge_data"]["dropped"] = surge_dropped
+            affordability_stats["drop_data"]["after"] = len(drop_data)
+            affordability_stats["drop_data"]["dropped"] = drop_dropped
+
+            unique_after_affordability = len(self._merge_stock_lists(volume_rank, surge_data, drop_data))
+            expansion_meta["stage_counts"].append({
+                **stage_meta,
+                "detail_requested": detail_meta["requested"],
+                "detail_enriched": detail_meta["enriched"],
+                "unique_after_junk": unique_after_junk,
+                "unique_after_affordability": unique_after_affordability,
+            })
+            final_groups = (volume_rank, surge_data, drop_data)
+            final_fx_rates = fx_rates
+            final_affordability_stats = affordability_stats
+            final_junk_stats = junk_stats
+            expansion_meta["final_stage"] = stage
+
+            if self._has_sufficient_us_monitor_candidates(volume_rank, surge_data, drop_data):
+                break
+
+        return (*final_groups, final_fx_rates, final_affordability_stats, {
+            **expansion_meta,
+            "triggered": bool(expansion_meta["triggered"]),
+        }, final_junk_stats)
+
+    @staticmethod
+    def _empty_candidate_market_summary(junk_filter_stats: dict[str, dict[str, object]] | None) -> str:
+        """후보가 모두 제거됐을 때 요약 메시지."""
+        if not junk_filter_stats:
+            return "가용 현금 기준 1주 매수 가능 후보 없음"
+
+        total_after_junk = sum(int(stats.get("after", 0)) for stats in junk_filter_stats.values())
+        total_junk_dropped = sum(int(stats.get("dropped", 0)) for stats in junk_filter_stats.values())
+        if total_after_junk == 0 and total_junk_dropped > 0:
+            return "프리마켓 잡주 필터 기준 후보 없음"
+        return "가용 현금 기준 1주 매수 가능 후보 없음"
+
+    @staticmethod
     def _selection_target_range(
         market: str,
         session: str,
@@ -316,7 +783,26 @@ class MarketScanner:
             cycle_id=cycle_id,
         )
 
+        from util.time_util import now_kst
+        from zoneinfo import ZoneInfo
+        from trading.market_profile import market_timezone
+
         scan_markets = settings.scan_markets_for(target)
+        now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
+        session = market_calendar.get_market_session(dt=now, market=target)
+        mkt_cfg = settings.get_market_config(target, session=session)
+        cutoff_time = now.replace(
+            hour=mkt_cfg["buy_cutoff_hour"],
+            minute=mkt_cfg["buy_cutoff_minute"],
+            second=0,
+            microsecond=0,
+        )
+        minutes_until_cutoff = max(0, int((cutoff_time - now).total_seconds() / 60))
+        selection_target_range = self._selection_target_range(
+            target,
+            session,
+            minutes_until_cutoff,
+        )
         if account_snapshot is None:
             (
                 account_snapshot,
@@ -349,8 +835,6 @@ class MarketScanner:
         if dynamic_limits:
             max_pos_pct = dynamic_limits.get("max_position_pct", 20.0) / 100
         max_per_stock = available_cash * max_pos_pct
-        all_candidates = [*volume_rank, *surge_data, *drop_data]
-        fx_rates = await self._build_affordability_fx_rates(all_candidates)
         available_cash_foreign = self._resolve_available_cash_foreign(
             target,
             balance,
@@ -360,39 +844,87 @@ class MarketScanner:
             if available_cash_foreign is not None
             else None
         )
-        affordability_stats = {
-            "volume_rank": {"before": len(volume_rank), "after": 0, "dropped": 0},
-            "surge_data": {"before": len(surge_data), "after": 0, "dropped": 0},
-            "drop_data": {"before": len(drop_data), "after": 0, "dropped": 0},
+        junk_filter_enabled = settings.is_us_premarket_junk_filter_session(target, session=session)
+        junk_filter_stats: dict[str, dict[str, object]] = {}
+        expansion_stats: dict[str, object] = {
+            "triggered": False,
+            "final_stage": 0,
+            "stage_counts": [],
         }
-        volume_rank, volume_dropped = self._filter_affordable_stocks(
-            volume_rank,
-            available_cash,
-            available_cash_foreign,
-            fx_rates,
-        )
-        surge_data, surge_dropped = self._filter_affordable_stocks(
-            surge_data,
-            available_cash,
-            available_cash_foreign,
-            fx_rates,
-        )
-        drop_data, drop_dropped = self._filter_affordable_stocks(
-            drop_data,
-            available_cash,
-            available_cash_foreign,
-            fx_rates,
-        )
-        affordability_stats["volume_rank"]["after"] = len(volume_rank)
-        affordability_stats["volume_rank"]["dropped"] = volume_dropped
-        affordability_stats["surge_data"]["after"] = len(surge_data)
-        affordability_stats["surge_data"]["dropped"] = surge_dropped
-        affordability_stats["drop_data"]["after"] = len(drop_data)
-        affordability_stats["drop_data"]["dropped"] = drop_dropped
+        if junk_filter_enabled:
+            (
+                volume_rank,
+                surge_data,
+                drop_data,
+                fx_rates,
+                affordability_stats,
+                expansion_stats,
+                junk_filter_stats,
+            ) = await self._prepare_us_premarket_candidates(
+                target,
+                scan_markets,
+                holdings,
+                available_cash,
+                available_cash_foreign,
+                (volume_rank, surge_data, drop_data),
+            )
+        else:
+            all_candidates = [*volume_rank, *surge_data, *drop_data]
+            fx_rates = await self._build_affordability_fx_rates(all_candidates)
+            affordability_stats = {
+                "volume_rank": {"before": len(volume_rank), "after": 0, "dropped": 0},
+                "surge_data": {"before": len(surge_data), "after": 0, "dropped": 0},
+                "drop_data": {"before": len(drop_data), "after": 0, "dropped": 0},
+            }
+            volume_rank, volume_dropped = self._filter_affordable_stocks(
+                volume_rank,
+                available_cash,
+                available_cash_foreign,
+                fx_rates,
+            )
+            surge_data, surge_dropped = self._filter_affordable_stocks(
+                surge_data,
+                available_cash,
+                available_cash_foreign,
+                fx_rates,
+            )
+            drop_data, drop_dropped = self._filter_affordable_stocks(
+                drop_data,
+                available_cash,
+                available_cash_foreign,
+                fx_rates,
+            )
+            affordability_stats["volume_rank"]["after"] = len(volume_rank)
+            affordability_stats["volume_rank"]["dropped"] = volume_dropped
+            affordability_stats["surge_data"]["after"] = len(surge_data)
+            affordability_stats["surge_data"]["dropped"] = surge_dropped
+            affordability_stats["drop_data"]["after"] = len(drop_data)
+            affordability_stats["drop_data"]["dropped"] = drop_dropped
 
         data_elapsed = activity_logger.elapsed_ms(timer)
         logger.info("MCP 데이터 수집 완료: {}ms", data_elapsed)
-        if volume_dropped or surge_dropped or drop_dropped:
+        if junk_filter_enabled:
+            junk_before = sum(int(stats.get("before", 0)) for stats in junk_filter_stats.values())
+            junk_after = sum(int(stats.get("after", 0)) for stats in junk_filter_stats.values())
+            junk_reasons: dict[str, int] = {}
+            for stats in junk_filter_stats.values():
+                for reason, count in dict(stats.get("reasons", {})).items():
+                    junk_reasons[reason] = junk_reasons.get(reason, 0) + int(count)
+            if junk_before != junk_after:
+                logger.info(
+                    "미국 프리마켓 잡주 필터 적용: {}건 → {}건 | {}",
+                    junk_before,
+                    junk_after,
+                    junk_reasons,
+                )
+            if expansion_stats.get("triggered"):
+                logger.info(
+                    "미국 프리마켓 후보 확장 완료: final_stage={} | {}",
+                    expansion_stats.get("final_stage", 0),
+                    expansion_stats.get("stage_counts", []),
+                )
+
+        if any(int(stats["dropped"]) > 0 for stats in affordability_stats.values()):
             if available_cash_foreign is not None:
                 logger.info(
                     "가용 현금 기준 후보 필터 적용: 거래량 {}→{}, 급등 {}→{}, 급락 {}→{} (실주문 기준 현금 {:,.2f}USD)",
@@ -417,7 +949,9 @@ class MarketScanner:
                 )
         if not volume_rank and not surge_data and not drop_data:
             elapsed = activity_logger.elapsed_ms(timer)
-            market_summary = "가용 현금 기준 1주 매수 가능 후보 없음"
+            market_summary = self._empty_candidate_market_summary(
+                junk_filter_stats if junk_filter_enabled else None,
+            )
             await activity_logger.log(
                 ActivityType.SCAN, ActivityPhase.COMPLETE,
                 f"\U0001f4e1 시장 스캔 완료: {market_summary}",
@@ -430,6 +964,8 @@ class MarketScanner:
                     "available_cash_foreign": available_cash_foreign,
                     "markets": scan_markets,
                     "affordability_filter": affordability_stats,
+                    "junk_filter": junk_filter_stats,
+                    "expansion": expansion_stats,
                 },
                 execution_time_ms=elapsed,
             )
@@ -445,27 +981,6 @@ class MarketScanner:
                 "max_per_stock_foreign": max_per_stock_foreign,
                 "markets": scan_markets,
             }
-
-        # 2. AI 시장 분석 + 종목 선별 (통합 1회 호출)
-        from util.time_util import now_kst
-        from core.config import settings as _settings
-        from zoneinfo import ZoneInfo
-        from trading.market_profile import market_timezone
-
-        now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
-        mkt_cfg = _settings.get_market_config(target)
-        cutoff_time = now.replace(
-            hour=mkt_cfg["buy_cutoff_hour"],
-            minute=mkt_cfg["buy_cutoff_minute"],
-            second=0, microsecond=0,
-        )
-        minutes_until_cutoff = max(0, int((cutoff_time - now).total_seconds() / 60))
-        session = market_calendar.get_market_session(dt=now, market=target)
-        selection_target_range = self._selection_target_range(
-            target,
-            session,
-            minutes_until_cutoff,
-        )
 
         prompt = get_market_scan_prompt(primary_market).format(
             market_label=get_market_label(primary_market),
@@ -549,6 +1064,8 @@ class MarketScanner:
                         **affordability_stats,
                         "selected_dropped": selected_affordability_dropped,
                     },
+                    "junk_filter": junk_filter_stats,
+                    "expansion": expansion_stats,
                 },
                 llm_provider=provider,
                 llm_tier="TIER1",
@@ -613,23 +1130,49 @@ class MarketScanner:
             logger.warning("성과 요약 조회 실패: {}", str(e))
             return "매매 이력 없음"
 
-    async def _get_volume_rank(self, markets: list[str]) -> list[dict]:
+    async def _get_volume_rank(
+        self,
+        markets: list[str],
+        *,
+        limit: int = _US_BASE_SCAN_LIMIT,
+        include_trade_growth: bool = False,
+    ) -> list[dict]:
         responses = await asyncio.gather(
-            *[mcp_client.get_volume_rank(market=market) for market in markets],
+            *[
+                mcp_client.get_volume_rank(
+                    market=market,
+                    limit=limit,
+                    include_trade_growth=include_trade_growth,
+                )
+                for market in markets
+            ],
             return_exceptions=True,
         )
         stocks = self._merge_scan_stocks(markets, responses)
         stocks.sort(key=lambda item: float(item.get("volume", 0)), reverse=True)
-        return stocks[:30]
+        return stocks[:limit]
 
-    async def _get_fluctuation_rank(self, markets: list[str], sort: str) -> list[dict]:
+    async def _get_fluctuation_rank(
+        self,
+        markets: list[str],
+        sort: str,
+        *,
+        limit: int = _US_BASE_SCAN_LIMIT,
+    ) -> list[dict]:
         responses = await asyncio.gather(
-            *[mcp_client.get_fluctuation_rank(market=market, sort=sort) for market in markets],
+            *[
+                mcp_client.get_fluctuation_rank(
+                    market=market,
+                    sort=sort,
+                    limit=limit,
+                )
+                for market in markets
+            ],
             return_exceptions=True,
         )
         stocks = self._merge_scan_stocks(markets, responses)
         stocks.sort(key=lambda item: float(item.get("change_rate", 0)), reverse=(sort != "bottom"))
-        return stocks[:30]
+        return stocks[:limit]
 
     def _merge_scan_stocks(self, markets: list[str], responses: list) -> list[dict]:
         """시장별 스캔 결과 병합"""

@@ -15,7 +15,7 @@ export async function loadReportList() {
       json.data.forEach(function (r) {
         var btn = document.createElement('button');
         btn.className = 'w-full text-left px-3 py-1 text-xs text-gray-400 hover:bg-dark-700 rounded';
-        btn.textContent = r.report_date + ' (' + (r.market_scope || state.currentMarket) + ')';
+        btn.textContent = r.report_date + ' (' + (r.market_scope || state.currentMarket) + ', ' + _reportCurrency(r) + ')';
         btn.onclick = function () { switchToReport(r.report_date); };
         listEl.appendChild(btn);
       });
@@ -128,6 +128,7 @@ export function createReportCard(report) {
   var realizedPnlColor = report.total_pnl >= 0 ? 'text-green-400' : 'text-red-400';
   var unrealizedPnl = report.unrealized_pnl || 0;
   var unrealizedPnlColor = unrealizedPnl >= 0 ? 'text-green-400' : 'text-red-400';
+  var reportCurrency = _reportCurrency(report);
   var buyCount = report.buy_count || 0;
   var sellCount = report.sell_count || 0;
   var openCount = report.open_position_count || 0;
@@ -148,7 +149,7 @@ export function createReportCard(report) {
   header.appendChild(document.createTextNode(' ' + report.report_date + ' \uC77C\uC77C \uB9AC\uD3EC\uD2B8 '));
   var scopeSpan = document.createElement('span');
   scopeSpan.className = 'text-xs text-gray-500';
-  scopeSpan.textContent = '(' + (report.market_scope || state.currentMarket) + ')';
+  scopeSpan.textContent = '(' + (report.market_scope || state.currentMarket) + ' · ' + reportCurrency + ')';
   header.appendChild(scopeSpan);
   div.appendChild(header);
 
@@ -176,8 +177,8 @@ export function createReportCard(report) {
   // PnL grid (2 cols)
   var pnlGrid = document.createElement('div');
   pnlGrid.className = 'grid grid-cols-2 gap-3 mb-4';
-  pnlGrid.appendChild(_pnlCell(formatSignedAmount(report.total_pnl, 'KRW'), '\uC2E4\uD604 \uC190\uC775 (\uC2B9\uB960 ' + winRate + '%)', realizedPnlColor));
-  pnlGrid.appendChild(_pnlCell(formatSignedAmount(unrealizedPnl, 'KRW'), '\uBBF8\uC2E4\uD604 \uC190\uC775', unrealizedPnlColor));
+  pnlGrid.appendChild(_pnlCell(formatSignedAmount(report.total_pnl, reportCurrency), '\uC2E4\uD604 \uC190\uC775 (\uC2B9\uB960 ' + winRate + '%)', realizedPnlColor));
+  pnlGrid.appendChild(_pnlCell(formatSignedAmount(unrealizedPnl, reportCurrency), '\uBBF8\uC2E4\uD604 \uC190\uC775', unrealizedPnlColor));
   div.appendChild(pnlGrid);
 
   // Text sections
@@ -253,7 +254,7 @@ export function renderReportComparison(data) {
   var refreshed = data.refreshed || {};
   var dateStr = refreshed.report_date || '';
   var scope = refreshed.market_scope || state.currentMarket;
-  header.appendChild(document.createTextNode(' \uB9AC\uD3EC\uD2B8 \uBE44\uAD50 \u2014 ' + escapeHtml(dateStr) + ' (' + escapeHtml(scope) + ') '));
+  header.appendChild(document.createTextNode(' \uB9AC\uD3EC\uD2B8 \uBE44\uAD50 \u2014 ' + escapeHtml(dateStr) + ' (' + escapeHtml(scope) + ' · ' + escapeHtml(_reportCurrency(refreshed)) + ') '));
 
   var recBadge = document.createElement('span');
   recBadge.className = 'text-xs font-medium px-2 py-0.5 rounded';
@@ -334,13 +335,16 @@ function _buildComparisonColumn(title, report, comparison, side, isRecommended) 
   }
 
   // Metric rows
+  var reportCurrency = _reportCurrency(report);
+  var comparisonCurrency = comparison.report_currency || null;
   var metrics = [
     { key: 'total_cycles', label: '\uC0AC\uC774\uD074', value: String(report.total_cycles || 0) },
     { key: 'total_analyses', label: '\uBD84\uC11D', value: String(report.total_analyses || 0) },
     { key: 'buy_count', label: '\uB9E4\uC218 \uC8FC\uBB38', value: String(report.buy_count || 0) },
     { key: 'open_position_count', label: '\uBCF4\uC720\uC885\uBAA9', value: String(report.open_position_count || 0) },
-    { key: 'total_pnl', label: '\uC2E4\uD604\uC190\uC775', value: formatSignedAmount(report.total_pnl, 'KRW') },
-    { key: 'unrealized_pnl', label: '\uBBF8\uC2E4\uD604\uC190\uC775', value: formatSignedAmount(report.unrealized_pnl || 0, 'KRW') },
+    { key: 'report_currency', label: '\uAE30\uC900 \uD1B5\uD654', value: reportCurrency },
+    { key: 'total_pnl', label: '\uC2E4\uD604\uC190\uC775', value: formatSignedAmount(report.total_pnl, reportCurrency) },
+    { key: 'unrealized_pnl', label: '\uBBF8\uC2E4\uD604\uC190\uC775', value: formatSignedAmount(report.unrealized_pnl || 0, reportCurrency) },
   ];
 
   metrics.forEach(function (m) {
@@ -358,15 +362,18 @@ function _buildComparisonColumn(title, report, comparison, side, isRecommended) 
     // Check if this field differs and this side is better
     if (comparison[m.key]) {
       var cmp = comparison[m.key];
-      var existVal = Number(cmp.existing) || 0;
-      var refreshVal = Number(cmp.refreshed) || 0;
-      if (existVal !== refreshVal) {
-        var betterSide = refreshVal > existVal ? 'refreshed' : 'existing';
-        if (betterSide === side) {
-          var badge = document.createElement('span');
-          badge.className = 'report-diff-badge';
-          badge.textContent = '\uAC1C\uC120';
-          valueWrap.appendChild(badge);
+      if (m.key !== 'report_currency') {
+        var sameCurrency = !comparisonCurrency || cmp.existing === cmp.refreshed;
+        var existVal = Number(cmp.existing) || 0;
+        var refreshVal = Number(cmp.refreshed) || 0;
+        if (sameCurrency && existVal !== refreshVal) {
+          var betterSide = refreshVal > existVal ? 'refreshed' : 'existing';
+          if (betterSide === side) {
+            var badge = document.createElement('span');
+            badge.className = 'report-diff-badge';
+            badge.textContent = '\uAC1C\uC120';
+            valueWrap.appendChild(badge);
+          }
         }
       }
     }
@@ -377,6 +384,10 @@ function _buildComparisonColumn(title, report, comparison, side, isRecommended) 
   });
 
   return col;
+}
+
+function _reportCurrency(report) {
+  return report && report.report_currency ? report.report_currency : 'KRW';
 }
 
 function _dismissComparison(wrapperEl, existingReport) {

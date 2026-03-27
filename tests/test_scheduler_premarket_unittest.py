@@ -14,9 +14,21 @@ from trading.models import MCPResponse
 class SchedulerPremarketProfileTest(unittest.TestCase):
     def setUp(self):
         self._original_premarket = settings.US_PREMARKET_ENABLED
+        self._original_scalp_enabled = settings.US_PREMARKET_SCALP_ENABLED
+        self._original_scalp_buy_hour = settings.US_PREMARKET_SCALP_BUY_CUTOFF_HOUR
+        self._original_scalp_buy_minute = settings.US_PREMARKET_SCALP_BUY_CUTOFF_MINUTE
+        self._original_scalp_force_hour = settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR
+        self._original_scalp_force_minute = settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE
+        self._original_day_trading_only = settings.DAY_TRADING_ONLY
 
     def tearDown(self):
         settings.US_PREMARKET_ENABLED = self._original_premarket
+        settings.US_PREMARKET_SCALP_ENABLED = self._original_scalp_enabled
+        settings.US_PREMARKET_SCALP_BUY_CUTOFF_HOUR = self._original_scalp_buy_hour
+        settings.US_PREMARKET_SCALP_BUY_CUTOFF_MINUTE = self._original_scalp_buy_minute
+        settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR = self._original_scalp_force_hour
+        settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE = self._original_scalp_force_minute
+        settings.DAY_TRADING_ONLY = self._original_day_trading_only
 
     def test_us_profile_uses_premarket_schedule_when_enabled(self):
         settings.US_PREMARKET_ENABLED = True
@@ -47,6 +59,26 @@ class SchedulerPremarketProfileTest(unittest.TestCase):
         settings.US_PREMARKET_ENABLED = False
 
         self.assertEqual(TradingScheduler._holdings_check_hours("NASDAQ"), "10-15")
+
+    def test_us_premarket_scalp_uses_session_specific_cutoffs(self):
+        settings.US_PREMARKET_ENABLED = True
+        settings.US_PREMARKET_SCALP_ENABLED = True
+        settings.DAY_TRADING_ONLY = False
+        settings.US_PREMARKET_SCALP_BUY_CUTOFF_HOUR = 9
+        settings.US_PREMARKET_SCALP_BUY_CUTOFF_MINUTE = 15
+        settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR = 9
+        settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE = 25
+
+        pre_cfg = settings.get_market_config("NASDAQ", session="US_PRE")
+        regular_cfg = settings.get_market_config("NASDAQ", session="US_REGULAR")
+
+        self.assertEqual(pre_cfg["buy_cutoff_hour"], 9)
+        self.assertEqual(pre_cfg["buy_cutoff_minute"], 15)
+        self.assertEqual(pre_cfg["force_liquidation_hour"], 9)
+        self.assertEqual(pre_cfg["force_liquidation_minute"], 25)
+        self.assertNotEqual(pre_cfg, regular_cfg)
+        self.assertTrue(settings.should_enforce_buy_cutoff("NASDAQ", session="US_PRE"))
+        self.assertFalse(settings.should_enforce_buy_cutoff("NASDAQ", session="US_REGULAR"))
 
 
 class SchedulerStartupActionTest(unittest.TestCase):
@@ -185,6 +217,48 @@ class SchedulerStartupExecutionTest(unittest.IsolatedAsyncioTestCase):
             call_order[:5],
             ["repair_recent", "repair_stale", "seed", "restore", "adaptive"],
         )
+
+    async def test_on_startup_runs_premarket_scalp_cleanup_before_recovery_schedule(self):
+        settings.ENABLED_MARKETS = "US"
+        call_order: list[str] = []
+
+        async def _cleanup(_market, startup_recovery=False):
+            call_order.append(f"cleanup:{startup_recovery}")
+
+        async def _adaptive(_market):
+            call_order.append("adaptive")
+
+        async def _schedule(_market, _reason):
+            call_order.append("schedule")
+
+        self.scheduler._market_open_scan = AsyncMock()
+        self.scheduler._post_market_if_needed = AsyncMock()
+        self.scheduler._schedule_startup_recovery = AsyncMock(side_effect=_schedule)
+        self.scheduler._seed_startup_holdings_watchlist = AsyncMock()
+        self.scheduler._restore_open_position_thresholds = AsyncMock(return_value=0)
+        self.scheduler._restore_adaptive_count = AsyncMock(side_effect=_adaptive)
+        self.scheduler._premarket_scalp_liquidation = AsyncMock(side_effect=_cleanup)
+
+        class DummyTask:
+            def add_done_callback(self, _callback):
+                return None
+
+        def fake_create_task(coro):
+            coro.close()
+            return DummyTask()
+
+        with patch("asyncio.sleep", AsyncMock()), \
+                patch("asyncio.create_task", side_effect=fake_create_task), \
+                patch("scheduler.scheduler.settings.CRYPTO_ENABLED", False), \
+                patch.object(market_calendar, "is_trading_hours", return_value=True), \
+                patch.object(self.scheduler, "_startup_trading_action", return_value="startup_resume"), \
+                patch.object(self.scheduler, "_is_premarket_scalp_liquidation_due", side_effect=lambda market: market == "NASDAQ"), \
+                patch("agent.decision_maker.decision_maker.repair_recent_broker_orders", AsyncMock(return_value=0)), \
+                patch("agent.decision_maker.decision_maker.repair_stale_open_trade_results", AsyncMock(return_value=0)):
+            await self.scheduler._on_startup()
+
+        self.scheduler._premarket_scalp_liquidation.assert_awaited_once_with("NASDAQ", startup_recovery=True)
+        self.assertEqual(call_order, ["cleanup:True", "adaptive", "schedule"])
 
 
 class SchedulerLoggingContextTest(unittest.IsolatedAsyncioTestCase):

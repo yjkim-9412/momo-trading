@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -16,6 +16,7 @@ async def test_admin_reports_latest_respects_market_scope(client):
             session.add(
                 DailyReport(
                     market_scope="KRX",
+                    report_currency="KRW",
                     report_date=report_date,
                     total_cycles=1,
                     total_analyses=2,
@@ -31,6 +32,7 @@ async def test_admin_reports_latest_respects_market_scope(client):
             session.add(
                 DailyReport(
                     market_scope="US",
+                    report_currency="USD",
                     report_date=report_date,
                     total_cycles=5,
                     total_analyses=6,
@@ -49,6 +51,7 @@ async def test_admin_reports_latest_respects_market_scope(client):
 
     assert resp.status_code == 200
     assert data["market_scope"] == "US"
+    assert data["report_currency"] == "USD"
     assert data["total_cycles"] == 5
 
 
@@ -82,7 +85,9 @@ async def test_admin_reports_list_filters_by_market_scope(client):
 @pytest.mark.asyncio
 async def test_admin_report_confirm_refresh_accepts_json_body(client, monkeypatch):
     refreshed = DailyReport(
+        id="refresh-report-1",
         market_scope="KRX",
+        report_currency="KRW",
         report_date=date(2026, 3, 16),
         total_cycles=7,
         total_analyses=8,
@@ -93,6 +98,9 @@ async def test_admin_report_confirm_refresh_accepts_json_body(client, monkeypatc
         win_count=2,
         loss_count=1,
         total_pnl=12345.0,
+        unrealized_pnl=0.0,
+        open_position_count=0,
+        created_at=datetime(2026, 3, 16, 16, 0, 0),
     )
 
     async def fake_regenerate(report_date, market_scope=None):

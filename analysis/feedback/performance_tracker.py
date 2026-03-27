@@ -19,6 +19,8 @@ class PerformanceStat:
     avg_return: float = 0.0
     avg_pnl: float = 0.0
     total_pnl: float = 0.0
+    avg_raw_pnl: float = 0.0
+    raw_total_pnl: float = 0.0
     avg_hold_days: float = 0.0
     best_return: float = 0.0
     worst_return: float = 0.0
@@ -244,11 +246,14 @@ class PerformanceTracker:
 
         returns = [t.return_pct for t in trades]
         pnls = [t.pnl for t in trades]
+        raw_pnls = [float(getattr(t, "raw_pnl", 0.0) or 0.0) for t in trades]
         hold_days = [t.hold_days for t in trades if t.hold_days > 0]
 
         stat.avg_return = sum(returns) / len(returns) if returns else 0.0
         stat.avg_pnl = sum(pnls) / len(pnls) if pnls else 0.0
         stat.total_pnl = sum(pnls)
+        stat.avg_raw_pnl = sum(raw_pnls) / len(raw_pnls) if raw_pnls else 0.0
+        stat.raw_total_pnl = sum(raw_pnls)
         stat.avg_hold_days = sum(hold_days) / len(hold_days) if hold_days else 0.0
         stat.best_return = max(returns) if returns else 0.0
         stat.worst_return = min(returns) if returns else 0.0

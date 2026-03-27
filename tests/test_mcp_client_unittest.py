@@ -559,6 +559,80 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fluctuation_mock.await_args_list[0].kwargs["gubn"], "1")
         self.assertEqual(fluctuation_mock.await_args_list[1].kwargs["gubn"], "0")
 
+    async def test_volume_rank_can_union_trade_growth_sources(self):
+        """확장 stage에서는 volume-surge와 trade-growth를 union 한다."""
+        client = MCPClient()
+
+        with (
+            patch(
+                "trading.kis_api.get_overseas_volume_surge",
+                new=AsyncMock(return_value=self._make_discovery_payload([
+                    {"symb": "TSLA", "last": "250", "tvol": "9999", "rate": "3.0"},
+                ])),
+            ),
+            patch(
+                "trading.kis_api.get_overseas_trade_growth",
+                new=AsyncMock(return_value=self._make_discovery_payload([
+                    {"symb": "MARA", "last": "20", "tvol": "8888", "rate": "5.0"},
+                ])),
+            ),
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
+        ):
+            response = await client.get_volume_rank(
+                market="NASDAQ",
+                include_trade_growth=True,
+                limit=60,
+            )
+
+        self.assertTrue(response.success)
+        stocks = response.data["stocks"]
+        self.assertEqual([item["symbol"] for item in stocks], ["TSLA", "MARA"])
+        self.assertEqual(stocks[0]["scan_source"], "DISCOVERY")
+        self.assertEqual(stocks[1]["scan_source"], "DISCOVERY_EXPANDED")
+
+    async def test_get_current_price_detail_normalizes_overseas_price_detail(self):
+        """price-detail 응답을 거래대금/시가총액 포함 내부 포맷으로 정규화한다."""
+        client = MCPClient()
+
+        with patch(
+            "trading.kis_api.get_overseas_price_detail",
+            new=AsyncMock(return_value={
+                "success": True,
+                "rt_cd": "0",
+                "msg1": "정상처리 되었습니다.",
+                "output": {
+                    "rsym": "PLTR",
+                    "last": "22.50",
+                    "base": "20.00",
+                    "tvol": "1500000",
+                    "tamt": "33750000",
+                    "tomv": "50000000000",
+                    "shar": "2200000000",
+                    "curr": "USD",
+                    "t_rate": "1450.0",
+                    "e_ordyn": "Y",
+                    "e_icod": "SOFTWARE",
+                    "etyp_nm": "COMMON",
+                },
+            }),
+        ):
+            response = await client.get_current_price_detail("PLTR", market="NASDAQ")
+
+        self.assertTrue(response.success)
+        data = response.data
+        self.assertEqual(data["symbol"], "PLTR")
+        self.assertEqual(data["price"], 22.5)
+        self.assertEqual(data["base_price"], 20.0)
+        self.assertEqual(data["change"], 2.5)
+        self.assertAlmostEqual(data["change_rate"], 12.5)
+        self.assertEqual(data["trade_value"], 33750000.0)
+        self.assertEqual(data["trade_value_usd"], 33750000.0)
+        self.assertEqual(data["market_cap"], 50000000000.0)
+        self.assertEqual(data["market_cap_usd"], 50000000000.0)
+        self.assertEqual(data["tradeable"], "Y")
+        self.assertEqual(data["sector"], "SOFTWARE")
+        self.assertEqual(data["etp_type_name"], "COMMON")
+
 
 if __name__ == "__main__":
     unittest.main()

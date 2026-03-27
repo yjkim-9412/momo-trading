@@ -14,11 +14,15 @@ class DynamicRescanSchedulerSetupTest(unittest.TestCase):
         self._original_markets = settings.ENABLED_MARKETS
         self._original_dynamic = settings.AI_DYNAMIC_RESCAN_ENABLED
         self._original_crypto_enabled = settings.CRYPTO_ENABLED
+        self._original_premarket = settings.US_PREMARKET_ENABLED
+        self._original_premarket_scalp = settings.US_PREMARKET_SCALP_ENABLED
 
     def tearDown(self):
         settings.ENABLED_MARKETS = self._original_markets
         settings.AI_DYNAMIC_RESCAN_ENABLED = self._original_dynamic
         settings.CRYPTO_ENABLED = self._original_crypto_enabled
+        settings.US_PREMARKET_ENABLED = self._original_premarket
+        settings.US_PREMARKET_SCALP_ENABLED = self._original_premarket_scalp
 
     def test_setup_jobs_omits_fixed_intraday_cron_when_dynamic_mode_enabled(self):
         settings.ENABLED_MARKETS = "KRX"
@@ -52,12 +56,25 @@ class DynamicRescanSchedulerSetupTest(unittest.TestCase):
         self.assertIn("crypto_settlement_BITHUMB", job_ids)
         self.assertNotIn("post_market_BITHUMB", job_ids)
 
+    def test_setup_jobs_registers_us_premarket_scalp_liquidation_job(self):
+        settings.ENABLED_MARKETS = "US"
+        settings.US_PREMARKET_ENABLED = True
+        settings.US_PREMARKET_SCALP_ENABLED = True
+        scheduler = TradingScheduler()
+
+        scheduler._setup_jobs()
+
+        job_ids = {job.id for job in scheduler.scheduler.get_jobs()}
+        self.assertIn("premarket_scalp_liquidation_NASDAQ", job_ids)
+
 
 class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._original_dynamic = settings.AI_DYNAMIC_RESCAN_ENABLED
         self._original_day_trading = settings.DAY_TRADING_ONLY
         self._original_max_cycles = settings.AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION
+        self._original_premarket = settings.US_PREMARKET_ENABLED
+        self._original_premarket_scalp = settings.US_PREMARKET_SCALP_ENABLED
         settings.AI_DYNAMIC_RESCAN_ENABLED = True
         settings.DAY_TRADING_ONLY = False
         settings.AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION = 3
@@ -67,6 +84,8 @@ class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
         settings.AI_DYNAMIC_RESCAN_ENABLED = self._original_dynamic
         settings.DAY_TRADING_ONLY = self._original_day_trading
         settings.AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION = self._original_max_cycles
+        settings.US_PREMARKET_ENABLED = self._original_premarket
+        settings.US_PREMARKET_SCALP_ENABLED = self._original_premarket_scalp
 
     async def test_schedule_next_adaptive_rescan_registers_one_shot_job(self):
         with patch.object(self.scheduler, "_log_schedule", AsyncMock()):
@@ -107,6 +126,32 @@ class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNone(self.scheduler.scheduler.get_job("adaptive_rescan_KRX"))
+        log_schedule.assert_awaited()
+
+    async def test_schedule_next_adaptive_rescan_stops_after_us_premarket_scalp_cutoff(self):
+        settings.US_PREMARKET_ENABLED = True
+        settings.US_PREMARKET_SCALP_ENABLED = True
+
+        with patch.object(self.scheduler, "_log_schedule", AsyncMock()) as log_schedule, \
+                patch.object(
+                    self.scheduler,
+                    "_market_now",
+                    side_effect=lambda _market, dt=None: dt or datetime(2026, 3, 13, 9, 20),
+                ):
+            await self.scheduler._schedule_next_adaptive_rescan(
+                "NASDAQ",
+                {
+                    "schedule_hint": {
+                        "action": "SCHEDULE_NEXT",
+                        "next_run_in_minutes": 10,
+                        "reason": "프리마켓 후속 확인",
+                        "confidence": 0.82,
+                        "source": "ai",
+                    }
+                },
+            )
+
+        self.assertIsNone(self.scheduler.scheduler.get_job("adaptive_rescan_NASDAQ"))
         log_schedule.assert_awaited()
 
     async def test_skipped_adaptive_cycle_does_not_consume_budget(self):

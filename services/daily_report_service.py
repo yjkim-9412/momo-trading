@@ -12,6 +12,11 @@ from repositories.agent_activity_repository import AgentActivityRepository
 from repositories.daily_report_repository import DailyReportRepository
 from repositories.trade_result_repository import TradeResultRepository
 from services.activity_logger import activity_logger
+from services.report_display import (
+    build_report_balance_metrics,
+    format_report_amount,
+    sum_trade_pnl,
+)
 from core.config import settings
 from trading.account_manager import account_manager
 from trading.enums import ActivityPhase, ActivityType
@@ -28,13 +33,14 @@ DAILY_REPORT_PROMPT = """당신은 AI 트레이딩 시스템의 일일 리포트
 - 추천 건수: {total_recommendations}
 - 오늘 매수: {buy_count}건 / 매도: {sell_count}건
 - 청산 승/패: {win_count}/{loss_count}
-- 실현 손익: {total_pnl:+,.0f}원
-- 미실현 손익: {unrealized_pnl:+,.0f}원 (보유 {open_position_count}종목)
+- 기준 통화: {report_currency}
+- 실현 손익: {total_pnl_text}
+- 미실현 손익: {unrealized_pnl_text} (보유 {open_position_count}종목)
 
 ## 계좌 현황
-- 총자산: {total_asset:,.0f}원
-- 현금: {cash:,.0f}원
-- 주식 평가: {stock_value:,.0f}원
+- 총자산: {total_asset_text}
+- 현금: {cash_text}
+- 주식 평가: {stock_value_text}
 
 ## 활동 타입별 집계
 {activity_counts}
@@ -54,6 +60,21 @@ DAILY_REPORT_PROMPT = """당신은 AI 트레이딩 시스템의 일일 리포트
 
 class DailyReportService:
     """일일 리포트 생성 서비스 (자체 세션 사용)"""
+
+    async def _load_report_balance_metrics(self, scope: str):
+        """리포트 생성용 계좌 표시 메트릭 조회"""
+        balance = None
+        scoped_holdings = []
+        representative_market = "NASDAQ" if scope == "US" else scope
+        try:
+            balance, holdings = await account_manager.get_account_snapshot(representative_market)
+            scoped_holdings = [
+                holding for holding in holdings if resolve_market_scope(holding.market) == scope
+            ]
+        except Exception as e:
+            logger.warning("계좌 스냅샷 조회 실패 (리포트 계속): {}", str(e))
+        metrics = build_report_balance_metrics(scope, balance, scoped_holdings)
+        return metrics, len(scoped_holdings)
 
     async def generate_daily_report(
         self,
@@ -76,23 +97,7 @@ class DailyReportService:
             )
 
             try:
-                # 계좌 스냅샷 조회 (세션 밖에서 — MCP 호출)
-                unrealized_pnl = 0.0
-                open_position_count = 0
-                total_asset = 0.0
-                cash = 0.0
-                stock_value = 0.0
-                representative_market = "NASDAQ" if scope == "US" else scope
-                try:
-                    balance, holdings = await account_manager.get_account_snapshot(representative_market)
-                    scoped_holdings = [holding for holding in holdings if resolve_market_scope(holding.market) == scope]
-                    unrealized_pnl = sum(holding.pnl for holding in scoped_holdings)
-                    open_position_count = len(scoped_holdings)
-                    total_asset = balance.total_asset
-                    cash = balance.cash
-                    stock_value = sum(holding.current_price * holding.quantity for holding in scoped_holdings)
-                except Exception as e:
-                    logger.warning("계좌 스냅샷 조회 실패 (리포트 계속): {}", str(e))
+                balance_metrics, open_position_count = await self._load_report_balance_metrics(scope)
 
                 async with AsyncSessionLocal() as session:
                     async with session.begin():
@@ -124,7 +129,7 @@ class DailyReportService:
                         total_orders = buy_count + sell_count
                         win_count = sum(1 for t in completed_trades if t.is_win)
                         loss_count = sum(1 for t in completed_trades if not t.is_win)
-                        total_pnl = sum(t.pnl for t in completed_trades)
+                        total_pnl = sum_trade_pnl(completed_trades, scope)
 
                         if open_position_count == 0:
                             all_open = await trade_result_repo.get_all_open(market_scope=scope)
@@ -140,6 +145,7 @@ class DailyReportService:
 
                         report = DailyReport(
                             market_scope=scope,
+                            report_currency=balance_metrics.report_currency,
                             report_date=report_date,
                             total_cycles=total_cycles,
                             total_analyses=total_analyses,
@@ -150,7 +156,7 @@ class DailyReportService:
                             win_count=win_count,
                             loss_count=loss_count,
                             total_pnl=total_pnl,
-                            unrealized_pnl=unrealized_pnl,
+                            unrealized_pnl=balance_metrics.unrealized_pnl,
                             open_position_count=open_position_count,
                         )
 
@@ -164,12 +170,17 @@ class DailyReportService:
                                 sell_count=sell_count,
                                 win_count=win_count,
                                 loss_count=loss_count,
-                                total_pnl=total_pnl,
-                                unrealized_pnl=unrealized_pnl,
+                                report_currency=balance_metrics.report_currency,
+                                total_pnl_text=format_report_amount(
+                                    total_pnl,
+                                    balance_metrics.report_currency,
+                                    signed=True,
+                                ),
+                                unrealized_pnl_text=balance_metrics.unrealized_pnl_text,
                                 open_position_count=open_position_count,
-                                total_asset=total_asset,
-                                cash=cash,
-                                stock_value=stock_value,
+                                total_asset_text=balance_metrics.total_asset_text,
+                                cash_text=balance_metrics.cash_text,
+                                stock_value_text=balance_metrics.stock_value_text,
                                 activity_counts=activity_count_text or "활동 없음",
                                 recent_activities=recent_summaries or "활동 없음",
                             )
@@ -208,10 +219,12 @@ class DailyReportService:
                 ActivityType.REPORT, ActivityPhase.COMPLETE,
                 f"\U0001f4cb [{scope}] 일일 리포트 생성 완료: {report_date}"
                 f"\n   사이클 {total_cycles}회 | 매수 {buy_count}건 | 매도 {sell_count}건"
-                f"\n   실현 {total_pnl:+,.0f}원 | 미실현 {unrealized_pnl:+,.0f}원",
+                f"\n   실현 {format_report_amount(total_pnl, report.report_currency, signed=True)}"
+                f" | 미실현 {format_report_amount(report.unrealized_pnl, report.report_currency, signed=True)}",
                 detail={
                     "report_date": str(report_date),
                     "market_scope": scope,
+                    "report_currency": report.report_currency,
                     "total_cycles": total_cycles,
                     "buy_count": buy_count,
                     "sell_count": sell_count,
@@ -237,23 +250,7 @@ class DailyReportService:
 
         logger.info("[{}] 일일 리포트 재생성 시작: {}", scope, report_date)
 
-        # 계좌 스냅샷 조회 (세션 밖에서 — MCP 호출)
-        unrealized_pnl = 0.0
-        open_position_count = 0
-        total_asset = 0.0
-        cash = 0.0
-        stock_value = 0.0
-        representative_market = "NASDAQ" if scope == "US" else scope
-        try:
-            balance, holdings = await account_manager.get_account_snapshot(representative_market)
-            scoped_holdings = [holding for holding in holdings if resolve_market_scope(holding.market) == scope]
-            unrealized_pnl = sum(holding.pnl for holding in scoped_holdings)
-            open_position_count = len(scoped_holdings)
-            total_asset = balance.total_asset
-            cash = balance.cash
-            stock_value = sum(holding.current_price * holding.quantity for holding in scoped_holdings)
-        except Exception as e:
-            logger.warning("계좌 스냅샷 조회 실패 (리포트 계속): {}", str(e))
+        balance_metrics, open_position_count = await self._load_report_balance_metrics(scope)
 
         existing = None
         async with AsyncSessionLocal() as session:
@@ -283,7 +280,7 @@ class DailyReportService:
                 total_orders = buy_count + sell_count
                 win_count = sum(1 for t in completed_trades if t.is_win)
                 loss_count = sum(1 for t in completed_trades if not t.is_win)
-                total_pnl = sum(t.pnl for t in completed_trades)
+                total_pnl = sum_trade_pnl(completed_trades, scope)
 
                 if open_position_count == 0:
                     all_open = await trade_result_repo.get_all_open(market_scope=scope)
@@ -304,6 +301,7 @@ class DailyReportService:
                     id=str(uuid4()),
                     created_at=now_kst(),
                     market_scope=scope,
+                    report_currency=balance_metrics.report_currency,
                     report_date=report_date,
                     total_cycles=total_cycles,
                     total_analyses=total_analyses,
@@ -314,7 +312,7 @@ class DailyReportService:
                     win_count=win_count,
                     loss_count=loss_count,
                     total_pnl=total_pnl,
-                    unrealized_pnl=unrealized_pnl,
+                    unrealized_pnl=balance_metrics.unrealized_pnl,
                     open_position_count=open_position_count,
                 )
 
@@ -329,12 +327,17 @@ class DailyReportService:
                         sell_count=sell_count,
                         win_count=win_count,
                         loss_count=loss_count,
-                        total_pnl=total_pnl,
-                        unrealized_pnl=unrealized_pnl,
+                        report_currency=balance_metrics.report_currency,
+                        total_pnl_text=format_report_amount(
+                            total_pnl,
+                            balance_metrics.report_currency,
+                            signed=True,
+                        ),
+                        unrealized_pnl_text=balance_metrics.unrealized_pnl_text,
                         open_position_count=open_position_count,
-                        total_asset=total_asset,
-                        cash=cash,
-                        stock_value=stock_value,
+                        total_asset_text=balance_metrics.total_asset_text,
+                        cash_text=balance_metrics.cash_text,
+                        stock_value_text=balance_metrics.stock_value_text,
                         activity_counts=activity_count_text or "활동 없음",
                         recent_activities=recent_summaries or "활동 없음",
                     )
@@ -395,6 +398,7 @@ class DailyReportService:
                 if existing:
                     # 기존 리포트 업데이트
                     for field in (
+                        "report_currency",
                         "total_cycles", "total_analyses", "total_recommendations",
                         "total_orders", "buy_count", "sell_count",
                         "win_count", "loss_count", "total_pnl",
@@ -448,6 +452,7 @@ class DailyReportService:
     ) -> dict:
         """두 리포트의 필드별 차이를 딕셔너리로 반환"""
         compare_fields = [
+            "report_currency",
             "total_cycles", "total_analyses", "total_recommendations",
             "total_orders", "buy_count", "sell_count",
             "win_count", "loss_count", "total_pnl",

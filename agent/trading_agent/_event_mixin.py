@@ -32,12 +32,13 @@ class EventMixin:
         if event_state.liquidation_complete:
             return
 
-        # 데이트레이딩: 매수 마감 시간 이후 신규 매수 이벤트 무시
-        if settings.DAY_TRADING_ONLY and settings.market_has_buy_cutoff(market_code):
+        # 데이트레이딩 또는 프리마켓 단타: 매수 마감 시간 이후 신규 매수 이벤트 무시
+        session = market_calendar.get_market_session(market=market_code)
+        if settings.should_enforce_buy_cutoff(market_code, session=session):
             from datetime import time as _dt_time
             from util.time_util import now_kst
             from zoneinfo import ZoneInfo
-            mkt_cfg = settings.get_market_config(market_code)
+            mkt_cfg = settings.get_market_config(market_code, session=session)
             cutoff = _dt_time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
             market_now = now_kst().astimezone(ZoneInfo(market_timezone(market_code)))
             if market_now.time() >= cutoff:

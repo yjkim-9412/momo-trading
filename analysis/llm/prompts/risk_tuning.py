@@ -14,6 +14,7 @@ RISK_TUNING_SYSTEM = """당신은 주식 자동매매 시스템의 리스크 관
   - 중액(10만~100만원): 적정 분산 (3~5종목)
   - 대액(100만원~): 충분한 분산 + 리스크 관리 강화
 - min_buy_quantity는 시장별 최소 주문 수량이다. 주식은 보통 정수, 코인은 소수점 가능.
+- 단일 주문 금액은 반드시 max_single_order_amount 필드에, 그 통화는 max_single_order_currency 필드에 작성
 - 반드시 JSON 형식으로 답변"""
 
 RISK_APPETITE_GUIDELINES = {
@@ -41,13 +42,14 @@ RISK_APPETITE_GUIDELINES = {
 RISK_TUNING_PROMPT = """## AI 한도 결정 요청
 
 ### 계좌 현황
-- 총자산: {total_asset:,.0f}원
-- 현금(예수금): {cash:,.0f}원
-- 매입금액: {purchase_amount:,.0f}원
-- 보유 주식 평가액: {stock_value:,.0f}원
-- **매수가능 금액: {buyable_amount:,.0f}원** (이 금액을 초과하는 주문은 불가)
+- 기준 통화: {display_currency}
+- 총자산: {total_asset_text}
+- 현금(예수금): {cash_text}
+- 매입금액: {purchase_amount_text}
+- 보유 주식 평가액: {stock_value_text}
+- **매수가능 금액: {buyable_amount_text}** (이 금액을 초과하는 주문은 불가)
 - 현재 현금 비율: {cash_ratio:.1f}%
-- 평가 손익: {total_pnl:+,.0f}원 ({total_pnl_rate:+.2f}%)
+- 평가 손익: {total_pnl_text} ({total_pnl_rate:+.2f}%)
 
 ### 현금 해석 메모
 {cash_interpretation_note}
@@ -66,13 +68,15 @@ RISK_TUNING_PROMPT = """## AI 한도 결정 요청
 
 위 정보를 분석하여 오늘의 적정 매매 한도를 자율적으로 결정해주세요.
 총자산 대비 적절한 단일 주문 금액, 포지션 비중, 현금 비율을 판단하세요.
-max_daily_trades=0은 무제한, max_single_order_krw=0은 무제한을 의미합니다.
+max_daily_trades=0은 무제한, max_single_order_amount=0은 무제한을 의미합니다.
+max_single_order_currency는 반드시 "{display_currency}"로 작성하세요.
 
 JSON 형식으로 답변:
 ```json
 {{
   "max_daily_trades": 0,
-  "max_single_order_krw": 0,
+  "max_single_order_amount": 0,
+  "max_single_order_currency": "{display_currency}",
   "min_buy_quantity": 5,
   "max_position_pct": 25.0,
   "min_cash_ratio": 0.05,

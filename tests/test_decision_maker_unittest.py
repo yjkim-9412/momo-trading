@@ -378,6 +378,70 @@ class DecisionMakerTradeResultPersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade_result.ai_take_profit_price, 157.0)
         self.assertEqual(trade_result.ai_stop_loss_price, 145.0)
 
+    async def test_record_trade_result_tags_us_premarket_scalp_entry_in_notes(self):
+        maker = DecisionMaker()
+        repo = MagicMock()
+        repo.get_open_buy = AsyncMock(return_value=None)
+
+        class DummyTransaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class DummySession:
+            def __init__(self):
+                self.added = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def begin(self):
+                return DummyTransaction()
+
+            def add(self, obj):
+                self.added.append(obj)
+
+        session = DummySession()
+
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", return_value=session),
+            patch("agent.decision_maker.TradeResultRepository", return_value=repo),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()),
+            patch("agent.decision_maker.market_calendar.get_market_session", return_value="US_PRE"),
+            patch("agent.decision_maker.settings.US_PREMARKET_ENABLED", True),
+            patch("agent.decision_maker.settings.US_PREMARKET_SCALP_ENABLED", True),
+            patch("agent.decision_maker.settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR", 9),
+            patch("agent.decision_maker.settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE", 25),
+        ):
+            await maker._record_trade_result(
+                symbol="PLTR",
+                market="NASDAQ",
+                side="BUY",
+                order_id="ord-pre-1",
+                filled_qty=2,
+                filled_price=25.5,
+                currency="USD",
+                exchange_rate_to_krw=1450.0,
+                analysis_context={
+                    "stock_name": "Palantir",
+                    "strategy_type": "AGGRESSIVE_SHORT",
+                },
+                cycle_id="cycle-pre-1",
+            )
+
+        self.assertEqual(len(session.added), 1)
+        trade_result = session.added[0]
+        notes = json.loads(trade_result.notes)
+        self.assertEqual(notes["entry_session"], "US_PRE")
+        self.assertEqual(notes["holding_policy"], "PREMARKET_SCALP")
+        self.assertEqual(notes["must_exit_by_time"], "09:25")
+        self.assertEqual(notes["must_exit_tz"], "America/New_York")
+
 
 class DecisionMakerStaleRepairTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

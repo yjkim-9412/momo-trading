@@ -40,6 +40,7 @@ from util.time_util import ensure_kst, now_kst
 
 _US_ORDER_SANITY_MAX_GAP_PCT = 0.15
 _OVERSEAS_CONFIRM_DELAYS_SECONDS = (3, 6, 10)
+_PREMARKET_SCALP_HOLDING_POLICY = "PREMARKET_SCALP"
 
 
 class DecisionMaker:
@@ -235,6 +236,28 @@ class DecisionMaker:
     def _trade_context_value(ctx: dict, key: str, fallback=0.0):
         value = ctx.get(key)
         return fallback if value in (None, "") else value
+
+    @classmethod
+    def _apply_premarket_scalp_trade_notes(
+        cls,
+        trade_notes: dict,
+        *,
+        market: str,
+        session: str | None,
+    ) -> dict:
+        """프리마켓 단타 모드면 TradeResult.notes에 세션 태그를 기록."""
+        if not settings.is_us_premarket_scalp_session(market, session):
+            return trade_notes
+
+        enriched = dict(trade_notes)
+        enriched["entry_session"] = "US_PRE"
+        enriched["holding_policy"] = _PREMARKET_SCALP_HOLDING_POLICY
+        enriched["must_exit_by_time"] = (
+            f"{int(settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR):02d}:"
+            f"{int(settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE):02d}"
+        )
+        enriched["must_exit_tz"] = "America/New_York"
+        return enriched
 
     @staticmethod
     def _position_key(symbol: str, market: str) -> tuple[str, str]:
@@ -1751,9 +1774,15 @@ class DecisionMaker:
             async with AsyncSessionLocal() as session:
                 async with session.begin():
                     repo = TradeResultRepository(session)
+                    current_session = market_calendar.get_market_session(market=market_code)
                     trade_notes = self._build_trade_notes(
                         analysis_context=ctx,
                         market=market,
+                    )
+                    trade_notes = self._apply_premarket_scalp_trade_notes(
+                        trade_notes,
+                        market=market_code,
+                        session=current_session,
                     )
 
                     if side == "BUY":
@@ -1764,6 +1793,11 @@ class DecisionMaker:
                                 analysis_context=ctx,
                                 market=market,
                                 existing_notes=getattr(open_buy, "notes", None),
+                            )
+                            trade_notes = self._apply_premarket_scalp_trade_notes(
+                                trade_notes,
+                                market=market_code,
+                                session=current_session,
                             )
                             previous_qty = int(open_buy.quantity or 0)
                             combined_qty = previous_qty + filled_qty

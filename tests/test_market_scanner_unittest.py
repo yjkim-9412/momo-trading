@@ -82,6 +82,8 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[])), \
                 patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
                 patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
+                patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", False), \
+                patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False), \
                 patch("agent.market_scanner.llm_factory.generate_tier1", AsyncMock(return_value=(
                     '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
                     "TEST",
@@ -100,6 +102,8 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[])), \
                 patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
                 patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
+                patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", False), \
+                patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False), \
                 patch("agent.market_scanner.llm_factory.generate_tier1", AsyncMock(return_value=(
                     '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
                     "TEST",
@@ -210,6 +214,8 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
         ])), \
                 patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
                 patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
+                patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", False), \
+                patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False), \
                 patch("agent.market_scanner.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1400.0)), \
                 patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock), \
                 patch("agent.market_scanner.activity_logger.log", log_mock):
@@ -225,6 +231,161 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["available_cash_foreign"], 100000 / 1450.0)
         detail = self._scan_complete_detail(log_mock)
         self.assertEqual(detail["affordability_filter"]["volume_rank"], {"before": 1, "after": 0, "dropped": 1})
+
+
+class MarketScannerPremarketJunkFilterTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _stock(
+        symbol: str,
+        *,
+        price: float,
+        change_rate: float,
+        volume: int,
+        trade_value_usd: float,
+        market: str = "NASDAQ",
+    ) -> dict:
+        return {
+            "symbol": symbol,
+            "name": symbol,
+            "market": market,
+            "currency": "USD",
+            "price": price,
+            "current_price": price,
+            "change": round(price * (change_rate / 100.0), 4),
+            "change_rate": change_rate,
+            "volume": volume,
+            "trade_value_usd": trade_value_usd,
+            "scan_source": "DISCOVERY",
+        }
+
+    async def test_scan_filters_premarket_junk_candidates_before_llm(self):
+        scanner = MarketScanner()
+        balance = MarketScannerCashTest._balance(
+            market="NASDAQ",
+            effective_cash=700000,
+            effective_cash_foreign=500.0,
+        )
+        junk_stock = self._stock(
+            "JUNK",
+            price=2.5,
+            change_rate=45.0,
+            volume=500000,
+            trade_value_usd=2_000_000.0,
+        )
+        llm_mock = AsyncMock(return_value=(
+            '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
+            "TEST",
+        ))
+        log_mock = AsyncMock()
+
+        with (
+            patch.object(settings, "US_PREMARKET_ENABLED", True),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", True),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_PROFILE", "MODERATE"),
+            patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False),
+            patch.object(settings, "US_PREMARKET_EXPANSION_MAX_STAGE", 0),
+            patch.object(settings, "US_SCAN_MARKETS", "NASDAQ"),
+            patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_PRE"),
+            patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[junk_stock])),
+            patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])),
+            patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),
+            patch(
+                "agent.market_scanner.mcp_client.get_current_price_detail",
+                AsyncMock(return_value=MCPResponse(success=True, data=junk_stock)),
+            ),
+            patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock),
+            patch("agent.market_scanner.activity_logger.log", log_mock),
+        ):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-1",
+                account_snapshot=(balance, []),
+            )
+
+        llm_mock.assert_not_awaited()
+        self.assertEqual(result["selected"], [])
+        self.assertEqual(result["market_summary"], "프리마켓 잡주 필터 기준 후보 없음")
+        detail = MarketScannerCashTest._scan_complete_detail(log_mock)
+        self.assertEqual(detail["junk_filter"]["volume_rank"]["dropped"], 1)
+        self.assertEqual(detail["junk_filter"]["volume_rank"]["reasons"]["price_below_min"], 1)
+
+    async def test_scan_expands_candidates_when_premarket_pool_is_too_small(self):
+        scanner = MarketScanner()
+        balance = MarketScannerCashTest._balance(
+            market="NASDAQ",
+            effective_cash=2_000_000,
+            effective_cash_foreign=2_000.0,
+        )
+        stock_map = {
+            "AAPL": self._stock("AAPL", price=15.0, change_rate=4.0, volume=400000, trade_value_usd=6_000_000.0),
+            "MSFT": self._stock("MSFT", price=18.0, change_rate=3.0, volume=350000, trade_value_usd=6_300_000.0),
+            "PLTR": self._stock("PLTR", price=20.0, change_rate=6.0, volume=500000, trade_value_usd=10_000_000.0),
+            "SOFI": self._stock("SOFI", price=8.0, change_rate=12.0, volume=600000, trade_value_usd=4_800_000.0),
+            "F": self._stock("F", price=11.0, change_rate=-6.0, volume=500000, trade_value_usd=5_500_000.0, market="NYSE"),
+            "HOOD": self._stock("HOOD", price=22.0, change_rate=9.0, volume=450000, trade_value_usd=9_900_000.0),
+            "NIO": self._stock("NIO", price=7.0, change_rate=-7.0, volume=700000, trade_value_usd=4_900_000.0),
+        }
+
+        async def volume_side_effect(markets, limit=30, include_trade_growth=False):
+            if limit == 30:
+                return [stock_map["AAPL"]]
+            if include_trade_growth:
+                return [stock_map["AAPL"], stock_map["MSFT"], stock_map["PLTR"]]
+            return [stock_map["AAPL"], stock_map["MSFT"]]
+
+        async def fluctuation_side_effect(markets, sort, limit=30):
+            if limit == 30:
+                return []
+            if sort == "top":
+                return [stock_map["SOFI"]]
+            return [stock_map["F"]]
+
+        async def price_detail_side_effect(symbol, market="NASDAQ"):
+            return MCPResponse(success=True, data=stock_map[symbol])
+
+        llm_mock = AsyncMock(return_value=(
+            '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
+            "TEST",
+        ))
+        log_mock = AsyncMock()
+
+        with (
+            patch.object(settings, "US_PREMARKET_ENABLED", True),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", True),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_PROFILE", "MODERATE"),
+            patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", True),
+            patch.object(settings, "US_PREMARKET_EXPANSION_MAX_STAGE", 3),
+            patch.object(settings, "US_PREMARKET_MIN_MONITOR_CANDIDATES", 4),
+            patch.object(settings, "US_SCAN_MARKETS", "NASDAQ,NYSE"),
+            patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_PRE"),
+            patch.object(scanner, "_get_volume_rank", AsyncMock(side_effect=volume_side_effect)),
+            patch.object(scanner, "_get_fluctuation_rank", AsyncMock(side_effect=fluctuation_side_effect)),
+            patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),
+            patch.object(
+                scanner,
+                "_build_us_expansion_candidates",
+                AsyncMock(return_value=[stock_map["HOOD"], stock_map["NIO"]]),
+            ),
+            patch(
+                "agent.market_scanner.mcp_client.get_current_price_detail",
+                AsyncMock(side_effect=price_detail_side_effect),
+            ),
+            patch("agent.market_scanner.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1400.0)),
+            patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock),
+            patch("agent.market_scanner.activity_logger.log", log_mock),
+        ):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-1",
+                account_snapshot=(balance, []),
+            )
+
+        llm_mock.assert_awaited()
+        self.assertEqual(result["selected"], [])
+        detail = MarketScannerCashTest._scan_complete_detail(log_mock)
+        self.assertTrue(detail["expansion"]["triggered"])
+        self.assertEqual(detail["expansion"]["final_stage"], 3)
+        self.assertEqual(detail["expansion"]["stage_counts"][-1]["supplemental_count"], 2)
 
 
 class MarketScannerRankTest(unittest.IsolatedAsyncioTestCase):

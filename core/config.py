@@ -13,6 +13,35 @@ from trading.enums import LLMProvider, LLMTier, Tier1Profile
 
 VALID_CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 REPORT_LLM_PHASES = {"report", "after_hours"}
+US_PREMARKET_JUNK_FILTER_PROFILES: dict[str, dict[str, float]] = {
+    "CONSERVATIVE": {
+        "min_price_usd": 5.0,
+        "min_volume": 300_000.0,
+        "min_trade_value_usd": 2_000_000.0,
+        "max_abs_change_pct": 60.0,
+        "hot_price_ceiling_usd": 12.0,
+        "hot_abs_change_pct": 25.0,
+        "hot_min_trade_value_usd": 5_000_000.0,
+    },
+    "MODERATE": {
+        "min_price_usd": 3.0,
+        "min_volume": 150_000.0,
+        "min_trade_value_usd": 1_000_000.0,
+        "max_abs_change_pct": 80.0,
+        "hot_price_ceiling_usd": 10.0,
+        "hot_abs_change_pct": 30.0,
+        "hot_min_trade_value_usd": 3_000_000.0,
+    },
+    "AGGRESSIVE": {
+        "min_price_usd": 1.0,
+        "min_volume": 75_000.0,
+        "min_trade_value_usd": 500_000.0,
+        "max_abs_change_pct": 120.0,
+        "hot_price_ceiling_usd": 5.0,
+        "hot_abs_change_pct": 50.0,
+        "hot_min_trade_value_usd": 1_500_000.0,
+    },
+}
 
 
 class Settings(BaseSettings):
@@ -51,6 +80,16 @@ class Settings(BaseSettings):
     US_TRADING_ENABLED: bool = False
     US_PREMARKET_ENABLED: bool = False
     US_AFTERMARKET_ENABLED: bool = False
+    US_PREMARKET_SCALP_ENABLED: bool = False
+    US_PREMARKET_SCALP_BUY_CUTOFF_HOUR: int = 9  # 프리마켓 단타 신규 매수 마감 시각 (ET)
+    US_PREMARKET_SCALP_BUY_CUTOFF_MINUTE: int = 15
+    US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR: int = 9  # 프리마켓 단타 강제 청산 시각 (ET)
+    US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE: int = 25
+    US_PREMARKET_JUNK_FILTER_ENABLED: bool = False
+    US_PREMARKET_JUNK_FILTER_PROFILE: str = "MODERATE"
+    US_PREMARKET_MIN_MONITOR_CANDIDATES: int = 10
+    US_PREMARKET_EXPANSION_ENABLED: bool = False
+    US_PREMARKET_EXPANSION_MAX_STAGE: int = 3
     US_WATCHLIST_SYMBOLS: str = ""
     US_SCAN_LIMIT: int = 12
     US_DYNAMIC_DISCOVERY_ENABLED: bool = True  # MCP 동적 발굴 우선, 실패 시 fallback seed 사용
@@ -420,7 +459,31 @@ class Settings(BaseSettings):
             return expand_scan_markets(items)
         return [m]
 
-    def get_market_config(self, market: str) -> dict:
+    def is_us_premarket_scalp_session(self, market: str, session: str | None = None) -> bool:
+        """미국 프리마켓 단타 전용 세션 여부."""
+        from trading.market_profile import is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        return bool(
+            is_us_market(norm)
+            and self.US_PREMARKET_ENABLED
+            and self.US_PREMARKET_SCALP_ENABLED
+            and session == "US_PRE"
+        )
+
+    def is_us_premarket_junk_filter_session(self, market: str, session: str | None = None) -> bool:
+        """미국 프리마켓 잡주 필터 적용 세션 여부."""
+        from trading.market_profile import is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        return bool(
+            is_us_market(norm)
+            and self.US_PREMARKET_ENABLED
+            and self.US_PREMARKET_JUNK_FILTER_ENABLED
+            and session == "US_PRE"
+        )
+
+    def get_market_config(self, market: str, session: str | None = None) -> dict:
         """시장별 매수마감/강제청산 시간 설정 반환 (크립토는 24/7 → 제한 없음)"""
         from trading.market_profile import is_crypto_market, is_us_market, normalize_market
 
@@ -433,6 +496,13 @@ class Settings(BaseSettings):
                 "force_liquidation_minute": None,
             }
         if is_us_market(norm):
+            if self.is_us_premarket_scalp_session(norm, session):
+                return {
+                    "buy_cutoff_hour": self.US_PREMARKET_SCALP_BUY_CUTOFF_HOUR,
+                    "buy_cutoff_minute": self.US_PREMARKET_SCALP_BUY_CUTOFF_MINUTE,
+                    "force_liquidation_hour": self.US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR,
+                    "force_liquidation_minute": self.US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE,
+                }
             return {
                 "buy_cutoff_hour": self.US_BUY_CUTOFF_HOUR,
                 "buy_cutoff_minute": self.US_BUY_CUTOFF_MINUTE,
@@ -446,21 +516,27 @@ class Settings(BaseSettings):
             "force_liquidation_minute": self.FORCE_LIQUIDATION_MINUTE,
         }
 
-    def market_has_buy_cutoff(self, market: str) -> bool:
+    def market_has_buy_cutoff(self, market: str, session: str | None = None) -> bool:
         """시장에 신규 매수 cutoff 개념이 존재하는지 반환"""
-        mkt_cfg = self.get_market_config(market)
+        mkt_cfg = self.get_market_config(market, session=session)
         return (
             mkt_cfg["buy_cutoff_hour"] is not None
             and mkt_cfg["buy_cutoff_minute"] is not None
         )
 
-    def market_has_force_liquidation(self, market: str) -> bool:
+    def market_has_force_liquidation(self, market: str, session: str | None = None) -> bool:
         """시장에 강제 청산 cutoff 개념이 존재하는지 반환"""
-        mkt_cfg = self.get_market_config(market)
+        mkt_cfg = self.get_market_config(market, session=session)
         return (
             mkt_cfg["force_liquidation_hour"] is not None
             and mkt_cfg["force_liquidation_minute"] is not None
         )
+
+    def should_enforce_buy_cutoff(self, market: str, session: str | None = None) -> bool:
+        """현재 세션에서 신규 매수 cutoff를 실제로 강제할지 반환."""
+        if self.is_us_premarket_scalp_session(market, session):
+            return True
+        return self.DAY_TRADING_ONLY and self.market_has_buy_cutoff(market, session=session)
 
     def is_trading_enabled_for_market(self, market: str) -> bool:
         """시장별 실주문 허용 여부 반환"""
@@ -739,6 +815,34 @@ class Settings(BaseSettings):
     def us_watchlist_symbols(self) -> list[str]:
         """미국장 discovery 실패/비활성 시 사용할 fallback seed 종목"""
         return self._parse_csv(self.US_WATCHLIST_SYMBOLS, upper=True)[: self.US_SCAN_LIMIT]
+
+    @property
+    def us_premarket_junk_filter_profile(self) -> str:
+        """프리마켓 잡주 필터 프로파일을 정규화한다."""
+        raw = (self.US_PREMARKET_JUNK_FILTER_PROFILE or "MODERATE").strip().upper()
+        if raw in US_PREMARKET_JUNK_FILTER_PROFILES:
+            return raw
+
+        logger.warning(
+            "US_PREMARKET_JUNK_FILTER_PROFILE={}는 지원되지 않습니다. MODERATE로 고정합니다.",
+            self.US_PREMARKET_JUNK_FILTER_PROFILE,
+        )
+        return "MODERATE"
+
+    @property
+    def us_premarket_junk_filter_thresholds(self) -> dict[str, float]:
+        """프리마켓 잡주 필터 threshold preset."""
+        return dict(US_PREMARKET_JUNK_FILTER_PROFILES[self.us_premarket_junk_filter_profile])
+
+    @property
+    def us_premarket_min_monitor_candidates(self) -> int:
+        """프리마켓 후보 부족 판단 기준."""
+        return max(0, int(self.US_PREMARKET_MIN_MONITOR_CANDIDATES or 0))
+
+    @property
+    def us_premarket_expansion_max_stage(self) -> int:
+        """프리마켓 확장 stage 개수 정규화."""
+        return min(3, max(0, int(self.US_PREMARKET_EXPANSION_MAX_STAGE or 0)))
 
     @property
     def us_leverage_allowed_sessions_list(self) -> list[str]:

@@ -17,6 +17,7 @@ class DailyReport(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     market_scope: Mapped[str] = mapped_column(String(10), default="KRX", nullable=False, index=True)
+    report_currency: Mapped[str] = mapped_column(String(10), default="KRW", nullable=False)
     report_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
 
     # 오늘 성과

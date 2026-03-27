@@ -1,4 +1,5 @@
 import unittest
+from contextlib import ExitStack
 from datetime import date, datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -9,6 +10,7 @@ from core.events import EventBus, EventType
 from scheduler.market_calendar import market_calendar
 from scheduler.scheduler import TradingScheduler
 from trading.mcp_client import mcp_client
+from trading.models import AccountBalance
 
 
 class _DummyAsyncSession:
@@ -157,6 +159,149 @@ class TradingAgentAfterHoursGuardTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["review_generated"])
         cleanup_watchlist.assert_awaited_once_with("NASDAQ")
+
+    async def test_after_hours_us_prompt_uses_usd_trade_and_balance_metrics(self):
+        agent = TradingAgent()
+        trading_date = date(2026, 4, 2)
+        balance = AccountBalance(
+            total_asset=301_240.0,
+            total_asset_foreign=200.0,
+            cash=150_620.0,
+            cash_foreign=100.0,
+            stock_value=150_620.0,
+            stock_value_foreign=100.0,
+            operating_cash=150_620.0,
+            operating_cash_foreign=100.0,
+            total_pnl=4_897.65,
+            total_pnl_rate=1.63,
+            raw_total_pnl=3.25,
+            raw_total_pnl_rate=1.63,
+            market="NASDAQ",
+            currency="KRW",
+            exchange_rate_to_krw=1506.2,
+            raw_cash=150_620.0,
+            raw_cash_foreign=100.0,
+            effective_cash=150_620.0,
+            effective_cash_foreign=100.0,
+            cash_source="BROKER",
+        )
+        opened = [
+            SimpleNamespace(
+                stock_name="NVIDIA",
+                stock_symbol="NVDA",
+                entry_price=100.0,
+                ai_confidence=0.67,
+                strategy_type="STABLE_SHORT",
+                currency="USD",
+            )
+        ]
+        completed = [
+            SimpleNamespace(
+                stock_name="NVIDIA",
+                stock_symbol="NVDA",
+                entry_price=100.0,
+                exit_price=110.0,
+                raw_pnl=10.0,
+                pnl=15062.0,
+                return_pct=10.0,
+                is_win=True,
+                currency="USD",
+                exit_at=datetime(2026, 4, 2, 15, 55),
+            )
+        ]
+        parsed_review = {
+            "today_review": "USD review",
+            "trade_evaluation": {"total_trades": 1, "profitable_trades": 1, "loss_trades": 0},
+            "success_patterns": [],
+            "failure_patterns": [],
+            "feedback_for_tomorrow": {},
+            "risk_alerts": [],
+        }
+        captured = {}
+
+        async def fake_generate_tier1(prompt, **kwargs):
+            captured["prompt"] = prompt
+            _ = kwargs
+            return "{}", "TEST"
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(TradingAgent, "_refresh_runtime_date", return_value=trading_date)
+            )
+            stack.enter_context(
+                patch.object(
+                    TradingAgent,
+                    "_preview_after_hours_cycle",
+                    AsyncMock(return_value={"skipped": False}),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    TradingAgent,
+                    "_collect_market_close_data",
+                    AsyncMock(return_value=("close", "volume", "surge", "drop")),
+                )
+            )
+            stack.enter_context(
+                patch("trading.account_manager.account_manager.get_balance", AsyncMock(return_value=balance))
+            )
+            stack.enter_context(
+                patch("agent.trading_agent._cycle_mixin.AsyncSessionLocal", return_value=_DummyAsyncSession())
+            )
+            stack.enter_context(
+                patch("repositories.agent_activity_repository.AgentActivityRepository.count_by_date", AsyncMock(return_value={}))
+            )
+            stack.enter_context(
+                patch("repositories.agent_activity_repository.AgentActivityRepository.get_by_date", AsyncMock(return_value=[]))
+            )
+            stack.enter_context(
+                patch("repositories.trade_result_repository.TradeResultRepository.get_opened_by_date", AsyncMock(return_value=opened))
+            )
+            stack.enter_context(
+                patch("repositories.trade_result_repository.TradeResultRepository.get_completed_by_date", AsyncMock(return_value=completed))
+            )
+            stack.enter_context(
+                patch("repositories.trade_result_repository.TradeResultRepository.get_recent", AsyncMock(return_value=completed))
+            )
+            stack.enter_context(
+                patch("repositories.trade_result_repository.TradeResultRepository.get_all_open", AsyncMock(return_value=[]))
+            )
+            stack.enter_context(patch.object(TradingAgent, "_parse_json", return_value=parsed_review))
+            stack.enter_context(patch.object(TradingAgent, "_save_daily_report", AsyncMock()))
+            stack.enter_context(
+                patch("analysis.feedback.trading_rules.trading_rule_engine.generate_rules_from_review", AsyncMock(return_value=[]))
+            )
+            stack.enter_context(patch("agent.trading_agent._cycle_mixin.llm_factory.start_session", MagicMock()))
+            stack.enter_context(patch("agent.trading_agent._cycle_mixin.llm_factory.end_session", MagicMock()))
+            stack.enter_context(
+                patch("agent.trading_agent._cycle_mixin.llm_factory.generate_tier1", AsyncMock(side_effect=fake_generate_tier1))
+            )
+            stack.enter_context(patch("agent.trading_agent._cycle_mixin.activity_logger.log", AsyncMock()))
+            stack.enter_context(patch("agent.trading_agent._cycle_mixin.event_bus.publish", AsyncMock()))
+            stack.enter_context(
+                patch(
+                    "agent.trading_agent._cycle_mixin.market_calendar.next_market_open",
+                    return_value=datetime(2026, 4, 3, 9, 30),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "services.watchlist_sync.cleanup_post_market_stock_watchlist",
+                    AsyncMock(return_value=None),
+                )
+            )
+            result = await agent._run_after_hours_cycle("NASDAQ")
+
+        prompt = captured["prompt"]
+        self.assertTrue(result["review_generated"])
+        self.assertIn("기준 통화: USD", prompt)
+        self.assertIn("총 자산: 200.00 USD", prompt)
+        self.assertIn("현금: 100.00 USD", prompt)
+        self.assertIn("주식 평가액: 100.00 USD", prompt)
+        self.assertIn("평가 손익: +3.25 USD (+1.63%)", prompt)
+        self.assertIn("매수 100.00 USD, 전략 STABLE_SHORT", prompt)
+        self.assertIn("매수 100.00 USD → 매도 110.00 USD, 손익 +10.00 USD (+10.0%)", prompt)
+        self.assertNotIn("매수 100원", prompt)
 
 
 class StartupIdempotencyTest(unittest.IsolatedAsyncioTestCase):

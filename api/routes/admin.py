@@ -933,6 +933,7 @@ async def confirm_refresh_report(
 
         # DailyReport 객체에서 저장할 필드 추출
         refreshed_data = {
+            "report_currency": refreshed.report_currency,
             "total_cycles": refreshed.total_cycles,
             "total_analyses": refreshed.total_analyses,
             "total_recommendations": refreshed.total_recommendations,

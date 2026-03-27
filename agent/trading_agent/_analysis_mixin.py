@@ -28,6 +28,7 @@ from admin.sse_manager import sse_manager
 from realtime.event_detector import event_detector
 from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
+from services.report_display import build_report_balance_metrics, sum_trade_pnl
 from strategy.risk_manager import risk_manager
 from strategy.signal import TradeSignal
 from trading.enums import (
@@ -1685,13 +1686,13 @@ class AnalysisMixin:
         }
 
         # 계좌 스냅샷 조회 (MCP 호출 — DB 세션 밖에서)
-        unrealized_pnl = 0.0
         open_position_count = 0
+        balance_metrics = build_report_balance_metrics(scope, None, None)
         representative_market = "NASDAQ" if scope == "US" else scope
         try:
             balance, holdings = await account_manager.get_account_snapshot(representative_market)
             scoped_holdings = [h for h in holdings if resolve_market_scope(h.market) == scope]
-            unrealized_pnl = sum(h.pnl for h in scoped_holdings)
+            balance_metrics = build_report_balance_metrics(scope, balance, scoped_holdings)
             open_position_count = len(scoped_holdings)
         except Exception as e:
             logger.warning("일일 리포트 계좌 스냅샷 조회 실패 (계속): {}", str(e))
@@ -1710,7 +1711,7 @@ class AnalysisMixin:
                 sell_count = len(completed_trades)
                 win_count = sum(1 for t in completed_trades if t.is_win)
                 loss_count = sum(1 for t in completed_trades if not t.is_win)
-                total_pnl = sum(t.pnl for t in completed_trades)
+                total_pnl = sum_trade_pnl(completed_trades, scope)
 
                 if open_position_count == 0:
                     all_open = await trade_result_repo.get_all_open(market_scope=scope)
@@ -1719,6 +1720,7 @@ class AnalysisMixin:
 
                 report_data = {
                     "market_scope": scope,
+                    "report_currency": balance_metrics.report_currency,
                     "total_cycles": today_cycles,
                     "total_analyses": today_analyses,
                     "total_recommendations": today_recommendations,
@@ -1728,7 +1730,7 @@ class AnalysisMixin:
                     "win_count": win_count,
                     "loss_count": loss_count,
                     "total_pnl": total_pnl,
-                    "unrealized_pnl": unrealized_pnl,
+                    "unrealized_pnl": balance_metrics.unrealized_pnl,
                     "open_position_count": open_position_count,
                     "market_summary": parsed.get("today_review", ""),
                     "performance_review": json.dumps(trade_eval, ensure_ascii=False),
@@ -1756,12 +1758,13 @@ class AnalysisMixin:
         target = normalize_market(market or settings.primary_market_code)
         scope = market_scope(target)
         state = self._get_state(scope)
-        mkt_cfg = settings.get_market_config(target)
 
         now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
+        session = market_calendar.get_market_session(dt=now, market=target)
+        mkt_cfg = settings.get_market_config(target, session=session)
 
         minutes_left: int | None = None
-        if settings.market_has_force_liquidation(target):
+        if settings.market_has_force_liquidation(target, session=session):
             close_time = now.replace(
                 hour=mkt_cfg["force_liquidation_hour"],
                 minute=mkt_cfg["force_liquidation_minute"],
@@ -1771,7 +1774,7 @@ class AnalysisMixin:
             minutes_left = max(0, int((close_time - now).total_seconds() / 60))
 
         minutes_until_buy_cutoff: int | None = None
-        if settings.market_has_buy_cutoff(target):
+        if settings.market_has_buy_cutoff(target, session=session):
             buy_cutoff_time = now.replace(
                 hour=mkt_cfg["buy_cutoff_hour"],
                 minute=mkt_cfg["buy_cutoff_minute"],
@@ -1779,7 +1782,6 @@ class AnalysisMixin:
                 microsecond=0,
             )
             minutes_until_buy_cutoff = max(0, int((buy_cutoff_time - now).total_seconds() / 60))
-        session = market_calendar.get_market_session(dt=now, market=target)
         timezone_label = now.tzname() or "LOCAL"
 
         daily_pnl_pct = 0.0

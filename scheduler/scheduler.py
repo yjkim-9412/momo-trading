@@ -45,6 +45,9 @@ from loguru import logger
 from core.config import settings
 from trading.enums import ActivityPhase, ActivityType
 
+_PREMARKET_SCALP_HOLDING_POLICY = "PREMARKET_SCALP"
+_PREMARKET_SCALP_EXIT_REASON = "PREMARKET_SCALP_CUTOFF"
+
 
 @dataclass(frozen=True)
 class MarketScheduleProfile:
@@ -151,6 +154,47 @@ class TradingScheduler:
         scope = market_scope(market)
         trading_date = market_calendar.market_date(market=scope)
         return scope, trading_date
+
+    @classmethod
+    def _market_session(cls, market: str, dt: datetime | None = None) -> str:
+        from scheduler.market_calendar import market_calendar
+
+        market_now = cls._market_now(market, dt)
+        return market_calendar.get_market_session(dt=market_now, market=market)
+
+    @classmethod
+    def _runtime_market_config(cls, market: str, dt: datetime | None = None) -> tuple[datetime, str, dict]:
+        market_now = cls._market_now(market, dt)
+        session = cls._market_session(market, market_now)
+        return market_now, session, settings.get_market_config(market, session=session)
+
+    @classmethod
+    def _run_crosses_buy_cutoff(cls, market: str, run_at: datetime) -> bool:
+        """현재 세션 정책 기준으로 다음 예약이 신규 진입 cutoff를 넘는지 반환."""
+        current_session = cls._market_session(market)
+        if settings.is_us_premarket_scalp_session(market, current_session):
+            scalp_cfg = settings.get_market_config(market, session="US_PRE")
+            scalp_cutoff = run_at.replace(
+                hour=scalp_cfg["buy_cutoff_hour"],
+                minute=scalp_cfg["buy_cutoff_minute"],
+                second=0,
+                microsecond=0,
+            )
+            if run_at >= scalp_cutoff:
+                return True
+
+        session = cls._market_session(market, run_at)
+        if not settings.should_enforce_buy_cutoff(market, session=session):
+            return False
+
+        mkt_cfg = settings.get_market_config(market, session=session)
+        cutoff = run_at.replace(
+            hour=mkt_cfg["buy_cutoff_hour"],
+            minute=mkt_cfg["buy_cutoff_minute"],
+            second=0,
+            microsecond=0,
+        )
+        return run_at >= cutoff
 
     async def _log_schedule(self, market: str, phase: ActivityPhase | str, summary: str) -> None:
         from services.activity_logger import activity_logger
@@ -364,11 +408,8 @@ class TradingScheduler:
 
         delay = self._clamp_adaptive_interval(settings.AI_DYNAMIC_RESCAN_MIN_INTERVAL_MINUTES)
         run_at = self._market_now(market) + timedelta(minutes=delay)
-        if settings.DAY_TRADING_ONLY:
-            mkt_cfg = settings.get_market_config(market)
-            cutoff = time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
-            if run_at.time() >= cutoff:
-                return
+        if self._run_crosses_buy_cutoff(market, run_at):
+            return
         state = self._adaptive_state(market)
         self._clear_adaptive_rescan_job(market)
         self.scheduler.add_job(
@@ -423,17 +464,14 @@ class TradingScheduler:
         delay = self._clamp_adaptive_interval(schedule_hint.get("next_run_in_minutes"))
         run_at = self._market_now(market) + timedelta(minutes=delay)
 
-        if settings.DAY_TRADING_ONLY:
-            mkt_cfg = settings.get_market_config(market)
-            cutoff = time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
-            if run_at.time() >= cutoff:
-                self._clear_adaptive_rescan_job(market)
-                await self._log_schedule(
-                    market,
-                    ActivityPhase.PROGRESS,
-                    f"🛑 [{market}] 다음 재스캔이 매수 마감 이후여서 예약 중단",
-                )
-                return
+        if self._run_crosses_buy_cutoff(market, run_at):
+            self._clear_adaptive_rescan_job(market)
+            await self._log_schedule(
+                market,
+                ActivityPhase.PROGRESS,
+                f"🛑 [{market}] 다음 재스캔이 매수 마감 이후여서 예약 중단",
+            )
+            return
 
         self._clear_adaptive_rescan_job(market)
         self.scheduler.add_job(
@@ -514,6 +552,8 @@ class TradingScheduler:
             holdings_hours = self._holdings_check_hours(market)
             force_h = mkt_cfg["force_liquidation_hour"]
             force_m = mkt_cfg["force_liquidation_minute"]
+            pre_scalp_force_h = settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR
+            pre_scalp_force_m = settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE
             post_h, post_m = (16, 10) if is_us else (15, 40)
             sync_h, sync_m = (16, 30) if is_us else (16, 0)
             data_h, data_m = (17, 0) if is_us else (16, 30)
@@ -571,6 +611,20 @@ class TradingScheduler:
                 name=f"보유종목 손절/익절 점검 ({label})",
                 misfire_grace_time=300,
             )
+
+            if is_us and settings.US_PREMARKET_ENABLED and settings.US_PREMARKET_SCALP_ENABLED:
+                self.scheduler.add_job(
+                    self._premarket_scalp_liquidation,
+                    "cron",
+                    args=[market],
+                    hour=pre_scalp_force_h,
+                    minute=pre_scalp_force_m,
+                    day_of_week="mon-fri",
+                    timezone=tz,
+                    id=f"premarket_scalp_liquidation_{label}",
+                    name=f"프리마켓 단타 청산 ({label})",
+                    misfire_grace_time=300,
+                )
 
             # ── 장 마감 전 청산 ──
             self.scheduler.add_job(
@@ -673,6 +727,8 @@ class TradingScheduler:
             restored = await self._restore_open_position_thresholds(market)
             if restored:
                 logger.info("[{}] 서버 기동 open position 임계값 복원: {}건", market, restored)
+            if self._is_premarket_scalp_liquidation_due(market):
+                await self._premarket_scalp_liquidation(market, startup_recovery=True)
             await self._restore_adaptive_count(market)
             startup_action = self._startup_trading_action(market)
             if settings.AI_DYNAMIC_RESCAN_ENABLED and startup_action:
@@ -723,6 +779,63 @@ class TradingScheduler:
         except json.JSONDecodeError:
             return {}
         return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _is_premarket_scalp_trade(cls, trade_result) -> bool:
+        """프리마켓 단타 태그 포지션 여부."""
+        notes = cls._parse_trade_notes(getattr(trade_result, "notes", None))
+        return str(notes.get("holding_policy") or "").upper() == _PREMARKET_SCALP_HOLDING_POLICY
+
+    @staticmethod
+    def _premarket_scalp_key(symbol: str | None, market: str | None) -> tuple[str, str]:
+        return str(market or "").upper().strip(), str(symbol or "").upper().strip()
+
+    @classmethod
+    def _is_premarket_scalp_liquidation_due(cls, market: str, dt: datetime | None = None) -> bool:
+        """프리마켓 단타 포지션 강제 청산 시각 도달 여부."""
+        from trading.market_profile import is_us_market, normalize_market
+
+        market_code = normalize_market(market)
+        if not (
+            is_us_market(market_code)
+            and settings.US_PREMARKET_ENABLED
+            and settings.US_PREMARKET_SCALP_ENABLED
+        ):
+            return False
+
+        market_now = cls._market_now(market_code, dt)
+        session = cls._market_session(market_code, market_now)
+        if session not in {"US_PRE", "US_REGULAR"}:
+            return False
+
+        cutoff = market_now.replace(
+            hour=settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_HOUR,
+            minute=settings.US_PREMARKET_SCALP_FORCE_LIQUIDATION_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+        return market_now >= cutoff
+
+    @staticmethod
+    def _build_premarket_scalp_sell_context(trade_result, holding) -> dict[str, object]:
+        """프리마켓 단타 청산용 최소 분석 컨텍스트."""
+        return {
+            "stock_name": str(getattr(holding, "name", "") or getattr(trade_result, "stock_name", "")),
+            "strategy_type": str(getattr(trade_result, "strategy_type", "") or "STABLE_SHORT"),
+            "market_regime": str(getattr(trade_result, "market_regime", "") or ""),
+            "ai_confidence": float(getattr(trade_result, "ai_confidence", 0.0) or 0.0),
+            "ai_target_price": getattr(trade_result, "ai_target_price", None),
+            "ai_stop_loss_price": getattr(trade_result, "ai_stop_loss_price", None),
+            "ai_take_profit_price": getattr(trade_result, "ai_take_profit_price", None),
+            "analysis_source": "PREMARKET_SCALP_LIQUIDATION",
+            "event_type": _PREMARKET_SCALP_EXIT_REASON,
+            "currency": str(getattr(trade_result, "currency", "") or getattr(holding, "currency", "") or "USD"),
+            "exchange_rate_to_krw": float(
+                getattr(trade_result, "exchange_rate_to_krw", 0.0)
+                or getattr(holding, "exchange_rate_to_krw", 0.0)
+                or 1.0
+            ),
+        }
 
     @staticmethod
     def _coerce_int(value, *, default: int = 0, minimum: int = 0) -> int:
@@ -920,6 +1033,204 @@ class TradingScheduler:
         except Exception as e:
             logger.warning("[{}] 트레이딩 규칙 로드 실패: {}", market, str(e))
 
+    async def _premarket_scalp_liquidation(
+        self,
+        market: str,
+        *,
+        startup_recovery: bool = False,
+    ) -> None:
+        """프리마켓 단타 태그 포지션만 정규장 전 강제 청산."""
+        from agent.decision_maker import decision_maker
+        from core.database import AsyncSessionLocal
+        from realtime.event_detector import event_detector
+        from repositories.trade_result_repository import TradeResultRepository
+        from trading.account_manager import account_manager
+        from trading.market_profile import market_scope as resolve_scope
+        from trading.mcp_client import mcp_client as _mcp
+
+        if not self._is_premarket_scalp_liquidation_due(market):
+            return
+        if not settings.is_trading_enabled_for_market(market):
+            logger.info("[{}] 프리마켓 단타 청산 스킵 — trading disabled", market)
+            return
+
+        try:
+            repaired = await decision_maker.repair_stale_open_trade_results(market_scope=market)
+            if repaired:
+                logger.warning("[{}] 프리마켓 단타 청산 전 stale open {}건 복구", market, repaired)
+
+            async with AsyncSessionLocal() as session:
+                repo = TradeResultRepository(session)
+                open_positions = await repo.get_all_open(market_scope=resolve_scope(market))
+
+            tagged_positions = [tr for tr in open_positions if self._is_premarket_scalp_trade(tr)]
+            if not tagged_positions:
+                return
+
+            holdings = await account_manager.get_holdings(market)
+            holding_map = {
+                self._premarket_scalp_key(h.symbol, h.market): h
+                for h in holdings
+                if float(getattr(h, "quantity", 0) or 0) > 0
+            }
+            tagged_map = {
+                self._premarket_scalp_key(tr.stock_symbol, tr.market): tr
+                for tr in tagged_positions
+            }
+            sellable_pairs = [
+                (holding_map[key], trade_result)
+                for key, trade_result in tagged_map.items()
+                if key in holding_map
+            ]
+            missing_pairs = [
+                trade_result
+                for key, trade_result in tagged_map.items()
+                if key not in holding_map
+            ]
+
+            if not sellable_pairs:
+                if missing_pairs:
+                    logger.warning(
+                        "[{}] 프리마켓 단타 태그 {}건은 DB에만 존재 — holding 없음",
+                        market,
+                        len(missing_pairs),
+                    )
+                return
+
+            mode_label = "startup 정리" if startup_recovery else "정시 청산"
+            await self._log_schedule(
+                market,
+                ActivityPhase.PROGRESS,
+                f"⏰ [{market}] 프리마켓 단타 {mode_label} — 매도 {len(sellable_pairs)}건",
+            )
+
+            async def _sell_one(holding, trade_result):
+                try:
+                    resp = await _mcp.place_order(
+                        symbol=holding.symbol,
+                        side="SELL",
+                        quantity=holding.quantity,
+                        price=None,
+                        market=holding.market,
+                    )
+                    return resp, holding, trade_result, None
+                except Exception as exc:  # pragma: no cover - gather 보호용
+                    return None, holding, trade_result, exc
+
+            first_pass = await asyncio.gather(
+                *[_sell_one(holding, trade_result) for holding, trade_result in sellable_pairs]
+            )
+
+            confirmations = []
+            sold_count = 0
+            failed_pairs: list[tuple[object, object]] = []
+
+            for resp, holding, trade_result, error in first_pass:
+                if error is not None:
+                    logger.error("[{}] 프리마켓 단타 청산 오류: {}({}) — {}", market, holding.name, holding.symbol, str(error))
+                    failed_pairs.append((holding, trade_result))
+                    continue
+
+                if not resp or not resp.success:
+                    logger.error(
+                        "[{}] 프리마켓 단타 청산 실패: {}({}) — {}",
+                        market,
+                        holding.name,
+                        holding.symbol,
+                        (resp.error if resp else "응답 없음"),
+                    )
+                    failed_pairs.append((holding, trade_result))
+                    continue
+
+                sold_count += 1
+                event_detector.remove_levels(holding.symbol, market=holding.market)
+                await self._log_schedule(
+                    market,
+                    ActivityPhase.PROGRESS,
+                    f"🚨 [{market}] 프리마켓 단타 청산 접수: {holding.name}({holding.symbol}) {holding.quantity}주",
+                )
+
+                order_id = str((resp.data or {}).get("order_id") or "")
+                if order_id:
+                    confirmations.append(
+                        decision_maker.confirm_and_record(
+                            symbol=holding.symbol,
+                            market=holding.market,
+                            side="SELL",
+                            order_id=order_id,
+                            quantity=holding.quantity,
+                            expected_price=float(
+                                getattr(holding, "current_price", 0.0)
+                                or getattr(holding, "avg_buy_price", 0.0)
+                                or 0.0
+                            ),
+                            analysis_context=self._build_premarket_scalp_sell_context(trade_result, holding),
+                            exit_reason=_PREMARKET_SCALP_EXIT_REASON,
+                        )
+                    )
+
+            if failed_pairs:
+                logger.warning("[{}] 프리마켓 단타 청산 {}건 실패 → 5초 후 재시도", market, len(failed_pairs))
+                await asyncio.sleep(5)
+                retry_results = await asyncio.gather(
+                    *[_sell_one(holding, trade_result) for holding, trade_result in failed_pairs]
+                )
+                remaining_failed: list[tuple[object, object]] = []
+                for resp, holding, trade_result, error in retry_results:
+                    if error is not None or not resp or not resp.success:
+                        remaining_failed.append((holding, trade_result))
+                        logger.error(
+                            "[{}] 프리마켓 단타 청산 재시도 실패: {}({}) — {}",
+                            market,
+                            holding.name,
+                            holding.symbol,
+                            str(error or (resp.error if resp else "응답 없음")),
+                        )
+                        continue
+
+                    sold_count += 1
+                    event_detector.remove_levels(holding.symbol, market=holding.market)
+                    order_id = str((resp.data or {}).get("order_id") or "")
+                    if order_id:
+                        confirmations.append(
+                            decision_maker.confirm_and_record(
+                                symbol=holding.symbol,
+                                market=holding.market,
+                                side="SELL",
+                                order_id=order_id,
+                                quantity=holding.quantity,
+                                expected_price=float(
+                                    getattr(holding, "current_price", 0.0)
+                                    or getattr(holding, "avg_buy_price", 0.0)
+                                    or 0.0
+                                ),
+                                analysis_context=self._build_premarket_scalp_sell_context(trade_result, holding),
+                                exit_reason=_PREMARKET_SCALP_EXIT_REASON,
+                            )
+                        )
+                failed_pairs = remaining_failed
+
+            if confirmations:
+                confirm_results = await asyncio.gather(*confirmations, return_exceptions=True)
+                for confirm_result in confirm_results:
+                    if isinstance(confirm_result, BaseException):
+                        logger.warning("[{}] 프리마켓 단타 체결 기록 후속 확인 실패: {}", market, str(confirm_result))
+
+            summary = f"⏰ [{market}] 프리마켓 단타 청산 완료: {sold_count}건 매도"
+            if failed_pairs:
+                summary += f" | 실패 {len(failed_pairs)}건"
+            if missing_pairs:
+                summary += f" | holding 없음 {len(missing_pairs)}건"
+            await self._log_schedule(market, ActivityPhase.PROGRESS, summary)
+            await self._update_realtime_subscriptions(market)
+        except Exception as e:
+            logger.error("[{}] 프리마켓 단타 청산 오류: {}", market, str(e))
+            await self._log_schedule(
+                market,
+                ActivityPhase.ERROR,
+                f"❌ [{market}] 프리마켓 단타 청산 오류: {str(e)[:100]}",
+            )
+
     async def _execute_trading_scan(
         self,
         market: str,
@@ -1069,11 +1380,12 @@ class TradingScheduler:
             self._clear_adaptive_rescan_job(market)
             return
 
-        if settings.DAY_TRADING_ONLY and settings.market_has_buy_cutoff(market):
-            mkt_cfg = settings.get_market_config(market)
+        tz = ZoneInfo(market_timezone(market))
+        market_now = now_kst().astimezone(tz)
+        session = market_calendar.get_market_session(dt=market_now, market=market)
+        if settings.should_enforce_buy_cutoff(market, session=session):
+            mkt_cfg = settings.get_market_config(market, session=session)
             cutoff = time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
-            tz = ZoneInfo(market_timezone(market))
-            market_now = now_kst().astimezone(tz)
             if market_now.time() >= cutoff:
                 logger.info("[{}] 매수 마감 시간 경과 → adaptive 재스캔 스킵", market)
                 self._clear_adaptive_rescan_job(market)
@@ -1104,19 +1416,19 @@ class TradingScheduler:
         if market_calendar.is_holiday(market):
             return
 
+        tz = ZoneInfo(market_timezone(market))
+        market_now = now_kst().astimezone(tz)
+
         # 매수 마감 시간 이후면 재스캔 불필요
-        if settings.DAY_TRADING_ONLY and settings.market_has_buy_cutoff(market):
+        session = market_calendar.get_market_session(dt=market_now, market=market)
+        if settings.should_enforce_buy_cutoff(market, session=session):
             from datetime import time as _time
-            mkt_cfg = settings.get_market_config(market)
+            mkt_cfg = settings.get_market_config(market, session=session)
             cutoff = _time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
-            tz = ZoneInfo(market_timezone(market))
-            market_now = now_kst().astimezone(tz)
             if market_now.time() >= cutoff:
                 logger.info("[{}] 매수 마감 시간 경과 → 장중 재스캔 스킵", market)
                 return
 
-        tz = ZoneInfo(market_timezone(market))
-        market_now = now_kst().astimezone(tz)
         await self._execute_trading_scan(
             market,
             trigger_reason="intraday_rescan",
@@ -1166,11 +1478,9 @@ class TradingScheduler:
             await self._update_realtime_subscriptions(market)
 
             # 강제 청산까지 남은 시간 계산 (시장 현지 시간 기준, 크립토는 비적용)
-            mkt_cfg = settings.get_market_config(market)
-            tz = ZoneInfo(market_timezone(market))
-            now = now_kst().astimezone(tz)
+            now, session, mkt_cfg = self._runtime_market_config(market)
             minutes_left: int | None = None
-            if settings.market_has_force_liquidation(market):
+            if settings.market_has_force_liquidation(market, session=session):
                 close_time = now.replace(
                     hour=mkt_cfg["force_liquidation_hour"],
                     minute=mkt_cfg["force_liquidation_minute"],
@@ -2136,6 +2446,10 @@ class TradingScheduler:
                     to_sell.append(h)
                     logger.warning("[{}] 미청산 TradeResult 없음 {} → SELL", market, h.symbol)
                     continue
+                if self._is_premarket_scalp_trade(trade_result):
+                    to_sell.append(h)
+                    logger.warning("[{}] 프리마켓 단타 태그 잔존 {} → HOLD 없이 SELL", market, h.symbol)
+                    continue
 
                 hold_plan = self._resolve_open_position_hold_plan(trade_result)
                 decision = await trading_agent.review_close_hold_position(
@@ -2267,6 +2581,17 @@ class TradingScheduler:
             if not open_positions:
                 return
 
+            premarket_scalps = [tr for tr in open_positions if self._is_premarket_scalp_trade(tr)]
+            open_positions = [tr for tr in open_positions if not self._is_premarket_scalp_trade(tr)]
+            if premarket_scalps:
+                logger.warning(
+                    "[{}] 오버나이트 점검에서 프리마켓 단타 태그 {}건 제외",
+                    market,
+                    len(premarket_scalps),
+                )
+            if not open_positions:
+                return
+
             restored = await self._restore_open_position_thresholds(market, open_positions=open_positions)
             warnings = []
             for tr in open_positions:
@@ -2307,7 +2632,11 @@ class TradingScheduler:
                 open_positions = await repo.get_all_open()
 
             # symbol → TradeResult 매핑
-            open_map = {(tr.market, tr.stock_symbol): tr for tr in open_positions}
+            open_map = {
+                (tr.market, tr.stock_symbol): tr
+                for tr in open_positions
+                if not self._is_premarket_scalp_trade(tr)
+            }
 
             alerts = []
             for h in holdings:

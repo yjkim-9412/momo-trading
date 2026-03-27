@@ -13,6 +13,14 @@ from analysis.llm.prompts.cycle_scheduler import SCHEDULE_HINT_PROMPT, SCHEDULE_
 from analysis.llm.prompts.daily_plan import DAILY_PLAN_PROMPT, DAILY_PLAN_SYSTEM
 from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
+from services.report_display import (
+    build_report_balance_metrics,
+    format_report_amount,
+    format_trade_pnl,
+    format_trade_price,
+    summarize_closed_trade_stats,
+    sum_trade_pnl,
+)
 from trading.enums import ActivityPhase, ActivityType, Tier1Profile
 from trading.market_profile import (
     is_crypto_market,
@@ -154,15 +162,17 @@ class CycleMixin:
                             "executed": 0,
                             "selected_symbols": [],
                         }
-                    # 데이트레이딩 모드: 매수 마감 시간 이후 신규 매수 차단
-                    if settings.DAY_TRADING_ONLY:
-                        from datetime import time as _time
-                        from util.time_util import now_kst
-                        from zoneinfo import ZoneInfo
+                    # 데이트레이딩 또는 프리마켓 단타 모드: 매수 마감 시간 이후 신규 매수 차단
+                    from util.time_util import now_kst
+                    from zoneinfo import ZoneInfo
 
-                        mkt_cfg = settings.get_market_config(target)
+                    market_now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
+                    session = market_calendar.get_market_session(dt=market_now, market=target)
+                    if settings.should_enforce_buy_cutoff(target, session=session):
+                        from datetime import time as _time
+
+                        mkt_cfg = settings.get_market_config(target, session=session)
                         cutoff = _time(mkt_cfg["buy_cutoff_hour"], mkt_cfg["buy_cutoff_minute"])
-                        market_now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
                         if market_now.time() >= cutoff:
                             self._set_cycle_runtime_state(
                                 runtime,
@@ -772,11 +782,7 @@ class CycleMixin:
 
                 # 2. 포트폴리오 현황 (데이트레이딩이면 청산 완료 상태)
                 balance = await account_manager.get_balance(target)
-
-                effective_cash = balance.effective_cash
-                cash_ratio = 0.0
-                if balance.total_asset > 0:
-                    cash_ratio = (effective_cash / balance.total_asset) * 100
+                report_metrics = build_report_balance_metrics(scope, balance, None)
 
                 # 3. 오늘 활동 집계
                 today_date = trading_date
@@ -819,27 +825,27 @@ class CycleMixin:
                         if opened:
                             lines.append(f"[신규 진입] {len(opened)}건")
                             for tr in opened:
-                                entry_p = f"{tr.entry_price:,.0f}" if tr.entry_price else "?"
+                                trade_currency = str(tr.currency or report_metrics.report_currency)
+                                entry_p = format_trade_price(tr.entry_price, trade_currency)
                                 conf = f", 신뢰도 {tr.ai_confidence:.2f}" if tr.ai_confidence else ""
                                 lines.append(
                                     f"  - {tr.stock_name}({tr.stock_symbol}): "
-                                    f"매수 {entry_p}원, 전략 {tr.strategy_type or '?'}{conf}"
+                                    f"매수 {entry_p}, 전략 {tr.strategy_type or '?'}{conf}"
                                 )
                         if completed:
                             wins = sum(1 for t in completed if t.is_win)
                             losses = len(completed) - wins
-                            total_pnl_trades = sum(t.pnl for t in completed if t.pnl)
+                            total_pnl_trades = sum_trade_pnl(completed, scope)
                             lines.append(
                                 f"[청산 완료] {len(completed)}건 "
-                                f"(수익 {wins}, 손실 {losses}, 합산 {total_pnl_trades:+,.0f}원)"
+                                f"(수익 {wins}, 손실 {losses}, 합산 "
+                                f"{format_report_amount(total_pnl_trades, report_metrics.report_currency, signed=True)})"
                             )
                             for tr in completed:
-                                entry_p = f"{tr.entry_price:,.0f}" if tr.entry_price else "?"
-                                exit_p = f"{tr.exit_price:,.0f}" if tr.exit_price else "?"
-                                pnl_text = (
-                                    f"{tr.pnl:+,.0f}원 ({tr.return_pct:+.1f}%)"
-                                    if tr.pnl is not None else "?"
-                                )
+                                trade_currency = str(tr.currency or report_metrics.report_currency)
+                                entry_p = format_trade_price(tr.entry_price, trade_currency)
+                                exit_p = format_trade_price(tr.exit_price, trade_currency)
+                                pnl_text = format_trade_pnl(tr, scope)
                                 lines.append(
                                     f"  - {tr.stock_name}({tr.stock_symbol}): "
                                     f"매수 {entry_p} → 매도 {exit_p}, 손익 {pnl_text}"
@@ -852,17 +858,31 @@ class CycleMixin:
                 # 4. 과거 매매 성과
                 performance_summary = "매매 이력 없음"
                 try:
-                    from analysis.feedback.performance_tracker import PerformanceTracker
                     async with AsyncSessionLocal() as session:
-                        tracker = PerformanceTracker(session)
-                        stats = await tracker.get_overall_stats(market_scope=scope)
-                        overall = stats.get("overall")
-                        if overall and overall.total_trades > 0:
-                            performance_summary = (
-                                f"총 {overall.total_trades}거래, "
-                                f"승률 {overall.win_rate * 100:.1f}%, "
-                                f"총손익 {overall.total_pnl:+,.0f}원"
-                            )
+                        if scope == "US":
+                            from repositories.trade_result_repository import TradeResultRepository
+
+                            trade_repo = TradeResultRepository(session)
+                            recent_trades = await trade_repo.get_recent(limit=200, market_scope=scope)
+                            summary = summarize_closed_trade_stats(recent_trades, scope)
+                            if summary["total_trades"] > 0:
+                                performance_summary = (
+                                    f"총 {int(summary['total_trades'])}거래, "
+                                    f"승률 {summary['win_rate'] * 100:.1f}%, "
+                                    f"총손익 {format_report_amount(summary['total_pnl'], report_metrics.report_currency, signed=True)}"
+                                )
+                        else:
+                            from analysis.feedback.performance_tracker import PerformanceTracker
+
+                            tracker = PerformanceTracker(session)
+                            stats = await tracker.get_overall_stats(market_scope=scope)
+                            overall = stats.get("overall")
+                            if overall and overall.total_trades > 0:
+                                performance_summary = (
+                                    f"총 {overall.total_trades}거래, "
+                                    f"승률 {overall.win_rate * 100:.1f}%, "
+                                    f"총손익 {format_report_amount(overall.total_pnl, report_metrics.report_currency, signed=True)}"
+                                )
                 except Exception as e:
                     logger.warning("성과 요약 실패: {}", str(e))
 
@@ -914,12 +934,13 @@ class CycleMixin:
                     volume_rank_data=volume_rank_data,
                     surge_data=surge_data,
                     drop_data=drop_data,
-                    total_asset=balance.total_asset,
-                    cash=effective_cash,
-                    cash_ratio=cash_ratio,
-                    stock_value=balance.stock_value,
-                    total_pnl=balance.total_pnl,
-                    total_pnl_rate=balance.total_pnl_rate,
+                    report_currency=report_metrics.report_currency,
+                    total_asset_text=report_metrics.total_asset_text,
+                    cash_text=report_metrics.cash_text,
+                    cash_ratio=report_metrics.cash_ratio,
+                    stock_value_text=report_metrics.stock_value_text,
+                    portfolio_total_pnl_text=report_metrics.total_pnl_text,
+                    total_pnl_rate=report_metrics.total_pnl_rate,
                     today_cycles=today_cycles,
                     today_analyses=today_analyses,
                     today_recommendations=today_recommendations,
@@ -1196,15 +1217,27 @@ class CycleMixin:
         return max(0.0, min(1.0, numeric))
 
     @staticmethod
+    def _current_market_session(market: str) -> str:
+        target = normalize_market(market)
+        return market_calendar.get_market_session(market=target)
+
+    @classmethod
+    def _should_enforce_market_buy_cutoff(cls, market: str) -> bool:
+        target = normalize_market(market)
+        session = cls._current_market_session(target)
+        return settings.should_enforce_buy_cutoff(target, session=session)
+
+    @staticmethod
     def _minutes_until_market_buy_cutoff(market: str) -> int | None:
         from util.time_util import now_kst
         from zoneinfo import ZoneInfo
 
         target = normalize_market(market)
-        if not settings.market_has_buy_cutoff(target):
-            return None
         now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
-        mkt_cfg = settings.get_market_config(target)
+        session = market_calendar.get_market_session(dt=now, market=target)
+        if not settings.market_has_buy_cutoff(target, session=session):
+            return None
+        mkt_cfg = settings.get_market_config(target, session=session)
         buy_cutoff_time = now.replace(
             hour=mkt_cfg["buy_cutoff_hour"],
             minute=mkt_cfg["buy_cutoff_minute"],
@@ -1251,7 +1284,7 @@ class CycleMixin:
 
         minutes_until_buy_cutoff = self._minutes_until_market_buy_cutoff(target)
         if (
-            settings.DAY_TRADING_ONLY
+            self._should_enforce_market_buy_cutoff(target)
             and minutes_until_buy_cutoff is not None
             and minutes_until_buy_cutoff <= 0
         ):
@@ -1361,7 +1394,7 @@ class CycleMixin:
             }
 
         if (
-            settings.DAY_TRADING_ONLY
+            self._should_enforce_market_buy_cutoff(target)
             and minutes_until_buy_cutoff is not None
             and minutes_until_buy_cutoff <= 0
         ):

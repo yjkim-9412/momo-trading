@@ -505,6 +505,28 @@ async def get_overseas_price(symbol: str, market: str = "NASDAQ") -> dict:
         return {"success": False, "error": str(e), "output": {}}
 
 
+async def get_overseas_price_detail(symbol: str, market: str = "NASDAQ") -> dict:
+    """해외주식 현재가 상세 조회"""
+    market_code = normalize_market(market)
+    try:
+        result = await _request_json(
+            "/uapi/overseas-price/v1/quotations/price-detail",
+            "HHDFS76200200",
+            params={
+                "AUTH": "",
+                "EXCD": kis_exchange_code(market_code),
+                "SYMB": symbol,
+            },
+        )
+        result["success"] = result.get("rt_cd") == "0"
+        result["market"] = market_code
+        result["currency"] = market_currency(market_code)
+        return result
+    except Exception as e:
+        logger.error("해외 현재가 상세 조회 오류 ({} {}): {}", market_code, symbol, str(e))
+        return {"success": False, "error": str(e), "output": {}}
+
+
 async def get_overseas_daily_price(symbol: str, market: str = "NASDAQ") -> dict:
     """해외주식 기간별 시세 조회"""
     market_code = normalize_market(market)

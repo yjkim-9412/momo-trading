@@ -907,6 +907,32 @@ class MCPClient:
         }
         return valid_items, diagnostics
 
+    @staticmethod
+    def _merge_ranked_us_stocks(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """미국장 discovery source들을 시장/심볼 기준으로 병합한다."""
+        seen: set[tuple[str, str]] = set()
+        merged: list[dict[str, Any]] = []
+        for group in groups:
+            for item in group:
+                symbol = str(item.get("symbol", "")).strip().upper()
+                if not symbol:
+                    continue
+                market_code = normalize_market(item.get("market", "NASDAQ"))
+                key = (market_code, symbol)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+        return merged
+
+    @staticmethod
+    def _tag_scan_source(
+        stocks: list[dict[str, Any]],
+        scan_source: str,
+    ) -> list[dict[str, Any]]:
+        """랭킹 후보에 scan_source 메타데이터를 덮어쓴다."""
+        return [{**item, "scan_source": scan_source} for item in stocks]
+
     def _log_us_discovery_diagnostics(
         self,
         market: str,
@@ -1118,11 +1144,13 @@ class MCPClient:
         *,
         sort_key: str,
         reverse: bool,
+        limit: int = _US_SCAN_RESULT_LIMIT,
     ) -> list[dict[str, Any]]:
         """미국장 랭킹 결과를 discovery 우선, fallback seed 보조로 정렬한다."""
         watchlist_stocks: list[dict[str, Any]] = []
         mode = "DISCOVERY"
         ranked_source = list(discovery_stocks)
+        rank_limit = max(1, int(limit or _US_SCAN_RESULT_LIMIT))
 
         if not settings.US_DYNAMIC_DISCOVERY_ENABLED:
             watchlist_stocks = await self._build_watchlist_scan(market)
@@ -1134,7 +1162,7 @@ class MCPClient:
             mode = "FALLBACK_SEED"
 
         ranked_source.sort(key=lambda item: item.get(sort_key, 0), reverse=reverse)
-        ranked = ranked_source[:_US_SCAN_RESULT_LIMIT]
+        ranked = ranked_source[:rank_limit]
         self._log_us_rank_summary(
             market,
             rank_name,
@@ -1170,7 +1198,6 @@ class MCPClient:
             item,
             "prdy_ctrt",
             "rate",
-            "t_rate",
             "change_rate",
             "ovrs_nmix_prdy_ctrt",
         ))
@@ -1209,18 +1236,44 @@ class MCPClient:
             "ovrs_excg_cd",
             default=market,
         ))
+        base_price_val = self._to_float(self._pick_first(item, "base", "prev_close", "stck_sdpr"))
+        if change_val == 0 and price_val > 0 and base_price_val > 0:
+            change_val = price_val - base_price_val
+        if change_rate_val == 0 and price_val > 0 and base_price_val > 0:
+            change_rate_val = ((price_val - base_price_val) / base_price_val) * 100.0
+        currency = str(self._pick_first(item, "curr", "currency", default=market_currency(market)))
+        trade_value_val = self._to_float(self._pick_first(
+            item,
+            "tamt",
+            "trade_value",
+            "trade_amount",
+            "pamt",
+        ))
+        market_cap_val = self._to_float(self._pick_first(item, "tomv", "market_cap"))
+        listed_shares_val = self._to_float(self._pick_first(item, "shar", "listed_shares"))
+        exchange_rate_val = self._to_float(self._pick_first(item, "t_rate", "exchange_rate_to_krw"))
 
         return {
             **item,
             "symbol": symbol,
             "name": name,
             "market": normalize_market(item_market, default=market),
-            "currency": market_currency(market),
+            "currency": currency or market_currency(market),
             "price": price_val,
             "current_price": price_val,
+            "base_price": base_price_val,
             "change": change_val,
             "change_rate": change_rate_val,
             "volume": volume_val,
+            "trade_value": trade_value_val,
+            "trade_value_usd": trade_value_val if str(currency or "").upper() == "USD" else 0.0,
+            "market_cap": market_cap_val,
+            "listed_shares": listed_shares_val,
+            "exchange_rate_to_krw": exchange_rate_val,
+            "tradeable": str(self._pick_first(item, "e_ordyn", "tradeable", default="")),
+            "sector": str(self._pick_first(item, "e_icod", "sector", default="")),
+            "etp_type_name": str(self._pick_first(item, "etyp_nm", default="")),
+            "quote_unit": str(self._pick_first(item, "e_hogau", default="")),
             "scan_source": str(item.get("scan_source", "DISCOVERY")).upper() or "DISCOVERY",
         }
 
@@ -1285,7 +1338,7 @@ class MCPClient:
                     source, "prdy_vrss", "diff", "t_xsgn", "ovrs_nmix_prdy_vrss",
                 )),
                 "change_rate": self._to_float(self._pick_first(
-                    source, "prdy_ctrt", "rate", "t_rate", "ovrs_nmix_prdy_ctrt",
+                    source, "prdy_ctrt", "rate", "ovrs_nmix_prdy_ctrt",
                 )),
                 "volume": self._to_int(self._pick_first(
                     source, "acml_vol", "tvol", "ovrs_vol",
@@ -1294,6 +1347,45 @@ class MCPClient:
                 "pbr": source.get("pbr", d.get("pbr", "N/A")),
             }
         return resp
+
+    async def get_current_price_detail(self, symbol: str, market: str = "NASDAQ") -> MCPResponse:
+        """해외주식 현재가 상세 조회"""
+        market_code = normalize_market(market)
+        if is_domestic_market(market_code) or is_crypto_market(market_code):
+            return await self.get_current_price(symbol=symbol, market=market_code)
+
+        from trading.kis_api import get_overseas_price_detail
+
+        response = await self._call_overseas_quote(
+            f"{market_code}:{symbol}:price-detail",
+            lambda: get_overseas_price_detail(symbol, market_code),
+        )
+        if not response.success or not response.data:
+            return await self.get_current_price(symbol=symbol, market=market_code)
+
+        detail_payload = response.data
+        source = detail_payload.get("output", detail_payload)
+        if not isinstance(source, dict):
+            source = {}
+        normalized = self._normalize_stock_item(source, market_code)
+        exchange_rate = self._to_float(
+            self._pick_first(source, "t_rate", "exchange_rate_to_krw"),
+            0.0,
+        )
+        if exchange_rate <= 0:
+            exchange_rate = await self._get_exchange_rate_to_krw(market_code)
+        price_val = self._to_float(normalized.get("price"), 0.0)
+        response.data = {
+            **detail_payload,
+            **normalized,
+            "market": market_code,
+            "currency": str(normalized.get("currency") or market_currency(market_code)).upper(),
+            "exchange_rate_to_krw": exchange_rate,
+            "price_krw": price_val * exchange_rate if exchange_rate > 0 else 0.0,
+            "trade_value_usd": self._to_float(normalized.get("trade_value"), 0.0),
+            "market_cap_usd": self._to_float(normalized.get("market_cap"), 0.0),
+        }
+        return response
 
     async def get_account_balance(self, market: str = "KRX") -> MCPResponse:
         """계좌 잔고 조회"""
@@ -1633,7 +1725,13 @@ class MCPClient:
             return await bithumb_client.get_order(order_id=order_id, market=market_code)
         return MCPResponse(success=False, error=f"단건 주문 조회 미지원 시장: {market_code}")
 
-    async def get_volume_rank(self, market: str = "KRX") -> MCPResponse:
+    async def get_volume_rank(
+        self,
+        market: str = "KRX",
+        *,
+        limit: int = _US_SCAN_RESULT_LIMIT,
+        include_trade_growth: bool = False,
+    ) -> MCPResponse:
         """거래량 상위 종목 조회"""
         from trading.kis_api import get_volume_rank
 
@@ -1641,32 +1739,58 @@ class MCPClient:
         if not is_domestic_market(market_code):
             discovery_stocks: list[dict[str, Any]] = []
             rank_name = "거래량순위"
+            rank_limit = max(1, int(limit or _US_SCAN_RESULT_LIMIT))
 
             if settings.US_DYNAMIC_DISCOVERY_ENABLED:
                 from trading.kis_api import get_overseas_volume_surge, get_overseas_trade_growth
 
                 exchange = kis_exchange_code(market_code)
-                response = await self._call_overseas_quote(
+                volume_response = await self._call_overseas_quote(
                     f"{market_code}:volume-surge",
                     lambda: get_overseas_volume_surge(exchange),
                 )
-                if not response.success:
-                    response = await self._call_overseas_quote(
-                        f"{market_code}:trade-growth",
-                        lambda: get_overseas_trade_growth(exchange),
-                    )
-                result = response.data or {}
-                if response.success:
-                    discovery_stocks, diagnostics = self._extract_us_discovery_stocks(
-                        result,
+                volume_stocks: list[dict[str, Any]] = []
+                if volume_response.success:
+                    volume_result = volume_response.data or {}
+                    volume_stocks, diagnostics = self._extract_us_discovery_stocks(
+                        volume_result,
                         market_code,
                     )
                     self._log_us_discovery_diagnostics(
                         market_code,
                         rank_name,
-                        self._summarize_us_discovery_payload(result),
+                        self._summarize_us_discovery_payload(volume_result),
                         diagnostics,
                     )
+
+                growth_stocks: list[dict[str, Any]] = []
+                if include_trade_growth or not volume_stocks:
+                    growth_response = await self._call_overseas_quote(
+                        f"{market_code}:trade-growth",
+                        lambda: get_overseas_trade_growth(exchange),
+                    )
+                    growth_result = growth_response.data or {}
+                    if growth_response.success:
+                        growth_stocks, diagnostics = self._extract_us_discovery_stocks(
+                            growth_result,
+                            market_code,
+                        )
+                        self._log_us_discovery_diagnostics(
+                            market_code,
+                            f"{rank_name}(trade-growth)",
+                            self._summarize_us_discovery_payload(growth_result),
+                            diagnostics,
+                        )
+                        if include_trade_growth:
+                            growth_stocks = self._tag_scan_source(
+                                growth_stocks,
+                                "DISCOVERY_EXPANDED",
+                            )
+
+                discovery_stocks = self._merge_ranked_us_stocks(
+                    volume_stocks,
+                    growth_stocks,
+                )
 
             ranked = await self._rank_us_stocks(
                 market_code,
@@ -1674,6 +1798,7 @@ class MCPClient:
                 discovery_stocks,
                 sort_key="volume",
                 reverse=True,
+                limit=rank_limit,
             )
             return MCPResponse(success=bool(ranked), data={"stocks": ranked})
 
@@ -1751,7 +1876,13 @@ class MCPClient:
             lambda: get_minute_chart(symbol, period),
         )
 
-    async def get_fluctuation_rank(self, market: str = "KRX", sort: str = "top") -> MCPResponse:
+    async def get_fluctuation_rank(
+        self,
+        market: str = "KRX",
+        sort: str = "top",
+        *,
+        limit: int = _US_SCAN_RESULT_LIMIT,
+    ) -> MCPResponse:
         """등락률 상위/하위 종목 조회"""
         from trading.kis_api import get_fluctuation_rank
 
@@ -1759,6 +1890,7 @@ class MCPClient:
         if not is_domestic_market(market_code):
             discovery_stocks: list[dict[str, Any]] = []
             rank_name = "등락률상위" if sort != "bottom" else "등락률하위"
+            rank_limit = max(1, int(limit or _US_SCAN_RESULT_LIMIT))
 
             if settings.US_DYNAMIC_DISCOVERY_ENABLED:
                 from trading.kis_api import get_overseas_price_fluct
@@ -1788,6 +1920,7 @@ class MCPClient:
                 discovery_stocks,
                 sort_key="change_rate",
                 reverse=(sort != "bottom"),
+                limit=rank_limit,
             )
             return MCPResponse(success=bool(ranked), data={"stocks": ranked})
 
