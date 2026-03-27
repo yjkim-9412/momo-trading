@@ -106,8 +106,9 @@ US_MARKET_SCAN_SYSTEM = """당신은 미국 주식 시장(NASDAQ/NYSE/AMEX) 전�
 
 ## 핵심 원칙
 - 제공된 데이터만 사용 (추측 금지)
-- 투자 가용 금액은 KRW 기준 리스크 한도임
-- 현재 가용 현금으로 1주도 매수할 수 없는 종목은 제외
+- 실주문 기준 현금과 1주 매수 가능성 평가는 USD 기준으로 판단
+- 표시된 종목당 최대 금액은 USD 기준 스캔용 리스크 한도임
+- 현재 실주문 기준 현금으로 1주도 매수할 수 없는 종목은 제외
 - 반드시 주어진 데이터 안의 종목만 선정
 - 반드시 한국어로 답변
 - JSON만 출력"""
@@ -116,7 +117,7 @@ US_MARKET_SCAN_PROMPT = """## 시장 데이터
 
 시장: {market_label}
 현재 시각({timezone_label}): {current_time} | 현재 세션: {market_session} | 매수 마감까지: {minutes_until_cutoff}분
-투자 가용 현금(리스크 기준 KRW): {available_cash:,.0f}원 | 종목당 최대: {max_per_stock:,.0f}원
+실주문 기준 현금: {available_cash_foreign:,.2f} USD | 종목당 최대(리스크 기준): {max_per_stock_foreign:,.2f} USD
 보유 종목 수: {holding_count}개
 이번 스캔 선정 목표: {selection_target_range}개 (적합한 후보가 없으면 0개 허용)
 
@@ -139,7 +140,7 @@ US_MARKET_SCAN_PROMPT = """## 시장 데이터
 
 위 데이터를 분석하여 미국장 기준으로 **심층 분석할 종목을 {selection_target_range}개 범위에서** 직접 선정하세요.
 각 종목에 적합한 전략(STABLE_SHORT/AGGRESSIVE_SHORT)을 배정하세요.
-현재 가용 현금으로 1주도 매수할 수 없는 종목은 절대 선정하지 마세요.
+현재 실주문 기준 현금으로 1주도 매수할 수 없는 종목은 절대 선정하지 마세요.
 
 JSON:
 ```json

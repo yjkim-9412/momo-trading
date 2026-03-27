@@ -25,6 +25,16 @@ class FeedbackContextBuilder:
         else:
             self.tracker = PerformanceTracker(session)
 
+    @staticmethod
+    def _is_low_sample(total_trades: int, threshold: int = 5) -> bool:
+        return int(total_trades or 0) < threshold
+
+    @classmethod
+    def _sample_note(cls, total_trades: int) -> str:
+        if cls._is_low_sample(total_trades):
+            return "저표본 참고, 현재 차트/거래량 우선"
+        return "표본 충분"
+
     async def build_strategy_context(self, strategy_type: str, market_scope: str | None = None) -> str:
         """전략별 성과 컨텍스트"""
         stat = await self.tracker.get_strategy_stats(strategy_type, market_scope=market_scope)
@@ -47,7 +57,7 @@ class FeedbackContextBuilder:
             return f"[{symbol}] 과거 매매 이력 없음 (처음 분석하는 종목)"
 
         return (
-            f"[{symbol} 과거 이력] "
+            f"[{symbol} 과거 이력 | {self._sample_note(stat.total_trades)}] "
             f"{stat.total_trades}거래, 승률 {stat.win_rate * 100:.1f}%, "
             f"평균 수익률 {stat.avg_return:+.2f}%, "
             f"총 손익 {stat.total_pnl:+,.0f}원"
@@ -59,7 +69,10 @@ class FeedbackContextBuilder:
         if not losses:
             return "[최근 손실 거래] 없음"
 
-        lines = ["[최근 손실 거래 — 동일 패턴 주의]"]
+        heading = "[최근 손실 거래 — 동일 패턴 주의]"
+        if len(losses) < 3:
+            heading = "[최근 손실 거래 — 저표본 참고, 현재 차트 우선]"
+        lines = [heading]
         for t in losses:
             pattern_info = f", 패턴: {t.entry_pattern}" if t.entry_pattern else ""
             rsi_info = f", RSI={t.entry_rsi:.0f}" if t.entry_rsi else ""
@@ -76,7 +89,10 @@ class FeedbackContextBuilder:
         if not wins:
             return "[최근 성공 거래] 없음"
 
-        lines = ["[최근 성공 거래 — 이런 패턴을 반복하세요]"]
+        heading = "[최근 성공 거래 — 이런 패턴을 반복하세요]"
+        if len(wins) < 3:
+            heading = "[최근 성공 거래 — 저표본 참고, 현재 차트와 함께 판단]"
+        lines = [heading]
         for t in wins:
             pattern_info = f", 패턴: {t.entry_pattern}" if t.entry_pattern else ""
             rsi_info = f", RSI={t.entry_rsi:.0f}" if t.entry_rsi else ""
@@ -113,7 +129,7 @@ class FeedbackContextBuilder:
             return f"[{current_regime} 시장에서의 이력] 데이터 없음"
 
         return (
-            f"[{current_regime} 시장 매매 성과] "
+            f"[{current_regime} 시장 매매 성과 | {self._sample_note(stat.total_trades)}] "
             f"{stat.total_trades}거래, 승률 {stat.win_rate * 100:.1f}%, "
             f"평균 수익률 {stat.avg_return:+.2f}%"
         )
@@ -135,7 +151,7 @@ class FeedbackContextBuilder:
             return ""
 
         return (
-            f"[RSI {rsi_low}~{rsi_high} 구간 매수 성과] "
+            f"[RSI {rsi_low}~{rsi_high} 구간 매수 성과 | {self._sample_note(stat.total_trades)}] "
             f"{stat.total_trades}거래, 승률 {stat.win_rate * 100:.1f}%, "
             f"평균 수익률 {stat.avg_return:+.2f}%"
         )

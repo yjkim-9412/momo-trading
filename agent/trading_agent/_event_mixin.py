@@ -111,7 +111,10 @@ class EventMixin:
                     async with event_state.cash_lock:
                         event_state.available_cash = balance.effective_cash
                         snapshot["cash"] = event_state.available_cash
+                    snapshot["cash_foreign"] = balance.cash_foreign
+                    snapshot["effective_cash_foreign"] = balance.effective_cash_foreign
                     snapshot["total_asset"] = balance.total_asset
+                    snapshot["total_asset_foreign"] = balance.total_asset_foreign
                     snapshot["holding_count"] = len(holdings)
                     holding_symbols, holding_positions = self._build_holding_snapshot(
                         holdings,

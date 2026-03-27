@@ -339,6 +339,64 @@ class TradingAgentScheduleHintTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hint["next_run_in_minutes"], 30)
         self.assertIn("ALTSEASON 국면 지속", hint["reason"])
 
+    async def test_fallback_schedule_hint_shortens_interval_when_day_buy_result_is_zero(self):
+        runtime = self.agent.get_runtime("KRX")
+        runtime.market_regime = "SIDEWAYS"
+        runtime.soft_exploration_attempted = False
+
+        with patch.object(
+            TradingAgent,
+            "_minutes_until_market_buy_cutoff",
+            return_value=120,
+        ), patch(
+            "agent.trading_agent.market_calendar.is_trading_hours",
+            return_value=True,
+        ):
+            hint = self.agent._fallback_schedule_hint(
+                "KRX",
+                results={
+                    "scanned": 5,
+                    "analyzed": 5,
+                    "signals": 0,
+                    "executed": 0,
+                    "today_buy_result_count": 0,
+                },
+                scheduled_budget_remaining=2,
+            )
+
+        self.assertEqual(hint["action"], "SCHEDULE_NEXT")
+        self.assertEqual(hint["next_run_in_minutes"], 30)
+        self.assertIn("당일 BUY 0건", hint["reason"])
+
+    async def test_fallback_schedule_hint_relaxes_to_45_after_soft_exploration_attempt(self):
+        runtime = self.agent.get_runtime("KRX")
+        runtime.market_regime = "SIDEWAYS"
+        runtime.soft_exploration_attempted = True
+
+        with patch.object(
+            TradingAgent,
+            "_minutes_until_market_buy_cutoff",
+            return_value=120,
+        ), patch(
+            "agent.trading_agent.market_calendar.is_trading_hours",
+            return_value=True,
+        ):
+            hint = self.agent._fallback_schedule_hint(
+                "KRX",
+                results={
+                    "scanned": 5,
+                    "analyzed": 5,
+                    "signals": 0,
+                    "executed": 0,
+                    "today_buy_result_count": 0,
+                },
+                scheduled_budget_remaining=2,
+            )
+
+        self.assertEqual(hint["action"], "SCHEDULE_NEXT")
+        self.assertEqual(hint["next_run_in_minutes"], 45)
+        self.assertIn("당일 BUY 0건 지속", hint["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

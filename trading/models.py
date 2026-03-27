@@ -68,9 +68,13 @@ class OrderResult(BaseModel):
 class AccountBalance(BaseModel):
     """계좌 잔고"""
     total_asset: float
+    total_asset_foreign: float = 0.0
     cash: float
+    cash_foreign: float = 0.0
     stock_value: float
+    stock_value_foreign: float = 0.0
     operating_cash: float = 0.0  # 총자산 - 주식평가 기준 현금성 자산
+    operating_cash_foreign: float = 0.0
     locked_krw: float = 0.0
     total_pnl: float
     total_pnl_rate: float
@@ -81,7 +85,9 @@ class AccountBalance(BaseModel):
     currency: str = "KRW"
     exchange_rate_to_krw: float = 1.0
     raw_cash: float = 0.0
+    raw_cash_foreign: float = 0.0
     effective_cash: float = 0.0
+    effective_cash_foreign: float = 0.0
     cash_source: str = "BROKER"
     purchase_amount: float = 0.0  # 매입금액합계 (pchs_amt_smtl_amt)
     status_message: str = ""

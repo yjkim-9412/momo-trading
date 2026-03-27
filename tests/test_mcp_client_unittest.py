@@ -175,6 +175,52 @@ class MCPClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary_mock.await_count, 2)
         holdings_mock.assert_awaited_once()
 
+    async def test_get_account_balance_normalizes_overseas_summary_units(self):
+        client = MCPClient()
+        client._rate_limit_overseas_balance = AsyncMock()
+
+        with (
+            patch(
+                "trading.kis_api.get_overseas_present_balance",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "output2": [{
+                        "crcy_cd": "USD",
+                        "frcr_dncl_amt_2": "100.000000",
+                        "frcr_drwg_psbl_amt_1": "100.000000",
+                        "frcr_evlu_amt2": "150620.000000",
+                        "frst_bltn_exrt": "1506.20000000",
+                    }],
+                    "output3": {
+                        "tot_asst_amt": "654619",
+                        "tot_evlu_pfls_amt": "0.00000000",
+                        "evlu_erng_rt1": "0.0000000000",
+                    },
+                }),
+            ),
+            patch(
+                "trading.kis_api.get_overseas_balance",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "output1": [],
+                    "output2": [],
+                }),
+            ),
+        ):
+            response = await client.get_account_balance("NASDAQ")
+
+        self.assertTrue(response.success)
+        summary = response.data["output2"][0]
+        self.assertEqual(summary["cash_foreign"], "100.000000")
+        self.assertEqual(summary["orderable_cash_foreign"], "100.000000")
+        self.assertEqual(summary["stock_value"], "150620.000000")
+        self.assertEqual(summary["total_asset"], "654619")
+        self.assertEqual(summary["total_pnl"], "0.00000000")
+        self.assertEqual(summary["total_pnl_rate"], "0.0000000000")
+        self.assertEqual(summary["exchange_rate_to_krw"], "1506.2")
+        self.assertNotIn("frcr_dncl_amt_2", summary)
+        self.assertEqual(response.data["exchange_rate_to_krw"], 1506.2)
+
     async def test_get_exchange_rate_to_krw_uses_matching_currency_row(self):
         client = MCPClient()
         client._rate_limit_overseas_balance = AsyncMock()
@@ -304,6 +350,16 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
             "scan_source": scan_source,
         }
 
+    @staticmethod
+    def _make_discovery_payload(items, *, output1=None):
+        return {
+            "success": True,
+            "rt_cd": "0",
+            "msg1": "정상처리 되었습니다.",
+            "output1": output1 or {"zdiv": "4", "stat": "무료실시간", "nrec": str(len(items))},
+            "output2": items,
+        }
+
     async def test_volume_rank_ignores_watchlist_when_discovery_succeeds(self):
         """US_DYNAMIC_DISCOVERY_ENABLED=True: discovery 성공 시 fallback seed를 섞지 않는다"""
         client = MCPClient()
@@ -314,7 +370,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "trading.kis_api.get_overseas_volume_surge",
-                new=AsyncMock(return_value={"success": True, "output1": discovery_items}),
+                new=AsyncMock(return_value=self._make_discovery_payload(discovery_items)),
             ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
             patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
@@ -398,7 +454,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "trading.kis_api.get_overseas_volume_surge",
-                new=AsyncMock(return_value={"success": True, "output1": discovery_items}),
+                new=AsyncMock(return_value=self._make_discovery_payload(discovery_items)),
             ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
             patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
@@ -422,7 +478,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "trading.kis_api.get_overseas_price_fluct",
-                new=AsyncMock(return_value={"success": True, "output1": discovery_items}),
+                new=AsyncMock(return_value=self._make_discovery_payload(discovery_items)),
             ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
             patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
@@ -446,7 +502,7 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         with (
             patch(
                 "trading.kis_api.get_overseas_price_fluct",
-                new=AsyncMock(return_value={"success": True, "output1": discovery_items}),
+                new=AsyncMock(return_value=self._make_discovery_payload(discovery_items)),
             ),
             patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=watchlist_stocks)) as watchlist_mock,
             patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
@@ -459,6 +515,49 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stocks[0]["symbol"], "M00")
         self.assertEqual(stocks[0]["scan_source"], "DISCOVERY")
         watchlist_mock.assert_not_awaited()
+
+    async def test_volume_rank_ignores_output1_metadata_row(self):
+        """output1 메타데이터 dict를 discovery 종목으로 오인하지 않는다"""
+        client = MCPClient()
+
+        with (
+            patch(
+                "trading.kis_api.get_overseas_volume_surge",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "rt_cd": "0",
+                    "msg1": "정상처리 되었습니다.",
+                    "output1": {"zdiv": "4", "stat": "무료실시간", "nrec": "100"},
+                }),
+            ),
+            patch(
+                "trading.kis_api.get_overseas_trade_growth",
+                new=AsyncMock(return_value={"success": False, "error": "unused"}),
+            ),
+            patch.object(client, "_build_watchlist_scan", new=AsyncMock(return_value=[])),
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
+        ):
+            response = await client.get_volume_rank(market="NASDAQ")
+
+        self.assertFalse(response.success)
+        self.assertEqual(response.data["stocks"], [])
+
+    async def test_fluctuation_rank_uses_gubn_for_sort_direction(self):
+        """미국 등락률 스캔은 sort 방향에 따라 GUBN을 분기한다"""
+        client = MCPClient()
+        fluctuation_mock = AsyncMock(return_value=self._make_discovery_payload([
+            {"symb": "MARA", "last": "20", "tvol": "800", "rate": "5.0"},
+        ]))
+
+        with (
+            patch("trading.kis_api.get_overseas_price_fluct", new=fluctuation_mock),
+            patch.object(settings, "US_DYNAMIC_DISCOVERY_ENABLED", True),
+        ):
+            await client.get_fluctuation_rank(market="NASDAQ", sort="top")
+            await client.get_fluctuation_rank(market="NASDAQ", sort="bottom")
+
+        self.assertEqual(fluctuation_mock.await_args_list[0].kwargs["gubn"], "1")
+        self.assertEqual(fluctuation_mock.await_args_list[1].kwargs["gubn"], "0")
 
 
 if __name__ == "__main__":

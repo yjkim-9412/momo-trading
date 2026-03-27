@@ -38,6 +38,8 @@ class MarketState:
     trading_context: str = ""
     daily_start_balance: float = 0.0
     available_cash: float = 0.0
+    today_buy_result_count: int = 0
+    soft_exploration_attempted: bool = False
     trading_date: date | None = None
     session_ids: dict[str, str | None] = field(default_factory=dict)
     active_trading_rules: dict = field(default_factory=dict)

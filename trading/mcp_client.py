@@ -105,6 +105,29 @@ class MCPClient:
             "output3_keys": sorted(output3.keys())[:8] if isinstance(output3, dict) else [],
         }
 
+    @staticmethod
+    def _summarize_us_discovery_payload(data: Any) -> dict[str, Any]:
+        """미국장 discovery 응답 요약"""
+        if not isinstance(data, dict):
+            return {"payload_type": type(data).__name__}
+
+        output = data.get("output")
+        output1 = data.get("output1")
+        output2 = data.get("output2")
+        dataframe1 = data.get("dataframe1")
+        dataframe2 = data.get("dataframe2")
+
+        return {
+            "success": data.get("success"),
+            "rt_cd": data.get("rt_cd"),
+            "msg1": data.get("msg1"),
+            "output_count": len(output) if isinstance(output, list) else int(isinstance(output, dict)),
+            "output1_count": len(output1) if isinstance(output1, list) else int(isinstance(output1, dict)),
+            "output2_count": len(output2) if isinstance(output2, list) else int(isinstance(output2, dict)),
+            "dataframe1_count": len(dataframe1) if isinstance(dataframe1, list) else int(isinstance(dataframe1, dict)),
+            "dataframe2_count": len(dataframe2) if isinstance(dataframe2, list) else int(isinstance(dataframe2, dict)),
+        }
+
     def _select_present_balance_currency_record(
         self,
         data: dict[str, Any] | None,
@@ -118,6 +141,23 @@ class MCPClient:
             if isinstance(rec, dict) and str(rec.get("crcy_cd") or "").upper() == target_currency:
                 return target_currency, rec
         return target_currency, {}
+
+    @staticmethod
+    def _normalize_overseas_balance_summary(
+        currency_record: dict[str, Any],
+        output3: dict[str, Any],
+        fx_rate: float,
+    ) -> dict[str, Any]:
+        """해외 잔고 요약값을 단위 안전한 내부 키로 정리한다."""
+        return {
+            "cash_foreign": currency_record.get("frcr_dncl_amt_2", "0"),
+            "orderable_cash_foreign": currency_record.get("frcr_drwg_psbl_amt_1", "0"),
+            "stock_value": currency_record.get("frcr_evlu_amt2", "0"),
+            "total_asset": output3.get("tot_asst_amt", "0"),
+            "total_pnl": output3.get("tot_evlu_pfls_amt", "0"),
+            "total_pnl_rate": output3.get("evlu_erng_rt1", "0"),
+            "exchange_rate_to_krw": str(fx_rate),
+        }
 
     def _normalize_overseas_order_record(
         self,
@@ -822,6 +862,80 @@ class MCPClient:
                 return [records]
         return []
 
+    def _extract_us_discovery_stocks(
+        self,
+        data: dict[str, Any],
+        market: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """미국장 discovery 응답에서 실제 종목 row만 추출"""
+        source_key = "none"
+        raw_items: list[dict[str, Any]] = []
+
+        for key in ("output2", "dataframe2", "output", "dataframe1", "output1"):
+            records = data.get(key)
+            if isinstance(records, list):
+                raw_items = [item for item in records if isinstance(item, dict)]
+                if raw_items:
+                    source_key = key
+                    break
+                continue
+            if isinstance(records, dict) and any(
+                records.get(field)
+                for field in ("symb", "symbol", "code", "pdno", "ovrs_pdno", "rsym")
+            ):
+                raw_items = [records]
+                source_key = key
+                break
+
+        normalized_items = [
+            self._normalize_stock_item(item, market)
+            for item in raw_items
+        ]
+        symbolized_items = [
+            item for item in normalized_items
+            if str(item.get("symbol", "")).strip()
+        ]
+        valid_items = [
+            item for item in symbolized_items
+            if float(item.get("price", 0) or 0) > 0
+        ]
+        diagnostics = {
+            "source_key": source_key,
+            "raw_count": len(raw_items),
+            "normalized_count": len(symbolized_items),
+            "valid_count": len(valid_items),
+        }
+        return valid_items, diagnostics
+
+    def _log_us_discovery_diagnostics(
+        self,
+        market: str,
+        rank_name: str,
+        payload_summary: dict[str, Any],
+        diagnostics: dict[str, Any],
+    ) -> None:
+        """미국장 discovery 응답 진단 로그"""
+        logger.info(
+            "[{}] 미국장 {} discovery 진단: output2 {}건, source={}, raw {}건, normalized {}건, valid {}건",
+            market,
+            rank_name,
+            payload_summary.get("output2_count", 0),
+            diagnostics.get("source_key", "none"),
+            diagnostics.get("raw_count", 0),
+            diagnostics.get("normalized_count", 0),
+            diagnostics.get("valid_count", 0),
+        )
+        if payload_summary.get("rt_cd") == "0" and diagnostics.get("valid_count", 0) == 0:
+            logger.warning(
+                "[{}] 미국장 {} discovery 응답은 성공했지만 유효 후보 0건 | {}",
+                market,
+                rank_name,
+                {
+                    "payload": payload_summary,
+                    "diagnostics": diagnostics,
+                },
+            )
+
     @staticmethod
     def _first_record(value: Any) -> dict[str, Any]:
         """dict 또는 dict 배열에서 첫 레코드 반환"""
@@ -1278,16 +1392,11 @@ class MCPClient:
             "bass_exrt",
         ), 1.0)
 
-        # _parse_balance가 기대하는 단일 요약 레코드로 정규화
-        normalized_summary = {
-            "frcr_dncl_amt_2": currency_record.get("frcr_dncl_amt_2", "0"),
-            "frcr_ord_psbl_amt1": currency_record.get("frcr_drwg_psbl_amt_1", "0"),
-            "ovrs_stck_evlu_amt": currency_record.get("frcr_evlu_amt2", "0"),
-            "tot_asst_amt": output3.get("tot_asst_amt", "0"),
-            "tot_evlu_pfls_amt": output3.get("tot_evlu_pfls_amt", "0"),
-            "evlu_pfls_rt": output3.get("evlu_erng_rt1", "0"),
-            "frst_bltn_exrt": str(fx_rate),
-        }
+        normalized_summary = self._normalize_overseas_balance_summary(
+            currency_record=currency_record,
+            output3=output3,
+            fx_rate=fx_rate,
+        )
 
         combined = {
             "output1": holdings.get("output1", []),
@@ -1531,6 +1640,7 @@ class MCPClient:
         market_code = normalize_market(market)
         if not is_domestic_market(market_code):
             discovery_stocks: list[dict[str, Any]] = []
+            rank_name = "거래량순위"
 
             if settings.US_DYNAMIC_DISCOVERY_ENABLED:
                 from trading.kis_api import get_overseas_volume_surge, get_overseas_trade_growth
@@ -1547,15 +1657,20 @@ class MCPClient:
                     )
                 result = response.data or {}
                 if response.success:
-                    items = (
-                        self._extract_records(result, "output1", "output", "dataframe1")
-                        or self._extract_records(result, "output2", "dataframe2")
+                    discovery_stocks, diagnostics = self._extract_us_discovery_stocks(
+                        result,
+                        market_code,
                     )
-                    discovery_stocks = [self._normalize_stock_item(item, market_code) for item in items]
+                    self._log_us_discovery_diagnostics(
+                        market_code,
+                        rank_name,
+                        self._summarize_us_discovery_payload(result),
+                        diagnostics,
+                    )
 
             ranked = await self._rank_us_stocks(
                 market_code,
-                "거래량순위",
+                rank_name,
                 discovery_stocks,
                 sort_key="volume",
                 reverse=True,
@@ -1643,26 +1758,33 @@ class MCPClient:
         market_code = normalize_market(market)
         if not is_domestic_market(market_code):
             discovery_stocks: list[dict[str, Any]] = []
+            rank_name = "등락률상위" if sort != "bottom" else "등락률하위"
 
             if settings.US_DYNAMIC_DISCOVERY_ENABLED:
                 from trading.kis_api import get_overseas_price_fluct
 
                 exchange = kis_exchange_code(market_code)
+                gubn = "1" if sort != "bottom" else "0"
                 response = await self._call_overseas_quote(
                     f"{market_code}:price-fluct:{sort}",
-                    lambda: get_overseas_price_fluct(exchange),
+                    lambda: get_overseas_price_fluct(exchange, gubn=gubn),
                 )
                 result = response.data or {}
                 if response.success:
-                    items = (
-                        self._extract_records(result, "output1", "output", "dataframe1")
-                        or self._extract_records(result, "output2", "dataframe2")
+                    discovery_stocks, diagnostics = self._extract_us_discovery_stocks(
+                        result,
+                        market_code,
                     )
-                    discovery_stocks = [self._normalize_stock_item(item, market_code) for item in items]
+                    self._log_us_discovery_diagnostics(
+                        market_code,
+                        rank_name,
+                        self._summarize_us_discovery_payload(result),
+                        diagnostics,
+                    )
 
             ranked = await self._rank_us_stocks(
                 market_code,
-                "등락률상위" if sort != "bottom" else "등락률하위",
+                rank_name,
                 discovery_stocks,
                 sort_key="change_rate",
                 reverse=(sort != "bottom"),

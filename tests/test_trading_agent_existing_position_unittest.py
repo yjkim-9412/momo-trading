@@ -18,15 +18,20 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
     def _balance() -> AccountBalance:
         return AccountBalance(
             total_asset=300_000_000,
+            total_asset_foreign=202_730.10,
             cash=100_000_000,
+            cash_foreign=67_576.70,
             stock_value=200_000_000,
+            stock_value_foreign=135_153.40,
             total_pnl=0.0,
             total_pnl_rate=0.0,
             market="NASDAQ",
             currency="USD",
             exchange_rate_to_krw=1479.8,
             raw_cash=100_000_000,
+            raw_cash_foreign=67_576.70,
             effective_cash=100_000_000,
+            effective_cash_foreign=67_576.70,
             cash_source="BROKER",
             is_valid=True,
         )
@@ -52,6 +57,47 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
             pnl_rate=pnl_rate,
             exchange_rate_to_krw=1479.8,
         )
+
+    def test_format_current_position_for_prompt_uses_usd_only_for_us_holdings(self):
+        text = self.agent._format_current_position_for_prompt(
+            {
+                "symbol": "PLTR",
+                "market": "NASDAQ",
+                "currency": "USD",
+                "quantity": 1000,
+                "avg_buy_price": 153.68,
+                "current_price": 149.63,
+                "pnl": -4050.0,
+                "pnl_rate": -2.64,
+                "current_value_krw": 221_421_074.0,
+                "position_pct": 73.8,
+            }
+        )
+
+        self.assertIn("평가손익: -2.64% (-4,050.00USD)", text)
+        self.assertIn("현재 비중: 73.8% (약 149,630.00USD)", text)
+        self.assertNotIn("원", text)
+
+    def test_build_account_context_does_not_convert_krw_totals_to_usd_without_foreign_snapshot(self):
+        context = self.agent._build_account_context(
+            market="NASDAQ",
+            portfolio_snapshot={
+                "cash": 100_000_000,
+                "total_asset": 300_000_000,
+                "holding_count": 0,
+            },
+            current_position=None,
+            dynamic_limits={"max_single_order_krw": 30_000_000, "max_position_pct": 25.0, "min_cash_ratio": 0.05},
+            current_price=149.63,
+            currency="USD",
+            exchange_rate_to_krw=1479.8,
+            orderable_amount_context=None,
+        )
+
+        self.assertIn("총자산: 조회값 없음 (USD)", context["text"])
+        self.assertIn("가용 현금: 조회값 없음 (USD)", context["text"])
+        self.assertNotIn("202,730.10USD", context["text"])
+        self.assertNotIn("67,576.70USD", context["text"])
 
     async def test_tier1_prompt_includes_current_position_and_account_context(self):
         chart_result = ChartAnalysisResult(
@@ -98,7 +144,10 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 portfolio_snapshot={
                     "cash": 100_000_000,
+                    "cash_foreign": 67_576.70,
+                    "effective_cash_foreign": 67_576.70,
                     "total_asset": 300_000_000,
+                    "total_asset_foreign": 202_730.10,
                     "holding_count": 1,
                 },
                 current_position=current_position,
@@ -118,10 +167,60 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("### 현재 종목 포지션", prompt)
         self.assertIn("보유 수량: 1000주", prompt)
         self.assertIn("### 계좌 상태", prompt)
-        self.assertIn("브로커 잔고 현금", prompt)
-        self.assertIn("이 종목 기준 주문가능금액", prompt)
+        self.assertIn("실주문 기준 현금", prompt)
+        self.assertIn("총자산: 202,730.10USD", prompt)
+        self.assertIn("4,392.00USD", prompt)
         self.assertIn("현재 이 종목 비중: 73.8%", prompt)
+        self.assertNotIn("300,000,000원", prompt)
+        self.assertNotIn("6,500,000원", prompt)
         self.assertNotIn("### 기존 보유 계획 상태", prompt)
+
+    async def test_tier2_review_formats_us_prompt_without_krw_values(self):
+        with patch(
+            "agent.trading_agent.llm_factory.generate_tier2",
+            AsyncMock(return_value=('{"approved": true, "action": "HOLD", "confidence": 0.41, "reason": "관망", "risk_warnings": []}', "CODEX_CLI")),
+        ) as tier2_mock:
+            await self.agent._tier2_review(
+                symbol="PLTR",
+                name="팔란티어 테크",
+                current_price=149.63,
+                strategy_type="STABLE_SHORT",
+                tier1_analysis={
+                    "market": "NASDAQ",
+                    "currency": "USD",
+                    "exchange_rate_to_krw": 1479.8,
+                    "confidence": 0.72,
+                },
+                market="NASDAQ",
+                market_context="시장 컨텍스트 없음",
+                trading_context="현재 세션: US_REGULAR",
+                portfolio_snapshot={
+                    "cash": 100_000_000,
+                    "cash_foreign": 67_576.70,
+                    "effective_cash_foreign": 67_576.70,
+                    "total_asset": 100_000_000,
+                    "total_asset_foreign": 67_576.70,
+                    "holding_count": 0,
+                },
+                dynamic_limits={
+                    "max_single_order_krw": 30_000_000,
+                    "max_position_pct": 100.0,
+                    "min_cash_ratio": 0.0,
+                },
+                orderable_amount_context={
+                    "orderable_amount_source": "INQUIRE_PSAMOUNT",
+                    "orderable_amount_krw": 6_500_000,
+                    "orderable_amount_foreign": 4_392.0,
+                    "orderable_qty": 43,
+                },
+                cycle_id="cycle-tier2-1",
+            )
+
+        prompt = tier2_mock.await_args.args[0]
+        self.assertIn("실주문 기준 현금: 4,392.00USD", prompt)
+        self.assertIn("종목당 최대: 4,392.00USD", prompt)
+        self.assertNotIn("환산 참고", prompt)
+        self.assertNotIn("6,500,000원", prompt)
 
     async def test_crypto_tier1_analysis_falls_back_to_change_price_when_change_is_direction_string(self):
         chart_result = ChartAnalysisResult(

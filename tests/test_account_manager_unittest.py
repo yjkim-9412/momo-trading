@@ -107,6 +107,73 @@ class AccountManagerBalanceTest(unittest.TestCase):
         self.assertEqual(balance.raw_total_pnl_rate, 1.23)
         self.assertEqual(balance.pnl_source, "HOLDINGS_SUM")
 
+    def test_parse_balance_converts_real_us_cash_from_foreign_to_krw(self):
+        settings.KIS_ACCOUNT_TYPE = "REAL"
+        holdings = [
+            HoldingInfo(
+                symbol="NVDA",
+                name="NVIDIA",
+                market="NASDAQ",
+                currency="USD",
+                quantity=1,
+                avg_buy_price=95.0,
+                current_price=100.0,
+                pnl=5.0,
+                pnl_rate=5.26,
+                exchange_rate_to_krw=1506.2,
+            )
+        ]
+        data = {
+            "output2": [{
+                "cash_foreign": "100.000000",
+                "orderable_cash_foreign": "100.000000",
+                "stock_value": "150620.000000",
+                "total_asset": "654619",
+                "total_pnl": "0.00000000",
+                "total_pnl_rate": "0.0000000000",
+                "exchange_rate_to_krw": "1506.20000000",
+            }],
+        }
+
+        balance = self.manager._parse_balance(data, holdings=holdings, market="NASDAQ")
+
+        self.assertAlmostEqual(balance.cash, 150620.0)
+        self.assertAlmostEqual(balance.raw_cash, 150620.0)
+        self.assertAlmostEqual(balance.effective_cash, 150620.0)
+        self.assertAlmostEqual(balance.cash_foreign, 100.0)
+        self.assertAlmostEqual(balance.raw_cash_foreign, 100.0)
+        self.assertAlmostEqual(balance.effective_cash_foreign, 100.0)
+        self.assertAlmostEqual(balance.stock_value, 150620.0)
+        self.assertAlmostEqual(balance.stock_value_foreign, 100.0)
+        self.assertAlmostEqual(balance.total_asset, 654619.0)
+        self.assertAlmostEqual(balance.total_asset_foreign, 200.0)
+        self.assertAlmostEqual(balance.operating_cash, 503999.0)
+        self.assertAlmostEqual(balance.operating_cash_foreign, 100.0)
+        self.assertEqual(balance.cash_source, "BROKER")
+        self.assertEqual(balance.currency, "KRW")
+        self.assertAlmostEqual(balance.exchange_rate_to_krw, 1506.2)
+
+    def test_parse_balance_does_not_convert_krw_total_asset_back_to_usd_without_foreign_components(self):
+        settings.KIS_ACCOUNT_TYPE = "REAL"
+        data = {
+            "output2": [{
+                "cash_foreign": "0",
+                "orderable_cash_foreign": "0",
+                "stock_value": "150620.000000",
+                "total_asset": "654619",
+                "total_pnl": "0.00000000",
+                "total_pnl_rate": "0.0000000000",
+                "exchange_rate_to_krw": "1506.20000000",
+            }],
+        }
+
+        balance = self.manager._parse_balance(data, holdings=[], market="NASDAQ")
+
+        self.assertEqual(balance.cash_foreign, 0.0)
+        self.assertEqual(balance.effective_cash_foreign, 0.0)
+        self.assertEqual(balance.stock_value_foreign, 0.0)
+        self.assertEqual(balance.total_asset_foreign, 0.0)
+
     def test_parse_balance_uses_domestic_deposit_when_orderable_missing(self):
         data = {
             "output2": [{

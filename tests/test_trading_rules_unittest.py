@@ -139,6 +139,58 @@ class TradingRuleEngineScopeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(session.added[0].param_name, "stop_loss_pct")
 
+    async def test_generate_rules_from_review_clamps_stock_min_confidence_on_low_sample_day(self):
+        engine = TradingRuleEngine()
+        session = _FakeSession()
+        parsed_review = {
+            "trade_evaluation": {"total_trades": 2},
+            "action_items": [
+                {
+                    "rule_type": "PARAM_OVERRIDE",
+                    "apply_scope": "STABLE_SHORT",
+                    "param_name": "min_confidence",
+                    "param_value": 0.68,
+                    "reason": "저표본 손실 방어",
+                }
+            ],
+        }
+
+        with patch("analysis.feedback.trading_rules.AsyncSessionLocal", new=lambda: _FakeSessionContext(session)):
+            rules = await engine.generate_rules_from_review(
+                parsed_review,
+                report_date="2026-03-27",
+                market_scope="KRX",
+            )
+
+        self.assertEqual(len(rules), 1)
+        self.assertAlmostEqual(rules[0].param_value, 0.58)
+
+    async def test_generate_rules_from_review_clamps_stock_rr_floor_relative_to_regime_default(self):
+        engine = TradingRuleEngine()
+        session = _FakeSession()
+        parsed_review = {
+            "trade_evaluation": {"total_trades": 6},
+            "action_items": [
+                {
+                    "rule_type": "PARAM_OVERRIDE",
+                    "apply_scope": "BULL",
+                    "param_name": "rr_floor",
+                    "param_value": 1.4,
+                    "reason": "강세장 RR 강화",
+                }
+            ],
+        }
+
+        with patch("analysis.feedback.trading_rules.AsyncSessionLocal", new=lambda: _FakeSessionContext(session)):
+            rules = await engine.generate_rules_from_review(
+                parsed_review,
+                report_date="2026-03-27",
+                market_scope="KRX",
+            )
+
+        self.assertEqual(len(rules), 1)
+        self.assertAlmostEqual(rules[0].param_value, 1.1)
+
 
 class RiskManagerRRFloorTest(unittest.TestCase):
     def test_normalize_crypto_regime_maps_legacy_aliases(self):

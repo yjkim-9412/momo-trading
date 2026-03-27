@@ -9,12 +9,18 @@ async def test_admin_account_balance_exposes_effective_cash(client, monkeypatch)
     async def fake_get_balance(market=None):
         return AccountBalance(
             total_asset=369166161,
+            total_asset_foreign=254597.35,
             cash=0,
+            cash_foreign=0,
             raw_cash=0,
+            raw_cash_foreign=0,
             effective_cash=368635000,
+            effective_cash_foreign=254231.03,
             operating_cash=368635000,
+            operating_cash_foreign=254231.03,
             cash_source="TOTAL_ASSET_PROXY",
             stock_value=531161,
+            stock_value_foreign=366.32,
             total_pnl=-249.441,
             total_pnl_rate=-0.05,
             raw_total_pnl=7497.903,
@@ -36,6 +42,9 @@ async def test_admin_account_balance_exposes_effective_cash(client, monkeypatch)
     assert payload["raw_cash"] == 0
     assert payload["effective_cash"] == 368635000
     assert payload["operating_cash"] == 368635000
+    assert payload["total_asset_foreign"] == 254597.35
+    assert payload["effective_cash_foreign"] == 254231.03
+    assert payload["stock_value_foreign"] == 366.32
     assert payload["cash_source"] == "TOTAL_ASSET_PROXY"
     assert payload["total_pnl"] == -249.441
     assert payload["raw_total_pnl"] == 7497.903
@@ -80,12 +89,18 @@ async def test_admin_account_overview_returns_combined_payload(client, monkeypat
         return AccountOverview(
             balance=AccountBalance(
                 total_asset=369166161,
+                total_asset_foreign=254597.35,
                 cash=0,
+                cash_foreign=0,
                 raw_cash=0,
+                raw_cash_foreign=0,
                 effective_cash=368635000,
+                effective_cash_foreign=254231.03,
                 operating_cash=368635000,
+                operating_cash_foreign=254231.03,
                 cash_source="TOTAL_ASSET_PROXY",
                 stock_value=531161,
+                stock_value_foreign=366.32,
                 total_pnl=-249.441,
                 total_pnl_rate=-0.05,
                 raw_total_pnl=7497.903,
@@ -136,6 +151,9 @@ async def test_admin_account_overview_returns_combined_payload(client, monkeypat
     payload = response.json()["data"]
     assert payload["balance"]["effective_cash"] == 368635000
     assert payload["balance"]["operating_cash"] == 368635000
+    assert payload["balance"]["total_asset_foreign"] == 254597.35
+    assert payload["balance"]["effective_cash_foreign"] == 254231.03
+    assert payload["balance"]["stock_value_foreign"] == 366.32
     assert payload["balance"]["market"] == "NASDAQ"
     assert payload["holdings"][0]["symbol"] == "NVDA"
     assert payload["pending_orders"][0]["order_id"] == "123456"

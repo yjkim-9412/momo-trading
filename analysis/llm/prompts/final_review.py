@@ -86,11 +86,11 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 - 종목: {stock_name} ({symbol})
 - 시장/통화: {market} / {currency}
 - 현재가: {current_price_text}
-- 환산 참고: 1{currency} ≈ {exchange_rate_to_krw:,.2f}원
+{exchange_rate_line}
 - 전략 유형: {strategy_type}
 
 ### 투자 가능 금액
-- 종목당 최대: {max_amount:,.0f}원
+- 종목당 최대: {max_amount_text}
 - 현재가 기준 최대 수량: {max_quantity}주
 - 현재 보유 종목 수: {holding_count}개
 - 현재 이 종목 비중: {current_position_pct:.1f}%
@@ -140,7 +140,7 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 - BUY 승인 시 `entry_price`, `target_price`, `stop_loss_price`, `take_profit_price`, `planned_hold_days`를 모두 반드시 채우세요
 - Long 기준 가격 관계는 `stop_loss_price < entry_price < take_profit_price <= target_price` 를 지키세요
 
-**주의**: 아래 JSON은 필드 구조 설명입니다. entry_price/target_price/stop_loss_price/take_profit_price는 반드시 `{currency}` 기준으로 작성하세요. 원화는 투자금 한도와 환산 참고용이며 가격 필드에 넣지 마세요.
+**주의**: 아래 JSON은 필드 구조 설명입니다. entry_price/target_price/stop_loss_price/take_profit_price는 반드시 `{currency}` 기준으로 작성하세요. 투자금 한도는 위 계좌 상태/투자 가능 금액 섹션을 따르며 가격 필드에 넣지 마세요.
 - confidence: 이 매매가 손절 전에 목표가에 도달할 확률 (0.00~1.00)
 - position_intent: NEW / ADD_ON_PYRAMID / ADD_ON_AVERAGE_DOWN / HOLD
 
@@ -224,7 +224,7 @@ STOCK_CLOSE_REVIEW_PROMPT = """## 장마감 보유 재검토 요청
 - 종목: {stock_name} ({symbol})
 - 시장/통화: {market} / {currency}
 - 현재가: {current_price_text}
-- 환산 참고: 1{currency} ≈ {exchange_rate_to_krw:,.2f}원
+{exchange_rate_line}
 - 전략 유형: {strategy_type}
 
 ### 기존 보유 계획
@@ -278,6 +278,7 @@ Tier 1 AI가 수행한 코인 분석을 **독립적으로 검증**하고, 최종
 - **Tier1 BUY + 신뢰도 0.70 이상 → 승인이 원칙**
 - REJECT은 논리적 오류, 데이터 불일치가 명백할 때만
 - 과거 손실 이력만으로 자동 거부 금지, 현재 기술적 근거 우선 판단
+- 과거 피드백이 `저표본 참고`로 표시되면 자동 거부 근거로 쓰지 말고 현재 차트/거래량 근거보다 앞세우지 마세요
 - 강세 국면(BULL_RUN/ALTSEASON/THEME)에서는 Tier1 BUY가 체크리스트를 통과하면 막연한 불안감만으로 HOLD로 돌리지 말고 BUY를 우선 검토하세요
 
 ## 시장 국면별 체크리스트 적용

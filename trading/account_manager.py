@@ -103,6 +103,17 @@ class AccountManager:
             for holding in holdings
         )
 
+    @staticmethod
+    def _calculate_holdings_stock_value_foreign(holdings: list[HoldingInfo] | None) -> float:
+        """보유 종목 현재가 합계를 시장 원통화 기준으로 계산한다."""
+        if not holdings:
+            return 0.0
+        return sum(
+            holding.current_price * holding.quantity
+            for holding in holdings
+            if holding.currency != "KRW"
+        )
+
     def _resolve_krx_cash_values(self, summary: dict) -> tuple[float, float, str]:
         """국내장 현금성 지표를 예수금/가용현금 기준으로 정리한다."""
         deposit_cash = self._to_float(
@@ -113,10 +124,71 @@ class AccountManager:
             return deposit_cash, self._to_float(orderable_value), "BROKER_ORDERABLE"
         return deposit_cash, deposit_cash, "BROKER_DEPOSIT"
 
+    def _resolve_overseas_cash_krw(self, summary: dict, exchange_rate: float) -> float:
+        """해외 잔고 현금성 지표를 KRW 기준으로 정규화한다."""
+        explicit_cash_krw = self._to_float(
+            self._first_value(
+                summary,
+                "cash_krw",
+                "orderable_cash_krw",
+                "cash",
+                "ovrs_ord_psbl_amt",
+            )
+        )
+        if explicit_cash_krw > 0:
+            return explicit_cash_krw
+
+        foreign_cash = self._to_float(
+            self._first_value(summary, "cash_foreign", "frcr_dncl_amt_2")
+        )
+        if foreign_cash > 0 and exchange_rate > 0:
+            return foreign_cash * exchange_rate
+
+        foreign_orderable_cash = self._to_float(
+            self._first_value(summary, "orderable_cash_foreign", "frcr_ord_psbl_amt1")
+        )
+        if foreign_orderable_cash > 0 and exchange_rate > 0:
+            return foreign_orderable_cash * exchange_rate
+
+        return 0.0
+
     @staticmethod
     def _calculate_operating_cash(total_asset: float, stock_value: float) -> float:
         """주식평가를 제외한 현금성 자산을 계산한다."""
         return max(total_asset - stock_value, 0.0)
+
+    def _resolve_overseas_display_values(
+        self,
+        summary: dict,
+        holdings: list[HoldingInfo] | None,
+    ) -> dict[str, float]:
+        """미국장 표시용 외화 자산 값을 계산한다.
+
+        미국장 UI/프롬프트 표시는 실제 보유 USD 기준만 사용한다.
+        KRW 정규화 필드를 다시 USD처럼 환산해서 보여주지 않는다.
+        """
+        cash_foreign = self._to_float(
+            self._first_value(summary, "cash_foreign", "frcr_dncl_amt_2")
+        )
+        orderable_cash_foreign = self._to_float(
+            self._first_value(summary, "orderable_cash_foreign", "frcr_drwg_psbl_amt_1")
+        )
+        stock_value_foreign = self._calculate_holdings_stock_value_foreign(holdings)
+        total_asset_foreign = 0.0
+        if cash_foreign > 0 or stock_value_foreign > 0:
+            total_asset_foreign = cash_foreign + stock_value_foreign
+
+        raw_cash_foreign = cash_foreign
+        effective_cash_foreign = orderable_cash_foreign if orderable_cash_foreign > 0 else cash_foreign
+        operating_cash_foreign = cash_foreign
+        return {
+            "cash_foreign": cash_foreign,
+            "raw_cash_foreign": raw_cash_foreign,
+            "effective_cash_foreign": effective_cash_foreign,
+            "operating_cash_foreign": operating_cash_foreign,
+            "stock_value_foreign": stock_value_foreign,
+            "total_asset_foreign": total_asset_foreign,
+        }
 
     def _log_krx_balance_mismatch(
         self,
@@ -311,17 +383,11 @@ class AccountManager:
                     is_valid=not is_error_payload,
                 )
 
-            cash = self._to_float(
-                self._first_value(
-                    summary,
-                    "cash",
-                    "dnca_tot_amt",
-                    "ord_psbl_amt",
-                    "ovrs_ord_psbl_amt",
-                    "frcr_dncl_amt_2",
-                    "frcr_ord_psbl_amt1",
-                )
+            exchange_rate = self._to_float(
+                self._first_value(summary, "exchange_rate_to_krw", "bass_exrt", "frst_bltn_exrt"),
+                1.0,
             )
+            cash = self._resolve_overseas_cash_krw(summary, exchange_rate)
 
             stock_value = self._calculate_holdings_stock_value(holdings)
             if stock_value <= 0:
@@ -374,23 +440,26 @@ class AccountManager:
                 total_pnl_rate,
                 holdings,
             )
-
-            exchange_rate = self._to_float(
-                self._first_value(summary, "exchange_rate_to_krw", "bass_exrt", "frst_bltn_exrt"),
-                1.0,
-            )
             effective_cash, cash_source = self._resolve_effective_cash(
                 normalized_market,
                 cash,
                 total_asset,
                 stock_value,
             )
+            display_foreign = self._resolve_overseas_display_values(
+                summary,
+                holdings,
+            )
 
             return AccountBalance(
                 total_asset=total_asset,
+                total_asset_foreign=display_foreign["total_asset_foreign"],
                 cash=cash,
+                cash_foreign=display_foreign["cash_foreign"],
                 stock_value=stock_value,
+                stock_value_foreign=display_foreign["stock_value_foreign"],
                 operating_cash=operating_cash,
+                operating_cash_foreign=display_foreign["operating_cash_foreign"],
                 locked_krw=0.0,
                 total_pnl=total_pnl,
                 total_pnl_rate=total_pnl_rate,
@@ -401,7 +470,9 @@ class AccountManager:
                 currency="KRW",
                 exchange_rate_to_krw=exchange_rate,
                 raw_cash=cash,
+                raw_cash_foreign=display_foreign["raw_cash_foreign"],
                 effective_cash=effective_cash,
+                effective_cash_foreign=display_foreign["effective_cash_foreign"],
                 cash_source=cash_source,
                 status_message=str(data.get("msg1") or ""),
                 is_valid=not is_error_payload,

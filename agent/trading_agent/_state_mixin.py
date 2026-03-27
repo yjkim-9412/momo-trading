@@ -57,6 +57,8 @@ class StateMixin:
             runtime.liquidation_complete = False
             runtime.daily_start_balance = 0.0
             runtime.available_cash = 0.0
+            runtime.today_buy_result_count = 0
+            runtime.soft_exploration_attempted = False
             runtime.market_context = ""
             runtime.trading_context = ""
             runtime.market_regime = ""

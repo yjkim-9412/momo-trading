@@ -1,6 +1,6 @@
 // ── app-account.js — Account display for KRX/US markets (ES module) ──
 
-import { state, API, formatAmount, formatSignedAmount, convertKrwToUsd } from './app-state.js';
+import { state, API, formatAmount, formatSignedAmount } from './app-state.js';
 import { fetchJSON, formatKRW, formatKRWFull, refreshIcons } from '../shared/admin-core.js';
 
 // ── Account Info ──
@@ -81,15 +81,7 @@ export function renderBalance(data, market) {
   var pnlColor = totalPnl >= 0 ? 'text-green-400' : 'text-red-400';
   // Cash source badge (US only)
   if (badgeEl) {
-    if (isUS) {
-      badgeEl.classList.remove('hidden');
-      badgeEl.textContent = data.cash_source === 'TOTAL_ASSET_PROXY' ? '\uCD1D\uC790\uC0B0 \uD504\uB85D\uC2DC' : '\uBE0C\uB85C\uCEE4 \uD604\uAE08';
-      badgeEl.className = data.cash_source === 'TOTAL_ASSET_PROXY'
-        ? 'px-2 py-0.5 rounded-full text-[11px] bg-sky-500/15 text-sky-300'
-        : 'px-2 py-0.5 rounded-full text-[11px] bg-slate-800 text-gray-300';
-    } else {
-      badgeEl.classList.add('hidden');
-    }
+    badgeEl.classList.add('hidden');
   }
   el.replaceChildren();
   if (isUS) {
@@ -130,28 +122,33 @@ function _balanceDetailWrapper() {
 }
 
 function _renderBalanceUS(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor, exchangeRate) {
-  var totalAssetUsd = convertKrwToUsd(data.total_asset, exchangeRate);
-  var effectiveCashUsd = convertKrwToUsd(effectiveCash, exchangeRate);
-  var rawCashUsd = convertKrwToUsd(rawCash, exchangeRate);
-  var operatingCashUsd = convertKrwToUsd(operatingCash, exchangeRate);
-  var stockValueUsd = convertKrwToUsd(data.stock_value, exchangeRate);
-  el.appendChild(_dualRow('\uCD1D\uC790\uC0B0', formatAmount(totalAssetUsd, 'USD'), formatAmount(data.total_asset, 'KRW'), 'text-white font-medium'));
-  el.appendChild(_dualRow('\uC190\uC775', formatSignedAmount(totalPnlRate, 'PCT'), formatSignedAmount(totalPnl, 'KRW'), pnlColor));
-  var detail = _balanceDetailWrapper();
-  el.appendChild(detail.toggle);
-  var bd = detail.body;
-  bd.appendChild(_dualRow('\uC2E4\uC8FC\uBB38 \uAE30\uC900 \uD604\uAE08', formatAmount(effectiveCashUsd, 'USD'), formatAmount(effectiveCash, 'KRW'), 'text-sky-300 font-medium'));
-  if (Math.abs(effectiveCash - rawCash) >= 1)
-    bd.appendChild(_dualRow('\uBE0C\uB85C\uCEE4 \uD604\uAE08', formatAmount(rawCashUsd, 'USD'), formatAmount(rawCash, 'KRW'), 'text-gray-300'));
-  if (Math.abs(operatingCash - effectiveCash) >= 1)
-    bd.appendChild(_dualRow('\uC8FC\uC2DD \uC81C\uC678 \uD604\uAE08', formatAmount(operatingCashUsd, 'USD'), formatAmount(operatingCash, 'KRW'), 'text-gray-300'));
-  bd.appendChild(_dualRow('\uC8FC\uC2DD \uD3C9\uAC00', formatAmount(stockValueUsd, 'USD'), formatAmount(data.stock_value, 'KRW'), 'text-gray-200'));
-  if (shouldShowRawPnl(data))
-    bd.appendChild(_dualRow('\uBE0C\uB85C\uCEE4 \uC694\uC57D \uC190\uC775', formatSignedAmount(rawTotalPnlRate, 'PCT'), formatSignedAmount(rawTotalPnl, 'KRW'), 'text-gray-400'));
-  bd.appendChild(_noteRow('\uD658\uC728 ' + (exchangeRate ? exchangeRate.toFixed(2) : '-') + ' KRW/USD'));
-  if (data.pnl_source === 'HOLDINGS_SUM') bd.appendChild(_noteRow('\uBAA8\uC758\uD22C\uC790 \uC190\uC775\uC740 \uBCF4\uC720\uC885\uBAA9 \uAE30\uC900\uC73C\uB85C \uC7AC\uACC4\uC0B0\uD569\uB2C8\uB2E4.'));
-  if (data.status_message) bd.appendChild(_noteRow(data.status_message, 'text-gray-500'));
-  el.appendChild(bd);
+  var totalAssetUsd = Number(data.total_asset_foreign || 0);
+  var effectiveCashUsd = Number(data.effective_cash_foreign || 0) || Number(data.cash_foreign || 0);
+  var stockValueUsd = Number(data.stock_value_foreign || 0);
+  var totalPnlUsd = exchangeRate > 0 ? (Number(totalPnl || 0) / exchangeRate) : 0;
+  var hero = document.createElement('div');
+  hero.className = 'mb-1';
+  var heroLabel = document.createElement('div');
+  heroLabel.className = 'text-[11px] text-gray-500';
+  heroLabel.textContent = '\uCD1D\uC790\uC0B0';
+  var heroValue = document.createElement('div');
+  heroValue.className = 'text-sm text-white font-semibold';
+  heroValue.textContent = totalAssetUsd > 0 ? formatAmount(totalAssetUsd, 'USD') : '\uC870\uD68C\uAC12 \uC5C6\uC74C';
+  hero.appendChild(heroLabel);
+  hero.appendChild(heroValue);
+  el.appendChild(hero);
+  var sep = document.createElement('div');
+  sep.className = 'border-t border-gray-700/50 my-1';
+  el.appendChild(sep);
+  el.appendChild(_singleRow('\uC8FC\uBB38\uAC00\uB2A5 \uD604\uAE08', effectiveCashUsd > 0 ? formatAmount(effectiveCashUsd, 'USD') : '\uC870\uD68C\uAC12 \uC5C6\uC74C', 'text-sky-300 font-medium'));
+  el.appendChild(_singleRow('\uC8FC\uC2DD \uD3C9\uAC00', stockValueUsd > 0 ? formatAmount(stockValueUsd, 'USD') : '\uC870\uD68C\uAC12 \uC5C6\uC74C', 'text-gray-200'));
+  el.appendChild(
+    _singleRow(
+      '\uC190\uC775',
+      formatSignedAmount(totalPnlUsd, 'USD') + ' (' + formatSignedAmount(totalPnlRate, 'PCT') + ')',
+      pnlColor,
+    ),
+  );
 }
 
 function _renderBalanceKRX(el, data, effectiveCash, rawCash, operatingCash, totalPnl, totalPnlRate, rawTotalPnl, rawTotalPnlRate, pnlColor) {
@@ -313,8 +310,6 @@ export function renderHoldings(data, market) {
 }
 
 function _buildUSHoldingCard(card, h, pnlColor, currency, evalAmt) {
-  var evalAmtKrw = evalAmt * (h.exchange_rate_to_krw || 0);
-  var pnlKrw = h.pnl * (h.exchange_rate_to_krw || 0);
   // Row 1: name + pnl rate
   var r1 = document.createElement('div');
   r1.className = 'flex justify-between items-center gap-2';
@@ -337,20 +332,17 @@ function _buildUSHoldingCard(card, h, pnlColor, currency, evalAmt) {
   card.appendChild(r1);
   // Row 2: avg + current
   card.appendChild(_flexRow('\uD3C9\uB2E8 ' + formatAmount(h.avg_buy_price, currency), '\uD604\uC7AC ' + formatAmount(h.current_price, currency), 'text-gray-400'));
-  // Row 3: eval
-  card.appendChild(_flexRow('\uD3C9\uAC00 ' + formatAmount(evalAmt, currency), formatAmount(evalAmtKrw, 'KRW'), 'text-gray-500'));
-  // Row 4: pnl
-  var r4 = document.createElement('div');
-  r4.className = 'flex justify-between text-gray-500';
-  var p1 = document.createElement('span');
-  p1.className = pnlColor;
-  p1.textContent = formatSignedAmount(h.pnl, currency);
-  var p2 = document.createElement('span');
-  p2.className = pnlColor;
-  p2.textContent = formatSignedAmount(pnlKrw, 'KRW');
-  r4.appendChild(p1);
-  r4.appendChild(p2);
-  card.appendChild(r4);
+  // Row 3: eval + pnl
+  var r3 = document.createElement('div');
+  r3.className = 'flex justify-between text-gray-500';
+  var evalEl = document.createElement('span');
+  evalEl.textContent = '\uD3C9\uAC00 ' + formatAmount(evalAmt, currency);
+  var pnlEl = document.createElement('span');
+  pnlEl.className = pnlColor;
+  pnlEl.textContent = formatSignedAmount(h.pnl, currency);
+  r3.appendChild(evalEl);
+  r3.appendChild(pnlEl);
+  card.appendChild(r3);
 }
 
 function _buildKRXHoldingCard(card, h, pnlColor, currency, evalAmt) {
@@ -444,7 +436,6 @@ export function renderPendingOrders(data, market) {
 }
 
 function _buildUSPendingCard(card, o, sideColor, currency, orderAmt, timeStr) {
-  var orderAmtKrw = orderAmt * (o.exchange_rate_to_krw || 0);
   // Row 1: name + side
   var r1 = document.createElement('div');
   r1.className = 'flex justify-between items-center gap-2';
@@ -466,7 +457,7 @@ function _buildUSPendingCard(card, o, sideColor, currency, orderAmt, timeStr) {
   r1.appendChild(sideEl);
   card.appendChild(r1);
   card.appendChild(_flexRow('\uBBF8\uCCB4\uACB0 ' + o.remaining_qty + '\uC8FC / ' + o.order_qty + '\uC8FC', formatAmount(o.order_price, currency), 'text-gray-400'));
-  card.appendChild(_flexRow(formatAmount(orderAmt, currency) + ' \u00b7 ' + formatAmount(orderAmtKrw, 'KRW'), timeStr, 'text-gray-500'));
+  card.appendChild(_flexRow(formatAmount(orderAmt, currency), timeStr, 'text-gray-500'));
 }
 
 function _buildKRXPendingCard(card, o, sideColor, currency, orderAmt, timeStr) {

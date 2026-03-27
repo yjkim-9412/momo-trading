@@ -11,7 +11,7 @@ from core.database import AsyncSessionLocal
 from models.coin_trading_rule import CoinTradingRule
 from models.trading_rule import TradingRule
 from trading.market_profile import MARKET_SCOPE_CRYPTO, normalize_market_scope
-from trading.risk_policy import normalize_crypto_regime
+from trading.risk_policy import BULL_THEME_RR_FLOOR, DEFENSIVE_RR_FLOOR, normalize_crypto_regime
 from util.time_util import now_kst
 
 # ──────────────────────────────────────────────
@@ -32,6 +32,16 @@ DEFAULT_EXPIRY_DAYS = 5
 STRATEGY_SCOPES = {"ALL", "STABLE_SHORT", "AGGRESSIVE_SHORT"}
 STOCK_REGIME_SCOPES = {"ALL", "BULL", "BEAR", "SIDEWAYS", "THEME"}
 CRYPTO_REGIME_SCOPES = {"ALL", "BULL_RUN", "BEAR_MARKET", "CONSOLIDATION", "ALTSEASON", "THEME"}
+STOCK_MIN_CONF_CAPS = {
+    "ALL": 0.58,
+    "STABLE_SHORT": 0.60,
+    "AGGRESSIVE_SHORT": 0.63,
+}
+STOCK_LOW_SAMPLE_MIN_CONF_CAPS = {
+    "ALL": 0.56,
+    "STABLE_SHORT": 0.58,
+    "AGGRESSIVE_SHORT": 0.60,
+}
 
 # 부트스트랩: 항상 활성화해야 할 기본 검증 규칙
 BOOTSTRAP_RULES = [
@@ -100,6 +110,46 @@ class TradingRuleEngine:
             return TradingRule(market_scope=normalize_market_scope(market_scope), **kwargs)
         return CoinTradingRule(**kwargs)
 
+    @staticmethod
+    def _extract_review_trade_count(parsed_review: dict) -> int:
+        trade_eval = parsed_review.get("trade_evaluation") or {}
+        for key in ("total_trades", "loss_trades", "profitable_trades"):
+            value = trade_eval.get(key)
+            try:
+                numeric = int(value)
+            except (TypeError, ValueError):
+                continue
+            if key == "total_trades":
+                return max(0, numeric)
+        wins = trade_eval.get("profitable_trades")
+        losses = trade_eval.get("loss_trades")
+        try:
+            return max(0, int(wins or 0) + int(losses or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _stock_rr_cap(target_scope: str, *, sample_size: int) -> float:
+        delta = 0.05 if sample_size < 4 else 0.10
+        base = BULL_THEME_RR_FLOOR if target_scope in {"BULL", "THEME"} else DEFENSIVE_RR_FLOOR
+        return round(base + delta, 4)
+
+    @classmethod
+    def _apply_stock_guardrails(
+        cls,
+        *,
+        param_name: str,
+        target_scope: str,
+        value: float,
+        sample_size: int,
+    ) -> float:
+        if param_name == "min_confidence":
+            caps = STOCK_LOW_SAMPLE_MIN_CONF_CAPS if sample_size < 4 else STOCK_MIN_CONF_CAPS
+            return min(float(value), float(caps.get(target_scope, caps["ALL"])))
+        if param_name == "rr_floor":
+            return min(float(value), cls._stock_rr_cap(target_scope, sample_size=sample_size))
+        return value
+
     # ──────────────────────────────────────────
     # 규칙 생성
     # ──────────────────────────────────────────
@@ -120,6 +170,7 @@ class TradingRuleEngine:
         now = now_kst()
         rules: list[TradingRule | CoinTradingRule] = []
         allowed_param_names = self._allowed_param_names(scope)
+        review_trade_count = self._extract_review_trade_count(parsed_review)
 
         for item in action_items:
             param_name = item.get("param_name", "")
@@ -164,6 +215,24 @@ class TradingRuleEngine:
                     "[TradingRule] {} 값 클램핑: {} → {} (범위 {}~{})",
                     param_name, raw_value, clamped, lo, hi,
                 )
+
+            if scope != MARKET_SCOPE_CRYPTO:
+                guarded = self._apply_stock_guardrails(
+                    param_name=param_name,
+                    target_scope=target_scope,
+                    value=clamped,
+                    sample_size=review_trade_count,
+                )
+                if guarded != clamped:
+                    logger.info(
+                        "[TradingRule] 주식 가드레일 적용: {} {} {} → {} (sample={})",
+                        target_scope,
+                        param_name,
+                        clamped,
+                        guarded,
+                        review_trade_count,
+                    )
+                clamped = guarded
 
             rule = self._build_rule(
                 rule_model,

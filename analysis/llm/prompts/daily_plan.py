@@ -83,6 +83,8 @@ DAILY_PLAN_PROMPT = """## 장 마감 데이트레이딩 성과 리뷰
 위 피드백에서 도출된 **구체적 파라미터 변경**을 action_items에 기록하세요.
 - 시스템이 코드 레벨에서 자동으로 강제 적용합니다 (프롬프트 제안이 아닌 하드 강제)
 - action_items는 가장 중요한 3~5개만 제안하세요. 우선순위가 낮은 세부 조정은 제외하세요.
+- 표본이 작을 때(당일 실제 체결 4건 미만) 과도한 과최적화 금지: 빈 배열 [] 또는 0.02~0.05 수준의 완만한 조정만 고려하세요.
+- `min_confidence`는 동일 문제가 반복되고 표본이 충분할 때만 올리세요. 작은 표본만 보고 0.60을 크게 넘기는 강화는 피하세요.
 - 사용 가능한 param_name:
   - min_confidence: 최소 신뢰도 임계값 (0.50~0.90) — Tier1 결과가 이 값 미만이면 Tier2 진행 차단
   - rr_floor: 최소 리스크:보상 비율 (0.8~3.0)
@@ -90,8 +92,8 @@ DAILY_PLAN_PROMPT = """## 장 마감 데이트레이딩 성과 리뷰
   - min_confidence는 `ALL`, `STABLE_SHORT`, `AGGRESSIVE_SHORT` 중 하나
   - rr_floor는 `ALL`, `BULL`, `BEAR`, `SIDEWAYS`, `THEME` 중 하나
 - 변경이 불필요하면 빈 배열 []로 두세요
-- 예시 1: 오늘 62% 신뢰도 종목이 손실 → {{"param_name": "min_confidence", "apply_scope": "ALL", "param_value": 0.75}}
-- 예시 2: BULL 국면에서 RR이 너무 낮아 손실 → {{"param_name": "rr_floor", "apply_scope": "BULL", "param_value": 1.3}}
+- 예시 1: 오늘 62% 신뢰도 종목이 반복 손실이고 표본이 충분 → {{"param_name": "min_confidence", "apply_scope": "ALL", "param_value": 0.58}}
+- 예시 2: BULL 국면에서 RR이 조금 낮아 손실 반복 → {{"param_name": "rr_floor", "apply_scope": "BULL", "param_value": 1.1}}
 
 JSON 형식으로 답변:
 ```json

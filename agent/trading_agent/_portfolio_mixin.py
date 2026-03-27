@@ -12,6 +12,7 @@ from services.activity_logger import activity_logger
 from trading.enums import ActivityPhase, ActivityType
 from trading.market_profile import (
     is_crypto_market,
+    is_us_market,
     market_currency,
     normalize_market,
     normalize_market_scope,
@@ -179,20 +180,27 @@ class PortfolioMixin:
         currency = str(position.get("currency") or "KRW")
         quantity = normalize_quantity(position.get("quantity") or 0, market_code)
         avg_buy_price = float(position.get("avg_buy_price") or 0.0)
+        current_price = float(position.get("current_price") or 0.0)
         pnl = float(position.get("pnl") or 0.0)
         pnl_rate = float(position.get("pnl_rate") or 0.0)
         position_pct = float(position.get("position_pct") or 0.0)
         current_value_krw = float(position.get("current_value_krw") or 0.0)
+        market_value = current_price * quantity if current_price > 0 and quantity > 0 else avg_buy_price * quantity
 
         price_text = f"{avg_buy_price:,.0f}원" if currency == "KRW" else f"{avg_buy_price:,.2f}{currency}"
         pnl_text = f"{pnl:+,.0f}원" if currency == "KRW" else f"{pnl:+,.2f}{currency}"
+        position_value_text = (
+            f"약 {market_value:,.2f}{currency}"
+            if is_us_market(market_code) and currency != "KRW"
+            else f"약 {current_value_krw:,.0f}원"
+        )
         return "\n".join(
             [
                 f"- 현재 보유 여부: 보유 중",
                 f"- 보유 수량: {format_quantity_with_unit(quantity, market_code)}",
                 f"- 평균단가: {price_text}",
                 f"- 평가손익: {pnl_rate:+.2f}% ({pnl_text})",
-                f"- 현재 비중: {position_pct:.1f}% (약 {current_value_krw:,.0f}원)",
+                f"- 현재 비중: {position_pct:.1f}% ({position_value_text})",
                 "- 해석: 이미 보유 중인 종목이므로 신규 진입보다 추가매수 필요성 검증이 우선입니다.",
             ]
         )
@@ -238,13 +246,17 @@ class PortfolioMixin:
         snap = portfolio_snapshot or {}
         market_code = normalize_market(market)
         total_asset = float(snap.get("total_asset") or 0.0)
+        snapshot_total_asset_foreign = float(snap.get("total_asset_foreign") or 0.0)
         broker_cash_krw = float(snap.get("cash") or 0.0)
+        snapshot_cash_foreign = float(snap.get("cash_foreign") or 0.0)
+        snapshot_effective_cash_foreign = float(snap.get("effective_cash_foreign") or 0.0)
         holding_count = int(snap.get("holding_count") or 0)
         cash_ratio = (broker_cash_krw / total_asset * 100) if total_asset > 0 else 0.0
 
         current_position_value_krw = float((current_position or {}).get("current_value_krw") or 0.0)
         current_position_pct = float((current_position or {}).get("position_pct") or 0.0)
         unit_price_krw = current_price if currency == "KRW" else current_price * float(exchange_rate_to_krw or 1.0)
+        exchange_rate = float(exchange_rate_to_krw or 0.0)
 
         orderable_context = orderable_amount_context or {}
         orderable_amount_source: str | None = orderable_context.get("orderable_amount_source") or None
@@ -260,6 +272,16 @@ class PortfolioMixin:
         cash_cap_krw = broker_cash_krw
         if symbol_orderable_amount_krw is not None:
             cash_cap_krw = symbol_orderable_amount_krw
+        cash_cap_foreign = None
+        broker_cash_foreign = None
+        if symbol_orderable_amount_foreign is not None and symbol_orderable_amount_foreign > 0:
+            cash_cap_foreign = symbol_orderable_amount_foreign
+        elif snapshot_effective_cash_foreign > 0:
+            cash_cap_foreign = snapshot_effective_cash_foreign
+        elif snapshot_cash_foreign > 0:
+            cash_cap_foreign = snapshot_cash_foreign
+        if snapshot_cash_foreign > 0:
+            broker_cash_foreign = snapshot_cash_foreign
 
         limits = self._resolve_effective_limits(dynamic_limits, market_code)
         hard_caps: list[float] = [max(cash_cap_krw, 0.0)]
@@ -280,18 +302,73 @@ class PortfolioMixin:
             if total_asset > 0
             else current_position_pct
         )
+        use_foreign_display = is_us_market(market_code) and currency != "KRW"
+        total_asset_foreign = (
+            snapshot_total_asset_foreign
+            if use_foreign_display and snapshot_total_asset_foreign > 0
+            else None
+        )
+        current_position_value_foreign = (
+            float((current_position or {}).get("current_price") or 0.0)
+            * float((current_position or {}).get("quantity") or 0.0)
+            if use_foreign_display
+            else None
+        )
+        if use_foreign_display:
+            if abs(max_additional_amount - cash_cap_krw) < 0.01:
+                max_additional_amount_foreign = cash_cap_foreign
+            else:
+                max_additional_amount_foreign = (
+                    max_additional_amount / exchange_rate if exchange_rate > 0 else None
+                )
+        else:
+            max_additional_amount_foreign = None
+
+        def _format_display_amount(
+            amount_krw: float,
+            *,
+            amount_foreign: float | None = None,
+        ) -> str:
+            if use_foreign_display:
+                resolved_foreign = amount_foreign
+                if resolved_foreign is not None:
+                    return f"{resolved_foreign:,.2f}{currency}"
+                return f"조회값 없음 ({currency})"
+            return f"{amount_krw:,.0f}원"
 
         add_label = "추가매수 가능 최대" if current_position_value_krw > 0 else "신규 진입 가능 최대"
-        lines = [
-            f"- 총자산: {total_asset:,.0f}원",
-            f"- 브로커 잔고 현금: {broker_cash_krw:,.0f}원 (현금비율 {cash_ratio:.1f}%)",
+        lines = [f"- 총자산: {_format_display_amount(total_asset, amount_foreign=total_asset_foreign)}"]
+        if use_foreign_display:
+            if orderable_amount_source and symbol_orderable_amount_krw is not None:
+                qty_text = (
+                    format_quantity_with_unit(symbol_orderable_qty, market_code)
+                    if symbol_orderable_qty is not None and symbol_orderable_qty > 0
+                    else "수량 정보 없음"
+                )
+                lines.append(
+                    f"- 실주문 기준 현금: "
+                    f"{_format_display_amount(cash_cap_krw, amount_foreign=symbol_orderable_amount_foreign or cash_cap_foreign)} "
+                    f"(최대 {qty_text}, 현금비율 {cash_ratio:.1f}%)"
+                )
+            elif orderable_error:
+                lines.append(f"- 실주문 기준 현금: 조회 실패 ({orderable_error})")
+            else:
+                lines.append(
+                    f"- 가용 현금: "
+                    f"{_format_display_amount(broker_cash_krw, amount_foreign=broker_cash_foreign)} "
+                    f"(현금비율 {cash_ratio:.1f}%)"
+                )
+        else:
+            lines.append(f"- 브로커 잔고 현금: {broker_cash_krw:,.0f}원 (현금비율 {cash_ratio:.1f}%)")
+
+        lines.extend([
             f"- 현재 보유 종목 수: {holding_count}개",
             f"- 현재 이 종목 비중: {current_position_pct:.1f}%",
-            f"- {add_label}: {max_additional_amount:,.0f}원",
+            f"- {add_label}: {_format_display_amount(max_additional_amount, amount_foreign=max_additional_amount_foreign)}",
             f"- 현재가 기준 최대 수량: {format_quantity(max_additional_quantity, market_code)}",
             f"- 하드 가드 기준 최대 집행 시 예상 합산 비중: {projected_combined_position_pct:.1f}%",
-        ]
-        if orderable_amount_source and symbol_orderable_amount_krw is not None:
+        ])
+        if orderable_amount_source and symbol_orderable_amount_krw is not None and not is_us_market(market_code):
             foreign_text = f"{symbol_orderable_amount_foreign:,.2f}{currency}"
             qty_text = (
                 format_quantity_with_unit(symbol_orderable_qty, market_code)
@@ -299,7 +376,7 @@ class PortfolioMixin:
                 else "수량 정보 없음"
             )
             lines.insert(2, f"- 이 종목 기준 주문가능금액: {symbol_orderable_amount_krw:,.0f}원 ({foreign_text}, 최대 {qty_text})")
-        elif orderable_error:
+        elif orderable_error and not is_us_market(market_code):
             lines.insert(2, f"- 이 종목 기준 주문가능금액: 조회 실패 ({orderable_error})")
 
         return {
@@ -311,13 +388,23 @@ class PortfolioMixin:
             "holding_count": holding_count,
             "current_position_pct": current_position_pct,
             "current_position_value_krw": current_position_value_krw,
+            "current_position_value_foreign": current_position_value_foreign,
             "max_additional_amount": max_additional_amount,
+            "max_additional_amount_foreign": max_additional_amount_foreign,
             "max_additional_quantity": max_additional_quantity,
             "projected_combined_position_pct": projected_combined_position_pct,
             "max_position_pct": limits["max_position_pct"],
             "min_cash_ratio": limits["min_cash_ratio"],
             "symbol_orderable_amount_krw": symbol_orderable_amount_krw,
             "symbol_orderable_amount_foreign": symbol_orderable_amount_foreign,
+            "available_cash_foreign": cash_cap_foreign,
+            "total_asset_foreign": total_asset_foreign,
+            "total_asset_text": _format_display_amount(total_asset, amount_foreign=total_asset_foreign),
+            "max_additional_amount_text": _format_display_amount(
+                max_additional_amount,
+                amount_foreign=max_additional_amount_foreign,
+            ),
+            "use_foreign_display": use_foreign_display,
             "symbol_orderable_qty": symbol_orderable_qty,
             "orderable_amount_source": orderable_amount_source,
         }
@@ -737,6 +824,51 @@ class PortfolioMixin:
                 return result.scalar() or 0
         except Exception as e:
             logger.warning("당일 체결 건수 조회 실패: {}", str(e))
+            return 0
+
+    async def _get_today_buy_result_count(self, market: str | None = None) -> int:
+        """당일 최종 BUY 결과 건수 조회 (추천 + AI 주문 생성 기준)"""
+        try:
+            from sqlalchemy import func, select
+            from models.order import Order
+            from models.recommendation import Recommendation
+            from models.stock import Stock
+            from trading.market_profile import MARKET_SCOPE_CRYPTO, markets_for_scope
+
+            scope = normalize_market_scope(market or settings.primary_market_code)
+            if scope == MARKET_SCOPE_CRYPTO:
+                return 0
+
+            trading_date = market_calendar.market_date(market=scope)
+            start, end = market_calendar.market_day_bounds(scope, trading_date)
+
+            async with AsyncSessionLocal() as session:
+                recommendation_count = await session.scalar(
+                    select(func.count(Recommendation.id))
+                    .select_from(Recommendation)
+                    .join(Stock, Stock.id == Recommendation.stock_id)
+                    .where(
+                        Stock.market.in_(markets_for_scope(scope)),
+                        Recommendation.action == "BUY",
+                        Recommendation.created_at >= start,
+                        Recommendation.created_at <= end,
+                    )
+                )
+                order_count = await session.scalar(
+                    select(func.count(Order.id))
+                    .select_from(Order)
+                    .join(Stock, Stock.id == Order.stock_id)
+                    .where(
+                        Stock.market.in_(markets_for_scope(scope)),
+                        Order.side == "BUY",
+                        Order.source == "AI",
+                        Order.created_at >= start,
+                        Order.created_at <= end,
+                    )
+                )
+                return int(recommendation_count or 0) + int(order_count or 0)
+        except Exception as e:
+            logger.warning("당일 BUY 결과 건수 조회 실패: {}", str(e))
             return 0
 
     # ── 유틸 ──

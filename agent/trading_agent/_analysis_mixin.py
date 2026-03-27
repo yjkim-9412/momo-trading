@@ -60,7 +60,11 @@ from trading.quantity_policy import (
     has_quantity,
     normalize_quantity,
 )
-from trading.risk_policy import get_crypto_trading_style_profile, resolve_crypto_rr_floor
+from trading.risk_policy import (
+    get_crypto_trading_style_profile,
+    resolve_crypto_rr_floor,
+    resolve_rr_floor,
+)
 
 from agent.trading_agent._types import _ENTRY_MODE_NEW
 
@@ -94,6 +98,129 @@ class AnalysisMixin:
         if normalized is None:
             normalized = default
         return max(minimum, normalized)
+
+    @staticmethod
+    def _resolve_rule_min_confidence(
+        strategy_type: str,
+        param_overrides: dict | None,
+    ) -> float | None:
+        rule_min_conf = None
+        for scope_name in [strategy_type, "ALL"]:
+            value = (param_overrides or {}).get(scope_name, {}).get("min_confidence")
+            if value is None:
+                continue
+            numeric = AnalysisMixin._try_float(value)
+            if numeric is None:
+                continue
+            if rule_min_conf is None or numeric > rule_min_conf:
+                rule_min_conf = numeric
+        return rule_min_conf
+
+    def _resolve_runtime_rr_floor(
+        self,
+        *,
+        market_scope_code: str,
+        market_regime: str,
+        active_rules: dict | None,
+        runtime_rr_overrides: dict[str, float] | None,
+ㅈ    ) -> float:
+        rr_overrides = (active_rules or {}).get("rr_floor_overrides", {})
+        merged_rr_overrides = {
+            **(runtime_rr_overrides or {}),
+            **rr_overrides,
+        }
+        if market_scope_code == "CRYPTO":
+            return resolve_crypto_rr_floor(
+                market_regime,
+                settings.crypto_trading_style_mode,
+                merged_rr_overrides,
+            )
+        return risk_manager.resolve_rr_floor(
+            market_regime,
+            merged_rr_overrides,
+        )
+
+    @staticmethod
+    def _resolve_strategy_default_min_confidence(strategy) -> float:
+        value = AnalysisMixin._try_float(getattr(strategy, "min_confidence", None))
+        if value is not None:
+            return value
+        return 0.5
+
+    def _build_soft_explore_overlay(
+        self,
+        *,
+        market_scope_code: str,
+        strategy,
+        market_regime: str,
+        rule_min_conf: float | None,
+        min_rr: float | None,
+    ) -> dict[str, float]:
+        if market_scope_code == "CRYPTO":
+            return {}
+
+        overlay: dict[str, float] = {}
+        if rule_min_conf is not None:
+            strategy_default = self._resolve_strategy_default_min_confidence(strategy)
+            relaxed_min_conf = max(strategy_default, round(float(rule_min_conf) - 0.05, 4))
+            if relaxed_min_conf < float(rule_min_conf):
+                overlay["min_confidence"] = relaxed_min_conf
+
+        if min_rr is not None:
+            default_rr = float(resolve_rr_floor(market_regime, None))
+            relaxed_rr = max(default_rr, round(float(min_rr) - 0.10, 4))
+            if relaxed_rr < float(min_rr):
+                overlay["rr_floor"] = relaxed_rr
+
+        return overlay
+
+    def _build_soft_explore_candidate(
+        self,
+        *,
+        stock_info: dict,
+        analysis: dict,
+        strategy_type: str,
+        market_code: str,
+        gate_type: str,
+        gate_reason: str,
+        overlay: dict[str, float],
+        tier1_confidence: float,
+        rule_min_conf: float | None = None,
+        code_rr: float | None = None,
+        min_rr: float | None = None,
+    ) -> dict | None:
+        if market_scope(market_code) == "CRYPTO" or not overlay:
+            return None
+
+        rank_score = 999.0
+        if gate_type == "CONFIDENCE":
+            relaxed_min_conf = self._try_float(overlay.get("min_confidence"))
+            if relaxed_min_conf is None or tier1_confidence < relaxed_min_conf:
+                return None
+            rank_score = max(0.0, float(rule_min_conf or relaxed_min_conf) - tier1_confidence)
+        elif gate_type == "RR":
+            relaxed_rr = self._try_float(overlay.get("rr_floor"))
+            if relaxed_rr is None or code_rr is None or code_rr < relaxed_rr:
+                return None
+            rank_score = max(0.0, float(min_rr or relaxed_rr) - float(code_rr))
+        else:
+            return None
+
+        return {
+            "symbol": str(stock_info.get("symbol") or "").upper(),
+            "market": market_code,
+            "strategy_type": strategy_type,
+            "stock_info": dict(stock_info),
+            "tier1_analysis": dict(analysis),
+            "overlay": dict(overlay),
+            "gate_type": gate_type,
+            "gate_reason": gate_reason,
+            "tier1_confidence": float(tier1_confidence or 0.0),
+            "rule_min_confidence": rule_min_conf,
+            "code_rr": code_rr,
+            "min_rr": min_rr,
+            "rank_score": round(rank_score, 4),
+        }
 
     @staticmethod
     def _parse_trade_notes(notes: str | None) -> dict:
@@ -394,6 +521,9 @@ class AnalysisMixin:
         dynamic_limits: dict | None = None,
         portfolio_snapshot: dict | None = None,
         executed_count_ref: Callable | None = None,
+        tier1_override: dict | None = None,
+        soft_explore_overlay: dict | None = None,
+        soft_explore_mode: bool = False,
     ) -> dict:
         """개별 종목 분석 → 전략 평가 → 매매 결정"""
         symbol = stock_info.get("symbol", "")
@@ -428,7 +558,12 @@ class AnalysisMixin:
                 event_parts.append(f"이벤트 감지값: 가격 {price_text}, 변동률 {change_text}")
             analysis_trading_context = "\n".join(event_parts)
 
-        result = {"symbol": symbol, "signal": False, "executed": False}
+        result = {
+            "symbol": symbol,
+            "signal": False,
+            "executed": False,
+            "soft_explored": soft_explore_mode,
+        }
 
         # 피드백 하드 룰: 연속 손실 차단 (매수만 차단, 매도는 허용)
         try:
@@ -670,44 +805,63 @@ class AnalysisMixin:
             logger.warning("피드백 컨텍스트 빌드 실패: {}", str(e))
 
         # 3d. Tier 1 AI 심층 분석
-        t1_timer = activity_logger.timer()
-        await activity_logger.log(
-            ActivityType.TIER1_ANALYSIS, ActivityPhase.START,
-            f"\U0001f4ca [{name}] Tier1 분석 시작",
-            cycle_id=cycle_id, symbol=symbol,
-            detail=self._enrich_activity_detail(None, product_context),
-        )
-
+        t1_elapsed = 0
         price_payload = dict(price_resp.data or {})
         if market_code and not price_payload.get("market"):
             price_payload["market"] = market_code
 
-        analysis = await self._tier1_analysis(
-            symbol, name, current_price, chart_result,
-            price_payload, feedback_context,
-            market=market_code,
-            product_context=product_context,
-            current_position_context=current_position_context,
-            portfolio_snapshot=snap,
-            current_position=current_position,
-            dynamic_limits=dynamic_limits,
-            market_context=mkt_state.market_context,
-            trading_context=analysis_trading_context,
-            orderable_amount_context=orderable_amount_context,
-            cycle_id=cycle_id,
-        )
-        t1_elapsed = activity_logger.elapsed_ms(t1_timer)
-
-        if not analysis:
+        if tier1_override is not None:
+            analysis = dict(tier1_override)
             await activity_logger.log(
-                ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
-                f"\U0001f4ca [{name}] Tier1: 분석 실패 (응답 파싱 불가)",
-                cycle_id=cycle_id, symbol=symbol,
-                detail=self._enrich_activity_detail({"reason": "응답 파싱 불가"}, product_context),
-                llm_tier="TIER1",
-                execution_time_ms=t1_elapsed,
+                ActivityType.TRADING_RULE,
+                ActivityPhase.PROGRESS,
+                f"🧪 [{name}] 당일 BUY 0건 soft 탐색 재평가",
+                cycle_id=cycle_id,
+                symbol=symbol,
+                detail=self._enrich_activity_detail(
+                    {
+                        "soft_explore_mode": True,
+                        "gate_overlay": dict(soft_explore_overlay or {}),
+                        "reason": "기존 Tier1 결과 재사용",
+                    },
+                    product_context,
+                ),
             )
-            return result
+        else:
+            t1_timer = activity_logger.timer()
+            await activity_logger.log(
+                ActivityType.TIER1_ANALYSIS, ActivityPhase.START,
+                f"\U0001f4ca [{name}] Tier1 분석 시작",
+                cycle_id=cycle_id, symbol=symbol,
+                detail=self._enrich_activity_detail(None, product_context),
+            )
+
+            analysis = await self._tier1_analysis(
+                symbol, name, current_price, chart_result,
+                price_payload, feedback_context,
+                market=market_code,
+                product_context=product_context,
+                current_position_context=current_position_context,
+                portfolio_snapshot=snap,
+                current_position=current_position,
+                dynamic_limits=dynamic_limits,
+                market_context=mkt_state.market_context,
+                trading_context=analysis_trading_context,
+                orderable_amount_context=orderable_amount_context,
+                cycle_id=cycle_id,
+            )
+            t1_elapsed = activity_logger.elapsed_ms(t1_timer)
+
+            if not analysis:
+                await activity_logger.log(
+                    ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
+                    f"\U0001f4ca [{name}] Tier1: 분석 실패 (응답 파싱 불가)",
+                    cycle_id=cycle_id, symbol=symbol,
+                    detail=self._enrich_activity_detail({"reason": "응답 파싱 불가"}, product_context),
+                    llm_tier="TIER1",
+                    execution_time_ms=t1_elapsed,
+                )
+                return result
 
         recommendation = analysis.get("recommendation", "HOLD")
 
@@ -757,26 +911,27 @@ class AnalysisMixin:
             )
             return result
 
-        await activity_logger.log(
-            ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
-            f"\U0001f4ca [{name}] Tier1 완료: {analysis.get('recommendation', '')} "
-            f"| 신뢰도 {(analysis.get('confidence') or 0):.0%}",
-            cycle_id=cycle_id, symbol=symbol,
-            detail=self._enrich_activity_detail(
-                {
-                    "recommendation": analysis.get("recommendation"),
-                    "reason": analysis.get("reason") or analysis.get("summary", ""),
-                    "target_price": analysis.get("target_price"),
-                    "stop_loss": analysis.get("stop_loss_price"),
-                    **orderable_detail,
-                },
-                product_context,
-            ),
-            llm_provider=analysis.get("provider"),
-            llm_tier="TIER1",
-            execution_time_ms=t1_elapsed,
-            confidence=analysis.get("confidence"),
-        )
+        if not soft_explore_mode:
+            await activity_logger.log(
+                ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
+                f"\U0001f4ca [{name}] Tier1 완료: {analysis.get('recommendation', '')} "
+                f"| 신뢰도 {(analysis.get('confidence') or 0):.0%}",
+                cycle_id=cycle_id, symbol=symbol,
+                detail=self._enrich_activity_detail(
+                    {
+                        "recommendation": analysis.get("recommendation"),
+                        "reason": analysis.get("reason") or analysis.get("summary", ""),
+                        "target_price": analysis.get("target_price"),
+                        "stop_loss": analysis.get("stop_loss_price"),
+                        **orderable_detail,
+                    },
+                    product_context,
+                ),
+                llm_provider=analysis.get("provider"),
+                llm_tier="TIER1",
+                execution_time_ms=t1_elapsed,
+                confidence=analysis.get("confidence"),
+            )
 
         # ── [하드 게이트] 트레이딩 규칙 기반 검증 (Tier2 진행 전) ──
         tier1_confidence = analysis.get("confidence") or 0
@@ -785,18 +940,56 @@ class AnalysisMixin:
         _validation_flags = active_rules.get("validation_flags", {})
 
         # (A) 신뢰도 게이트
-        rule_min_conf = None
-        for scope in [strategy_type, "ALL"]:
-            val = _param_overrides.get(scope, {}).get("min_confidence")
-            if val is not None and (rule_min_conf is None or val > rule_min_conf):
-                rule_min_conf = val
+        rule_min_conf = self._resolve_rule_min_confidence(strategy_type, _param_overrides)
+        effective_min_conf = self._try_float((soft_explore_overlay or {}).get("min_confidence"))
+        if effective_min_conf is None:
+            effective_min_conf = rule_min_conf
 
-        if rule_min_conf and tier1_confidence < rule_min_conf:
+        if effective_min_conf and tier1_confidence < effective_min_conf:
+            soft_candidate = None
+            if not soft_explore_mode:
+                strategy = mkt_state.strategies.get(strategy_type)
+                overlay = self._build_soft_explore_overlay(
+                    market_scope_code=scope,
+                    strategy=strategy,
+                    market_regime=mkt_state.market_regime,
+                    rule_min_conf=rule_min_conf,
+                    min_rr=None,
+                )
+                soft_candidate = self._build_soft_explore_candidate(
+                    stock_info=stock_info,
+                    analysis=analysis,
+                    strategy_type=strategy_type,
+                    market_code=market_code,
+                    gate_type="CONFIDENCE",
+                    gate_reason="confidence_gate",
+                    overlay=overlay,
+                    tier1_confidence=float(tier1_confidence),
+                    rule_min_conf=rule_min_conf,
+                )
+                if soft_candidate:
+                    result["soft_explore_candidate"] = soft_candidate
             await activity_logger.log(
                 ActivityType.TRADING_RULE, ActivityPhase.SKIP,
-                f"🚫 [{name}] 신뢰도 게이트 차단: {tier1_confidence:.0%} < "
-                f"규칙 최소 {rule_min_conf:.0%} (일일 리뷰 피드백)",
-                cycle_id=cycle_id, symbol=symbol,
+                (
+                    f"🚫 [{name}] soft 탐색 신뢰도 재평가 미달: {tier1_confidence:.0%} < "
+                    f"완화 기준 {effective_min_conf:.0%}"
+                    if soft_explore_mode
+                    else f"🚫 [{name}] 신뢰도 게이트 차단: {tier1_confidence:.0%} < "
+                    f"규칙 최소 {rule_min_conf:.0%} (일일 리뷰 피드백)"
+                ),
+                cycle_id=cycle_id,
+                symbol=symbol,
+                detail=self._enrich_activity_detail(
+                    {
+                        "tier1_confidence": tier1_confidence,
+                        "rule_min_confidence": rule_min_conf,
+                        "effective_min_confidence": effective_min_conf,
+                        "soft_explore_mode": soft_explore_mode,
+                        "soft_explore_candidate": bool(result.get("soft_explore_candidate")),
+                    },
+                    product_context,
+                ),
             )
             return result
 
@@ -811,30 +1004,66 @@ class AnalysisMixin:
 
                 if code_risk > 0:
                     code_rr = code_reward / code_risk
-                    rr_overrides = active_rules.get("rr_floor_overrides", {})
-                    merged_rr_overrides = {
-                        **(mkt_state.rr_floor_overrides or {}),
-                        **rr_overrides,
-                    }
-                    if scope == "CRYPTO":
-                        min_rr = resolve_crypto_rr_floor(
-                            mkt_state.market_regime,
-                            settings.crypto_trading_style_mode,
-                            merged_rr_overrides,
-                        )
-                    else:
-                        min_rr = risk_manager.resolve_rr_floor(
-                            mkt_state.market_regime,
-                            merged_rr_overrides,
-                        )
-                    if code_rr < min_rr:
+                    min_rr = self._resolve_runtime_rr_floor(
+                        market_scope_code=scope,
+                        market_regime=mkt_state.market_regime,
+                        active_rules=active_rules,
+                        runtime_rr_overrides=mkt_state.rr_floor_overrides,
+                    )
+                    effective_min_rr = self._try_float((soft_explore_overlay or {}).get("rr_floor"))
+                    if effective_min_rr is None:
+                        effective_min_rr = min_rr
+
+                    if code_rr < effective_min_rr:
+                        if not soft_explore_mode:
+                            strategy = mkt_state.strategies.get(strategy_type)
+                            overlay = self._build_soft_explore_overlay(
+                                market_scope_code=scope,
+                                strategy=strategy,
+                                market_regime=mkt_state.market_regime,
+                                rule_min_conf=None,
+                                min_rr=min_rr,
+                            )
+                            soft_candidate = self._build_soft_explore_candidate(
+                                stock_info=stock_info,
+                                analysis=analysis,
+                                strategy_type=strategy_type,
+                                market_code=market_code,
+                                gate_type="RR",
+                                gate_reason="rr_floor_gate",
+                                overlay=overlay,
+                                tier1_confidence=float(tier1_confidence),
+                                code_rr=code_rr,
+                                min_rr=min_rr,
+                            )
+                            if soft_candidate:
+                                result["soft_explore_candidate"] = soft_candidate
                         await activity_logger.log(
                             ActivityType.TRADING_RULE, ActivityPhase.SKIP,
-                            f"🚫 [{name}] RR 비율 검증 실패: "
-                            f"코드 계산 {code_rr:.2f}:1 < 최소 {min_rr}:1 "
-                            f"(target={t1_target:,.0f}, stop={t1_stop:,.0f}, "
-                            f"현재가={current_price:,.0f})",
-                            cycle_id=cycle_id, symbol=symbol,
+                            (
+                                f"🚫 [{name}] soft 탐색 RR 재평가 미달: "
+                                f"{code_rr:.2f}:1 < 완화 기준 {effective_min_rr}:1 "
+                                f"(target={t1_target:,.0f}, stop={t1_stop:,.0f}, 현재가={current_price:,.0f})"
+                                if soft_explore_mode
+                                else f"🚫 [{name}] RR 비율 검증 실패: "
+                                f"코드 계산 {code_rr:.2f}:1 < 최소 {min_rr}:1 "
+                                f"(target={t1_target:,.0f}, stop={t1_stop:,.0f}, 현재가={current_price:,.0f})"
+                            ),
+                            cycle_id=cycle_id,
+                            symbol=symbol,
+                            detail=self._enrich_activity_detail(
+                                {
+                                    "code_rr": round(code_rr, 4),
+                                    "min_rr": min_rr,
+                                    "effective_min_rr": effective_min_rr,
+                                    "target_price": t1_target,
+                                    "stop_loss_price": t1_stop,
+                                    "current_price": current_price,
+                                    "soft_explore_mode": soft_explore_mode,
+                                    "soft_explore_candidate": bool(result.get("soft_explore_candidate")),
+                                },
+                                product_context,
+                            ),
                         )
                         return result
                 elif code_risk == 0 and analysis.get("recommendation") == "BUY":
@@ -1760,7 +1989,15 @@ class AnalysisMixin:
         market_code = normalize_market(market or price_data.get("market", settings.primary_market_code))
         scope = market_scope(market_code)
         currency = price_data.get("currency", market_currency(market_code))
-        exchange_rate_to_krw = float(price_data.get("exchange_rate_to_krw", 1.0) or 1.0)
+        exchange_rate_to_krw = float(price_data.get("exchange_rate_to_krw", 0.0) or 0.0)
+        if exchange_rate_to_krw <= 0 and currency != "KRW":
+            price_krw_hint = self._try_float(price_data.get("price_krw"))
+            if price_krw_hint is not None and price_krw_hint > 0 and current_price > 0:
+                exchange_rate_to_krw = price_krw_hint / current_price
+            elif current_position:
+                exchange_rate_to_krw = float(current_position.get("exchange_rate_to_krw") or 0.0)
+        if exchange_rate_to_krw <= 0:
+            exchange_rate_to_krw = 1.0
         account_context = self._build_account_context(
             market=market_code,
             portfolio_snapshot=portfolio_snapshot,
@@ -1905,6 +2142,9 @@ class AnalysisMixin:
             market_code,
             trading_style_mode=settings.crypto_trading_style_mode if scope == "CRYPTO" else None,
         )
+        exchange_rate_line = ""
+        if currency != "KRW" and not bool(account_context.get("use_foreign_display")):
+            exchange_rate_line = f"- 환산 참고: 1{currency} ≈ {exchange_rate_to_krw:,.2f}원"
         prompt = review_prompt_template.format(
             tier1_analysis=json.dumps(tier1_prompt_payload, ensure_ascii=False, indent=2),
             stock_name=name,
@@ -1918,8 +2158,10 @@ class AnalysisMixin:
             product_context=self._format_product_context_for_prompt(product_context),
             current_price_text=current_price_text,
             trade_value_text=trade_value_text,
+            exchange_rate_line=exchange_rate_line,
             exchange_rate_to_krw=exchange_rate_to_krw,
             strategy_type=strategy_type,
+            max_amount_text=account_context["max_additional_amount_text"],
             max_amount=account_context["max_additional_amount"] or 0,
             max_quantity=format_quantity(account_context["max_additional_quantity"] or 0, market_code),
             holding_count=snap.get("holding_count") or 0,
@@ -2220,6 +2462,7 @@ class AnalysisMixin:
             current_price_text=(
                 f"{current_price:,.2f}원" if currency == "KRW" else f"{current_price:,.2f}{currency}"
             ),
+            exchange_rate_line="" if is_us_market(market_code) or currency == "KRW" else f"- 환산 참고: 1{currency} ≈ {exchange_rate_to_krw:,.2f}원",
             exchange_rate_to_krw=exchange_rate_to_krw,
             strategy_type=getattr(trade_result, "strategy_type", "") or "",
             planned_hold_days=trade_plan["planned_hold_days"],

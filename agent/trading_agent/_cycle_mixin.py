@@ -245,6 +245,9 @@ class CycleMixin:
             "analyzed": 0,
             "signals": 0,
             "executed": 0,
+            "today_buy_result_count": 0,
+            "soft_explored": 0,
+            "soft_exploration_attempted": False,
             "selected_symbols": [],
         }
         selected_watchlist: list[dict[str, object]] = []
@@ -255,6 +258,7 @@ class CycleMixin:
             "holding_symbols": [],
             "holding_positions": {},
             "today_trade_count": 0,
+            "today_buy_result_count": 0,
         }
         prefetched_snapshot = None
         prefetched_balance = None
@@ -463,7 +467,10 @@ class CycleMixin:
                     else:
                         balance_ok = True
                         snapshot["cash"] = balance.effective_cash
+                        snapshot["cash_foreign"] = balance.cash_foreign
+                        snapshot["effective_cash_foreign"] = balance.effective_cash_foreign
                         snapshot["total_asset"] = balance.total_asset
+                        snapshot["total_asset_foreign"] = balance.total_asset_foreign
                         snapshot["holding_count"] = len(holdings)
                         holding_symbols, holding_positions = self._build_holding_snapshot(
                             holdings,
@@ -472,6 +479,9 @@ class CycleMixin:
                         snapshot["holding_symbols"] = holding_symbols
                         snapshot["holding_positions"] = holding_positions
                         snapshot["today_trade_count"] = await self._get_today_trade_count(scope)
+                        snapshot["today_buy_result_count"] = await self._get_today_buy_result_count(scope)
+                        state.today_buy_result_count = snapshot["today_buy_result_count"]
+                        results["today_buy_result_count"] = snapshot["today_buy_result_count"]
                         for holding in holdings:
                             self._remember_product_metadata(
                                 holding.symbol,
@@ -497,6 +507,7 @@ class CycleMixin:
 
                     semaphore = asyncio.Semaphore(3)
                     executed_count = 0
+                    soft_explore_candidates: list[dict] = []
 
                     # 최소 주문 금액 (사전 차단용)
                     if is_crypto_market(target):
@@ -576,8 +587,37 @@ class CycleMixin:
                             results["analyzed"] += 1
                             if r.get("signal"):
                                 results["signals"] += 1
+                                if not is_crypto_market(target):
+                                    snapshot["today_buy_result_count"] = int(
+                                        snapshot.get("today_buy_result_count") or 0
+                                    ) + 1
+                                    results["today_buy_result_count"] = snapshot["today_buy_result_count"]
+                                    state.today_buy_result_count = snapshot["today_buy_result_count"]
                             if r.get("executed"):
                                 results["executed"] += 1
+                            if r.get("soft_explore_candidate"):
+                                soft_explore_candidates.append(dict(r["soft_explore_candidate"]))
+
+                    if self._should_run_stock_soft_exploration(
+                        target,
+                        results=results,
+                        snapshot=snapshot,
+                        candidate_count=len(soft_explore_candidates),
+                    ):
+                        soft_explore_result = await self._run_stock_soft_exploration(
+                            target,
+                            cycle_id=cycle_id,
+                            results=results,
+                            snapshot=snapshot,
+                            candidates=soft_explore_candidates,
+                            dynamic_limits=dynamic_limits,
+                            state=state,
+                            effective_min_order_amount=eff_min_order_amount,
+                        )
+                        results["soft_explored"] = int(soft_explore_result.get("attempted_count") or 0)
+                        results["soft_exploration_attempted"] = bool(
+                            soft_explore_result.get("attempted")
+                        )
             if settings.should_use_adaptive_rescan(target) and scheduled_budget_remaining is not None:
                 stage = "generate_schedule_hint"
                 schedule_hint = await self._generate_schedule_hint(
@@ -1187,6 +1227,116 @@ class CycleMixin:
 
         return min(allowed, key=lambda value: (abs(value - numeric), value))
 
+    def _should_run_stock_soft_exploration(
+        self,
+        market: str,
+        *,
+        results: dict,
+        snapshot: dict,
+        candidate_count: int,
+    ) -> bool:
+        target = normalize_market(market)
+        if is_crypto_market(target):
+            return False
+
+        state = self._get_state(market_scope(target))
+        if state.soft_exploration_attempted or candidate_count <= 0:
+            return False
+        if int(snapshot.get("today_buy_result_count") or 0) > 0:
+            return False
+        if int(results.get("signals") or 0) > 0:
+            return False
+        if not market_calendar.is_trading_hours(target):
+            return False
+
+        minutes_until_buy_cutoff = self._minutes_until_market_buy_cutoff(target)
+        if (
+            settings.DAY_TRADING_ONLY
+            and minutes_until_buy_cutoff is not None
+            and minutes_until_buy_cutoff <= 0
+        ):
+            return False
+        return True
+
+    async def _run_stock_soft_exploration(
+        self,
+        market: str,
+        *,
+        cycle_id: str,
+        results: dict,
+        snapshot: dict,
+        candidates: list[dict],
+        dynamic_limits: dict | None,
+        state,
+        effective_min_order_amount: float,
+    ) -> dict:
+        target = normalize_market(market)
+        ranked_candidates = sorted(
+            candidates,
+            key=lambda item: (float(item.get("rank_score") or 999.0), str(item.get("symbol") or "")),
+        )[:2]
+        if not ranked_candidates:
+            return {"attempted": False, "attempted_count": 0}
+
+        state.soft_exploration_attempted = True
+        await activity_logger.log(
+            ActivityType.CYCLE,
+            ActivityPhase.PROGRESS,
+            f"🧪 [{market_scope(target)}] 당일 BUY 0건 → soft 탐색 {len(ranked_candidates)}건 재평가",
+            cycle_id=cycle_id,
+            detail={
+                "soft_explore_symbols": [item.get("symbol") for item in ranked_candidates],
+                "today_buy_result_count": snapshot.get("today_buy_result_count", 0),
+            },
+        )
+
+        attempted_count = 0
+        for candidate in ranked_candidates:
+            attempted_count += 1
+            async with state.cash_lock:
+                if state.available_cash < effective_min_order_amount:
+                    logger.info(
+                        "[{}] soft 탐색 현금 부족 스킵: {:,.0f} < {:,.0f}",
+                        candidate.get("symbol", "?"),
+                        state.available_cash,
+                        effective_min_order_amount,
+                    )
+                    break
+                local_snapshot = {
+                    **snapshot,
+                    "cash": state.available_cash,
+                    "today_buy_result_count": snapshot.get("today_buy_result_count", 0),
+                }
+
+            rerun_result = await self._analyze_and_trade(
+                candidate.get("stock_info") or {},
+                cycle_id,
+                dynamic_limits=dynamic_limits,
+                portfolio_snapshot=local_snapshot,
+                tier1_override=candidate.get("tier1_analysis"),
+                soft_explore_overlay=candidate.get("overlay"),
+                soft_explore_mode=True,
+            )
+
+            if rerun_result.get("signal"):
+                results["signals"] = int(results.get("signals") or 0) + 1
+                snapshot["today_buy_result_count"] = int(snapshot.get("today_buy_result_count") or 0) + 1
+                results["today_buy_result_count"] = snapshot["today_buy_result_count"]
+                state.today_buy_result_count = snapshot["today_buy_result_count"]
+
+            if rerun_result.get("executed"):
+                results["executed"] = int(results.get("executed") or 0) + 1
+                order_amount = float(rerun_result.get("order_amount") or 0.0)
+                if order_amount > 0:
+                    async with state.cash_lock:
+                        state.available_cash -= order_amount
+                        snapshot["cash"] = state.available_cash
+
+            if rerun_result.get("signal"):
+                break
+
+        return {"attempted": True, "attempted_count": attempted_count}
+
     def _fallback_schedule_hint(
         self,
         market: str,
@@ -1198,6 +1348,7 @@ class CycleMixin:
         target = normalize_market(market)
         state = self._get_state(market_scope(target))
         minutes_until_buy_cutoff = self._minutes_until_market_buy_cutoff(target)
+        today_buy_result_count = int(results.get("today_buy_result_count") or 0)
         prefix = f"{reason_prefix} | " if reason_prefix else ""
 
         if scheduled_budget_remaining <= 0:
@@ -1246,6 +1397,13 @@ class CycleMixin:
         elif results.get("scanned", 0) == 0 or results.get("analyzed", 0) == 0:
             interval = 90
             reason = "후보/분석 부족 → 더 긴 관찰 간격"
+        elif not is_crypto_market(target) and today_buy_result_count == 0:
+            interval = 45 if state.soft_exploration_attempted else 30
+            reason = (
+                "당일 BUY 0건 지속 → 후속 확인"
+                if state.soft_exploration_attempted
+                else "당일 BUY 0건 → soft 탐색 재평가 우선"
+            )
         else:
             interval = int(settings.AI_DYNAMIC_RESCAN_DEFAULT_INTERVAL_MINUTES or 60)
             reason = "중립 상태 → 기본 간격 유지"
@@ -1290,6 +1448,12 @@ class CycleMixin:
         market_now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
         available_cash = float(snap.get("cash", state.available_cash) or 0.0)
         today_trade_count = int(snap.get("today_trade_count") or 0)
+        today_buy_result_count = int(
+            results.get("today_buy_result_count")
+            or snap.get("today_buy_result_count")
+            or state.today_buy_result_count
+            or 0
+        )
         total_asset = float(snap.get("total_asset") or 0.0)
         daily_pnl_pct = 0.0
         if state.daily_start_balance > 0 and total_asset > 0:
@@ -1312,6 +1476,7 @@ class CycleMixin:
             executed=int(results.get("executed", 0) or 0),
             available_cash=available_cash,
             today_trade_count=today_trade_count,
+            today_buy_result_count=today_buy_result_count,
             daily_pnl_pct=daily_pnl_pct,
             remaining_scheduled_budget=remaining_budget,
             allowed_intervals=", ".join(str(v) for v in allowed_intervals),

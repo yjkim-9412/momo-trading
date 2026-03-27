@@ -688,7 +688,7 @@ async def get_overseas_trade_growth(exchange: str = "NAS") -> dict:
         return {"success": False, "error": str(e), "output": []}
 
 
-async def get_overseas_price_fluct(exchange: str = "NAS") -> dict:
+async def get_overseas_price_fluct(exchange: str = "NAS", gubn: str = "0") -> dict:
     """해외주식 가격급등락 조회"""
     try:
         result = await _request_json(
@@ -697,7 +697,7 @@ async def get_overseas_price_fluct(exchange: str = "NAS") -> dict:
             params={
                 "AUTH": "",
                 "EXCD": exchange,
-                "GUBN": "0",
+                "GUBN": gubn,
                 "MINX": "0",
                 "VOL_RANG": "0",
                 "KEYB": "",

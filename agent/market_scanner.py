@@ -155,10 +155,56 @@ class MarketScanner:
             return 0.0
         return price * exchange_rate
 
+    def _resolve_available_cash_foreign(
+        self,
+        market: str,
+        balance,
+    ) -> float | None:
+        """미국장 스캔용 실주문 기준 현금을 USD 기준으로 정리한다."""
+        market_code = normalize_market(market)
+        if not is_us_market(market_code):
+            return None
+
+        effective_cash_foreign = self._to_float(getattr(balance, "effective_cash_foreign", 0.0), 0.0)
+        if effective_cash_foreign > 0:
+            return effective_cash_foreign
+
+        cash_foreign = self._to_float(getattr(balance, "cash_foreign", 0.0), 0.0)
+        if cash_foreign > 0:
+            return cash_foreign
+
+        return None
+
+    def _is_affordable_stock(
+        self,
+        item: dict,
+        *,
+        available_cash_krw: float,
+        available_cash_foreign: float | None,
+        fx_rates: dict[str, float],
+    ) -> tuple[bool, float]:
+        """종목이 현재 현금으로 1주 매수 가능한지 판단한다."""
+        price = self._to_float(item.get("price", item.get("current_price", 0.0)))
+        market_code = normalize_market(item.get("market", settings.primary_market_code))
+        currency = str(item.get("currency") or ("USD" if is_us_market(market_code) else "KRW")).upper()
+
+        if price <= 0:
+            return False, 0.0
+
+        price_krw = self._resolve_price_krw(item, fx_rates)
+        if price_krw <= 0:
+            return False, 0.0
+
+        if is_us_market(market_code) and currency != "KRW" and available_cash_foreign is not None:
+            return price <= available_cash_foreign, price_krw
+
+        return price_krw <= available_cash_krw, price_krw
+
     def _filter_affordable_stocks(
         self,
         stocks: list[dict],
-        available_cash: float,
+        available_cash_krw: float,
+        available_cash_foreign: float | None,
         fx_rates: dict[str, float],
     ) -> tuple[list[dict], int]:
         """현재 가용 현금으로 1주 매수 가능한 후보만 남긴다."""
@@ -166,8 +212,13 @@ class MarketScanner:
         dropped = 0
 
         for item in stocks:
-            price_krw = self._resolve_price_krw(item, fx_rates)
-            if price_krw <= 0 or price_krw > available_cash:
+            is_affordable, price_krw = self._is_affordable_stock(
+                item,
+                available_cash_krw=available_cash_krw,
+                available_cash_foreign=available_cash_foreign,
+                fx_rates=fx_rates,
+            )
+            if not is_affordable:
                 dropped += 1
                 continue
             filtered.append({**item, "price_krw": price_krw})
@@ -190,7 +241,8 @@ class MarketScanner:
         self,
         selected: list[dict],
         stock_lookup: dict[tuple[str, str], dict],
-        available_cash: float,
+        available_cash_krw: float,
+        available_cash_foreign: float | None,
         fx_rates: dict[str, float],
         default_market: str,
     ) -> tuple[list[dict], int]:
@@ -212,8 +264,13 @@ class MarketScanner:
                     source = matches[0]
                     market_code = normalize_market(source.get("market", market_code), default=market_code)
             candidate = {**(source or {}), **item, "market": market_code}
-            price_krw = self._resolve_price_krw(candidate, fx_rates)
-            if not symbol or price_krw <= 0 or price_krw > available_cash:
+            is_affordable, price_krw = self._is_affordable_stock(
+                candidate,
+                available_cash_krw=available_cash_krw,
+                available_cash_foreign=available_cash_foreign,
+                fx_rates=fx_rates,
+            )
+            if not symbol or not is_affordable:
                 dropped += 1
                 continue
             filtered.append(candidate)
@@ -294,14 +351,38 @@ class MarketScanner:
         max_per_stock = available_cash * max_pos_pct
         all_candidates = [*volume_rank, *surge_data, *drop_data]
         fx_rates = await self._build_affordability_fx_rates(all_candidates)
+        available_cash_foreign = self._resolve_available_cash_foreign(
+            target,
+            balance,
+        )
+        max_per_stock_foreign = (
+            available_cash_foreign * max_pos_pct
+            if available_cash_foreign is not None
+            else None
+        )
         affordability_stats = {
             "volume_rank": {"before": len(volume_rank), "after": 0, "dropped": 0},
             "surge_data": {"before": len(surge_data), "after": 0, "dropped": 0},
             "drop_data": {"before": len(drop_data), "after": 0, "dropped": 0},
         }
-        volume_rank, volume_dropped = self._filter_affordable_stocks(volume_rank, available_cash, fx_rates)
-        surge_data, surge_dropped = self._filter_affordable_stocks(surge_data, available_cash, fx_rates)
-        drop_data, drop_dropped = self._filter_affordable_stocks(drop_data, available_cash, fx_rates)
+        volume_rank, volume_dropped = self._filter_affordable_stocks(
+            volume_rank,
+            available_cash,
+            available_cash_foreign,
+            fx_rates,
+        )
+        surge_data, surge_dropped = self._filter_affordable_stocks(
+            surge_data,
+            available_cash,
+            available_cash_foreign,
+            fx_rates,
+        )
+        drop_data, drop_dropped = self._filter_affordable_stocks(
+            drop_data,
+            available_cash,
+            available_cash_foreign,
+            fx_rates,
+        )
         affordability_stats["volume_rank"]["after"] = len(volume_rank)
         affordability_stats["volume_rank"]["dropped"] = volume_dropped
         affordability_stats["surge_data"]["after"] = len(surge_data)
@@ -312,16 +393,28 @@ class MarketScanner:
         data_elapsed = activity_logger.elapsed_ms(timer)
         logger.info("MCP 데이터 수집 완료: {}ms", data_elapsed)
         if volume_dropped or surge_dropped or drop_dropped:
-            logger.info(
-                "가용 현금 기준 후보 필터 적용: 거래량 {}→{}, 급등 {}→{}, 급락 {}→{} (현금 {:,.0f}원)",
-                affordability_stats["volume_rank"]["before"],
-                affordability_stats["volume_rank"]["after"],
-                affordability_stats["surge_data"]["before"],
-                affordability_stats["surge_data"]["after"],
-                affordability_stats["drop_data"]["before"],
-                affordability_stats["drop_data"]["after"],
-                available_cash,
-            )
+            if available_cash_foreign is not None:
+                logger.info(
+                    "가용 현금 기준 후보 필터 적용: 거래량 {}→{}, 급등 {}→{}, 급락 {}→{} (실주문 기준 현금 {:,.2f}USD)",
+                    affordability_stats["volume_rank"]["before"],
+                    affordability_stats["volume_rank"]["after"],
+                    affordability_stats["surge_data"]["before"],
+                    affordability_stats["surge_data"]["after"],
+                    affordability_stats["drop_data"]["before"],
+                    affordability_stats["drop_data"]["after"],
+                    available_cash_foreign,
+                )
+            else:
+                logger.info(
+                    "가용 현금 기준 후보 필터 적용: 거래량 {}→{}, 급등 {}→{}, 급락 {}→{} (현금 {:,.0f}원)",
+                    affordability_stats["volume_rank"]["before"],
+                    affordability_stats["volume_rank"]["after"],
+                    affordability_stats["surge_data"]["before"],
+                    affordability_stats["surge_data"]["after"],
+                    affordability_stats["drop_data"]["before"],
+                    affordability_stats["drop_data"]["after"],
+                    available_cash,
+                )
         if not volume_rank and not surge_data and not drop_data:
             elapsed = activity_logger.elapsed_ms(timer)
             market_summary = "가용 현금 기준 1주 매수 가능 후보 없음"
@@ -334,6 +427,7 @@ class MarketScanner:
                     "selected": [],
                     "market_analysis": market_summary,
                     "available_cash": available_cash,
+                    "available_cash_foreign": available_cash_foreign,
                     "markets": scan_markets,
                     "affordability_filter": affordability_stats,
                 },
@@ -346,7 +440,9 @@ class MarketScanner:
                 "market_analysis": market_summary,
                 "leading_sectors": [],
                 "available_cash": available_cash,
+                "available_cash_foreign": available_cash_foreign,
                 "max_per_stock": max_per_stock,
+                "max_per_stock_foreign": max_per_stock_foreign,
                 "markets": scan_markets,
             }
 
@@ -379,7 +475,9 @@ class MarketScanner:
             minutes_until_cutoff=minutes_until_cutoff,
             selection_target_range=selection_target_range,
             available_cash=available_cash,
+            available_cash_foreign=available_cash_foreign or 0.0,
             max_per_stock=max_per_stock,
+            max_per_stock_foreign=max_per_stock_foreign or 0.0,
             volume_rank_data=self._format_data(volume_rank),
             surge_data=self._format_data(surge_data),
             drop_data=self._format_data(drop_data),
@@ -405,6 +503,7 @@ class MarketScanner:
                 selected,
                 stock_lookup,
                 available_cash,
+                available_cash_foreign,
                 fx_rates,
                 primary_market,
             )
@@ -444,6 +543,7 @@ class MarketScanner:
                     "market_regime": parsed.get("market_regime", ""),
                     "market_analysis": market_analysis,
                     "available_cash": available_cash,
+                    "available_cash_foreign": available_cash_foreign,
                     "markets": scan_markets,
                     "affordability_filter": {
                         **affordability_stats,
@@ -462,7 +562,9 @@ class MarketScanner:
                 "market_analysis": parsed.get("market_analysis", ""),
                 "leading_sectors": parsed.get("leading_sectors", []),
                 "available_cash": available_cash,
+                "available_cash_foreign": available_cash_foreign,
                 "max_per_stock": max_per_stock,
+                "max_per_stock_foreign": max_per_stock_foreign,
                 "provider": provider,
                 "markets": scan_markets,
             }

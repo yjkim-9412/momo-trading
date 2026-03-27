@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from agent.market_scanner import MarketScanner
+from trading.enums import ActivityPhase, ActivityType
 from trading.models import AccountBalance
 from trading.models import MCPResponse
 from core.config import settings
@@ -43,12 +44,27 @@ class MarketScannerPolicyTest(unittest.TestCase):
 
 class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def _balance(market: str = "NASDAQ", effective_cash: float = 700000) -> AccountBalance:
+    def _scan_complete_detail(log_mock: AsyncMock) -> dict:
+        for call in log_mock.await_args_list:
+            if call.args[:2] == (ActivityType.SCAN, ActivityPhase.COMPLETE):
+                return call.kwargs.get("detail", {})
+        raise AssertionError("SCAN COMPLETE 로그를 찾지 못했습니다.")
+
+    @staticmethod
+    def _balance(
+        market: str = "NASDAQ",
+        effective_cash: float = 700000,
+        *,
+        effective_cash_foreign: float = 0.0,
+        cash_foreign: float = 0.0,
+    ) -> AccountBalance:
         return AccountBalance(
             total_asset=1000000,
             cash=0,
+            cash_foreign=cash_foreign,
             raw_cash=0,
             effective_cash=effective_cash,
+            effective_cash_foreign=effective_cash_foreign,
             cash_source="TOTAL_ASSET_PROXY",
             stock_value=300000,
             total_pnl=0,
@@ -60,7 +76,7 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_scan_uses_effective_cash_for_available_cash(self):
         scanner = MarketScanner()
-        balance = self._balance()
+        balance = self._balance(effective_cash_foreign=700000 / 1450.0)
 
         with patch("agent.market_scanner.account_manager.get_account_snapshot", AsyncMock(return_value=(balance, []))), \
                 patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[])), \
@@ -71,13 +87,14 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
                     "TEST",
                 ))), \
                 patch("agent.market_scanner.activity_logger.log", AsyncMock()):
-            result = await scanner.scan(cycle_id="cycle-1")
+            result = await scanner.scan(market="NASDAQ", cycle_id="cycle-1")
 
         self.assertEqual(result["available_cash"], 700000)
+        self.assertAlmostEqual(result["available_cash_foreign"], 700000 / 1450.0)
 
     async def test_scan_uses_prefetched_account_snapshot_when_provided(self):
         scanner = MarketScanner()
-        balance = self._balance()
+        balance = self._balance(effective_cash_foreign=700000 / 1450.0)
 
         with patch("agent.market_scanner.account_manager.get_account_snapshot", AsyncMock()) as snapshot_mock, \
                 patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[])), \
@@ -96,6 +113,7 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
 
         snapshot_mock.assert_not_awaited()
         self.assertEqual(result["available_cash"], 700000)
+        self.assertAlmostEqual(result["available_cash_foreign"], 700000 / 1450.0)
 
     async def test_scan_skips_llm_when_no_affordable_candidates_remain(self):
         scanner = MarketScanner()
@@ -129,6 +147,7 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
             '{"selected": [{"symbol": "005930", "name": "삼성전자", "strategy_type": "STABLE_SHORT", "reason": "현금 내 매수 가능"}], "market_analysis": "기회", "market_regime": "BULL"}',
             "TEST",
         ))
+        log_mock = AsyncMock()
 
         with patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[
             {"symbol": "005930", "name": "삼성전자", "market": "KRX", "currency": "KRW", "price": 50000},
@@ -136,7 +155,7 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])), \
                 patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
                 patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock), \
-                patch("agent.market_scanner.activity_logger.log", AsyncMock()):
+                patch("agent.market_scanner.activity_logger.log", log_mock):
             result = await scanner.scan(
                 market="KRX",
                 cycle_id="cycle-1",
@@ -147,6 +166,8 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
         llm_mock.assert_awaited()
         self.assertEqual(result["max_per_stock"], 10000)
         self.assertEqual([item["symbol"] for item in result["selected"]], ["005930"])
+        detail = self._scan_complete_detail(log_mock)
+        self.assertEqual(detail["affordability_filter"]["volume_rank"], {"before": 1, "after": 1, "dropped": 0})
 
     async def test_scan_filters_unaffordable_selected_symbol_from_llm(self):
         scanner = MarketScanner()
@@ -171,13 +192,18 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item["symbol"] for item in result["selected"]], ["005930"])
 
-    async def test_scan_filters_us_candidates_using_fx_converted_cash(self):
+    async def test_scan_filters_us_candidates_using_real_orderable_cash_usd(self):
         scanner = MarketScanner()
-        balance = self._balance(market="NASDAQ", effective_cash=100000)
+        balance = self._balance(
+            market="NASDAQ",
+            effective_cash=100000,
+            effective_cash_foreign=100000 / 1450.0,
+        )
         llm_mock = AsyncMock(return_value=(
             '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
             "TEST",
         ))
+        log_mock = AsyncMock()
 
         with patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[
             {"symbol": "AAPL", "name": "Apple", "market": "NASDAQ", "currency": "USD", "price": 100.0},
@@ -186,7 +212,7 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
                 patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")), \
                 patch("agent.market_scanner.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1400.0)), \
                 patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock), \
-                patch("agent.market_scanner.activity_logger.log", AsyncMock()):
+                patch("agent.market_scanner.activity_logger.log", log_mock):
             result = await scanner.scan(
                 market="NASDAQ",
                 cycle_id="cycle-1",
@@ -196,6 +222,9 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
         llm_mock.assert_not_awaited()
         self.assertEqual(result["selected"], [])
         self.assertEqual(result["market_summary"], "가용 현금 기준 1주 매수 가능 후보 없음")
+        self.assertAlmostEqual(result["available_cash_foreign"], 100000 / 1450.0)
+        detail = self._scan_complete_detail(log_mock)
+        self.assertEqual(detail["affordability_filter"]["volume_rank"], {"before": 1, "after": 0, "dropped": 1})
 
 
 class MarketScannerRankTest(unittest.IsolatedAsyncioTestCase):
