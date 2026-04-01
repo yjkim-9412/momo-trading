@@ -180,7 +180,7 @@ class EventMixin:
                 self._analyzing.discard(cooldown_key)
 
     async def _on_stop_loss(self, event: Event) -> None:
-        """손절선 도달 → 즉시 매도"""
+        """손절선 도달 → 전량 즉시 매도"""
         if not self._running:
             return
         symbol = event.data.get("symbol", "")
@@ -189,6 +189,7 @@ class EventMixin:
         trading_date = market_calendar.market_date(market=scope)
         price = event.data.get("price", 0)
         stop_loss = event.data.get("stop_loss_price", 0)
+        exit_plan_id = event.data.get("exit_plan_id")
 
         with activity_logger.context(market_scope=scope, trading_date=trading_date):
             logger.warning("손절선 도달: {} (현재가: {:,.0f}, 손절: {:,.0f})", symbol, price, stop_loss)
@@ -228,11 +229,18 @@ class EventMixin:
                                 expected_price=price,
                                 exit_reason="STOP_LOSS",
                             )
+                            # ExitPlan 비활성화
+                            if exit_plan_id:
+                                try:
+                                    from strategy.exit_plan_manager import exit_plan_manager
+                                    await exit_plan_manager.deactivate_plan(exit_plan_id)
+                                except Exception:
+                                    logger.exception("ExitPlan 비활성화 실패: %s", exit_plan_id)
                 except Exception as e:
                     logger.error("손절 매도 실패 ({}): {}", symbol, str(e))
 
     async def _on_take_profit(self, event: Event) -> None:
-        """익절선 도달 → 즉시 매도"""
+        """익절선 도달 → 부분 또는 전량 매도 (ExitPlan 연동)"""
         if not self._running:
             return
         symbol = event.data.get("symbol", "")
@@ -241,13 +249,18 @@ class EventMixin:
         trading_date = market_calendar.market_date(market=scope)
         price = event.data.get("price", 0)
         take_profit = event.data.get("take_profit_price", 0)
+        sell_pct = event.data.get("sell_pct", 100)
+        level_index = event.data.get("level_index")
+        exit_plan_id = event.data.get("exit_plan_id")
 
         with activity_logger.context(market_scope=scope, trading_date=trading_date):
-            logger.info("익절선 도달: {} (현재가: {:,.0f}, 익절: {:,.0f})", symbol, price, take_profit)
+            label = f"L{level_index} " if level_index is not None else ""
+            pct_label = f" ({sell_pct}% 청산)" if sell_pct < 100 else ""
+            logger.info("익절선 도달: {} {}(현재가: {:,.2f}, 익절: {:,.2f}){}", symbol, label, price, take_profit, pct_label)
             await activity_logger.log(
                 ActivityType.EVENT, ActivityPhase.PROGRESS,
-                f"\U0001f3af 익절선 도달: {symbol} — 매도 실행 "
-                f"(현재가: {price:,.0f}원, 익절: {take_profit:,.0f}원)",
+                f"\U0001f3af 익절선 도달: {symbol} {label}— 매도 실행 "
+                f"(현재가: {price:,.0f}원, 익절: {take_profit:,.0f}원{pct_label})",
                 symbol=symbol,
                 detail=event.data,
             )
@@ -257,29 +270,53 @@ class EventMixin:
                     holdings = await account_manager.get_holdings(market_code)
                     holding = next((h for h in holdings if h.symbol == symbol and h.market == market_code), None)
                     if holding and holding.quantity > 0:
+                        # 부분 매도: sell_pct에 따라 매도 수량 계산
+                        if sell_pct < 100 and exit_plan_id:
+                            from strategy.exit_plan_manager import ExitPlanManager
+                            sell_qty = ExitPlanManager.calculate_sell_quantity(holding.quantity, sell_pct)
+                        else:
+                            sell_qty = holding.quantity
+
                         resp = await mcp_client.place_order(
                             symbol=symbol, side="SELL",
-                            quantity=holding.quantity, price=None, market=market_code,
+                            quantity=sell_qty, price=None, market=market_code,
                         )
                         await activity_logger.log(
                             ActivityType.ORDER, ActivityPhase.COMPLETE,
-                            f"\U0001f3af 익절 매도: {symbol} {format_quantity_with_unit(holding.quantity, market_code)} "
+                            f"\U0001f3af 익절 매도: {symbol} {format_quantity_with_unit(sell_qty, market_code)} "
                             f"({'성공' if resp.success else '실패: ' + (resp.error or '')})",
                             symbol=symbol,
                         )
                         if resp.success:
-                            event_detector.remove_levels(symbol, market=market_code)
                             order_data = resp.data or {}
                             order_id = order_data.get("order_id", "")
+                            is_full_exit = (sell_qty >= holding.quantity)
+
                             await decision_maker.confirm_and_record(
                                 symbol=symbol,
                                 market=market_code,
                                 side="SELL",
                                 order_id=order_id,
-                                quantity=holding.quantity,
+                                quantity=sell_qty,
                                 expected_price=price,
                                 exit_reason="TAKE_PROFIT",
                             )
+
+                            # ExitPlan 레벨 마킹 + EventDetector 다음 레벨 이동
+                            if exit_plan_id and level_index is not None:
+                                try:
+                                    from strategy.exit_plan_manager import exit_plan_manager
+                                    await exit_plan_manager.mark_level_triggered(exit_plan_id, level_index)
+                                    if is_full_exit:
+                                        await exit_plan_manager.deactivate_plan(exit_plan_id)
+                                        event_detector.remove_levels(symbol, market=market_code)
+                                    else:
+                                        event_detector.advance_tp_level(symbol, market=market_code)
+                                except Exception:
+                                    logger.exception("ExitPlan 레벨 업데이트 실패: %s L%s", exit_plan_id, level_index)
+                            else:
+                                # ExitPlan 미연동 (하위 호환)
+                                event_detector.remove_levels(symbol, market=market_code)
                 except Exception as e:
                     logger.error("익절 매도 실패 ({}): {}", symbol, str(e))
 

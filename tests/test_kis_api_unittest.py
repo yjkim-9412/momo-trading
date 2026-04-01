@@ -179,6 +179,43 @@ class OverseasOrderRoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["SLL_TYPE"], "")
         self.assertEqual(params["ORD_DVSN"], "00")
 
+    async def test_place_overseas_order_keeps_regular_route_for_us_regular_sell(self):
+        mock_request = AsyncMock(return_value={"rt_cd": "0", "output": {}})
+
+        with patch("trading.kis_api._request_json", mock_request):
+            await place_overseas_order(
+                symbol="PLTR",
+                side="SELL",
+                quantity=1,
+                price=198.5,
+                market="NASDAQ",
+                session="US_REGULAR",
+            )
+
+        self.assertEqual(mock_request.await_args.args[0], "/uapi/overseas-stock/v1/trading/order")
+        self.assertEqual(mock_request.await_args.args[1], "TTTT1006U")
+        params = mock_request.await_args.kwargs["params"]
+        self.assertEqual(params["SLL_TYPE"], "00")
+        self.assertEqual(params["ORD_DVSN"], "00")
+
+    async def test_place_overseas_order_rejects_zero_price_for_us_orders_before_request(self):
+        mock_request = AsyncMock(return_value={"rt_cd": "0", "output": {}})
+
+        with patch("trading.kis_api._request_json", mock_request):
+            result = await place_overseas_order(
+                symbol="PLTR",
+                side="SELL",
+                quantity=1,
+                price=None,
+                market="NASDAQ",
+                session="US_REGULAR",
+            )
+
+        mock_request.assert_not_awaited()
+        self.assertFalse(result["success"])
+        self.assertEqual(result["msg_cd"], "LOCAL_PRICE_REQUIRED")
+        self.assertEqual(result["resolved_limit_price"], "0")
+
     async def test_cancel_overseas_order_routes_us_premarket_to_regular_cancel(self):
         mock_request = AsyncMock(return_value={"rt_cd": "0", "output": {}})
 

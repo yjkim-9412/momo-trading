@@ -895,7 +895,7 @@ class MCPClient:
                 return round(price, 4)
         return 0.0
 
-    async def _resolve_us_premarket_limit_price(
+    async def _resolve_us_limit_price(
         self,
         *,
         symbol: str,
@@ -903,7 +903,7 @@ class MCPClient:
         market_code: str,
         requested_price: float | None,
     ) -> tuple[float, str]:
-        """미국 프리마켓 주문은 지정가만 허용되므로 중앙에서 가격을 보정한다."""
+        """미국장 주문은 지정가만 허용되므로 중앙에서 가격을 보정한다."""
         normalized_requested = self._to_float(requested_price, 0.0)
         if normalized_requested > 0:
             return round(normalized_requested, 4), "REQUESTED"
@@ -918,7 +918,7 @@ class MCPClient:
             if best_limit > 0:
                 return best_limit, "BEST_ASK" if side_code == "BUY" else "BEST_BID"
             logger.warning(
-                "[{}] 미국 프리마켓 호가 응답에서 유효 {} 미발견",
+                "[{}] 미국장 호가 응답에서 유효 {} 미발견",
                 symbol,
                 "매도호가" if side_code == "BUY" else "매수호가",
             )
@@ -932,7 +932,7 @@ class MCPClient:
             )
             if fallback_price > 0:
                 logger.warning(
-                    "[{}] 미국 프리마켓 지정가를 현재가 fallback 으로 대체: {:.4f}",
+                    "[{}] 미국장 지정가를 현재가 fallback 으로 대체: {:.4f}",
                     symbol,
                     fallback_price,
                 )
@@ -1696,6 +1696,7 @@ class MCPClient:
                 "market": market_code,
                 "name": name,
                 "category": str(self._pick_first(source, "category", "prdt_type", default="")),
+                "etp_type_name": str(self._pick_first(source, "etyp_nm", default="")),
                 "currency": market_currency(market_code),
                 "exchange_rate_to_krw": exchange_rate,
                 "price": price_val,
@@ -1746,6 +1747,7 @@ class MCPClient:
             **detail_payload,
             **normalized,
             "market": market_code,
+            "category": str(self._pick_first(source, "category", "prdt_type", default="")),
             "currency": str(normalized.get("currency") or market_currency(market_code)).upper(),
             "exchange_rate_to_krw": exchange_rate,
             "price_krw": price_val * exchange_rate if exchange_rate > 0 else 0.0,
@@ -2039,15 +2041,16 @@ class MCPClient:
             from trading.kis_api import place_overseas_order
 
             is_us_premarket = settings.is_real_trading and is_us_market(market_code) and session == "US_PRE"
-            if is_us_premarket:
-                resolved_price, resolved_limit_source = await self._resolve_us_premarket_limit_price(
+            should_resolve_us_limit_price = is_us_market(market_code) and price is None
+            if should_resolve_us_limit_price:
+                resolved_price, resolved_limit_source = await self._resolve_us_limit_price(
                     symbol=symbol,
                     side=side,
                     market_code=market_code,
                     requested_price=price,
                 )
                 if resolved_price <= 0:
-                    error_msg = "미국 프리마켓 지정가 산출 실패"
+                    error_msg = "미국장 지정가 산출 실패"
                     logger.warning(
                         "[{} {}] session={} route={} price_source={} — {}",
                         market_code,

@@ -1,9 +1,11 @@
 import unittest
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from agent.trading_agent import TradingAgent
 from analysis.chart_analyzer import ChartAnalysisResult
+from analysis.technical.trend_analyzer import TrendReport
 from core.config import settings
 from core.events import Event, EventType
 from scheduler.market_calendar import market_calendar
@@ -77,6 +79,26 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("평가손익: -2.64% (-4,050.00USD)", text)
         self.assertIn("현재 비중: 73.8% (약 149,630.00USD)", text)
         self.assertNotIn("원", text)
+
+    def test_format_product_context_for_prompt_includes_market_alignment(self):
+        text = self.agent._format_product_context_for_prompt(
+            {
+                "product_type": "INVERSE_ETF",
+                "is_inverse": True,
+                "leverage_multiplier": 1.0,
+                "restricted_product": True,
+                "classification_source": "override",
+                "etp_type_name": "ETF",
+                "market_bias": "BEAR",
+                "market_alignment": "ALIGNED",
+                "alignment_reason": "약세장과 같은 방향의 순노출",
+            }
+        )
+
+        self.assertIn("노출 배수: -1x", text)
+        self.assertIn("시장 방향 정합성: BEAR 정합", text)
+        self.assertIn("약세장과 같은 방향의 순노출", text)
+        self.assertIn("ETP 유형 힌트: ETF", text)
 
     def test_build_account_context_does_not_convert_krw_totals_to_usd_without_foreign_snapshot(self):
         context = self.agent._build_account_context(
@@ -267,6 +289,398 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["action"], "HOLD")
         self.assertIn("외부 링크", result["reason"])
 
+    async def test_build_trading_context_uses_premarket_scalp_mode_for_us_pre(self):
+        balance = self._balance()
+        with patch.object(settings, "US_PREMARKET_SCALP_ENABLED", True), \
+                patch("util.time_util.now_kst", return_value=datetime(2026, 3, 27, 22, 0, tzinfo=ZoneInfo("Asia/Seoul"))), \
+                patch("agent.trading_agent._analysis_mixin.market_calendar.get_market_session", return_value="US_PRE"), \
+                patch("trading.account_manager.account_manager.get_balance", AsyncMock(return_value=balance)), \
+                patch.object(self.agent, "_get_today_trade_stats", AsyncMock(return_value={"wins": 1, "losses": 0, "total": 1})):
+            context = await self.agent._build_trading_context("NASDAQ")
+
+        self.assertIn("모드: 프리마켓 스캘프 | holding_policy=PREMARKET_SCALP | 정규장 carry 금지", context)
+        self.assertIn("세션 규칙: 신규 매수 마감 09:15 EDT | 강제 청산 09:25 EDT", context)
+        self.assertIn("이번 세션은 강제 청산 시각 전 정리 전제의 단타만 허용", context)
+        self.assertIn("session=US_PRE", context)
+        self.assertIn("minutes_until_buy_cutoff=15", context)
+        self.assertIn("minutes_until_force_liquidation=25", context)
+        self.assertNotIn("모드: 스윙", context)
+
+    async def test_build_trading_context_uses_regular_opening_guard_mode_for_us_open(self):
+        balance = self._balance()
+        with patch.object(settings, "US_REGULAR_OPENING_GUARD_ENABLED", True), \
+                patch("util.time_util.now_kst", return_value=datetime(2026, 3, 27, 22, 45, tzinfo=ZoneInfo("Asia/Seoul"))), \
+                patch("agent.trading_agent._analysis_mixin.market_calendar.get_market_session", return_value="US_REGULAR"), \
+                patch("trading.account_manager.account_manager.get_balance", AsyncMock(return_value=balance)), \
+                patch.object(self.agent, "_get_today_trade_stats", AsyncMock(return_value={"wins": 1, "losses": 0, "total": 1})):
+            context = await self.agent._build_trading_context("NASDAQ")
+
+        self.assertIn("모드: 정규장 오프닝 가드 | opening_guard_active=true", context)
+        self.assertIn("추격 매수보다 확인 우선", context)
+        self.assertIn("session=US_REGULAR", context)
+        self.assertIn("minutes_from_regular_open=15", context)
+        self.assertNotIn("모드: 스윙", context)
+
+    def test_apply_us_premarket_scalp_tier1_gate_blocks_late_new_buy(self):
+        analysis = {
+            "recommendation": "BUY",
+            "position_intent": "NEW",
+            "confidence": 0.68,
+            "target_price": 6.47,
+            "stop_loss_price": 4.74,
+            "reason": "매수",
+        }
+        chart_result = ChartAnalysisResult(
+            trend=TrendReport(
+                momentum="ACCELERATING",
+                intraday={"direction": "BULLISH", "vwap_position": "ABOVE_VWAP"},
+            )
+        )
+
+        gated, gate_detail = self.agent._apply_us_premarket_scalp_tier1_gate(
+            analysis,
+            market_code="NASDAQ",
+            current_price=5.47,
+            current_position=None,
+            product_context={"restricted_product": False},
+            chart_result=chart_result,
+            session_context={
+                "session": "US_PRE",
+                "holding_policy": "PREMARKET_SCALP",
+                "minutes_until_buy_cutoff": 9,
+                "minutes_until_force_liquidation": 19,
+                "is_us_premarket_scalp": True,
+            },
+        )
+
+        self.assertEqual(gated["recommendation"], "HOLD")
+        self.assertEqual(gated["position_intent"], "HOLD")
+        self.assertTrue(gated["reason"].startswith("[TIMEBOX_TOO_SHORT]"))
+        self.assertTrue(gate_detail["tier1_gate_applied"])
+        self.assertEqual(gate_detail["tier1_gate_reason_code"], "TIMEBOX_TOO_SHORT")
+
+    def test_apply_us_premarket_scalp_tier1_gate_blocks_loose_restricted_product_buy(self):
+        analysis = {
+            "recommendation": "BUY",
+            "position_intent": "NEW",
+            "confidence": 0.64,
+            "target_price": 11.03,
+            "stop_loss_price": 8.89,
+            "reason": "매수",
+        }
+        chart_result = ChartAnalysisResult(
+            trend=TrendReport(
+                momentum="ACCELERATING",
+                intraday={"direction": "BULLISH", "vwap_position": "ABOVE_VWAP"},
+            )
+        )
+
+        gated, gate_detail = self.agent._apply_us_premarket_scalp_tier1_gate(
+            analysis,
+            market_code="AMEX",
+            current_price=9.98,
+            current_position=None,
+            product_context={"restricted_product": True},
+            chart_result=chart_result,
+            session_context={
+                "session": "US_PRE",
+                "holding_policy": "PREMARKET_SCALP",
+                "minutes_until_buy_cutoff": 11,
+                "minutes_until_force_liquidation": 21,
+                "is_us_premarket_scalp": True,
+            },
+        )
+
+        self.assertEqual(gated["recommendation"], "HOLD")
+        self.assertTrue(gated["reason"].startswith("[RESTRICTED_PRODUCT_NOT_TIGHT]"))
+        self.assertEqual(gate_detail["tier1_gate_reason_code"], "RESTRICTED_PRODUCT_NOT_TIGHT")
+
+    def test_apply_us_regular_opening_tier1_gate_blocks_low_price_hot_mover(self):
+        analysis = {
+            "recommendation": "BUY",
+            "position_intent": "NEW",
+            "confidence": 0.61,
+            "target_price": 2.5,
+            "stop_loss_price": 2.05,
+            "reason": "강한 상승",
+        }
+        chart_result = ChartAnalysisResult(
+            trend=TrendReport(
+                momentum="ACCELERATING",
+                intraday={"direction": "BULLISH", "vwap_position": "ABOVE_VWAP"},
+            )
+        )
+
+        with patch.object(settings, "US_REGULAR_OPENING_GUARD_ENABLED", True):
+            gated, gate_detail = self.agent._apply_us_regular_opening_tier1_gate(
+                analysis,
+                market_code="NASDAQ",
+                current_price=2.22,
+                change_rate=62.03,
+                current_position=None,
+                chart_result=chart_result,
+                session_context={
+                    "session": "US_REGULAR",
+                    "is_us_regular_opening": True,
+                    "opening_guard_active": True,
+                    "minutes_from_regular_open": 12,
+                },
+            )
+
+        self.assertEqual(gated["recommendation"], "HOLD")
+        self.assertEqual(gated["position_intent"], "HOLD")
+        self.assertTrue(gated["reason"].startswith("[OPENING_LOW_PRICE_HOT_MOVER]"))
+        self.assertTrue(gate_detail["tier1_gate_applied"])
+        self.assertEqual(gate_detail["tier1_gate_reason_code"], "OPENING_LOW_PRICE_HOT_MOVER")
+        self.assertEqual(gate_detail["opening_gate_reason_code"], "OPENING_LOW_PRICE_HOT_MOVER")
+
+    async def test_analyze_and_trade_skips_tier2_when_premarket_scalp_tier1_gate_downgrades_buy(self):
+        portfolio_snapshot = {
+            "cash": 100_000_000,
+            "total_asset": 300_000_000,
+            "holding_count": 0,
+            "holding_symbols": set(),
+            "holding_positions": {},
+            "today_trade_count": 0,
+        }
+        chart_result = ChartAnalysisResult(
+            trend=TrendReport(
+                momentum="ACCELERATING",
+                intraday={"direction": "BULLISH", "vwap_position": "ABOVE_VWAP"},
+            ),
+            signal_summary={"direction": "BULLISH"},
+        )
+        price_response = MCPResponse(
+            success=True,
+            data={
+                "market": "NASDAQ",
+                "currency": "USD",
+                "price": 5.47,
+                "price_krw": 8_094.006,
+                "exchange_rate_to_krw": 1479.8,
+                "change": 1.0,
+                "change_rate": 22.37,
+                "volume": 1_000_000,
+            },
+        )
+        daily_response = MCPResponse(
+            success=True,
+            data={
+                "prices": [
+                    {"date": "20260310", "open": 4.1, "high": 4.2, "low": 4.0, "close": 4.15, "volume": 1000},
+                    {"date": "20260311", "open": 4.15, "high": 4.3, "low": 4.1, "close": 4.22, "volume": 1100},
+                    {"date": "20260312", "open": 4.22, "high": 4.5, "low": 4.2, "close": 4.4, "volume": 1200},
+                    {"date": "20260313", "open": 4.4, "high": 4.9, "low": 4.35, "close": 4.82, "volume": 1300},
+                    {"date": "20260314", "open": 4.82, "high": 5.6, "low": 4.8, "close": 5.47, "volume": 1400},
+                ]
+            },
+        )
+        minute_response = MCPResponse(
+            success=True,
+            data={
+                "prices": [
+                    {"time": "0900", "open": 5.1, "high": 5.2, "low": 5.0, "close": 5.15, "volume": 100},
+                    {"time": "0905", "open": 5.15, "high": 5.5, "low": 5.1, "close": 5.47, "volume": 160},
+                ]
+            },
+        )
+        orderable_response = MCPResponse(
+            success=True,
+            data={
+                "orderable_amount_source": "INQUIRE_PSAMOUNT",
+                "orderable_amount_krw": 150_620,
+                "orderable_amount_foreign": 100.0,
+                "orderable_qty": 18,
+            },
+        )
+
+        class DummySession:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        activity_log = AsyncMock()
+        detector = MagicMock()
+
+        with patch.object(settings, "US_PREMARKET_SCALP_ENABLED", True), \
+                patch("util.time_util.now_kst", return_value=datetime(2026, 3, 27, 22, 6, tzinfo=ZoneInfo("Asia/Seoul"))), \
+                patch("agent.trading_agent._analysis_mixin.market_calendar.get_market_session", return_value="US_PRE"), \
+                patch("agent.trading_agent.activity_logger.log", activity_log), \
+                patch("agent.trading_agent.AsyncSessionLocal", return_value=DummySession()), \
+                patch(
+                    "analysis.feedback.performance_tracker.PerformanceTracker.get_consecutive_losses",
+                    AsyncMock(return_value=0),
+                ), \
+                patch("agent.trading_agent.FeedbackContextBuilder.build_full_context", AsyncMock(return_value="매매 이력 없음")), \
+                patch("agent.trading_agent.chart_analyzer.analyze", return_value=chart_result), \
+                patch("agent.trading_agent.mcp_client.get_current_price", AsyncMock(return_value=price_response)), \
+                patch("agent.trading_agent.mcp_client.get_daily_price", AsyncMock(return_value=daily_response)), \
+                patch("agent.trading_agent.mcp_client.get_minute_price", AsyncMock(return_value=minute_response)), \
+                patch("agent.trading_agent.mcp_client.get_orderable_amount", AsyncMock(return_value=orderable_response)), \
+                patch.object(self.agent, "_tier1_analysis", AsyncMock(return_value={
+                    "recommendation": "BUY",
+                    "position_intent": "NEW",
+                    "confidence": 0.68,
+                    "target_price": 6.47,
+                    "stop_loss_price": 4.74,
+                    "reason": "강한 추세",
+                })) as tier1_mock, \
+                patch.object(self.agent, "_tier2_review", AsyncMock()) as tier2_mock, \
+                patch("agent.trading_agent._analysis_mixin.event_detector", detector), \
+                patch("agent.trading_agent.risk_manager.check", AsyncMock()) as risk_mock, \
+                patch("agent.trading_agent.decision_maker.execute", AsyncMock()) as decision_mock:
+            result = await self.agent._analyze_and_trade(
+                {
+                    "symbol": "ONCO",
+                    "name": "온코네틱스",
+                    "market": "NASDAQ",
+                    "strategy_type": "STABLE_SHORT",
+                },
+                cycle_id="cycle-tier1-gate",
+                portfolio_snapshot=portfolio_snapshot,
+            )
+
+        self.assertFalse(result["signal"])
+        self.assertFalse(result["executed"])
+        tier1_mock.assert_awaited_once()
+        tier2_mock.assert_not_awaited()
+        risk_mock.assert_not_awaited()
+        decision_mock.assert_not_awaited()
+        matching_calls = [
+            call for call in activity_log.await_args_list
+            if call.args[:2] == ("TIER1_ANALYSIS", "COMPLETE")
+        ]
+        self.assertTrue(matching_calls)
+        hold_detail = matching_calls[-1].kwargs["detail"]
+        self.assertEqual(hold_detail["tier1_gate_reason_code"], "TIMEBOX_TOO_SHORT")
+        self.assertTrue(hold_detail["tier1_gate_applied"])
+
+    async def test_analyze_and_trade_skips_tier2_when_regular_opening_gate_downgrades_buy(self):
+        portfolio_snapshot = {
+            "cash": 100_000_000,
+            "total_asset": 300_000_000,
+            "holding_count": 0,
+            "holding_symbols": set(),
+            "holding_positions": {},
+            "today_trade_count": 0,
+        }
+        chart_result = ChartAnalysisResult(
+            trend=TrendReport(
+                momentum="ACCELERATING",
+                intraday={"direction": "BULLISH", "vwap_position": "ABOVE_VWAP"},
+            ),
+            signal_summary={"direction": "BULLISH"},
+        )
+        price_response = MCPResponse(
+            success=True,
+            data={
+                "market": "NASDAQ",
+                "currency": "USD",
+                "price": 2.22,
+                "price_krw": 3285.156,
+                "exchange_rate_to_krw": 1479.8,
+                "change": 0.85,
+                "change_rate": 62.03,
+                "volume": 13_340_000,
+            },
+        )
+        daily_response = MCPResponse(
+            success=True,
+            data={
+                "prices": [
+                    {"date": "20260310", "open": 1.1, "high": 1.2, "low": 1.05, "close": 1.15, "volume": 1000},
+                    {"date": "20260311", "open": 1.15, "high": 1.3, "low": 1.1, "close": 1.22, "volume": 1100},
+                    {"date": "20260312", "open": 1.22, "high": 1.5, "low": 1.2, "close": 1.4, "volume": 1200},
+                    {"date": "20260313", "open": 1.4, "high": 2.0, "low": 1.35, "close": 1.82, "volume": 1300},
+                    {"date": "20260314", "open": 1.82, "high": 2.4, "low": 1.8, "close": 2.22, "volume": 1400},
+                ]
+            },
+        )
+        minute_response = MCPResponse(
+            success=True,
+            data={
+                "prices": [
+                    {"time": "0940", "open": 2.05, "high": 2.12, "low": 2.0, "close": 2.1, "volume": 100},
+                    {"time": "0945", "open": 2.1, "high": 2.25, "low": 2.08, "close": 2.22, "volume": 160},
+                ]
+            },
+        )
+        orderable_response = MCPResponse(
+            success=True,
+            data={
+                "orderable_amount_source": "INQUIRE_PSAMOUNT",
+                "orderable_amount_krw": 150_620,
+                "orderable_amount_foreign": 100.0,
+                "orderable_qty": 45,
+            },
+        )
+
+        class DummySession:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        activity_log = AsyncMock()
+        detector = MagicMock()
+
+        with patch.object(settings, "US_REGULAR_OPENING_GUARD_ENABLED", True), \
+                patch("util.time_util.now_kst", return_value=datetime(2026, 3, 27, 22, 45, tzinfo=ZoneInfo("Asia/Seoul"))), \
+                patch("agent.trading_agent._analysis_mixin.market_calendar.get_market_session", return_value="US_REGULAR"), \
+                patch("agent.trading_agent.activity_logger.log", activity_log), \
+                patch("agent.trading_agent.AsyncSessionLocal", return_value=DummySession()), \
+                patch(
+                    "analysis.feedback.performance_tracker.PerformanceTracker.get_consecutive_losses",
+                    AsyncMock(return_value=0),
+                ), \
+                patch("agent.trading_agent.FeedbackContextBuilder.build_full_context", AsyncMock(return_value="매매 이력 없음")), \
+                patch("agent.trading_agent.chart_analyzer.analyze", return_value=chart_result), \
+                patch("agent.trading_agent.mcp_client.get_current_price", AsyncMock(return_value=price_response)), \
+                patch("agent.trading_agent.mcp_client.get_daily_price", AsyncMock(return_value=daily_response)), \
+                patch("agent.trading_agent.mcp_client.get_minute_price", AsyncMock(return_value=minute_response)), \
+                patch("agent.trading_agent.mcp_client.get_orderable_amount", AsyncMock(return_value=orderable_response)), \
+                patch.object(self.agent, "_tier1_analysis", AsyncMock(return_value={
+                    "recommendation": "BUY",
+                    "position_intent": "NEW",
+                    "confidence": 0.61,
+                    "target_price": 2.5,
+                    "stop_loss_price": 2.05,
+                    "reason": "강한 추세",
+                })) as tier1_mock, \
+                patch.object(self.agent, "_tier2_review", AsyncMock()) as tier2_mock, \
+                patch("agent.trading_agent._analysis_mixin.event_detector", detector), \
+                patch("agent.trading_agent.risk_manager.check", AsyncMock()) as risk_mock, \
+                patch("agent.trading_agent.decision_maker.execute", AsyncMock()) as decision_mock:
+            result = await self.agent._analyze_and_trade(
+                {
+                    "symbol": "VSA",
+                    "name": "VSA",
+                    "market": "NASDAQ",
+                    "strategy_type": "STABLE_SHORT",
+                },
+                cycle_id="cycle-opening-gate",
+                portfolio_snapshot=portfolio_snapshot,
+            )
+
+        self.assertFalse(result["signal"])
+        self.assertFalse(result["executed"])
+        tier1_mock.assert_awaited_once()
+        tier2_mock.assert_not_awaited()
+        risk_mock.assert_not_awaited()
+        decision_mock.assert_not_awaited()
+        matching_calls = [
+            call for call in activity_log.await_args_list
+            if call.args[:2] == ("TIER1_ANALYSIS", "COMPLETE")
+        ]
+        self.assertTrue(matching_calls)
+        hold_detail = matching_calls[-1].kwargs["detail"]
+        self.assertEqual(hold_detail["tier1_gate_reason_code"], "OPENING_LOW_PRICE_HOT_MOVER")
+        self.assertEqual(hold_detail["opening_gate_reason_code"], "OPENING_LOW_PRICE_HOT_MOVER")
+        self.assertTrue(hold_detail["tier1_gate_applied"])
+
     async def test_crypto_tier1_analysis_falls_back_to_change_price_when_change_is_direction_string(self):
         chart_result = ChartAnalysisResult(
             indicators_text="지표",
@@ -328,6 +742,7 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.agent, "_build_trading_context", AsyncMock(return_value="ctx")), \
                 patch.object(self.agent, "_get_today_trade_count", AsyncMock(return_value=0)), \
                 patch("agent.trading_agent._event_mixin.settings.AI_RISK_TUNING_ENABLED", False), \
+                patch("agent.trading_agent._event_mixin.market_calendar.get_market_session", return_value="US_REGULAR"), \
                 patch("trading.account_manager.account_manager.get_account_snapshot", AsyncMock(return_value=(self._balance(), [self._holding()]))), \
                 patch("agent.trading_agent.activity_logger.log", AsyncMock()) as log_mock, \
                 patch.object(self.agent, "_ensure_realtime_subscription", AsyncMock()) as subscribe_mock, \
@@ -360,6 +775,7 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.agent, "_build_trading_context", AsyncMock(return_value="ctx")), \
                 patch.object(self.agent, "_get_today_trade_count", AsyncMock(return_value=0)), \
                 patch("agent.trading_agent._event_mixin.settings.AI_RISK_TUNING_ENABLED", False), \
+                patch("agent.trading_agent._event_mixin.market_calendar.get_market_session", return_value="US_REGULAR"), \
                 patch("trading.account_manager.account_manager.get_account_snapshot", AsyncMock(return_value=(self._balance(), [self._holding()]))), \
                 patch("agent.trading_agent.activity_logger.log", AsyncMock()), \
                 patch("services.watchlist_sync.reconcile_market_watchlist", AsyncMock(return_value=[("PLTR", "NASDAQ")])) as reconcile_mock, \

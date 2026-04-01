@@ -1,4 +1,6 @@
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from unittest.mock import AsyncMock, patch
 
 from agent.market_scanner import MarketScanner
@@ -16,12 +18,20 @@ class MarketScannerPolicyTest(unittest.TestCase):
             "US_LEVERAGE_ALLOWED_SESSIONS": settings.US_LEVERAGE_ALLOWED_SESSIONS,
             "US_LEVERAGE_ALLOWED_STRATEGIES": settings.US_LEVERAGE_ALLOWED_STRATEGIES,
             "US_REGULAR_MIN_SELECTED_CANDIDATES": settings.US_REGULAR_MIN_SELECTED_CANDIDATES,
+            "US_REGULAR_OPENING_GUARD_ENABLED": settings.US_REGULAR_OPENING_GUARD_ENABLED,
+            "US_REGULAR_OPENING_GUARD_MIN_PRICE_USD": settings.US_REGULAR_OPENING_GUARD_MIN_PRICE_USD,
+            "US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT": settings.US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT,
+            "US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT": settings.US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT,
         }
         settings.US_LEVERAGED_PRODUCTS_ENABLED = True
         settings.US_INVERSE_PRODUCTS_ENABLED = True
         settings.US_LEVERAGE_ALLOWED_SESSIONS = "US_REGULAR"
         settings.US_LEVERAGE_ALLOWED_STRATEGIES = "STABLE_SHORT"
         settings.US_REGULAR_MIN_SELECTED_CANDIDATES = 3
+        settings.US_REGULAR_OPENING_GUARD_ENABLED = True
+        settings.US_REGULAR_OPENING_GUARD_MIN_PRICE_USD = 5.0
+        settings.US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT = 20.0
+        settings.US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT = 50.0
 
     def tearDown(self):
         for field_name, value in self._original.items():
@@ -48,6 +58,44 @@ class MarketScannerPolicyTest(unittest.TestCase):
             MarketScanner._selection_target_range("NASDAQ", "US_REGULAR", 20),
             "3~4",
         )
+
+    def test_apply_us_regular_opening_guard_filters_low_price_hot_mover(self):
+        scanner = MarketScanner()
+
+        filtered, stats = scanner._apply_us_regular_opening_guard(
+            [{
+                "symbol": "VSA",
+                "name": "VSA",
+                "market": "NASDAQ",
+                "price": 2.22,
+                "current_price": 2.22,
+                "change_rate": 62.03,
+            }],
+            settings.us_regular_opening_guard_thresholds,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(stats["dropped"], 1)
+        self.assertEqual(stats["reasons"]["opening_low_price_hot_mover"], 1)
+
+    def test_apply_us_regular_opening_guard_filters_mid_price_extreme_mover(self):
+        scanner = MarketScanner()
+
+        filtered, stats = scanner._apply_us_regular_opening_guard(
+            [{
+                "symbol": "ONCO",
+                "name": "ONCO",
+                "market": "NASDAQ",
+                "price": 6.05,
+                "current_price": 6.05,
+                "change_rate": 88.0,
+            }],
+            settings.us_regular_opening_guard_thresholds,
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(stats["dropped"], 1)
+        self.assertEqual(stats["reasons"]["opening_mid_price_extreme_mover"], 1)
 
 
 class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
@@ -540,6 +588,131 @@ class MarketScannerPremarketJunkFilterTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(detail["expansion"]["triggered"])
         self.assertEqual(detail["expansion"]["final_stage"], 3)
         self.assertEqual(detail["expansion"]["stage_counts"][-1]["supplemental_count"], 2)
+
+
+class MarketScannerRegularOpeningGuardTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _stock(
+        symbol: str,
+        *,
+        price: float,
+        change_rate: float,
+        volume: int = 500_000,
+        market: str = "NASDAQ",
+    ) -> dict:
+        return {
+            "symbol": symbol,
+            "name": symbol,
+            "market": market,
+            "currency": "USD",
+            "price": price,
+            "current_price": price,
+            "change": round(price * (change_rate / 100.0), 4),
+            "change_rate": change_rate,
+            "volume": volume,
+        }
+
+    async def test_scan_filters_opening_hot_mover_before_llm(self):
+        scanner = MarketScanner()
+        balance = MarketScannerCashTest._balance(
+            market="NASDAQ",
+            effective_cash=700000,
+            effective_cash_foreign=500.0,
+        )
+        llm_mock = AsyncMock(return_value=(
+            '{"selected": [], "market_analysis": "관망", "market_regime": "SIDEWAYS"}',
+            "TEST",
+        ))
+        log_mock = AsyncMock()
+        vsa = self._stock("VSA", price=2.22, change_rate=62.03)
+
+        with (
+            patch.object(settings, "US_REGULAR_OPENING_GUARD_ENABLED", True),
+            patch("util.time_util.now_kst", return_value=datetime(2026, 3, 27, 22, 45, tzinfo=ZoneInfo("Asia/Seoul"))),
+            patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=[vsa])),
+            patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])),
+            patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", False),
+            patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False),
+            patch("agent.market_scanner.llm_factory.generate_tier1", llm_mock),
+            patch("agent.market_scanner.activity_logger.log", log_mock),
+        ):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-opening-empty",
+                account_snapshot=(balance, []),
+            )
+
+        llm_mock.assert_not_awaited()
+        self.assertEqual(result["selected"], [])
+        self.assertEqual(result["market_summary"], "정규장 오프닝 가드 기준 후보 없음")
+        detail = MarketScannerCashTest._scan_complete_detail(log_mock)
+        self.assertEqual(detail["opening_guard"]["volume_rank"]["dropped"], 1)
+        self.assertEqual(
+            detail["opening_guard"]["volume_rank"]["reasons"]["opening_low_price_hot_mover"],
+            1,
+        )
+
+    async def test_scan_opening_guard_does_not_reintroduce_filtered_candidates_via_backfill(self):
+        scanner = MarketScanner()
+        balance = MarketScannerCashTest._balance(
+            market="NASDAQ",
+            effective_cash=700000,
+            effective_cash_foreign=500.0,
+        )
+        stock_map = {
+            "AAPL": self._stock("AAPL", price=100.0, change_rate=4.0),
+            "MSFT": self._stock("MSFT", price=110.0, change_rate=5.0),
+            "PLTR": self._stock("PLTR", price=90.0, change_rate=7.0),
+            "VSA": self._stock("VSA", price=2.22, change_rate=62.03),
+        }
+        log_mock = AsyncMock()
+
+        async def volume_side_effect(markets, limit=30, include_trade_growth=False):
+            if limit == 30:
+                return [stock_map["AAPL"]]
+            return [stock_map["AAPL"], stock_map["MSFT"], stock_map["VSA"]]
+
+        async def fluctuation_side_effect(markets, sort, limit=30):
+            if limit == 30:
+                return []
+            return [stock_map["PLTR"]] if sort == "top" else []
+
+        with (
+            patch.object(settings, "US_REGULAR_OPENING_GUARD_ENABLED", True),
+            patch("util.time_util.now_kst", return_value=datetime(2026, 3, 27, 22, 45, tzinfo=ZoneInfo("Asia/Seoul"))),
+            patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch.object(scanner, "_get_volume_rank", AsyncMock(side_effect=volume_side_effect)),
+            patch.object(scanner, "_get_fluctuation_rank", AsyncMock(side_effect=fluctuation_side_effect)),
+            patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),
+            patch.object(scanner, "_build_us_expansion_candidates", AsyncMock(return_value=[])),
+            patch.object(settings, "US_PREMARKET_JUNK_FILTER_ENABLED", False),
+            patch.object(settings, "US_PREMARKET_EXPANSION_ENABLED", False),
+            patch(
+                "agent.market_scanner.llm_factory.generate_tier1",
+                AsyncMock(return_value=(
+                    '{"selected": [{"symbol": "AAPL", "name": "AAPL", "market": "NASDAQ", "strategy_type": "STABLE_SHORT", "reason": "기준"}], "market_analysis": "기회", "market_regime": "BULL"}',
+                    "TEST",
+                )),
+            ),
+            patch("agent.market_scanner.activity_logger.log", log_mock),
+        ):
+            result = await scanner.scan(
+                market="NASDAQ",
+                cycle_id="cycle-opening-floor",
+                account_snapshot=(balance, []),
+            )
+
+        self.assertEqual([item["symbol"] for item in result["selected"]], ["AAPL", "MSFT", "PLTR"])
+        detail = MarketScannerCashTest._scan_complete_detail(log_mock)
+        self.assertTrue(detail["regular_floor"]["triggered"])
+        self.assertEqual(detail["regular_floor"]["candidate_pool_count"], 3)
+        self.assertEqual(detail["regular_floor"]["backfilled_count"], 2)
+        self.assertEqual(
+            detail["opening_guard"]["volume_rank"]["reasons"]["opening_low_price_hot_mover"],
+            1,
+        )
 
 
 class MarketScannerRankTest(unittest.IsolatedAsyncioTestCase):

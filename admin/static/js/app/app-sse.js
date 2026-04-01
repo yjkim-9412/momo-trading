@@ -57,7 +57,7 @@ export function connectSSE() {
           var scopeLabel = scopeKey === 'KRX' ? '\uAD6D\uB0B4' : '\uD574\uC678';
           var fullTitle = '[' + scopeLabel + '] ' + importance.title;
 
-          Toast.show(fullTitle + ': ' + (msg.data.symbol || '') + ' ' + (msg.data.summary || ''), {
+          Toast.show(fullTitle + ': ' + (msg.data.name || msg.data.symbol || '') + ' ' + (msg.data.summary || ''), {
             level: importance.level,
             persistent: importance.level === 'CRITICAL',
             onClick: function () { Feed.navigateToCard(msg.data); },

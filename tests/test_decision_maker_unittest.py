@@ -20,6 +20,12 @@ from util.time_util import KST, now_kst
 
 
 class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        event_detector.clear_all()
+
+    async def asyncTearDown(self):
+        event_detector.clear_all()
+
     async def test_us_order_price_guard_blocks_krw_mispriced_limit_order(self):
         signal = TradeSignal(
             symbol="COIN",
@@ -53,6 +59,57 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
         place_order_mock.assert_not_awaited()
         publish_mock.assert_awaited_once()
         self.assertGreaterEqual(log_mock.await_count, 2)
+
+    async def test_failed_buy_clears_trade_thresholds_only(self):
+        signal = TradeSignal(
+            symbol="CRCD",
+            stock_id="stock-1",
+            action=SignalAction.BUY,
+            strength=0.7,
+            suggested_price=7.17,
+            suggested_quantity=2,
+            urgency=SignalUrgency.IMMEDIATE,
+            metadata={
+                "market": "AMEX",
+                "currency": "USD",
+                "exchange_rate_to_krw": 1450.0,
+                "live_price": 7.17,
+                "live_price_krw": 10396.5,
+                "entry_price_krw": 10396.5,
+            },
+        )
+        event_detector.set_thresholds(
+            "CRCD",
+            market="AMEX",
+            surge_pct=3.5,
+            drop_pct=-3.5,
+            volume_spike_ratio=4.0,
+            stop_loss=6.8,
+            take_profit=7.9,
+            trailing_stop_pct=2.0,
+        )
+
+        maker = DecisionMaker()
+
+        with (
+            patch("agent.decision_maker.settings.KIS_ACCOUNT_TYPE", "REAL"),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()),
+            patch("agent.decision_maker.event_bus.publish", AsyncMock()),
+            patch(
+                "agent.decision_maker.mcp_client.place_order",
+                AsyncMock(return_value=MCPResponse(success=False, error="주문 실패")),
+            ),
+        ):
+            result = await maker.execute(signal, cycle_id="cycle-failed-buy")
+
+        self.assertFalse(result["success"])
+        thresholds = event_detector.get_thresholds("CRCD", market="AMEX")
+        self.assertEqual(thresholds.surge_pct, 3.5)
+        self.assertEqual(thresholds.drop_pct, -3.5)
+        self.assertEqual(thresholds.volume_spike_ratio, 4.0)
+        self.assertEqual(thresholds.stop_loss, 0.0)
+        self.assertEqual(thresholds.take_profit, 0.0)
+        self.assertEqual(thresholds.trailing_stop_pct, 0.0)
 
     async def test_paper_us_premarket_falls_back_to_recommendation(self):
         signal = TradeSignal(

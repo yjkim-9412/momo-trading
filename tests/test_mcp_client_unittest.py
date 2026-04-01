@@ -136,6 +136,96 @@ class MCPClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data["resolved_limit_source"], "BEST_BID")
         self.assertEqual(response.data["resolved_limit_price"], 197.1)
 
+    async def test_place_order_uses_best_ask_for_us_regular_buy_without_price(self):
+        client = MCPClient()
+        client._get_exchange_rate_to_krw = AsyncMock(return_value=1300.0)
+
+        with (
+            patch("trading.mcp_client.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch.object(
+                client,
+                "get_stock_ask",
+                AsyncMock(return_value=MCPResponse(success=True, data={"output1": {"askp1": "198.40", "bidp1": "198.20"}})),
+            ),
+            patch(
+                "trading.kis_api.place_overseas_order",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "rt_cd": "0",
+                    "order_route": "REGULAR_ORDER",
+                    "order_endpoint": "/uapi/overseas-stock/v1/trading/order",
+                    "order_tr_id": "TTTT1002U",
+                    "exchange_code": "NASD",
+                    "resolved_limit_price": "198.40",
+                    "output": [{"ODNO": "80112235"}],
+                }),
+            ) as place_mock,
+        ):
+            response = await client.place_order("PLTR", "BUY", 2, price=None, market="NASDAQ")
+
+        self.assertTrue(response.success)
+        self.assertEqual(place_mock.await_args.kwargs["price"], 198.4)
+        self.assertEqual(place_mock.await_args.kwargs["session"], "US_REGULAR")
+        self.assertEqual(response.data["resolved_limit_source"], "BEST_ASK")
+        self.assertEqual(response.data["resolved_limit_price"], 198.4)
+
+    async def test_place_order_uses_best_bid_for_us_regular_sell_without_price(self):
+        client = MCPClient()
+        client._get_exchange_rate_to_krw = AsyncMock(return_value=1300.0)
+
+        with (
+            patch("trading.mcp_client.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch.object(
+                client,
+                "get_stock_ask",
+                AsyncMock(return_value=MCPResponse(success=True, data={"output1": {"askp1": "198.40", "bidp1": "198.20"}})),
+            ),
+            patch(
+                "trading.kis_api.place_overseas_order",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "rt_cd": "0",
+                    "order_route": "REGULAR_ORDER",
+                    "order_endpoint": "/uapi/overseas-stock/v1/trading/order",
+                    "order_tr_id": "TTTT1006U",
+                    "exchange_code": "NASD",
+                    "resolved_limit_price": "198.20",
+                    "output": [{"ODNO": "80112236"}],
+                }),
+            ) as place_mock,
+        ):
+            response = await client.place_order("PLTR", "SELL", 2, price=None, market="NASDAQ")
+
+        self.assertTrue(response.success)
+        self.assertEqual(place_mock.await_args.kwargs["price"], 198.2)
+        self.assertEqual(place_mock.await_args.kwargs["session"], "US_REGULAR")
+        self.assertEqual(response.data["resolved_limit_source"], "BEST_BID")
+        self.assertEqual(response.data["resolved_limit_price"], 198.2)
+
+    async def test_place_order_fails_closed_when_us_limit_price_cannot_be_resolved(self):
+        client = MCPClient()
+
+        with (
+            patch("trading.mcp_client.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch.object(
+                client,
+                "get_stock_ask",
+                AsyncMock(return_value=MCPResponse(success=False, error="ask unavailable")),
+            ),
+            patch.object(
+                client,
+                "get_current_price",
+                AsyncMock(return_value=MCPResponse(success=False, error="price unavailable")),
+            ),
+            patch("trading.kis_api.place_overseas_order", new=AsyncMock()) as place_mock,
+        ):
+            response = await client.place_order("PLTR", "SELL", 2, price=None, market="NASDAQ")
+
+        place_mock.assert_not_awaited()
+        self.assertFalse(response.success)
+        self.assertEqual(response.error, "미국장 지정가 산출 실패")
+        self.assertEqual(response.data["resolved_limit_price"], 0.0)
+
     async def test_place_order_falls_back_to_mcp_on_us_premarket_session_mismatch(self):
         client = MCPClient()
         client._get_exchange_rate_to_krw = AsyncMock(return_value=1300.0)

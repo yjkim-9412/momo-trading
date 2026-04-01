@@ -95,12 +95,12 @@ function _isHoldLikeTier1Summary(summary, summaryUpper) {
     || summary.includes('미승인');
 }
 
-function _buildTier1Signal(symbol, summary, recommendation) {
+function _buildTier1Signal(symbol, summary, recommendation, name) {
   if (recommendation === 'BUY' || recommendation === 'SELL') {
     return {
       level: 'HIGH',
       title: recommendation === 'BUY' ? '\uB9E4\uC218 \uC2E0\uD638' : '\uB9E4\uB3C4 \uC2E0\uD638',
-      body: (symbol || '') + ' \u2014 ' + (summary || ''),
+      body: (name || symbol || '') + ' \u2014 ' + (summary || ''),
     };
   }
   return { level: 'NONE' };
@@ -120,11 +120,13 @@ export function classifyImportance(data) {
     ? detail.recommendation.toUpperCase()
     : '';
 
+  var displayName = data.name || data.symbol || '';
+
   if ((t === 'ORDER' || t === 'TRADE_RESULT') && p === 'COMPLETE') {
     return {
       level: 'CRITICAL',
       title: (s.includes('\uB9E4\uB3C4') || s.includes('SELL')) ? '\uB9E4\uB3C4 \uCCB4\uACB0' : '\uB9E4\uC218 \uCCB4\uACB0',
-      body: (data.symbol || '') + ' \u2014 ' + summary,
+      body: displayName + ' \u2014 ' + summary,
     };
   }
 
@@ -134,11 +136,11 @@ export function classifyImportance(data) {
     }
 
     if (recommendation === 'BUY' || recommendation === 'SELL') {
-      return _buildTier1Signal(data.symbol, summary, recommendation);
+      return _buildTier1Signal(data.symbol, summary, recommendation, data.name);
     }
 
     if (s.includes('BUY') || s.includes('SELL')) {
-      return _buildTier1Signal(data.symbol, summary, s.includes('BUY') ? 'BUY' : 'SELL');
+      return _buildTier1Signal(data.symbol, summary, s.includes('BUY') ? 'BUY' : 'SELL', data.name);
     }
   }
 
@@ -146,7 +148,7 @@ export function classifyImportance(data) {
     return {
       level: 'HIGH',
       title: 'TIER2 \uBBF8\uC2B9\uC778',
-      body: (data.symbol || '') + ' \u2014 ' + summary,
+      body: displayName + ' \u2014 ' + summary,
     };
   }
 
@@ -154,7 +156,7 @@ export function classifyImportance(data) {
     return {
       level: 'HIGH',
       title: '\uC8FC\uBB38 \uC2E4\uD589',
-      body: (data.symbol || '') + ' \u2014 ' + summary,
+      body: displayName + ' \u2014 ' + summary,
     };
   }
 

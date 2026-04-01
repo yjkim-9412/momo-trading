@@ -90,6 +90,13 @@ class Settings(BaseSettings):
     US_PREMARKET_MIN_MONITOR_CANDIDATES: int = 10
     US_PREMARKET_EXPANSION_ENABLED: bool = False
     US_PREMARKET_EXPANSION_MAX_STAGE: int = 3
+    US_REGULAR_OPENING_GUARD_ENABLED: bool = False
+    US_REGULAR_OPENING_GUARD_WINDOW_MINUTES: int = 60
+    US_REGULAR_OPENING_GUARD_MIN_PRICE_USD: float = 5.0
+    US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT: float = 20.0
+    US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT: float = 50.0
+    US_REGULAR_OPENING_GUARD_MAX_POSITION_PCT: float = 10.0
+    US_REGULAR_OPENING_GUARD_SIZE_SCALE: float = 0.5
     US_REGULAR_MIN_SELECTED_CANDIDATES: int = 3
     US_WATCHLIST_SYMBOLS: str = ""
     US_SCAN_LIMIT: int = 12
@@ -103,6 +110,7 @@ class Settings(BaseSettings):
     US_LEVERAGE_MAX_SINGLE_ORDER_RATIO: float = 0.3
     US_LEVERAGE_ALLOWLIST: str = ""
     US_LEVERAGE_DENYLIST: str = ""
+    US_PRODUCT_TYPE_OVERRIDES: str = ""
     US_BUY_CUTOFF_HOUR: int = 15  # 미국장 신규 매수 마감 시각 (ET)
     US_BUY_CUTOFF_MINUTE: int = 30
     US_FORCE_LIQUIDATION_HOUR: int = 15  # 미국장 강제 청산 시각 (ET)
@@ -484,6 +492,25 @@ class Settings(BaseSettings):
             and session == "US_PRE"
         )
 
+    def is_us_regular_opening_guard_session(
+        self,
+        market: str,
+        session: str | None = None,
+        *,
+        minutes_from_regular_open: int | None = None,
+    ) -> bool:
+        """미국 정규장 오프닝 보수 가드 세션 여부."""
+        from trading.market_profile import is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        return bool(
+            is_us_market(norm)
+            and self.US_REGULAR_OPENING_GUARD_ENABLED
+            and session == "US_REGULAR"
+            and minutes_from_regular_open is not None
+            and 0 <= minutes_from_regular_open < self.us_regular_opening_guard_window_minutes
+        )
+
     def get_market_config(self, market: str, session: str | None = None) -> dict:
         """시장별 매수마감/강제청산 시간 설정 반환 (크립토는 24/7 → 제한 없음)"""
         from trading.market_profile import is_crypto_market, is_us_market, normalize_market
@@ -851,6 +878,37 @@ class Settings(BaseSettings):
         return min(3, max(0, int(self.US_PREMARKET_EXPANSION_MAX_STAGE or 0)))
 
     @property
+    def us_regular_opening_guard_window_minutes(self) -> int:
+        """미국 정규장 오프닝 가드 적용 시간."""
+        return max(0, int(self.US_REGULAR_OPENING_GUARD_WINDOW_MINUTES or 0))
+
+    @property
+    def us_regular_opening_guard_thresholds(self) -> dict[str, float]:
+        """미국 정규장 오프닝 가드 threshold preset."""
+        return {
+            "min_price_usd": max(0.0, float(self.US_REGULAR_OPENING_GUARD_MIN_PRICE_USD or 0.0)),
+            "mid_price_ceiling_usd": 10.0,
+            "low_price_max_abs_change_pct": max(
+                0.0,
+                float(self.US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT or 0.0),
+            ),
+            "mid_price_max_abs_change_pct": max(
+                0.0,
+                float(self.US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT or 0.0),
+            ),
+        }
+
+    @property
+    def us_regular_opening_guard_max_position_pct(self) -> float:
+        """미국 정규장 오프닝 가드 최대 비중 상한."""
+        return max(0.0, float(self.US_REGULAR_OPENING_GUARD_MAX_POSITION_PCT or 0.0))
+
+    @property
+    def us_regular_opening_guard_size_scale(self) -> float:
+        """미국 정규장 오프닝 가드 신규 매수 수량 축소 비율."""
+        return min(1.0, max(0.0, float(self.US_REGULAR_OPENING_GUARD_SIZE_SCALE or 0.0)))
+
+    @property
     def us_leverage_allowed_sessions_list(self) -> list[str]:
         """미국 레버리지 상품 허용 세션 목록"""
         return self._parse_csv(self.US_LEVERAGE_ALLOWED_SESSIONS, upper=True)
@@ -869,6 +927,22 @@ class Settings(BaseSettings):
     def us_leverage_denylist_symbols(self) -> list[str]:
         """미국 레버리지 상품 명시 차단 티커"""
         return self._parse_csv(self.US_LEVERAGE_DENYLIST, upper=True)
+
+    @property
+    def us_product_type_overrides_map(self) -> dict[str, str]:
+        """미국 상품 유형 강제 오버라이드 매핑."""
+        allowed_types = {"ETF", "ETN", "LEVERAGED_ETF", "INVERSE_ETF", "COMMON"}
+        parsed: dict[str, str] = {}
+        for raw in self._parse_csv(self.US_PRODUCT_TYPE_OVERRIDES):
+            if "=" not in raw:
+                continue
+            symbol_raw, product_type_raw = raw.split("=", 1)
+            symbol = symbol_raw.strip().upper()
+            product_type = product_type_raw.strip().upper()
+            if not symbol or product_type not in allowed_types:
+                continue
+            parsed[symbol] = product_type
+        return parsed
 
     @property
     def us_leverage_keywords_list(self) -> list[str]:

@@ -11,6 +11,7 @@ from models.broker_order import BrokerOrder
 from models.agent_activity import AgentActivityLog
 from models.daily_report import DailyReport
 from models.trading_rule import TradingRule
+from models.exit_plan import ExitPlan, ExitPlanHistory
 
 # 코인 전용 테이블 (주식 DB와 완전 분리)
 from models.coin_asset import CoinAsset

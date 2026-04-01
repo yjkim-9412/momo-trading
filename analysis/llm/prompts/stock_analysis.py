@@ -42,6 +42,18 @@ STOCK_ANALYSIS_SYSTEM = """당신은 한국/미국 주식 시장 단기 매매 �
 - `ADD_ON_AVERAGE_DOWN`은 RSI/모멘텀 반전과 거래량 확인이 동시에 있을 때만 선택하세요
 - 실행 계약: 이 경로는 신규 매수 기회 탐색 전용이므로 최종 recommendation은 BUY 또는 HOLD만 사용하고 SELL은 사용하지 마세요
 - 제한 상품 주의: 레버리지/인버스 상품은 배수만큼 변동성과 갭 리스크가 커질 수 있으므로 일반 종목보다 더 강한 추세·거래량 확인과 더 보수적인 손절/수량 판단이 필요합니다
+- 방향성 해석 규칙: 인버스/레버리지 상품은 종목 가격 변화가 아니라 `시장 노출 방향` 기준으로 해석하세요
+- 방향성 해석 규칙: `BEAR + inverse(-x) 매수`는 시장과 같은 방향 노출이며, `BULL + inverse(-x) 매수`는 시장 역행 노출입니다
+- 방향성 해석 규칙: `BEAR + positive exposure(+1x/+2x/+3x)`는 시장 역행, `BULL + positive exposure`는 시장 정합입니다
+- 방향성 해석 규칙: `THEME/SIDEWAYS`는 broad market 방향 정합성을 중립으로 두고 종목 자체 추세·거래량을 더 우선하세요
+- 프리마켓 스캘프 예외: trading_context에 `holding_policy=PREMARKET_SCALP`가 있으면 이 세션은 강제 청산 전 정리 전제의 단타만 허용합니다
+- 프리마켓 스캘프 예외: 신규 매수 마감까지 10분 미만이면 BUY 금지, HOLD로 판단하세요
+- 프리마켓 스캘프 예외: 강제 청산까지 30분 이하이면 목표가는 현재 세션 내 도달 가능한 근거리 목표만 허용하세요
+- 프리마켓 스캘프 예외: 분봉이 NEUTRAL, VWAP 위 안착 아님, 모멘텀 감속이면 추격 BUY에 매우 보수적으로 대응하세요
+- 프리마켓 스캘프 예외: 정규장 carry, 보유일 계획, 늦은 시간의 과도한 목표가 논리를 사용하지 마세요
+- 미국 정규장 오프닝 가드 예외: trading_context에 `opening_guard_active=true`가 있으면 정규장 시작 후 첫 60분은 추격 매수보다 확인을 우선하세요
+- 미국 정규장 오프닝 가드 예외: `price < 5USD and abs(change_rate) >= 20%` 또는 `price < 10USD and abs(change_rate) >= 50%`인 저가 급등주는 BUY보다 HOLD를 우선하세요
+- 미국 정규장 오프닝 가드 예외: 분봉이 NEUTRAL, VWAP 위 안착 아님, 시장 국면이 BEAR/SIDEWAYS인데 특정 저가주만 과열이면 BUY보다 HOLD를 우선하세요
 - **절대 규칙**: 목표가/손절가는 반드시 위 현재가/일봉 데이터에서 도출할 것. 임의의 가격을 만들지 마세요
 - 반드시 한국어로 답변"""
 STOCK_ANALYSIS_SYSTEM = (
@@ -99,6 +111,9 @@ STOCK_ANALYSIS_PROMPT = """## 종목 분석 요청: {stock_name} ({symbol})
 - recommendation: BUY 또는 HOLD만 사용하세요. SELL은 사용하지 마세요.
 - confidence: 이 매매가 손절 전에 목표가에 도달할 확률 (0.00~1.00)
 - position_intent: NEW / ADD_ON_PYRAMID / ADD_ON_AVERAGE_DOWN / HOLD
+- `holding_policy=PREMARKET_SCALP`이면 target_price는 이번 세션 내 실현 가능한 목표가로 작성하세요
+- `holding_policy=PREMARKET_SCALP`이면 stop_loss_price는 짧은 시간 안에 아이디어가 무효화되는 가격으로 더 타이트하게 작성하세요
+- `reason`에는 시간 제약을 반영했는지 반드시 한 줄 포함하세요
 
 JSON 형식으로 답변:
 ```json
@@ -111,9 +126,22 @@ JSON 형식으로 답변:
   "target_price": 0,
   "stop_loss_price": 0,
   "trailing_stop_pct": 0.0,
+  "exit_levels": [
+    {{"type": "TAKE_PROFIT", "price": 0, "pct": 50, "reason": "1차 익절 근거"}},
+    {{"type": "TAKE_PROFIT", "price": 0, "pct": 100, "reason": "최종 목표가 근거"}}
+  ],
+  "exit_reasoning": "다단계 익절 전략 요약 (1줄)",
   "key_factors": ["위 분석에서 도출한 근거"]
 }}
-```"""
+```
+**exit_levels 작성 규칙**:
+- type은 TAKE_PROFIT만 사용 (STOP_LOSS는 stop_loss_price 필드 사용)
+- pct는 해당 가격 도달 시 보유 수량의 몇 %를 청산할지 (누적 아닌 잔여 기준)
+- 마지막 레벨의 pct는 반드시 100 (잔여 전량 청산)
+- 최소 1개, 최대 3개 레벨
+- 가격은 오름차순 정렬
+- 익절 레벨이 1개뿐이면 pct=100으로 작성
+- exit_levels의 마지막(최고) 가격이 target_price와 동일"""
 
 # ---------------------------------------------------------------------------
 # 크립토 Tier 1 프롬프트

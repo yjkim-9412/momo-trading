@@ -386,6 +386,67 @@ class MarketScanner:
             "drop_data": drop_stats,
         }
 
+    def _resolve_us_regular_opening_guard_reason(
+        self,
+        item: dict,
+        thresholds: dict[str, float],
+    ) -> str | None:
+        """미국 정규장 오프닝 급등 저가주 제외 사유."""
+        price = self._to_float(item.get("price", item.get("current_price", 0.0)), 0.0)
+        abs_change_pct = abs(self._to_float(item.get("change_rate", 0.0), 0.0))
+
+        if (
+            price < thresholds["min_price_usd"]
+            and abs_change_pct >= thresholds["low_price_max_abs_change_pct"]
+        ):
+            return "opening_low_price_hot_mover"
+        if (
+            price < thresholds["mid_price_ceiling_usd"]
+            and abs_change_pct >= thresholds["mid_price_max_abs_change_pct"]
+        ):
+            return "opening_mid_price_extreme_mover"
+        return None
+
+    def _apply_us_regular_opening_guard(
+        self,
+        stocks: list[dict],
+        thresholds: dict[str, float],
+    ) -> tuple[list[dict], dict[str, object]]:
+        """미국 정규장 오프닝 급등 저가주 필터 적용."""
+        filtered: list[dict] = []
+        reasons: dict[str, int] = {}
+
+        for item in stocks:
+            reason = self._resolve_us_regular_opening_guard_reason(item, thresholds)
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+                continue
+            filtered.append(item)
+
+        return filtered, {
+            "before": len(stocks),
+            "after": len(filtered),
+            "dropped": len(stocks) - len(filtered),
+            "reasons": reasons,
+        }
+
+    def _apply_us_regular_opening_guard_groups(
+        self,
+        volume_rank: list[dict],
+        surge_data: list[dict],
+        drop_data: list[dict],
+    ) -> tuple[list[dict], list[dict], list[dict], dict[str, dict[str, object]]]:
+        """카테고리별 미국 정규장 오프닝 가드 적용."""
+        thresholds = settings.us_regular_opening_guard_thresholds
+        volume_rank, volume_stats = self._apply_us_regular_opening_guard(volume_rank, thresholds)
+        surge_data, surge_stats = self._apply_us_regular_opening_guard(surge_data, thresholds)
+        drop_data, drop_stats = self._apply_us_regular_opening_guard(drop_data, thresholds)
+        return volume_rank, surge_data, drop_data, {
+            "volume_rank": volume_stats,
+            "surge_data": surge_stats,
+            "drop_data": drop_stats,
+        }
+
     @staticmethod
     def _bucket_monitor_floor_met(
         volume_rank: list[dict],
@@ -833,8 +894,19 @@ class MarketScanner:
         return merged, backfilled
 
     @staticmethod
-    def _empty_candidate_market_summary(junk_filter_stats: dict[str, dict[str, object]] | None) -> str:
+    def _empty_candidate_market_summary(
+        junk_filter_stats: dict[str, dict[str, object]] | None,
+        opening_guard_stats: dict[str, dict[str, object]] | None = None,
+    ) -> str:
         """후보가 모두 제거됐을 때 요약 메시지."""
+        if not junk_filter_stats:
+            if not opening_guard_stats:
+                return "가용 현금 기준 1주 매수 가능 후보 없음"
+        if opening_guard_stats:
+            total_after_guard = sum(int(stats.get("after", 0)) for stats in opening_guard_stats.values())
+            total_guard_dropped = sum(int(stats.get("dropped", 0)) for stats in opening_guard_stats.values())
+            if total_after_guard == 0 and total_guard_dropped > 0:
+                return "정규장 오프닝 가드 기준 후보 없음"
         if not junk_filter_stats:
             return "가용 현금 기준 1주 매수 가능 후보 없음"
 
@@ -899,6 +971,10 @@ class MarketScanner:
         scan_markets = settings.scan_markets_for(target)
         now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
         session = market_calendar.get_market_session(dt=now, market=target)
+        regular_open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        minutes_from_regular_open = None
+        if is_us_market(target) and session == "US_REGULAR":
+            minutes_from_regular_open = max(0, int((now - regular_open_time).total_seconds() / 60))
         mkt_cfg = settings.get_market_config(target, session=session)
         cutoff_time = now.replace(
             hour=mkt_cfg["buy_cutoff_hour"],
@@ -960,7 +1036,13 @@ class MarketScanner:
             else None
         )
         junk_filter_enabled = settings.is_us_premarket_junk_filter_session(target, session=session)
+        opening_guard_enabled = settings.is_us_regular_opening_guard_session(
+            target,
+            session=session,
+            minutes_from_regular_open=minutes_from_regular_open,
+        )
         junk_filter_stats: dict[str, dict[str, object]] = {}
+        opening_guard_stats: dict[str, dict[str, object]] = {}
         expansion_stats: dict[str, object] = {
             "triggered": False,
             "final_stage": 0,
@@ -1026,6 +1108,17 @@ class MarketScanner:
             affordability_stats["surge_data"]["dropped"] = surge_dropped
             affordability_stats["drop_data"]["after"] = len(drop_data)
             affordability_stats["drop_data"]["dropped"] = drop_dropped
+            if opening_guard_enabled:
+                (
+                    volume_rank,
+                    surge_data,
+                    drop_data,
+                    opening_guard_stats,
+                ) = self._apply_us_regular_opening_guard_groups(
+                    volume_rank,
+                    surge_data,
+                    drop_data,
+                )
 
         if regular_floor_target > 0:
             regular_floor_candidate_pool = self._build_regular_floor_candidate_pool(
@@ -1081,6 +1174,17 @@ class MarketScanner:
                 affordability_stats["surge_data"]["dropped"] = surge_dropped
                 affordability_stats["drop_data"]["after"] = len(drop_data)
                 affordability_stats["drop_data"]["dropped"] = drop_dropped
+                if opening_guard_enabled:
+                    (
+                        volume_rank,
+                        surge_data,
+                        drop_data,
+                        opening_guard_stats,
+                    ) = self._apply_us_regular_opening_guard_groups(
+                        volume_rank,
+                        surge_data,
+                        drop_data,
+                    )
                 regular_floor_candidate_pool = self._build_regular_floor_candidate_pool(
                     volume_rank,
                     surge_data,
@@ -1110,6 +1214,20 @@ class MarketScanner:
                     "미국 프리마켓 후보 확장 완료: final_stage={} | {}",
                     expansion_stats.get("final_stage", 0),
                     expansion_stats.get("stage_counts", []),
+                )
+        if opening_guard_enabled:
+            opening_before = sum(int(stats.get("before", 0)) for stats in opening_guard_stats.values())
+            opening_after = sum(int(stats.get("after", 0)) for stats in opening_guard_stats.values())
+            opening_reasons: dict[str, int] = {}
+            for stats in opening_guard_stats.values():
+                for reason, count in dict(stats.get("reasons", {})).items():
+                    opening_reasons[reason] = opening_reasons.get(reason, 0) + int(count)
+            if opening_before != opening_after:
+                logger.info(
+                    "미국 정규장 오프닝 가드 적용: {}건 → {}건 | {}",
+                    opening_before,
+                    opening_after,
+                    opening_reasons,
                 )
         if regular_floor_stats.get("triggered"):
             logger.info(
@@ -1146,6 +1264,7 @@ class MarketScanner:
             elapsed = activity_logger.elapsed_ms(timer)
             market_summary = self._empty_candidate_market_summary(
                 junk_filter_stats if junk_filter_enabled else None,
+                opening_guard_stats if opening_guard_enabled else None,
             )
             if regular_floor_target > 0:
                 regular_floor_stats["unmet_floor"] = True
@@ -1162,6 +1281,7 @@ class MarketScanner:
                     "markets": scan_markets,
                     "affordability_filter": affordability_stats,
                     "junk_filter": junk_filter_stats,
+                    "opening_guard": opening_guard_stats,
                     "expansion": expansion_stats,
                     "regular_floor": regular_floor_stats,
                 },
@@ -1178,6 +1298,7 @@ class MarketScanner:
                 "max_per_stock": max_per_stock,
                 "max_per_stock_foreign": max_per_stock_foreign,
                 "markets": scan_markets,
+                "opening_guard": opening_guard_stats,
                 "regular_floor": regular_floor_stats,
             }
 
@@ -1278,6 +1399,7 @@ class MarketScanner:
                         "selected_dropped": selected_affordability_dropped,
                     },
                     "junk_filter": junk_filter_stats,
+                    "opening_guard": opening_guard_stats,
                     "expansion": expansion_stats,
                     "regular_floor": regular_floor_stats,
                 },

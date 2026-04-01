@@ -1032,6 +1032,25 @@ async def place_overseas_order(
     order_quantity = _format_overseas_order_quantity(quantity)
     order_price = _format_overseas_order_price(price)
     exchange_code = kis_order_exchange_code(market_code)
+    if is_us_market(market_code) and order_price == "0":
+        error_message = "미국장 주문은 0보다 큰 지정가가 필요합니다."
+        logger.warning("[{} {}] {}", market_code, symbol, error_message)
+        return {
+            "success": False,
+            "error": error_message,
+            "msg1": error_message,
+            "msg_cd": "LOCAL_PRICE_REQUIRED",
+            "output": {},
+            "market": market_code,
+            "currency": market_currency(market_code),
+            "session": session_code,
+            "order_route": order_route,
+            "order_endpoint": api_url,
+            "order_tr_id": tr_id,
+            "exchange_code": exchange_code,
+            "resolved_limit_price": order_price,
+            "resolved_limit_quantity": order_quantity,
+        }
     params = {
         "CANO": cano,
         "ACNT_PRDT_CD": acnt_prdt_cd,
@@ -1047,7 +1066,7 @@ async def place_overseas_order(
         params["ORD_DVSN"] = "00"
     else:
         params["SLL_TYPE"] = "00" if not is_buy else ""
-        params["ORD_DVSN"] = "00" if price else "31"
+        params["ORD_DVSN"] = "00" if is_us_market(market_code) else "00" if price else "31"
 
     try:
         result = await _request_json(

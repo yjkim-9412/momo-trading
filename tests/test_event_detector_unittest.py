@@ -37,6 +37,31 @@ class EventDetectorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detector._prev_prices["NASDAQ:AAPL"], 200.0)
         self.assertEqual(detector._prev_prices["NYSE:AAPL"], 150.0)
 
+    async def test_clear_trade_thresholds_preserves_scan_monitors(self):
+        detector = EventDetector()
+
+        detector.set_thresholds(
+            "CRCD",
+            market="AMEX",
+            surge_pct=4.0,
+            drop_pct=-4.0,
+            volume_spike_ratio=5.0,
+            stop_loss=6.8,
+            take_profit=7.8,
+            trailing_stop_pct=2.0,
+        )
+
+        detector.clear_trade_thresholds("CRCD", market="AMEX")
+        thresholds = detector.get_thresholds("CRCD", market="AMEX")
+
+        self.assertEqual(thresholds.surge_pct, 4.0)
+        self.assertEqual(thresholds.drop_pct, -4.0)
+        self.assertEqual(thresholds.volume_spike_ratio, 5.0)
+        self.assertEqual(thresholds.stop_loss, 0.0)
+        self.assertEqual(thresholds.take_profit, 0.0)
+        self.assertEqual(thresholds.trailing_stop_pct, 0.0)
+        self.assertEqual(thresholds.highest_price, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

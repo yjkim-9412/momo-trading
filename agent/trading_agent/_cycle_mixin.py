@@ -31,6 +31,7 @@ from trading.market_profile import (
     normalize_market_scope,
     requires_mcp_connection,
 )
+from realtime.event_detector import event_detector
 from trading.mcp_client import mcp_client
 from trading.quantity_policy import normalize_quantity
 from trading.risk_policy import normalize_crypto_regime
@@ -86,7 +87,7 @@ class CycleMixin:
         )
 
     async def start(self) -> None:
-        """에이전트 시작 - 실시간 이벤트 구독"""
+        """에이전트 시작 - 실시간 이벤트 구독 + ExitPlan 복원"""
         if self._running:
             logger.debug("AI Trading Agent 이미 시작됨 — 이벤트 재구독 스킵")
             return
@@ -96,6 +97,15 @@ class CycleMixin:
         event_bus.subscribe(EventType.PRICE_DROP, self._on_market_event)
         event_bus.subscribe(EventType.STOP_LOSS_HIT, self._on_stop_loss)
         event_bus.subscribe(EventType.TAKE_PROFIT_HIT, self._on_take_profit)
+
+        # DB에서 활성 ExitPlan 복원 → EventDetector에 임계값 로드
+        try:
+            restored = await event_detector.restore_from_db()
+            if restored:
+                logger.info("ExitPlan 복원: {}건의 활성 plan 로드 완료", restored)
+        except Exception as e:
+            logger.warning("ExitPlan 복원 실패 (무시하고 계속): {}", str(e))
+
         logger.info("AI Trading Agent 시작 — 실시간 이벤트 구독 활성화")
 
     async def stop(self) -> None:

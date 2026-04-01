@@ -61,6 +61,7 @@ class PortfolioMixin:
         for field_name in (
             "name",
             "category",
+            "etp_type_name",
             "product_type",
             "is_leveraged",
             "is_inverse",
@@ -68,6 +69,9 @@ class PortfolioMixin:
             "signed_exposure",
             "restricted_product",
             "classification_source",
+            "market_bias",
+            "market_alignment",
+            "alignment_reason",
         ):
             value = metadata.get(field_name)
             if value not in (None, ""):
@@ -93,6 +97,9 @@ class PortfolioMixin:
         is_inverse = bool(context.get("is_inverse"))
         restricted = bool(context.get("restricted_product"))
         multiplier = float(context.get("leverage_multiplier") or 1.0)
+        market_bias = str(context.get("market_bias") or "")
+        market_alignment = str(context.get("market_alignment") or "UNKNOWN")
+        alignment_reason = str(context.get("alignment_reason") or "시장 방향성 정보 없음")
         if is_inverse:
             exposure_text = f"-{multiplier:g}x"
         elif is_leveraged:
@@ -100,6 +107,14 @@ class PortfolioMixin:
         else:
             exposure_text = "1x"
 
+        if market_alignment == "ALIGNED":
+            alignment_text = f"{market_bias or '시장'} 정합"
+        elif market_alignment == "COUNTER":
+            alignment_text = f"{market_bias or '시장'} 역행"
+        elif market_alignment == "NEUTRAL":
+            alignment_text = f"{market_bias or '시장'} 중립"
+        else:
+            alignment_text = "정보 없음"
         restriction_text = "제한 상품" if restricted else "일반 종목"
         guidance = (
             "레버리지/인버스 특성상 일반 종목보다 더 강한 추세·거래량 확인, 더 보수적인 수량 판단, "
@@ -111,7 +126,9 @@ class PortfolioMixin:
             [
                 f"- 상품 유형: {product_type}",
                 f"- 노출 배수: {exposure_text}",
+                f"- 시장 방향 정합성: {alignment_text} ({alignment_reason})",
                 f"- 제한 상품 여부: {restriction_text}",
+                f"- ETP 유형 힌트: {context.get('etp_type_name') or '없음'}",
                 f"- 분류 근거: {context.get('classification_source') or 'default'}",
                 f"- 분석 메모: {guidance}",
             ]

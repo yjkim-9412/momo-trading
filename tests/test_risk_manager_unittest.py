@@ -25,6 +25,9 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
             "US_LEVERAGE_ALLOWED_SESSIONS": settings.US_LEVERAGE_ALLOWED_SESSIONS,
             "US_LEVERAGE_ALLOWED_STRATEGIES": settings.US_LEVERAGE_ALLOWED_STRATEGIES,
             "US_LEVERAGE_MAX_SINGLE_ORDER_RATIO": settings.US_LEVERAGE_MAX_SINGLE_ORDER_RATIO,
+            "US_REGULAR_OPENING_GUARD_ENABLED": settings.US_REGULAR_OPENING_GUARD_ENABLED,
+            "US_REGULAR_OPENING_GUARD_MAX_POSITION_PCT": settings.US_REGULAR_OPENING_GUARD_MAX_POSITION_PCT,
+            "US_REGULAR_OPENING_GUARD_SIZE_SCALE": settings.US_REGULAR_OPENING_GUARD_SIZE_SCALE,
         }
         settings.TRADING_ENABLED = True
         settings.MAX_SINGLE_ORDER_KRW = 10000
@@ -41,6 +44,9 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
         settings.US_LEVERAGE_ALLOWED_SESSIONS = "US_REGULAR"
         settings.US_LEVERAGE_ALLOWED_STRATEGIES = "STABLE_SHORT"
         settings.US_LEVERAGE_MAX_SINGLE_ORDER_RATIO = 0.3
+        settings.US_REGULAR_OPENING_GUARD_ENABLED = True
+        settings.US_REGULAR_OPENING_GUARD_MAX_POSITION_PCT = 10.0
+        settings.US_REGULAR_OPENING_GUARD_SIZE_SCALE = 0.5
 
     def tearDown(self):
         for field_name, value in self._original.items():
@@ -386,6 +392,44 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["approved"])
         self.assertIn("리스크:보상 비율 부족", result["reason"])
+
+    async def test_us_regular_opening_guard_caps_position_and_scales_quantity(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="AAPL",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=100.0,
+            suggested_quantity=200,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="STABLE_SHORT",
+            metadata={
+                "market": "NASDAQ",
+                "price_krw": 100.0,
+                "session": "US_REGULAR",
+                "opening_guard_active": True,
+                "is_us_regular_opening": True,
+                "minutes_from_regular_open": 12,
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50_000,
+                portfolio_budget=100_000,
+                today_trade_count=0,
+                current_holding_count=0,
+                orderable_cash_krw=50_000,
+                dynamic_limits={"max_single_order_krw": 0, "max_position_pct": 90.0},
+            )
+
+        self.assertTrue(result["approved"])
+        self.assertEqual(result["adjusted_quantity"], 50)
+        self.assertAlmostEqual(result["combined_position_pct"], 5.0)
+        self.assertTrue(result["opening_guard_active"])
+        self.assertIn("정규장 오프닝 가드", result["reason"])
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@ import unittest
 
 from core.config import settings
 from trading.product_policy import (
+    build_product_context,
     classify_product,
+    classification_from_metadata,
     coerce_strategy_for_product,
     is_product_trade_allowed,
 )
@@ -17,6 +19,7 @@ class ProductPolicyTest(unittest.TestCase):
             "US_LEVERAGE_ALLOWED_STRATEGIES": settings.US_LEVERAGE_ALLOWED_STRATEGIES,
             "US_LEVERAGE_ALLOWLIST": settings.US_LEVERAGE_ALLOWLIST,
             "US_LEVERAGE_DENYLIST": settings.US_LEVERAGE_DENYLIST,
+            "US_PRODUCT_TYPE_OVERRIDES": settings.US_PRODUCT_TYPE_OVERRIDES,
             "US_LEVERAGE_KEYWORDS": settings.US_LEVERAGE_KEYWORDS,
             "US_INVERSE_KEYWORDS": settings.US_INVERSE_KEYWORDS,
         }
@@ -26,6 +29,7 @@ class ProductPolicyTest(unittest.TestCase):
         settings.US_LEVERAGE_ALLOWED_STRATEGIES = "STABLE_SHORT"
         settings.US_LEVERAGE_ALLOWLIST = ""
         settings.US_LEVERAGE_DENYLIST = ""
+        settings.US_PRODUCT_TYPE_OVERRIDES = ""
         settings.US_LEVERAGE_KEYWORDS = "2X,3X,ULTRA,ULTRAPRO,LEVERAGED"
         settings.US_INVERSE_KEYWORDS = "INVERSE,SHORT,BEAR"
 
@@ -64,6 +68,54 @@ class ProductPolicyTest(unittest.TestCase):
         self.assertEqual(inverse.product_type, "INVERSE_ETF")
         self.assertEqual(inverse.leverage_multiplier, 1.0)
         self.assertEqual(inverse.signed_exposure, -1.0)
+
+    def test_classify_uses_etp_type_name_and_override_before_fallback_common(self):
+        settings.US_PRODUCT_TYPE_OVERRIDES = "UVIX=LEVERAGED_ETF"
+
+        from_detail = classification_from_metadata(
+            symbol="CRCD",
+            market="AMEX",
+            metadata={
+                "name": "CoreCard ETF",
+                "product_type": "COMMON",
+                "classification_source": "default",
+                "etp_type_name": "ETF",
+            },
+        )
+        from_override = classification_from_metadata(
+            symbol="UVIX",
+            market="NASDAQ",
+            metadata={
+                "name": "2x UVIX",
+                "product_type": "COMMON",
+                "classification_source": "default",
+            },
+        )
+
+        self.assertEqual(from_detail.product_type, "ETF")
+        self.assertEqual(from_detail.classification_source, "etp_type_or_text")
+        self.assertEqual(from_detail.etp_type_name, "ETF")
+        self.assertEqual(from_override.product_type, "LEVERAGED_ETF")
+        self.assertTrue(from_override.is_leveraged)
+        self.assertEqual(from_override.classification_source, "override")
+
+    def test_build_product_context_marks_bear_inverse_as_aligned(self):
+        context = build_product_context(
+            symbol="SQQQ",
+            market="NASDAQ",
+            metadata={
+                "name": "ProShares UltraPro Short QQQ",
+                "product_type": "INVERSE_ETF",
+                "is_inverse": True,
+                "leverage_multiplier": 3.0,
+                "classification_source": "metadata",
+            },
+            market_regime="BEAR",
+        )
+
+        self.assertEqual(context["market_bias"], "BEAR")
+        self.assertEqual(context["market_alignment"], "ALIGNED")
+        self.assertIn("약세장과 같은 방향", context["alignment_reason"])
 
     def test_coerce_restricted_strategy_to_stable(self):
         classification = classify_product(

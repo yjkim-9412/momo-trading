@@ -82,6 +82,12 @@ class AnalysisMixin:
             re.IGNORECASE,
         ),
     )
+    _US_PRE_SCALP_TIER1_MIN_BUY_WINDOW_MIN = 10
+    _US_PRE_SCALP_TIER1_MAX_FORCE_EXIT_WINDOW_MIN = 30
+    _US_PRE_SCALP_TIER1_COMMON_MAX_TARGET_DIST_PCT = 6.0
+    _US_PRE_SCALP_TIER1_COMMON_MAX_STOP_DIST_PCT = 3.0
+    _US_PRE_SCALP_TIER1_RESTRICTED_MAX_TARGET_DIST_PCT = 4.0
+    _US_PRE_SCALP_TIER1_RESTRICTED_MAX_STOP_DIST_PCT = 2.0
 
     @staticmethod
     def _try_float(value) -> float | None:
@@ -109,6 +115,108 @@ class AnalysisMixin:
         if normalized is None:
             normalized = default
         return max(minimum, normalized)
+
+    @staticmethod
+    def _format_clock_label(hour: int | None, minute: int | None) -> str | None:
+        if hour is None or minute is None:
+            return None
+        return f"{int(hour):02d}:{int(minute):02d}"
+
+    @staticmethod
+    def _is_us_premarket_scalp_session(*, market_code: str, session: str | None) -> bool:
+        return (
+            is_us_market(market_code)
+            and str(session or "").upper() == "US_PRE"
+            and settings.US_PREMARKET_SCALP_ENABLED
+        )
+
+    @staticmethod
+    def _merge_tier1_gate_details(*details: dict) -> dict:
+        merged: dict = {}
+        for detail in details:
+            for key, value in (detail or {}).items():
+                if isinstance(value, bool):
+                    if key not in merged or value:
+                        merged[key] = value
+                    continue
+                if value is None or value == "" or value == {}:
+                    continue
+                merged[key] = value
+        return merged
+
+    @classmethod
+    def _build_market_session_context(cls, market: str | None = None) -> dict:
+        from util.time_util import now_kst
+        from zoneinfo import ZoneInfo
+
+        target = normalize_market(market or settings.primary_market_code)
+        now_local = now_kst().astimezone(ZoneInfo(market_timezone(target)))
+        session = market_calendar.get_market_session(dt=now_local, market=target)
+        market_cfg = settings.get_market_config(target, session=session)
+
+        buy_cutoff_hour = market_cfg.get("buy_cutoff_hour")
+        buy_cutoff_minute = market_cfg.get("buy_cutoff_minute")
+        force_hour = market_cfg.get("force_liquidation_hour")
+        force_minute = market_cfg.get("force_liquidation_minute")
+
+        minutes_until_buy_cutoff: int | None = None
+        if settings.market_has_buy_cutoff(target, session=session):
+            buy_cutoff_time = now_local.replace(
+                hour=buy_cutoff_hour,
+                minute=buy_cutoff_minute,
+                second=0,
+                microsecond=0,
+            )
+            minutes_until_buy_cutoff = max(0, int((buy_cutoff_time - now_local).total_seconds() / 60))
+
+        minutes_until_force_liquidation: int | None = None
+        if settings.market_has_force_liquidation(target, session=session):
+            force_time = now_local.replace(
+                hour=force_hour,
+                minute=force_minute,
+                second=0,
+                microsecond=0,
+            )
+            minutes_until_force_liquidation = max(0, int((force_time - now_local).total_seconds() / 60))
+
+        is_premarket_scalp = cls._is_us_premarket_scalp_session(
+            market_code=target,
+            session=session,
+        )
+        minutes_from_regular_open: int | None = None
+        is_us_regular_opening = False
+        if is_us_market(target) and str(session or "").upper() == "US_REGULAR":
+            regular_open_time = now_local.replace(
+                hour=9,
+                minute=30,
+                second=0,
+                microsecond=0,
+            )
+            minutes_from_regular_open = max(0, int((now_local - regular_open_time).total_seconds() / 60))
+            is_us_regular_opening = settings.is_us_regular_opening_guard_session(
+                target,
+                session=session,
+                minutes_from_regular_open=minutes_from_regular_open,
+            )
+        return {
+            "market": target,
+            "session": str(session or "").upper(),
+            "now_local": now_local,
+            "timezone_label": now_local.tzname() or "LOCAL",
+            "minutes_until_buy_cutoff": minutes_until_buy_cutoff,
+            "minutes_until_force_liquidation": minutes_until_force_liquidation,
+            "buy_cutoff_hour": buy_cutoff_hour,
+            "buy_cutoff_minute": buy_cutoff_minute,
+            "buy_cutoff_label": cls._format_clock_label(buy_cutoff_hour, buy_cutoff_minute),
+            "force_liquidation_hour": force_hour,
+            "force_liquidation_minute": force_minute,
+            "force_liquidation_label": cls._format_clock_label(force_hour, force_minute),
+            "is_us_premarket_scalp": is_premarket_scalp,
+            "is_us_regular_opening": is_us_regular_opening,
+            "opening_guard_active": is_us_regular_opening,
+            "minutes_from_regular_open": minutes_from_regular_open,
+            "holding_policy": "PREMARKET_SCALP" if is_premarket_scalp else None,
+        }
 
     @staticmethod
     def _resolve_rule_min_confidence(
@@ -447,7 +555,63 @@ class AnalysisMixin:
             return "Tier2 익절가가 진입가 이하로 설정됨"
         if required_prices["take_profit_price"] > required_prices["target_price"]:
             return "Tier2 익절가가 목표가를 초과함"
+
+        # exit_levels 검증 (선택 필드 — 없으면 단일 TP로 폴백)
+        cls._normalize_exit_levels(final, required_prices["entry_price"])
         return None
+
+    @classmethod
+    def _normalize_exit_levels(
+        cls,
+        final: dict,
+        entry_price: float,
+    ) -> None:
+        """exit_levels를 검증·정규화한다. 유효하지 않으면 단일 TP 폴백 생성."""
+        raw_levels = final.get("exit_levels")
+        if not isinstance(raw_levels, list) or not raw_levels:
+            # AI가 exit_levels를 출력하지 않은 경우 → 단일 TP 폴백
+            tp_price = cls._try_float(final.get("take_profit_price")) or cls._try_float(final.get("target_price"))
+            if tp_price and tp_price > entry_price:
+                final["exit_levels"] = [
+                    {"type": "TAKE_PROFIT", "price": round(tp_price, 4), "pct": 100,
+                     "reason": "단일 익절", "triggered": False, "triggered_at": None},
+                ]
+            return
+
+        validated: list[dict] = []
+        for level in raw_levels:
+            if not isinstance(level, dict):
+                continue
+            ltype = str(level.get("type", "")).upper()
+            if ltype != "TAKE_PROFIT":
+                continue
+            price = cls._try_float(level.get("price"))
+            pct = cls._try_int(level.get("pct"))
+            if price is None or price <= entry_price or pct is None or pct <= 0:
+                continue
+            validated.append({
+                "type": "TAKE_PROFIT",
+                "price": round(price, 4),
+                "pct": min(pct, 100),
+                "reason": str(level.get("reason", "")),
+                "triggered": False,
+                "triggered_at": None,
+            })
+
+        if not validated:
+            # 유효한 레벨 없음 → 단일 TP 폴백
+            tp_price = cls._try_float(final.get("take_profit_price")) or cls._try_float(final.get("target_price"))
+            if tp_price and tp_price > entry_price:
+                final["exit_levels"] = [
+                    {"type": "TAKE_PROFIT", "price": round(tp_price, 4), "pct": 100,
+                     "reason": "단일 익절 (exit_levels 검증 실패 폴백)", "triggered": False, "triggered_at": None},
+                ]
+            return
+
+        # 가격 오름차순 정렬 + 마지막 pct=100 보장
+        validated.sort(key=lambda x: x["price"])
+        validated[-1]["pct"] = 100
+        final["exit_levels"] = validated
 
     @classmethod
     def _detect_external_evidence(cls, *payloads: object) -> str | None:
@@ -558,6 +722,229 @@ class AnalysisMixin:
             return -numeric
         return numeric
 
+    @classmethod
+    def _apply_us_premarket_scalp_tier1_gate(
+        cls,
+        analysis: dict | None,
+        *,
+        market_code: str,
+        current_price: float,
+        current_position: dict | None,
+        product_context: dict | None,
+        chart_result: ChartAnalysisResult | None,
+        session_context: dict | None,
+    ) -> tuple[dict | None, dict]:
+        gate_detail = {
+            "session": (session_context or {}).get("session"),
+            "holding_policy": (session_context or {}).get("holding_policy"),
+            "minutes_until_buy_cutoff": (session_context or {}).get("minutes_until_buy_cutoff"),
+            "minutes_until_force_liquidation": (session_context or {}).get("minutes_until_force_liquidation"),
+            "target_distance_pct": None,
+            "stop_distance_pct": None,
+            "tier1_gate_applied": False,
+            "tier1_gate_reason_code": None,
+        }
+
+        if not analysis or not (session_context or {}).get("is_us_premarket_scalp"):
+            return analysis, gate_detail
+        if current_position:
+            return analysis, gate_detail
+
+        recommendation = str(analysis.get("recommendation") or "").upper()
+        position_intent = str(analysis.get("position_intent") or "NEW").upper()
+        if recommendation != "BUY" or position_intent in {"ADD_ON_PYRAMID", "ADD_ON_AVERAGE_DOWN"}:
+            return analysis, gate_detail
+
+        target_price = cls._try_float(analysis.get("target_price"))
+        stop_loss_price = cls._try_float(
+            analysis.get("stop_loss_price", analysis.get("stop_loss"))
+        )
+        target_distance_pct = None
+        if target_price is not None and current_price > 0:
+            target_distance_pct = round(((target_price - current_price) / current_price) * 100, 2)
+        stop_distance_pct = None
+        if stop_loss_price is not None and current_price > 0:
+            stop_distance_pct = round(((current_price - stop_loss_price) / current_price) * 100, 2)
+        gate_detail["target_distance_pct"] = target_distance_pct
+        gate_detail["stop_distance_pct"] = stop_distance_pct
+
+        minutes_until_buy_cutoff = cls._try_int(gate_detail["minutes_until_buy_cutoff"])
+        minutes_until_force_liquidation = cls._try_int(gate_detail["minutes_until_force_liquidation"])
+        restricted_product = bool((product_context or {}).get("restricted_product"))
+        trend = chart_result.trend if chart_result else None
+        intraday = dict(getattr(trend, "intraday", None) or {})
+        intraday_direction = str(intraday.get("direction") or "NEUTRAL").upper()
+        intraday_vwap = str(intraday.get("vwap_position") or "AT_VWAP").upper()
+        momentum = str(getattr(trend, "momentum", "NEUTRAL") or "NEUTRAL").upper()
+
+        gate_reason_code: str | None = None
+        gate_reason: str | None = None
+
+        if (
+            minutes_until_buy_cutoff is not None
+            and minutes_until_buy_cutoff < cls._US_PRE_SCALP_TIER1_MIN_BUY_WINDOW_MIN
+        ):
+            gate_reason_code = "TIMEBOX_TOO_SHORT"
+            gate_reason = (
+                f"[{gate_reason_code}] 프리마켓 스캘프는 신규 매수 마감까지 "
+                f"{minutes_until_buy_cutoff}분 미만이면 신규 BUY를 허용하지 않습니다."
+            )
+        elif (
+            minutes_until_force_liquidation is not None
+            and minutes_until_force_liquidation <= cls._US_PRE_SCALP_TIER1_MAX_FORCE_EXIT_WINDOW_MIN
+        ):
+            if restricted_product and (
+                (
+                    target_distance_pct is not None
+                    and target_distance_pct > cls._US_PRE_SCALP_TIER1_RESTRICTED_MAX_TARGET_DIST_PCT
+                )
+                or (
+                    stop_distance_pct is not None
+                    and stop_distance_pct > cls._US_PRE_SCALP_TIER1_RESTRICTED_MAX_STOP_DIST_PCT
+                )
+            ):
+                gate_reason_code = "RESTRICTED_PRODUCT_NOT_TIGHT"
+                gate_reason = (
+                    f"[{gate_reason_code}] 제한 상품은 강제 청산까지 "
+                    f"{minutes_until_force_liquidation}분 남은 프리마켓에서 더 짧은 목표와 더 타이트한 손절이 필요합니다."
+                )
+            elif (
+                not restricted_product
+                and target_distance_pct is not None
+                and target_distance_pct > cls._US_PRE_SCALP_TIER1_COMMON_MAX_TARGET_DIST_PCT
+            ):
+                gate_reason_code = "TARGET_TOO_FAR"
+                gate_reason = (
+                    f"[{gate_reason_code}] 강제 청산까지 {minutes_until_force_liquidation}분 남은 프리마켓에서는 "
+                    f"현재가 대비 +{target_distance_pct:.2f}% 목표가가 너무 멉니다."
+                )
+            elif (
+                not restricted_product
+                and stop_distance_pct is not None
+                and stop_distance_pct > cls._US_PRE_SCALP_TIER1_COMMON_MAX_STOP_DIST_PCT
+            ):
+                gate_reason_code = "STOP_TOO_WIDE"
+                gate_reason = (
+                    f"[{gate_reason_code}] 프리마켓 스캘프는 현재가 대비 -{stop_distance_pct:.2f}% 손절폭을 허용하지 않습니다."
+                )
+
+        if gate_reason_code is None:
+            intraday_not_confirmed = (
+                intraday_direction != "BULLISH"
+                or intraday_vwap != "ABOVE_VWAP"
+                or momentum in {"DECELERATING", "REVERSING"}
+            )
+            if intraday_not_confirmed:
+                gate_reason_code = "INTRADAY_NOT_CONFIRMED"
+                gate_reason = (
+                    f"[{gate_reason_code}] 분봉 확인이 부족합니다 "
+                    f"(direction={intraday_direction}, vwap={intraday_vwap}, momentum={momentum})."
+                )
+
+        if gate_reason_code is None:
+            return analysis, gate_detail
+
+        gated_analysis = dict(analysis)
+        gated_analysis["recommendation"] = "HOLD"
+        gated_analysis["position_intent"] = "HOLD"
+        gated_analysis["reason"] = gate_reason
+        gated_analysis["tier1_gate_reason_code"] = gate_reason_code
+        gate_detail["tier1_gate_applied"] = True
+        gate_detail["tier1_gate_reason_code"] = gate_reason_code
+        return gated_analysis, gate_detail
+
+    @classmethod
+    def _apply_us_regular_opening_tier1_gate(
+        cls,
+        analysis: dict | None,
+        *,
+        market_code: str,
+        current_price: float,
+        change_rate: float | None,
+        current_position: dict | None,
+        chart_result: ChartAnalysisResult | None,
+        session_context: dict | None,
+    ) -> tuple[dict | None, dict]:
+        gate_detail = {
+            "session": (session_context or {}).get("session"),
+            "is_us_regular_opening": bool((session_context or {}).get("is_us_regular_opening")),
+            "opening_guard_active": bool((session_context or {}).get("opening_guard_active")),
+            "minutes_from_regular_open": (session_context or {}).get("minutes_from_regular_open"),
+            "target_distance_pct": None,
+            "stop_distance_pct": None,
+            "tier1_gate_applied": False,
+            "tier1_gate_reason_code": None,
+            "opening_gate_reason_code": None,
+        }
+
+        if not analysis or not (session_context or {}).get("is_us_regular_opening"):
+            return analysis, gate_detail
+        if current_position:
+            return analysis, gate_detail
+
+        recommendation = str(analysis.get("recommendation") or "").upper()
+        position_intent = str(analysis.get("position_intent") or "NEW").upper()
+        if recommendation != "BUY" or position_intent in {"ADD_ON_PYRAMID", "ADD_ON_AVERAGE_DOWN"}:
+            return analysis, gate_detail
+
+        target_price = cls._try_float(analysis.get("target_price"))
+        stop_loss_price = cls._try_float(
+            analysis.get("stop_loss_price", analysis.get("stop_loss"))
+        )
+        if target_price is not None and current_price > 0:
+            gate_detail["target_distance_pct"] = round(((target_price - current_price) / current_price) * 100, 2)
+        if stop_loss_price is not None and current_price > 0:
+            gate_detail["stop_distance_pct"] = round(((current_price - stop_loss_price) / current_price) * 100, 2)
+
+        thresholds = settings.us_regular_opening_guard_thresholds
+        abs_change_pct = abs(cls._try_float(change_rate) or 0.0)
+        trend = chart_result.trend if chart_result else None
+        intraday = dict(getattr(trend, "intraday", None) or {})
+        intraday_direction = str(intraday.get("direction") or "NEUTRAL").upper()
+        intraday_vwap = str(intraday.get("vwap_position") or "AT_VWAP").upper()
+
+        gate_reason_code: str | None = None
+        gate_reason: str | None = None
+
+        if (
+            current_price < thresholds["min_price_usd"]
+            and abs_change_pct >= thresholds["low_price_max_abs_change_pct"]
+        ):
+            gate_reason_code = "OPENING_LOW_PRICE_HOT_MOVER"
+            gate_reason = (
+                f"[{gate_reason_code}] 미국 정규장 오프닝 구간에서는 "
+                f"{current_price:.2f}USD 저가주가 {abs_change_pct:.2f}% 급등한 추격 BUY를 허용하지 않습니다."
+            )
+        elif (
+            current_price < thresholds["mid_price_ceiling_usd"]
+            and abs_change_pct >= thresholds["mid_price_max_abs_change_pct"]
+        ):
+            gate_reason_code = "OPENING_EXTREME_MOVER"
+            gate_reason = (
+                f"[{gate_reason_code}] 미국 정규장 오프닝 구간에서는 "
+                f"{current_price:.2f}USD 종목의 {abs_change_pct:.2f}% 급등 추격 BUY를 허용하지 않습니다."
+            )
+        elif intraday_direction != "BULLISH" or intraday_vwap != "ABOVE_VWAP":
+            gate_reason_code = "OPENING_INTRADAY_NOT_CONFIRMED"
+            gate_reason = (
+                f"[{gate_reason_code}] 정규장 오프닝 구간은 분봉 확인이 필요합니다 "
+                f"(direction={intraday_direction}, vwap={intraday_vwap})."
+            )
+
+        if gate_reason_code is None:
+            return analysis, gate_detail
+
+        gated_analysis = dict(analysis)
+        gated_analysis["recommendation"] = "HOLD"
+        gated_analysis["position_intent"] = "HOLD"
+        gated_analysis["reason"] = gate_reason
+        gated_analysis["tier1_gate_reason_code"] = gate_reason_code
+        gated_analysis["opening_gate_reason_code"] = gate_reason_code
+        gate_detail["tier1_gate_applied"] = True
+        gate_detail["tier1_gate_reason_code"] = gate_reason_code
+        gate_detail["opening_gate_reason_code"] = gate_reason_code
+        return gated_analysis, gate_detail
+
     async def _analyze_and_trade(
         self, stock_info: dict, cycle_id: str,
         dynamic_limits: dict | None = None,
@@ -626,7 +1013,11 @@ class AnalysisMixin:
 
         # MCP로 데이터 병렬 조회 (일봉 60일 + 분봉 5분 + 현재가)
         price_resp, daily_resp, minute_resp = await asyncio.gather(
-            mcp_client.get_current_price(symbol, market=market_code),
+            (
+                mcp_client.get_current_price_detail(symbol, market=market_code)
+                if is_us_market(market_code)
+                else mcp_client.get_current_price(symbol, market=market_code)
+            ),
             mcp_client.get_daily_price(symbol, count=60, market=market_code),
             mcp_client.get_minute_price(symbol, period="5", market=market_code),
         )
@@ -693,6 +1084,8 @@ class AnalysisMixin:
             "name": stock_info.get("name") or cached_product.get("name") or name,
             "category": stock_info.get("category") or cached_product.get("category")
             or ((price_resp.data or {}).get("category") if price_resp.success and price_resp.data else ""),
+            "etp_type_name": stock_info.get("etp_type_name") or cached_product.get("etp_type_name")
+            or ((price_resp.data or {}).get("etp_type_name") if price_resp.success and price_resp.data else ""),
             "product_type": stock_info.get("product_type") or cached_product.get("product_type"),
             "is_leveraged": stock_info.get("is_leveraged", cached_product.get("is_leveraged")),
             "is_inverse": stock_info.get("is_inverse", cached_product.get("is_inverse")),
@@ -709,7 +1102,12 @@ class AnalysisMixin:
         self._remember_product_metadata(symbol, market_code, product_metadata)
         stock_info.update(product_metadata)
         name = product_metadata.get("name", name) or name
-        product_context = build_product_context(symbol, market_code, product_metadata)
+        product_context = build_product_context(
+            symbol,
+            market_code,
+            product_metadata,
+            market_regime=mkt_state.market_regime,
+        )
 
         effective_strategy = coerce_strategy_for_product(strategy_type, classification)
         if not effective_strategy:
@@ -905,6 +1303,34 @@ class AnalysisMixin:
                 )
                 return result
 
+        session_context = self._build_market_session_context(market_code)
+        analysis, premarket_gate_detail = self._apply_us_premarket_scalp_tier1_gate(
+            analysis,
+            market_code=market_code,
+            current_price=current_price,
+            current_position=current_position,
+            product_context=product_context,
+            chart_result=chart_result,
+            session_context=session_context,
+        )
+        analysis, opening_gate_detail = self._apply_us_regular_opening_tier1_gate(
+            analysis,
+            market_code=market_code,
+            current_price=current_price,
+            change_rate=self._try_float(price_payload.get("change_rate")),
+            current_position=current_position,
+            chart_result=chart_result,
+            session_context=session_context,
+        )
+        tier1_gate_detail = self._merge_tier1_gate_details(
+            premarket_gate_detail,
+            opening_gate_detail,
+        )
+        gate_log_detail = {
+            key: value
+            for key, value in tier1_gate_detail.items()
+            if value not in (None, "", {})
+        }
         recommendation = analysis.get("recommendation", "HOLD")
 
         # 스캔 파이프라인은 매수 기회 탐색 전용 — SELL 추천은 무시
@@ -915,14 +1341,15 @@ class AnalysisMixin:
                 f"\U0001f4ca [{name}] Tier1: SELL → 스캔 경로에서 매도 스킵 | {reason[:100]}",
                 cycle_id=cycle_id, symbol=symbol,
                 detail=self._enrich_activity_detail(
-                    {
-                        "recommendation": "SELL",
-                        "reason": reason,
-                        "confidence": analysis.get("confidence") or 0,
-                        **orderable_detail,
-                    },
-                    product_context,
-                ),
+                        {
+                            "recommendation": "SELL",
+                            "reason": reason,
+                            "confidence": analysis.get("confidence") or 0,
+                            **gate_log_detail,
+                            **orderable_detail,
+                        },
+                        product_context,
+                    ),
                 llm_provider=analysis.get("provider"),
                 llm_tier="TIER1",
                 execution_time_ms=t1_elapsed,
@@ -937,15 +1364,16 @@ class AnalysisMixin:
                 f"\U0001f4ca [{name}] Tier1: HOLD → 스킵 | {reason[:100]}",
                 cycle_id=cycle_id, symbol=symbol,
                 detail=self._enrich_activity_detail(
-                    {
-                        "recommendation": "HOLD",
-                        "reason": reason,
-                        "confidence": analysis.get("confidence") or 0,
-                        "key_factors": analysis.get("key_factors", []),
-                        **orderable_detail,
-                    },
-                    product_context,
-                ),
+                        {
+                            "recommendation": "HOLD",
+                            "reason": reason,
+                            "confidence": analysis.get("confidence") or 0,
+                            "key_factors": analysis.get("key_factors", []),
+                            **gate_log_detail,
+                            **orderable_detail,
+                        },
+                        product_context,
+                    ),
                 llm_provider=analysis.get("provider"),
                 llm_tier="TIER1",
                 execution_time_ms=t1_elapsed,
@@ -965,6 +1393,7 @@ class AnalysisMixin:
                         "reason": analysis.get("reason") or analysis.get("summary", ""),
                         "target_price": analysis.get("target_price"),
                         "stop_loss": analysis.get("stop_loss_price"),
+                        **gate_log_detail,
                         **orderable_detail,
                     },
                     product_context,
@@ -1299,6 +1728,13 @@ class AnalysisMixin:
                 current_position and has_quantity(current_position.get("quantity") or 0, market_code)
             ),
         )
+        session_signal_metadata = {
+            "session": session_context.get("session"),
+            "holding_policy": session_context.get("holding_policy"),
+            "opening_guard_active": bool(session_context.get("opening_guard_active")),
+            "is_us_regular_opening": bool(session_context.get("is_us_regular_opening")),
+            "minutes_from_regular_open": session_context.get("minutes_from_regular_open"),
+        }
         # 4. 전략 적용
         strategy = mkt_state.strategies.get(strategy_type)
         crypto_buy_plan = (
@@ -1383,8 +1819,13 @@ class AnalysisMixin:
                     "current_position": dict(current_position or {}),
                     "analysis_source": analysis_source,
                     "event_type": event_type or None,
+                    **session_signal_metadata,
                     **orderable_signal_metadata,
                     **classification.to_metadata(),
+                    "market_regime": mkt_state.market_regime,
+                    "market_bias": product_context.get("market_bias"),
+                    "market_alignment": product_context.get("market_alignment"),
+                    "alignment_reason": product_context.get("alignment_reason"),
                 },
             )
 
@@ -1500,8 +1941,15 @@ class AnalysisMixin:
                 "current_position": dict(current_position or {}),
                 "analysis_source": analysis_source,
                 "event_type": event_type or None,
+                **session_signal_metadata,
                 **orderable_signal_metadata,
                 **classification.to_metadata(),
+                **{
+                    "market_regime": mkt_state.market_regime,
+                    "market_bias": product_context.get("market_bias"),
+                    "market_alignment": product_context.get("market_alignment"),
+                    "alignment_reason": product_context.get("alignment_reason"),
+                },
             }
 
         if signal.action == SignalAction.BUY:
@@ -1626,6 +2074,11 @@ class AnalysisMixin:
             "current_position": dict(current_position or {}),
             "analysis_source": analysis_source,
             "event_type": event_type or None,
+            "market_regime": mkt_state.market_regime,
+            "market_bias": product_context.get("market_bias"),
+            "market_alignment": product_context.get("market_alignment"),
+            "alignment_reason": product_context.get("alignment_reason"),
+            **session_signal_metadata,
             **orderable_signal_metadata,
         })
 
@@ -1654,6 +2107,10 @@ class AnalysisMixin:
             "signed_exposure": float(product_context.get("signed_exposure") or 1.0),
             "restricted_product": bool(product_context.get("restricted_product")),
             "classification_source": product_context.get("classification_source"),
+            "etp_type_name": product_context.get("etp_type_name"),
+            "market_bias": product_context.get("market_bias"),
+            "market_alignment": product_context.get("market_alignment"),
+            "alignment_reason": product_context.get("alignment_reason"),
             "entry_mode": entry_mode,
             "combined_position_pct": signal.metadata.get("combined_position_pct"),
             "post_trade_cash_ratio": signal.metadata.get("post_trade_cash_ratio"),
@@ -1792,38 +2249,17 @@ class AnalysisMixin:
 
     async def _build_trading_context(self, market: str | None = None) -> str:
         """트레이딩 컨텍스트 (프롬프트 주입용)"""
-        from util.time_util import now_kst
         from trading.account_manager import account_manager
-        from zoneinfo import ZoneInfo
 
         target = normalize_market(market or settings.primary_market_code)
         scope = market_scope(target)
         state = self._get_state(scope)
-
-        now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
-        session = market_calendar.get_market_session(dt=now, market=target)
-        mkt_cfg = settings.get_market_config(target, session=session)
-
-        minutes_left: int | None = None
-        if settings.market_has_force_liquidation(target, session=session):
-            close_time = now.replace(
-                hour=mkt_cfg["force_liquidation_hour"],
-                minute=mkt_cfg["force_liquidation_minute"],
-                second=0,
-                microsecond=0,
-            )
-            minutes_left = max(0, int((close_time - now).total_seconds() / 60))
-
-        minutes_until_buy_cutoff: int | None = None
-        if settings.market_has_buy_cutoff(target, session=session):
-            buy_cutoff_time = now.replace(
-                hour=mkt_cfg["buy_cutoff_hour"],
-                minute=mkt_cfg["buy_cutoff_minute"],
-                second=0,
-                microsecond=0,
-            )
-            minutes_until_buy_cutoff = max(0, int((buy_cutoff_time - now).total_seconds() / 60))
-        timezone_label = now.tzname() or "LOCAL"
+        session_context = self._build_market_session_context(target)
+        now = session_context["now_local"]
+        session = session_context["session"]
+        timezone_label = session_context["timezone_label"]
+        minutes_until_buy_cutoff = session_context["minutes_until_buy_cutoff"]
+        minutes_left = session_context["minutes_until_force_liquidation"]
 
         daily_pnl_pct = 0.0
         if state.daily_start_balance > 0:
@@ -1844,10 +2280,10 @@ class AnalysisMixin:
             f"{f'{minutes_until_buy_cutoff}분' if minutes_until_buy_cutoff is not None else '제한 없음'} | "
             f"강제 청산까지: "
             f"{f'{minutes_left}분' if minutes_left is not None else '없음'}\n"
-            f"오늘 누적 손익: {daily_pnl_pct:+.2f}% | "
-            f"매매 성적: {stats['wins']}승 {stats['losses']}패 "
-            f"(총 {stats['total']}건)"
-        )
+                f"오늘 누적 손익: {daily_pnl_pct:+.2f}% | "
+                f"매매 성적: {stats['wins']}승 {stats['losses']}패 "
+                f"(총 {stats['total']}건)"
+            )
 
         if scope == "CRYPTO":
             trading_style_profile = get_crypto_trading_style_profile(settings.crypto_trading_style_mode)
@@ -1856,6 +2292,28 @@ class AnalysisMixin:
                 f"만료 시 자동 청산·정산 | 스캔 전 자동 리포트 없음"
                 f"\n코인 매매 성향: {trading_style_profile['mode']} "
                 f"({trading_style_profile['label']} | {trading_style_profile['summary']})"
+            )
+        elif session_context.get("is_us_premarket_scalp"):
+            buy_cutoff_label = session_context.get("buy_cutoff_label") or "N/A"
+            force_label = session_context.get("force_liquidation_label") or "N/A"
+            context += (
+                "\n모드: 프리마켓 스캘프 | holding_policy=PREMARKET_SCALP | 정규장 carry 금지"
+                f"\n세션 규칙: 신규 매수 마감 {buy_cutoff_label} {timezone_label} | "
+                f"강제 청산 {force_label} {timezone_label}"
+                "\n이번 세션은 강제 청산 시각 전 정리 전제의 단타만 허용"
+                f"\n정량 컨텍스트: session={session} | holding_policy=PREMARKET_SCALP | "
+                f"minutes_until_buy_cutoff={minutes_until_buy_cutoff} | "
+                f"minutes_until_force_liquidation={minutes_left}"
+            )
+        elif session_context.get("is_us_regular_opening"):
+            context += (
+                f"\n모드: 정규장 오프닝 가드 | opening_guard_active=true | "
+                f"시작 후 {settings.us_regular_opening_guard_window_minutes}분 보수 운용"
+                "\n세션 규칙: 추격 매수보다 확인 우선 | 저가 급등주 신규 BUY 매우 보수적"
+                f"\n정량 컨텍스트: session={session} | opening_guard_active=true | "
+                f"minutes_from_regular_open={session_context.get('minutes_from_regular_open')} | "
+                f"minutes_until_buy_cutoff={minutes_until_buy_cutoff} | "
+                f"minutes_until_force_liquidation={minutes_left}"
             )
         elif not settings.DAY_TRADING_ONLY:
             context += (
@@ -1964,12 +2422,32 @@ class AnalysisMixin:
         if trailing and float(trailing) > 0:
             kwargs["trailing_stop_pct"] = float(trailing)
 
-        if kwargs:
-            event_detector.set_thresholds(symbol, market=market, **kwargs)
+        # exit_levels → 다단계 TP 레벨 적용
+        exit_levels = tier2.get("exit_levels") or tier1.get("exit_levels")
+        tp_levels_for_detector = None
+        if isinstance(exit_levels, list) and exit_levels:
+            tp_active = [
+                l for l in exit_levels
+                if l.get("type") == "TAKE_PROFIT" and not l.get("triggered")
+            ]
+            if tp_active:
+                tp_levels_for_detector = [
+                    {"price": l["price"], "pct": l["pct"], "level_index": i}
+                    for i, l in enumerate(tp_active)
+                ]
+
+        if kwargs or tp_levels_for_detector:
+            event_detector.set_thresholds(
+                symbol, market=market,
+                tp_levels=tp_levels_for_detector,
+                **kwargs,
+            )
+            level_info = f", TP레벨={len(tp_levels_for_detector)}단계" if tp_levels_for_detector else ""
             logger.info(
-                "AI 손절/익절 설정: {} → {}",
+                "AI 손절/익절 설정: {} → {}{}",
                 symbol,
                 ", ".join(f"{k}={v}" for k, v in kwargs.items()),
+                level_info,
             )
 
     def _resolve_applied_trade_thresholds(
@@ -2485,7 +2963,12 @@ class AnalysisMixin:
         product_metadata = self._get_product_metadata(symbol, market_code)
         if not product_metadata:
             product_metadata = {"name": name}
-        product_context = build_product_context(symbol, market_code, product_metadata)
+        product_context = build_product_context(
+            symbol,
+            market_code,
+            product_metadata,
+            market_regime=runtime.market_regime,
+        )
 
         entry_price = float(getattr(trade_result, "entry_price", 0.0) or 0.0)
         target_price = self._try_float(getattr(trade_result, "ai_target_price", None))

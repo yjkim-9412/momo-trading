@@ -75,7 +75,12 @@ class RiskManager:
     def _signal_product_context(signal: TradeSignal) -> dict:
         metadata = signal.metadata or {}
         market_code = str(metadata.get("market") or "KRX")
-        return build_product_context(signal.symbol, market_code, metadata)
+        return build_product_context(
+            signal.symbol,
+            market_code,
+            metadata,
+            market_regime=str(metadata.get("market_regime") or ""),
+        )
 
     @classmethod
     def _signal_amount_krw(cls, signal: TradeSignal, market_code: str) -> float:
@@ -88,6 +93,18 @@ class RiskManager:
         if unit_price_krw > 0 and quantity > 0:
             return unit_price_krw * quantity
         return 0.0
+
+    @staticmethod
+    def _is_us_regular_opening_buy(signal: TradeSignal) -> bool:
+        metadata = signal.metadata or {}
+        market_code = str(metadata.get("market") or "KRX")
+        session = str(metadata.get("session") or "").upper()
+        return bool(
+            signal.action == SignalAction.BUY
+            and is_us_market(market_code)
+            and session == "US_REGULAR"
+            and metadata.get("opening_guard_active")
+        )
 
     @staticmethod
     def _format_daily_trade_progress(today_trade_count: int, effective_max_daily: int) -> str:
@@ -225,6 +242,13 @@ class RiskManager:
                 eff_max_order *= leverage_ratio
             if leverage_ratio > 0:
                 eff_max_pos_pct *= leverage_ratio
+
+        opening_guard_active = self._is_us_regular_opening_buy(signal)
+        if opening_guard_active:
+            eff_max_pos_pct = min(
+                eff_max_pos_pct,
+                settings.us_regular_opening_guard_max_position_pct,
+            )
 
         total_amount = requested_amount_krw if _is_crypto else unit_price_krw * quantity
         current_position_value_krw = float((current_position or {}).get("current_value_krw") or 0.0)
@@ -436,6 +460,7 @@ class RiskManager:
 
         requested_quantity = quantity
         adjustment_labels: list[str] = []
+        opening_guard_scale = settings.us_regular_opening_guard_size_scale if opening_guard_active else 1.0
 
         def _apply_quantity_cap(capped_qty: float, label: str) -> tuple[bool, dict | None]:
             nonlocal quantity, total_amount
@@ -550,6 +575,23 @@ class RiskManager:
                     )
                     return reject_result
 
+        if opening_guard_scale > 0 and opening_guard_scale < 1.0:
+            _, reject_result = _apply_quantity_cap(
+                normalize_quantity(quantity * opening_guard_scale, market_code),
+                "정규장 오프닝 가드",
+            )
+            if reject_result:
+                reject_result.update({
+                    "broker_cash_krw": broker_cash_krw,
+                    "cash_basis_krw": cash_basis_krw,
+                    "orderable_cash_krw": orderable_cash_krw,
+                    "opening_guard_active": True,
+                })
+                await self._log_result(
+                    symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
+                )
+                return reject_result
+
         combined_position_pct = (
             ((current_position_value_krw + total_amount) / portfolio_budget) * 100
             if portfolio_budget > 0
@@ -573,6 +615,7 @@ class RiskManager:
             "broker_cash_krw": broker_cash_krw,
             "cash_basis_krw": cash_basis_krw,
             "orderable_cash_krw": orderable_cash_krw,
+            "opening_guard_active": opening_guard_active,
         }
         await self._log_result(
             symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily

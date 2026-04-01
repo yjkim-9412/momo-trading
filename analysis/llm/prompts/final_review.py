@@ -37,12 +37,18 @@ Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매
 - 강제 청산까지 2시간 미만 → 목표가 축소, 포지션 사이즈 축소
 - 오늘 누적 손실 -2% 이상 → 매우 보수적으로, -3% 이상 → 매수 자제
 - 제한 상품 주의: 레버리지/인버스 상품은 배수만큼 갭 리스크가 확대될 수 있으므로 일반 종목보다 더 타이트한 손절, 더 보수적인 수량, 세션 종료 전 청산 가능성을 우선 검토하세요
+- 방향성 해석 규칙: 인버스/레버리지 상품은 종목 가격 방향이 아니라 `시장 노출 방향` 기준으로 검증하세요
+- 방향성 해석 규칙: `BEAR + inverse(-x)`는 시장 정합, `BULL + inverse(-x)`는 시장 역행으로 판단하세요
+- 방향성 해석 규칙: `BEAR + positive exposure(+1x/+2x/+3x)`는 시장 역행, `BULL + positive exposure`는 시장 정합입니다
+- 방향성 해석 규칙: `THEME/SIDEWAYS`는 broad market 방향 정합성을 중립 처리하고 종목 자체 추세와 실행 가능성을 우선 검토하세요
+- 미국 정규장 오프닝 가드: trading_context에 `opening_guard_active=true`가 있으면 정규장 첫 60분은 추격 매수보다 확인을 우선하고, 저가 급등주는 수량 축소보다 미승인을 우선 검토하세요
 
 ## 거부(REJECT) 기준
 - THEME/BULL 국면: RR비율 __BULL_THEME_RR__:1 미만 → REJECT
 - SIDEWAYS/BEAR 국면: RR비율 __DEFENSIVE_RR__:1 미만 → REJECT
 - 시장 전체 급락 중에 무리한 역추세 매수 (단, 과매도 반등은 허용)
 - 거래량 뒷받침 전혀 없는 돌파/반전 시그널
+- 미국 정규장 오프닝 가드: BEAR/SIDEWAYS + 저가 급등주 + 과열 지표 다중 발생 + 분봉/VWAP 확인 부족 조합이면 승인보다 REJECT를 우선하세요
 - 현재 종목 포지션이 이미 크면 추가매수 정당성이 명확하지 않은 한 승인하지 마세요
 - 보유 종목 BUY는 반드시 `position_intent`를 `ADD_ON_PYRAMID` 또는 `ADD_ON_AVERAGE_DOWN`으로 명시하세요
 - `ADD_ON_AVERAGE_DOWN`은 손실 구간 반등 확인형 추가매수일 때만 허용하세요
@@ -142,7 +148,8 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 - take_profit_price: 익절 기준가 ({currency}) = target_price와 동일하거나 별도 설정
 - trailing_stop_pct: 고점 대비 자동 손절 % (0이면 미사용)
 - planned_hold_days: 총 계획 보유일 (장마감 AI 재리뷰 횟수 기준, 최소 1일)
-- BUY 승인 시 `entry_price`, `target_price`, `stop_loss_price`, `take_profit_price`, `planned_hold_days`를 모두 반드시 채우세요
+- exit_levels: 다단계 익절 계획 (최소 1개, 최대 3개 레벨)
+- BUY 승인 시 `entry_price`, `target_price`, `stop_loss_price`, `take_profit_price`, `planned_hold_days`, `exit_levels`를 모두 반드시 채우세요
 - Long 기준 가격 관계는 `stop_loss_price < entry_price < take_profit_price <= target_price` 를 지키세요
 - 외부 링크, 뉴스 출처, URL, 웹페이지 이름을 reason/risk_warnings에 쓰지 마세요
 
@@ -169,10 +176,21 @@ JSON 형식으로 답변:
   "trailing_stop_pct": 0.0,
   "planned_hold_days": 0,
   "suggested_quantity": 0,
+  "exit_levels": [
+    {{"type": "TAKE_PROFIT", "price": 0, "pct": 50, "reason": "1차 익절 근거"}},
+    {{"type": "TAKE_PROFIT", "price": 0, "pct": 100, "reason": "최종 목표가 근거"}}
+  ],
+  "exit_reasoning": "다단계 익절 전략 요약",
   "reason": "위 체크리스트와 스트레스 테스트 기반 최종 판단 이유",
   "risk_warnings": ["위 분석에서 도출한 리스크"]
 }}
-```"""
+```
+**exit_levels 작성 규칙**:
+- type은 TAKE_PROFIT만 사용 (STOP_LOSS는 stop_loss_price 필드 사용)
+- pct는 해당 가격 도달 시 보유 수량의 몇 %를 청산할지 (누적 아닌 잔여 기준)
+- 마지막 레벨의 pct는 반드시 100 (잔여 전량 청산)
+- 최소 1개, 최대 3개 레벨, 가격은 오름차순 정렬
+- exit_levels의 마지막(최고) 가격 = target_price, 첫 번째 레벨 가격 = take_profit_price"""
 FINAL_REVIEW_PROMPT = (
     FINAL_REVIEW_PROMPT
     .replace("__BULL_THEME_RR__", f"{BULL_THEME_RR_FLOOR:.1f}")
@@ -265,10 +283,17 @@ JSON 형식으로 답변:
   "stop_loss_price": 0,
   "take_profit_price": 0,
   "trailing_stop_pct": 0.0,
+  "exit_levels": [
+    {{"type": "TAKE_PROFIT", "price": 0, "pct": 50, "reason": "1차 익절 근거"}},
+    {{"type": "TAKE_PROFIT", "price": 0, "pct": 100, "reason": "최종 목표가 근거"}}
+  ],
+  "exit_reasoning": "다단계 익절 전략 요약",
   "reason": "장마감 보유 연장 또는 청산 판단 이유",
   "risk_warnings": ["내일 장 기준 주요 리스크"]
 }}
-```"""
+```
+- HOLD 선택 시 exit_levels도 내일 장에 적용할 다단계 익절 레벨로 재설정하세요
+- exit_levels 작성 규칙은 위 Tier 2 참조"""
 
 # ---------------------------------------------------------------------------
 # 크립토 Tier 2 프롬프트

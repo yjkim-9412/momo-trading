@@ -52,13 +52,25 @@ EventHandler = Callable[[Event], Coroutine[Any, Any, None]]
 
 
 class EventBus:
-    """asyncio 기반 이벤트 버스"""
+    """asyncio 기반 이벤트 버스
+
+    긴급 이벤트(STOP_LOSS_HIT, TAKE_PROFIT_HIT)는 큐에서 뽑자마자 즉시 await.
+    일반 이벤트(VOLUME_SPIKE, PRICE_SURGE 등)는 create_task로 비동기 실행하여
+    장시간 핸들러(_on_market_event 등)가 큐를 블로킹하지 않도록 한다.
+    """
+
+    # 즉시 await 대상 — 큐 병목 없이 최우선 처리
+    _CRITICAL_EVENTS: set[EventType] = {
+        EventType.STOP_LOSS_HIT,
+        EventType.TAKE_PROFIT_HIT,
+    }
 
     def __init__(self):
         self._handlers: dict[EventType, list[EventHandler]] = defaultdict(list)
         self._queue: asyncio.Queue[Event] = asyncio.Queue()
         self._running = False
         self._task: asyncio.Task | None = None
+        self._background_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _same_handler(left: EventHandler, right: EventHandler) -> bool:
@@ -99,7 +111,21 @@ class EventBus:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        # 백그라운드 태스크 정리
+        for task in self._background_tasks:
+            task.cancel()
+        self._background_tasks.clear()
         logger.info("이벤트 버스 중지")
+
+    async def _safe_handler(self, handler: EventHandler, event: Event) -> None:
+        """백그라운드 태스크용 안전한 핸들러 래퍼"""
+        try:
+            await handler(event)
+        except Exception as e:
+            logger.error(
+                "이벤트 핸들러 오류: {} - {} - {}",
+                event.type.value, handler.__name__, str(e),
+            )
 
     async def _process_events(self) -> None:
         while self._running:
@@ -107,13 +133,22 @@ class EventBus:
                 event = await asyncio.wait_for(self._queue.get(), timeout=1.0)
                 handlers = self._handlers.get(event.type, [])
                 for handler in handlers:
-                    try:
-                        await handler(event)
-                    except Exception as e:
-                        logger.error(
-                            "이벤트 핸들러 오류: {} - {} - {}",
-                            event.type.value, handler.__name__, str(e)
+                    if event.type in self._CRITICAL_EVENTS:
+                        # 긴급 이벤트: 즉시 실행 (큐 블로킹 허용)
+                        try:
+                            await handler(event)
+                        except Exception as e:
+                            logger.error(
+                                "이벤트 핸들러 오류: {} - {} - {}",
+                                event.type.value, handler.__name__, str(e),
+                            )
+                    else:
+                        # 일반 이벤트: 백그라운드 실행 (큐 즉시 진행)
+                        task = asyncio.create_task(
+                            self._safe_handler(handler, event)
                         )
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:

@@ -19,6 +19,7 @@ from models.coin_asset import CoinAsset
 from models.coin_recommendation import CoinRecommendation
 from models.coin_trade_result import CoinTradeResult
 from models.trade_result import TradeResult
+from realtime.event_detector import event_detector
 from repositories.trade_result_repository import TradeResultRepository
 from services.activity_logger import activity_logger
 from strategy.signal import TradeSignal
@@ -130,7 +131,12 @@ class DecisionMaker:
     def _signal_product_context(signal: TradeSignal) -> dict:
         metadata = signal.metadata or {}
         market_code = normalize_market(metadata.get("market", "KRX"))
-        return build_product_context(signal.symbol, market_code, metadata)
+        return build_product_context(
+            signal.symbol,
+            market_code,
+            metadata,
+            market_regime=str(metadata.get("market_regime") or ""),
+        )
 
     @staticmethod
     def _parse_trade_notes(notes: str | None) -> dict:
@@ -1181,6 +1187,8 @@ class DecisionMaker:
             task.add_done_callback(self._pending_tasks.discard)
         else:
             error_msg = response.error or order_data.get("msg1") or "주문번호 없음"
+            if signal.action == SignalAction.BUY:
+                event_detector.clear_trade_thresholds(signal.symbol, market=market_code)
             # 매매불가 종목 → 런타임 블록리스트 등록 (이후 스캔에서 제외)
             if "매매불가" in error_msg:
                 from agent.market_scanner import market_scanner
@@ -1901,6 +1909,16 @@ class DecisionMaker:
                             },
                         )
 
+                        # ExitPlan 생성/업데이트 (DB 트랜잭션 외부)
+                        await self._sync_exit_plan(
+                            symbol=symbol,
+                            market=market_code,
+                            avg_entry_price=combined_price if is_add_on else filled_price,
+                            total_quantity=combined_qty if is_add_on else filled_qty,
+                            analysis_context=ctx,
+                            is_add_on=is_add_on,
+                        )
+
                     elif side == "SELL":
                         # 매도 체결 → 미청산 BUY 기록 찾아서 업데이트
                         open_buy = await repo.get_open_buy(symbol, market=market)
@@ -1999,6 +2017,82 @@ class DecisionMaker:
 
         except Exception as e:
             logger.error("[TradeResult] 기록 실패 ({}): {}", symbol, str(e))
+
+    async def _sync_exit_plan(
+        self,
+        *,
+        symbol: str,
+        market: str,
+        avg_entry_price: float,
+        total_quantity: int,
+        analysis_context: dict | None = None,
+        is_add_on: bool = False,
+    ) -> None:
+        """BUY 체결 후 ExitPlan 생성 또는 추가매수 시 업데이트"""
+        ctx = analysis_context or {}
+        exit_levels = ctx.get("exit_levels")
+        if not isinstance(exit_levels, list) or not exit_levels:
+            return  # exit_levels 없으면 ExitPlan 미생성 (기존 로직 유지)
+
+        # SL 레벨 추가
+        sl_price = self._try_float(ctx.get("ai_stop_loss_price") or ctx.get("stop_loss_price"))
+        levels_for_plan = list(exit_levels)  # 복사
+        if sl_price and sl_price > 0:
+            # 기존 SL 중복 방지
+            has_sl = any(l.get("type") == "STOP_LOSS" for l in levels_for_plan)
+            if not has_sl:
+                levels_for_plan.append({
+                    "type": "STOP_LOSS", "price": round(sl_price, 4),
+                    "pct": 100, "triggered": False, "triggered_at": None,
+                    "reason": "손절가",
+                })
+
+        trailing = self._try_float(ctx.get("trailing_stop_pct"))
+
+        try:
+            from strategy.exit_plan_manager import exit_plan_manager
+
+            if is_add_on:
+                reason = ctx.get("position_intent", "ADD_ON_PYRAMID")
+                if reason not in ("ADD_ON_PYRAMID", "ADD_ON_AVERAGE_DOWN"):
+                    reason = "ADD_ON_PYRAMID"
+                await exit_plan_manager.update_plan(
+                    symbol=symbol,
+                    market=market,
+                    new_levels=levels_for_plan,
+                    new_avg_price=avg_entry_price,
+                    new_qty=int(total_quantity),
+                    reason=reason,
+                    ai_reasoning=ctx.get("exit_reasoning", ""),
+                )
+            else:
+                await exit_plan_manager.create_plan(
+                    symbol=symbol,
+                    market=market,
+                    avg_entry_price=avg_entry_price,
+                    total_quantity=int(total_quantity),
+                    levels=levels_for_plan,
+                    trailing_stop_pct=float(trailing or 0.0),
+                    reason="INITIAL",
+                    ai_reasoning=ctx.get("exit_reasoning", ""),
+                )
+            logger.info(
+                "[ExitPlan] %s %s/%s avg=%.2f qty=%d levels=%d",
+                "업데이트" if is_add_on else "생성",
+                symbol, market, avg_entry_price, total_quantity, len(levels_for_plan),
+            )
+        except Exception as e:
+            logger.error("[ExitPlan] 생성/업데이트 실패 ({}): {}", symbol, str(e))
+
+    @staticmethod
+    def _try_float(value) -> float | None:
+        if value is None:
+            return None
+        try:
+            v = float(value)
+            return v if not (v != v) else None  # NaN 체크
+        except (TypeError, ValueError):
+            return None
 
     async def _create_recommendation(
         self, signal: TradeSignal, analysis_id: str, cycle_id: str | None = None,
