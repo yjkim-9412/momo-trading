@@ -41,14 +41,18 @@ Tier 1 AI가 수행한 분석을 **독립적으로 검증**하고, 최종 매매
 - 방향성 해석 규칙: `BEAR + inverse(-x)`는 시장 정합, `BULL + inverse(-x)`는 시장 역행으로 판단하세요
 - 방향성 해석 규칙: `BEAR + positive exposure(+1x/+2x/+3x)`는 시장 역행, `BULL + positive exposure`는 시장 정합입니다
 - 방향성 해석 규칙: `THEME/SIDEWAYS`는 broad market 방향 정합성을 중립 처리하고 종목 자체 추세와 실행 가능성을 우선 검토하세요
-- 미국 정규장 오프닝 가드: trading_context에 `opening_guard_active=true`가 있으면 정규장 첫 60분은 추격 매수보다 확인을 우선하고, 저가 급등주는 수량 축소보다 미승인을 우선 검토하세요
+- 개장 관찰 모드: trading_context에 `opening_policy=OBSERVE_ONLY`가 있으면 이 구간은 신규/추가 BUY 금지로 보고 승인하지 마세요
+- 정규장 오프닝 가드: trading_context에 `opening_policy=SOFT_GUARD` 또는 `opening_guard_active=true`가 있으면 정규장 시작 직후에는 추격 매수보다 확인을 우선하고, 저가 급등주는 수량 축소보다 미승인을 우선 검토하세요
+- KRX hot-mover 가드: trading_context에 `krx_hot_mover_guard=true`가 있으면 이미 급등 후 과열 구간으로 간주하고, 현가 추격보다 최소 __KRX_PULLBACK_PCT__% 낮은 눌림목 `entry_price`를 우선 제시하세요
+- KRX hot-mover 가드: `krx_hot_mover_guard=true` 인데 `entry_price`가 현재가와 거의 같으면 승인하지 마세요
 
 ## 거부(REJECT) 기준
 - THEME/BULL 국면: RR비율 __BULL_THEME_RR__:1 미만 → REJECT
 - SIDEWAYS/BEAR 국면: RR비율 __DEFENSIVE_RR__:1 미만 → REJECT
 - 시장 전체 급락 중에 무리한 역추세 매수 (단, 과매도 반등은 허용)
 - 거래량 뒷받침 전혀 없는 돌파/반전 시그널
-- 미국 정규장 오프닝 가드: BEAR/SIDEWAYS + 저가 급등주 + 과열 지표 다중 발생 + 분봉/VWAP 확인 부족 조합이면 승인보다 REJECT를 우선하세요
+- 정규장 오프닝 가드: 미국장은 BEAR/SIDEWAYS + 저가 급등주 + 과열 지표 다중 발생 + 분봉/VWAP 확인 부족 조합이면 승인보다 REJECT를 우선하세요
+- 정규장 오프닝 가드: 국내장은 저가 급등주 + 분봉/VWAP 확인 부족 조합이면 승인보다 REJECT를 우선하세요
 - 현재 종목 포지션이 이미 크면 추가매수 정당성이 명확하지 않은 한 승인하지 마세요
 - 보유 종목 BUY는 반드시 `position_intent`를 `ADD_ON_PYRAMID` 또는 `ADD_ON_AVERAGE_DOWN`으로 명시하세요
 - `ADD_ON_AVERAGE_DOWN`은 손실 구간 반등 확인형 추가매수일 때만 허용하세요
@@ -64,6 +68,7 @@ FINAL_REVIEW_SYSTEM = (
     FINAL_REVIEW_SYSTEM
     .replace("__BULL_THEME_RR__", f"{BULL_THEME_RR_FLOOR:.1f}")
     .replace("__DEFENSIVE_RR__", f"{DEFENSIVE_RR_FLOOR:.1f}")
+    .replace("__KRX_PULLBACK_PCT__", f"{settings.krx_hot_mover_pullback_entry_pct:.1f}")
 )
 
 FINAL_REVIEW_PROMPT = """## 최종 검토 요청
@@ -135,6 +140,7 @@ FINAL_REVIEW_PROMPT = """## 최종 검토 요청
 **[실행 검증]**
 8. 거래량이 충분하여 원하는 수량을 체결할 수 있는가?
 9. 진입가가 현재가 대비 현실적인가? (호가 괴리 없는가?)
+10. trading_context에 `krx_hot_mover_guard=true`가 있으면 현재가 추격이 아니라 최소 __KRX_PULLBACK_PCT__% 눌림목 진입가인가?
 
 ## 스트레스 테스트 (시나리오 분석)
 다음 3가지 시나리오에서의 결과를 간략히 예측하세요:
@@ -195,6 +201,7 @@ FINAL_REVIEW_PROMPT = (
     FINAL_REVIEW_PROMPT
     .replace("__BULL_THEME_RR__", f"{BULL_THEME_RR_FLOOR:.1f}")
     .replace("__DEFENSIVE_RR__", f"{DEFENSIVE_RR_FLOOR:.1f}")
+    .replace("__KRX_PULLBACK_PCT__", f"{settings.krx_hot_mover_pullback_entry_pct:.1f}")
 )
 
 # ---------------------------------------------------------------------------

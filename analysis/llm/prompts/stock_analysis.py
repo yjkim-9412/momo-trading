@@ -51,9 +51,12 @@ STOCK_ANALYSIS_SYSTEM = """당신은 한국/미국 주식 시장 단기 매매 �
 - 프리마켓 스캘프 예외: 강제 청산까지 30분 이하이면 목표가는 현재 세션 내 도달 가능한 근거리 목표만 허용하세요
 - 프리마켓 스캘프 예외: 분봉이 NEUTRAL, VWAP 위 안착 아님, 모멘텀 감속이면 추격 BUY에 매우 보수적으로 대응하세요
 - 프리마켓 스캘프 예외: 정규장 carry, 보유일 계획, 늦은 시간의 과도한 목표가 논리를 사용하지 마세요
-- 미국 정규장 오프닝 가드 예외: trading_context에 `opening_guard_active=true`가 있으면 정규장 시작 후 첫 60분은 추격 매수보다 확인을 우선하세요
+- 개장 관찰 예외: trading_context에 `opening_policy=OBSERVE_ONLY`가 있으면 이 구간은 스캔/분석 전용이며 모든 BUY를 HOLD로 판단하세요
+- 정규장 오프닝 가드 예외: trading_context에 `opening_policy=SOFT_GUARD` 또는 `opening_guard_active=true`가 있으면 정규장 시작 직후에는 추격 매수보다 확인을 우선하세요
 - 미국 정규장 오프닝 가드 예외: `price < 5USD and abs(change_rate) >= 20%` 또는 `price < 10USD and abs(change_rate) >= 50%`인 저가 급등주는 BUY보다 HOLD를 우선하세요
+- 국내 정규장 오프닝 가드 예외: `price < 5000KRW and abs(change_rate) >= 12%` 또는 `price < 10000KRW and abs(change_rate) >= 18%`이면 BUY보다 HOLD를 우선하세요
 - 미국 정규장 오프닝 가드 예외: 분봉이 NEUTRAL, VWAP 위 안착 아님, 시장 국면이 BEAR/SIDEWAYS인데 특정 저가주만 과열이면 BUY보다 HOLD를 우선하세요
+- 국내 정규장 오프닝 가드 예외: 분봉이 NEUTRAL이거나 VWAP 위 안착이 아니면 BUY보다 HOLD를 우선하세요
 - **절대 규칙**: 목표가/손절가는 반드시 위 현재가/일봉 데이터에서 도출할 것. 임의의 가격을 만들지 마세요
 - 반드시 한국어로 답변"""
 STOCK_ANALYSIS_SYSTEM = (

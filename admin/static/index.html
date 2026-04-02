@@ -110,18 +110,6 @@
           </div>
         </div>
 
-        <!-- 보유종목 (collapsible) -->
-        <div id="holdings-section">
-          <button onclick="toggleAccountSection('holdings')" class="flex items-center justify-between mt-3 mb-1 w-full text-left" aria-expanded="true">
-            <span class="flex items-center gap-1">
-              <span class="section-toggle-icon" id="holdings-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
-              <span class="text-xs text-green-400 font-medium">보유종목</span>
-            </span>
-            <span id="holdings-count" class="text-xs text-gray-500">0종목</span>
-          </button>
-          <div id="holdings-info" class="account-section-body text-xs space-y-1 max-h-60 overflow-y-auto account-data-transition" style="max-height:240px"></div>
-        </div>
-
         <!-- 미체결 주문 (collapsible) -->
         <div id="pending-section">
           <button onclick="toggleAccountSection('pending')" class="flex items-center justify-between mt-3 mb-1 w-full text-left" aria-expanded="true">
@@ -291,6 +279,19 @@
       </button>
       <div class="sidebar-content overflow-y-auto flex-1">
       <div class="p-3 space-y-3">
+        <!-- 보유종목 (collapsible) -->
+        <div id="holdings-section">
+          <button onclick="toggleAccountSection('holdings')" class="flex items-center justify-between mb-1 w-full text-left" aria-expanded="true">
+            <span class="flex items-center gap-1">
+              <span class="section-toggle-icon" id="holdings-arrow"><i data-lucide="chevron-down" class="w-3 h-3"></i></span>
+              <span class="text-xs text-green-400 font-medium">보유종목</span>
+            </span>
+            <span id="holdings-count" class="text-xs text-gray-500">0종목</span>
+          </button>
+          <div id="holdings-info" class="account-section-body text-xs space-y-1 overflow-y-auto account-data-transition" style="max-height:400px"></div>
+        </div>
+        <div class="border-t border-gray-700"></div>
+
         <!-- AI Watchlist -->
         <div id="watchlist-section">
           <div class="flex items-center justify-between mb-2">
@@ -303,6 +304,8 @@
           <div id="watchlist-info" class="text-xs space-y-1"></div>
         </div>
         <div class="border-t border-gray-700"></div>
+
+
 
         <!-- Schedule Timeline -->
         <div id="schedule-panel">
@@ -324,30 +327,7 @@
           </div>
         </div>
 
-        <div class="text-xs text-gray-500 font-medium">LLM Usage</div>
 
-        <!-- Summary -->
-        <div id="usage-summary" class="space-y-2">
-          <div class="text-gray-500 text-xs">로딩 중...</div>
-        </div>
-
-        <!-- App (trading) usage -->
-        <div class="border-t border-gray-700 pt-2">
-          <div class="text-xs text-gray-500 font-medium mb-1">Trading App 사용량</div>
-          <div id="usage-app" class="text-xs space-y-1"></div>
-        </div>
-
-        <!-- Subscription model usage -->
-        <div class="border-t border-gray-700 pt-2">
-          <div class="text-xs text-gray-500 font-medium mb-1">구독 누적 사용량</div>
-          <div id="usage-models" class="text-xs space-y-1"></div>
-        </div>
-
-        <!-- Daily chart (last 7 days) -->
-        <div class="border-t border-gray-700 pt-2">
-          <div class="text-xs text-gray-500 font-medium mb-1">일별 토큰 추이</div>
-          <div id="usage-chart" class="space-y-1"></div>
-        </div>
       </div>
       </div><!-- /sidebar-content -->
     </aside>

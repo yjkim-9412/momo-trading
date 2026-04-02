@@ -97,6 +97,64 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertAlmostEqual(normalized["stop_loss_price"], 189.459, places=3)
         self.assertIn("normalized_price_fields", normalized)
 
+    def test_should_refresh_tier2_market_snapshot_for_event_buy(self):
+        should_refresh = TradingAgent._should_refresh_tier2_market_snapshot(
+            market_code="KRX",
+            analysis_source="event",
+            recommendation="BUY",
+            snapshot_age_seconds=1.0,
+        )
+
+        self.assertTrue(should_refresh)
+
+    def test_detect_krx_hot_mover_chase_setup_flags_near_high_breakout(self):
+        chart_result = ChartAnalysisResult(indicators={"bb_upper": 228000.0})
+        minute_df = pd.DataFrame(
+            {
+                "time": ["093000", "093500", "094000"],
+                "high": [226000.0, 229500.0, 230000.0],
+                "low": [224000.0, 227000.0, 228000.0],
+                "close": [225000.0, 229000.0, 229500.0],
+            }
+        )
+
+        setup = TradingAgent._detect_krx_hot_mover_chase_setup(
+            market_code="KRX",
+            current_price=229500.0,
+            change_rate=8.1,
+            chart_result=chart_result,
+            minute_df=minute_df,
+            price_payload={"output": {"stck_hgpr": "230000"}},
+        )
+
+        self.assertIsNotNone(setup)
+        assert setup is not None
+        self.assertTrue(setup["krx_hot_mover_guard"])
+        self.assertTrue(setup["near_session_high"])
+        self.assertTrue(setup["above_bollinger_upper"])
+
+    def test_validate_krx_hot_mover_tier2_entry_requires_pullback_price(self):
+        hot_mover_setup = {
+            "required_pullback_pct": 0.5,
+        }
+
+        rejected = TradingAgent._validate_krx_hot_mover_tier2_entry(
+            {"action": "BUY", "entry_price": 229500.0},
+            market_code="KRX",
+            current_price=230000.0,
+            hot_mover_setup=hot_mover_setup,
+        )
+        allowed = TradingAgent._validate_krx_hot_mover_tier2_entry(
+            {"action": "BUY", "entry_price": 228850.0},
+            market_code="KRX",
+            current_price=230000.0,
+            hot_mover_setup=hot_mover_setup,
+        )
+
+        self.assertIsNotNone(rejected)
+        self.assertIn("눌림목 진입가", rejected)
+        self.assertIsNone(allowed)
+
     def test_stock_analysis_prompt_uses_trend_summary_label(self):
         self.assertIn("### 추세 분석 요약", STOCK_ANALYSIS_PROMPT)
         self.assertNotIn("### 최근 일봉 데이터", STOCK_ANALYSIS_PROMPT)
@@ -114,9 +172,13 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("신규 매수 마감까지 10분 미만이면 BUY 금지, HOLD", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("강제 청산까지 30분 이하이면 목표가는 현재 세션 내 도달 가능한 근거리 목표만 허용", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("정규장 carry, 보유일 계획, 늦은 시간의 과도한 목표가 논리를 사용하지 마세요", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("opening_policy=OBSERVE_ONLY", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("모든 BUY를 HOLD로 판단", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("opening_policy=SOFT_GUARD", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("opening_guard_active=true", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("정규장 시작 후 첫 60분은 추격 매수보다 확인을 우선", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("정규장 시작 직후에는 추격 매수보다 확인을 우선", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("price < 5USD and abs(change_rate) >= 20%", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("price < 5000KRW and abs(change_rate) >= 12%", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("인버스/레버리지 상품은 종목 가격 변화가 아니라 `시장 노출 방향` 기준으로 해석", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("BEAR + inverse(-x) 매수", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("THEME/SIDEWAYS", STOCK_ANALYSIS_SYSTEM)
@@ -163,9 +225,17 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("stop_loss_price < entry_price < take_profit_price <= target_price", FINAL_REVIEW_PROMPT)
         self.assertIn("웹 검색, 뉴스/기사 확인, 외부 사실 보강, URL/도메인/출처 인용을 금지합니다", FINAL_REVIEW_SYSTEM)
         self.assertIn("외부 링크, 뉴스 출처, URL, 웹페이지 이름을 reason/risk_warnings에 쓰지 마세요", FINAL_REVIEW_PROMPT)
+        self.assertIn("opening_policy=OBSERVE_ONLY", FINAL_REVIEW_SYSTEM)
+        self.assertIn("신규/추가 BUY 금지", FINAL_REVIEW_SYSTEM)
+        self.assertIn("opening_policy=SOFT_GUARD", FINAL_REVIEW_SYSTEM)
         self.assertIn("opening_guard_active=true", FINAL_REVIEW_SYSTEM)
-        self.assertIn("정규장 첫 60분은 추격 매수보다 확인을 우선", FINAL_REVIEW_SYSTEM)
+        self.assertIn("정규장 시작 직후에는 추격 매수보다 확인을 우선", FINAL_REVIEW_SYSTEM)
+        self.assertIn("krx_hot_mover_guard=true", FINAL_REVIEW_SYSTEM)
+        self.assertIn("눌림목 `entry_price`", FINAL_REVIEW_SYSTEM)
+        self.assertIn("krx_hot_mover_guard=true", FINAL_REVIEW_PROMPT)
+        self.assertIn("눌림목 진입가인가", FINAL_REVIEW_PROMPT)
         self.assertIn("BEAR/SIDEWAYS + 저가 급등주 + 과열 지표 다중 발생 + 분봉/VWAP 확인 부족", FINAL_REVIEW_SYSTEM)
+        self.assertIn("국내장은 저가 급등주 + 분봉/VWAP 확인 부족", FINAL_REVIEW_SYSTEM)
         self.assertIn("인버스/레버리지 상품은 종목 가격 방향이 아니라 `시장 노출 방향` 기준", FINAL_REVIEW_SYSTEM)
         self.assertIn("BEAR + inverse(-x)", FINAL_REVIEW_SYSTEM)
         self.assertIn("THEME/SIDEWAYS", FINAL_REVIEW_SYSTEM)

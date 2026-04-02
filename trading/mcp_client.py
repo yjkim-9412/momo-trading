@@ -1355,6 +1355,77 @@ class MCPClient:
 
         return sorted(records, key=sort_key)
 
+    @staticmethod
+    def _domestic_minute_bucket_label(raw_time: Any, interval_minutes: int) -> str:
+        """국내 분봉 time 값을 요청 interval 기준 bucket 라벨로 정규화한다."""
+        digits = "".join(ch for ch in str(raw_time or "").strip() if ch.isdigit())
+        if not digits:
+            return ""
+
+        date_prefix = digits[:-6] if len(digits) > 6 else ""
+        time_digits = digits[-6:].rjust(6, "0")
+        try:
+            hour = int(time_digits[:2])
+            minute = int(time_digits[2:4])
+        except ValueError:
+            return digits
+
+        bucket_minute = max(0, min(55, (minute // max(1, interval_minutes)) * max(1, interval_minutes)))
+        bucket_time = f"{hour:02d}{bucket_minute:02d}00"
+        return f"{date_prefix}{bucket_time}" if date_prefix else bucket_time
+
+    @classmethod
+    def _resample_domestic_minute_prices(
+        cls,
+        prices: list[dict[str, Any]],
+        *,
+        period: str,
+    ) -> list[dict[str, Any]]:
+        """국내 분봉 응답은 1분 원본으로 내려오므로 요청 interval로 로컬 집계한다."""
+        ordered = cls._sort_series_records(prices, "time")
+        interval_minutes = max(1, cls._to_int(period, 1))
+        if interval_minutes <= 1 or not ordered:
+            return ordered
+
+        aggregated: list[dict[str, Any]] = []
+        current_bucket = ""
+        current_item: dict[str, Any] | None = None
+
+        for item in ordered:
+            bucket = cls._domestic_minute_bucket_label(item.get("time"), interval_minutes)
+            if not bucket:
+                continue
+
+            open_price = cls._to_float(item.get("open"))
+            high_price = cls._to_float(item.get("high"))
+            low_price = cls._to_float(item.get("low"))
+            close_price = cls._to_float(item.get("close"))
+            volume = cls._to_int(item.get("volume"))
+
+            if current_item is None or bucket != current_bucket:
+                if current_item is not None:
+                    aggregated.append(current_item)
+                current_bucket = bucket
+                current_item = {
+                    "time": bucket,
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": close_price,
+                    "volume": volume,
+                }
+                continue
+
+            current_item["high"] = max(float(current_item["high"]), high_price)
+            current_item["low"] = min(float(current_item["low"]), low_price)
+            current_item["close"] = close_price
+            current_item["volume"] = int(current_item["volume"]) + volume
+
+        if current_item is not None:
+            aggregated.append(current_item)
+
+        return aggregated
+
     async def call_any_tool(
         self, tool_calls: list[tuple[str, dict[str, Any]]]
     ) -> MCPResponse:
@@ -2356,10 +2427,31 @@ class MCPClient:
                 }
             return response
 
-        return await self._call_kis_rest_request(
+        response = await self._call_kis_rest_request(
             f"{market_code}:{symbol}:minute:{period}",
             lambda: get_minute_chart(symbol, period),
         )
+        if response.success and response.data:
+            items = self._extract_records(response.data, "prices", "output2", "output")
+            prices = [
+                {
+                    "time": self._pick_first(item, "time", "stck_cntg_hour", "xymd", default=""),
+                    "open": self._to_float(self._pick_first(item, "open", "stck_oprc")),
+                    "high": self._to_float(self._pick_first(item, "high", "stck_hgpr")),
+                    "low": self._to_float(self._pick_first(item, "low", "stck_lwpr")),
+                    "close": self._to_float(self._pick_first(item, "close", "stck_prpr", "clos")),
+                    "volume": self._to_int(self._pick_first(item, "volume", "cntg_vol", "tvol")),
+                }
+                for item in items
+            ]
+            response.data = {
+                **response.data,
+                "market": market_code,
+                "symbol": symbol,
+                "period": period,
+                "prices": self._resample_domestic_minute_prices(prices, period=period),
+            }
+        return response
 
     async def get_fluctuation_rank(
         self,

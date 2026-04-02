@@ -306,20 +306,79 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("minutes_until_force_liquidation=25", context)
         self.assertNotIn("모드: 스윙", context)
 
+    def test_build_market_session_context_marks_krx_observation_window(self):
+        with patch.object(settings, "KRX_REGULAR_OPENING_OBSERVATION_ENABLED", True), \
+                patch.object(settings, "KRX_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES", 10), \
+                patch.object(settings, "KRX_REGULAR_OPENING_GUARD_ENABLED", True), \
+                patch.object(settings, "KRX_REGULAR_OPENING_GUARD_WINDOW_MINUTES", 30), \
+                patch("util.time_util.now_kst", return_value=datetime(2026, 4, 1, 9, 5, tzinfo=ZoneInfo("Asia/Seoul"))), \
+                patch("agent.trading_agent._analysis_mixin.market_calendar.get_market_session", return_value="KRX_NXT"):
+            context = self.agent._build_market_session_context("KRX")
+
+        self.assertEqual(context["opening_policy"], "OBSERVE_ONLY")
+        self.assertTrue(context["opening_observation_active"])
+        self.assertFalse(context["opening_guard_active"])
+        self.assertEqual(context["minutes_from_regular_open"], 5)
+
+    def test_build_market_session_context_marks_us_soft_guard_window(self):
+        with patch.object(settings, "US_REGULAR_OPENING_OBSERVATION_ENABLED", True), \
+                patch.object(settings, "US_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES", 15), \
+                patch.object(settings, "US_REGULAR_OPENING_GUARD_ENABLED", True), \
+                patch.object(settings, "US_REGULAR_OPENING_GUARD_WINDOW_MINUTES", 30), \
+                patch("util.time_util.now_kst", return_value=datetime(2026, 3, 27, 22, 55, tzinfo=ZoneInfo("Asia/Seoul"))), \
+                patch("agent.trading_agent._analysis_mixin.market_calendar.get_market_session", return_value="US_REGULAR"):
+            context = self.agent._build_market_session_context("NASDAQ")
+
+        self.assertEqual(context["opening_policy"], "SOFT_GUARD")
+        self.assertFalse(context["opening_observation_active"])
+        self.assertTrue(context["opening_guard_active"])
+        self.assertEqual(context["minutes_from_regular_open"], 25)
+
     async def test_build_trading_context_uses_regular_opening_guard_mode_for_us_open(self):
         balance = self._balance()
-        with patch.object(settings, "US_REGULAR_OPENING_GUARD_ENABLED", True), \
+        with patch.object(settings, "US_REGULAR_OPENING_OBSERVATION_ENABLED", True), \
+                patch.object(settings, "US_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES", 15), \
+                patch.object(settings, "US_REGULAR_OPENING_GUARD_ENABLED", True), \
+                patch.object(settings, "US_REGULAR_OPENING_GUARD_WINDOW_MINUTES", 30), \
                 patch("util.time_util.now_kst", return_value=datetime(2026, 3, 27, 22, 45, tzinfo=ZoneInfo("Asia/Seoul"))), \
                 patch("agent.trading_agent._analysis_mixin.market_calendar.get_market_session", return_value="US_REGULAR"), \
                 patch("trading.account_manager.account_manager.get_balance", AsyncMock(return_value=balance)), \
                 patch.object(self.agent, "_get_today_trade_stats", AsyncMock(return_value={"wins": 1, "losses": 0, "total": 1})):
             context = await self.agent._build_trading_context("NASDAQ")
 
-        self.assertIn("모드: 정규장 오프닝 가드 | opening_guard_active=true", context)
+        self.assertIn("모드: 미국 정규장 오프닝 가드 | opening_policy=SOFT_GUARD", context)
         self.assertIn("추격 매수보다 확인 우선", context)
         self.assertIn("session=US_REGULAR", context)
+        self.assertIn("opening_guard_active=true", context)
         self.assertIn("minutes_from_regular_open=15", context)
         self.assertNotIn("모드: 스윙", context)
+
+    def test_apply_regular_opening_observation_tier1_gate_blocks_all_buy_intents(self):
+        analysis = {
+            "recommendation": "BUY",
+            "position_intent": "ADD_ON_PYRAMID",
+            "confidence": 0.72,
+            "target_price": 71_500,
+            "stop_loss_price": 68_000,
+            "reason": "재돌파",
+        }
+
+        gated, gate_detail = self.agent._apply_regular_opening_observation_tier1_gate(
+            analysis,
+            market_code="KRX",
+            session_context={
+                "session": "KRX_NXT",
+                "opening_policy": "OBSERVE_ONLY",
+                "opening_observation_active": True,
+                "minutes_from_regular_open": 6,
+            },
+        )
+
+        self.assertEqual(gated["recommendation"], "HOLD")
+        self.assertEqual(gated["position_intent"], "HOLD")
+        self.assertTrue(gated["reason"].startswith("[OPENING_OBSERVATION_WINDOW]"))
+        self.assertTrue(gate_detail["tier1_gate_applied"])
+        self.assertEqual(gate_detail["tier1_gate_reason_code"], "OPENING_OBSERVATION_WINDOW")
 
     def test_apply_us_premarket_scalp_tier1_gate_blocks_late_new_buy(self):
         analysis = {
@@ -358,6 +417,44 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(gated["reason"].startswith("[TIMEBOX_TOO_SHORT]"))
         self.assertTrue(gate_detail["tier1_gate_applied"])
         self.assertEqual(gate_detail["tier1_gate_reason_code"], "TIMEBOX_TOO_SHORT")
+
+    def test_apply_krx_regular_opening_tier1_gate_blocks_low_price_hot_mover(self):
+        analysis = {
+            "recommendation": "BUY",
+            "position_intent": "NEW",
+            "confidence": 0.63,
+            "target_price": 4_300,
+            "stop_loss_price": 3_850,
+            "reason": "거래량 동반 상승",
+        }
+        chart_result = ChartAnalysisResult(
+            trend=TrendReport(
+                momentum="ACCELERATING",
+                intraday={"direction": "BULLISH", "vwap_position": "ABOVE_VWAP"},
+            )
+        )
+
+        with patch.object(settings, "KRX_REGULAR_OPENING_GUARD_ENABLED", True):
+            gated, gate_detail = self.agent._apply_krx_regular_opening_tier1_gate(
+                analysis,
+                market_code="KRX",
+                current_price=3_950,
+                change_rate=14.2,
+                current_position=None,
+                chart_result=chart_result,
+                session_context={
+                    "session": "KRX_NXT",
+                    "opening_policy": "SOFT_GUARD",
+                    "opening_guard_active": True,
+                    "minutes_from_regular_open": 18,
+                },
+            )
+
+        self.assertEqual(gated["recommendation"], "HOLD")
+        self.assertEqual(gated["position_intent"], "HOLD")
+        self.assertTrue(gated["reason"].startswith("[OPENING_LOW_PRICE_HOT_MOVER]"))
+        self.assertTrue(gate_detail["tier1_gate_applied"])
+        self.assertEqual(gate_detail["tier1_gate_reason_code"], "OPENING_LOW_PRICE_HOT_MOVER")
 
     def test_apply_us_premarket_scalp_tier1_gate_blocks_loose_restricted_product_buy(self):
         analysis = {
@@ -791,6 +888,161 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         reconcile_mock.assert_awaited_once_with("NASDAQ")
         subscribe_mock.assert_awaited_once_with("PLTR", market="NASDAQ")
 
+    async def test_on_stop_loss_skips_sell_when_symbol_is_not_held(self):
+        self.agent._running = True
+        event = Event(
+            type=EventType.STOP_LOSS_HIT,
+            data={
+                "symbol": "319400",
+                "market": "KRX",
+                "price": 28_700,
+                "stop_loss_price": 28_825,
+            },
+            source="test",
+        )
+
+        with patch.object(type(settings), "is_trading_enabled_for_market", return_value=True), \
+                patch("agent.trading_agent.activity_logger.log", AsyncMock()) as log_mock, \
+                patch("trading.account_manager.account_manager.get_holdings", AsyncMock(return_value=[])), \
+                patch("agent.trading_agent._event_mixin.mcp_client.place_order", AsyncMock()) as place_order_mock:
+            await self.agent._on_stop_loss(event)
+
+        place_order_mock.assert_not_awaited()
+        summaries = [call.args[2] for call in log_mock.await_args_list]
+        self.assertTrue(any("손절 조건 감지" in summary for summary in summaries))
+        self.assertTrue(any("보유 수량 없음으로 매도 생략" in summary for summary in summaries))
+        self.assertFalse(any("즉시 매도 실행" in summary for summary in summaries))
+
+    async def test_analyze_and_trade_does_not_arm_trade_thresholds_before_risk_approval(self):
+        portfolio_snapshot = {
+            "cash": 10_000_000,
+            "total_asset": 30_000_000,
+            "holding_count": 0,
+            "holding_symbols": set(),
+            "holding_positions": {},
+            "today_trade_count": 0,
+        }
+        chart_result = ChartAnalysisResult(
+            indicators={
+                "rsi_14": 58.0,
+                "macd_histogram": 0.9,
+            },
+            signal_summary={"direction": "BULLISH"},
+        )
+        price_response = MCPResponse(
+            success=True,
+            data={
+                "market": "KRX",
+                "currency": "KRW",
+                "price": 29_400,
+                "price_krw": 29_400,
+                "exchange_rate_to_krw": 1.0,
+                "change": 2_000,
+                "change_rate": 7.3,
+                "volume": 120_000,
+            },
+        )
+        daily_response = MCPResponse(
+            success=True,
+            data={
+                "prices": [
+                    {"date": "20260326", "open": 25_500, "high": 26_000, "low": 25_100, "close": 25_800, "volume": 1000},
+                    {"date": "20260327", "open": 25_900, "high": 26_500, "low": 25_600, "close": 26_200, "volume": 1200},
+                    {"date": "20260330", "open": 26_300, "high": 27_100, "low": 26_100, "close": 26_900, "volume": 1500},
+                    {"date": "20260331", "open": 27_000, "high": 27_800, "low": 26_900, "close": 27_500, "volume": 1700},
+                    {"date": "20260401", "open": 27_600, "high": 29_900, "low": 27_400, "close": 29_400, "volume": 2200},
+                ]
+            },
+        )
+        minute_response = MCPResponse(
+            success=True,
+            data={
+                "prices": [
+                    {"time": "0915", "open": 28_100, "high": 28_600, "low": 28_000, "close": 28_450, "volume": 400},
+                    {"time": "0920", "open": 28_450, "high": 29_500, "low": 28_400, "close": 29_400, "volume": 620},
+                ]
+            },
+        )
+        orderable_response = MCPResponse(
+            success=True,
+            data={
+                "orderable_amount_source": "INQUIRE_PSAMOUNT",
+                "orderable_amount_krw": 2_000_000,
+                "orderable_qty": 68,
+            },
+        )
+
+        class DummySession:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        detector = MagicMock()
+        detector.get_thresholds.return_value = type(
+            "Thresholds",
+            (),
+            {"stop_loss": 0.0, "take_profit": 0.0, "trailing_stop_pct": 0.0},
+        )()
+
+        with patch("agent.trading_agent.activity_logger.log", AsyncMock()), \
+                patch("agent.trading_agent.AsyncSessionLocal", return_value=DummySession()), \
+                patch(
+                    "analysis.feedback.performance_tracker.PerformanceTracker.get_consecutive_losses",
+                    AsyncMock(return_value=0),
+                ), \
+                patch("agent.trading_agent.FeedbackContextBuilder.build_full_context", AsyncMock(return_value="매매 이력 없음")), \
+                patch("agent.trading_agent.chart_analyzer.analyze", return_value=chart_result), \
+                patch("agent.trading_agent.mcp_client.get_current_price", AsyncMock(return_value=price_response)), \
+                patch("agent.trading_agent.mcp_client.get_daily_price", AsyncMock(return_value=daily_response)), \
+                patch("agent.trading_agent.mcp_client.get_minute_price", AsyncMock(return_value=minute_response)), \
+                patch("agent.trading_agent.mcp_client.get_orderable_amount", AsyncMock(return_value=orderable_response)), \
+                patch.object(self.agent, "_tier1_analysis", AsyncMock(return_value={
+                    "recommendation": "BUY",
+                    "position_intent": "NEW",
+                    "confidence": 0.73,
+                    "target_price": 31_000,
+                    "stop_loss_price": 28_825,
+                    "trailing_stop_pct": 2.8,
+                    "reason": "오프닝 돌파",
+                })), \
+                patch.object(self.agent, "_tier2_review", AsyncMock(return_value={
+                    "approved": True,
+                    "action": "BUY",
+                    "position_intent": "NEW",
+                    "suggested_quantity": 6,
+                    "entry_price": 29_500,
+                    "target_price": 31_000,
+                    "stop_loss_price": 28_825,
+                    "take_profit_price": 30_035,
+                    "planned_hold_days": 1,
+                    "reason": "조건 충족",
+                    "provider": "CODEX_CLI",
+                })), \
+                patch("agent.trading_agent._analysis_mixin.event_detector", detector), \
+                patch("agent.trading_agent.risk_manager.check", AsyncMock(return_value={
+                    "approved": False,
+                    "reason": "리스크:보상 비율 부족",
+                })) as risk_mock, \
+                patch("agent.trading_agent.decision_maker.execute", AsyncMock()) as decision_mock:
+            result = await self.agent._analyze_and_trade(
+                {
+                    "symbol": "319400",
+                    "name": "테스트종목",
+                    "market": "KRX",
+                    "strategy_type": "STABLE_SHORT",
+                },
+                cycle_id="cycle-risk-reject",
+                portfolio_snapshot=portfolio_snapshot,
+            )
+
+        self.assertTrue(result["signal"])
+        self.assertFalse(result["executed"])
+        risk_mock.assert_awaited_once()
+        decision_mock.assert_not_awaited()
+        detector.set_thresholds.assert_not_called()
+
     async def test_analyze_and_trade_runs_cycle_for_held_symbol_when_tier2_approves_add_on(self):
         holding_symbols, holding_positions = self.agent._build_holding_snapshot(
             [self._holding(current_price=159.63, pnl=5950.0, pnl_rate=3.87)],
@@ -1008,6 +1260,9 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(analysis_context["existing_hold_plan_stop_loss_price"], 145.0)
         self.assertEqual(analysis_context["existing_hold_plan_take_profit_price"], 157.0)
         self.assertEqual(analysis_context["existing_hold_plan_trailing_stop_pct"], 3.25)
+        self.assertEqual(analysis_context["trade_threshold_payload"]["stop_loss"], 145.0)
+        self.assertEqual(analysis_context["trade_threshold_payload"]["take_profit"], 157.0)
+        self.assertEqual(analysis_context["trade_threshold_payload"]["trailing_stop_pct"], 4.0)
 
     async def test_evaluate_position_intent_blocks_second_average_down_same_day(self):
         chart_result = ChartAnalysisResult(

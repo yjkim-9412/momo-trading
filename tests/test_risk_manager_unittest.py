@@ -25,6 +25,13 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
             "US_LEVERAGE_ALLOWED_SESSIONS": settings.US_LEVERAGE_ALLOWED_SESSIONS,
             "US_LEVERAGE_ALLOWED_STRATEGIES": settings.US_LEVERAGE_ALLOWED_STRATEGIES,
             "US_LEVERAGE_MAX_SINGLE_ORDER_RATIO": settings.US_LEVERAGE_MAX_SINGLE_ORDER_RATIO,
+            "KRX_REGULAR_OPENING_OBSERVATION_ENABLED": settings.KRX_REGULAR_OPENING_OBSERVATION_ENABLED,
+            "KRX_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES": settings.KRX_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES,
+            "KRX_REGULAR_OPENING_GUARD_ENABLED": settings.KRX_REGULAR_OPENING_GUARD_ENABLED,
+            "KRX_REGULAR_OPENING_GUARD_MAX_POSITION_PCT": settings.KRX_REGULAR_OPENING_GUARD_MAX_POSITION_PCT,
+            "KRX_REGULAR_OPENING_GUARD_SIZE_SCALE": settings.KRX_REGULAR_OPENING_GUARD_SIZE_SCALE,
+            "US_REGULAR_OPENING_OBSERVATION_ENABLED": settings.US_REGULAR_OPENING_OBSERVATION_ENABLED,
+            "US_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES": settings.US_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES,
             "US_REGULAR_OPENING_GUARD_ENABLED": settings.US_REGULAR_OPENING_GUARD_ENABLED,
             "US_REGULAR_OPENING_GUARD_MAX_POSITION_PCT": settings.US_REGULAR_OPENING_GUARD_MAX_POSITION_PCT,
             "US_REGULAR_OPENING_GUARD_SIZE_SCALE": settings.US_REGULAR_OPENING_GUARD_SIZE_SCALE,
@@ -44,6 +51,13 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
         settings.US_LEVERAGE_ALLOWED_SESSIONS = "US_REGULAR"
         settings.US_LEVERAGE_ALLOWED_STRATEGIES = "STABLE_SHORT"
         settings.US_LEVERAGE_MAX_SINGLE_ORDER_RATIO = 0.3
+        settings.KRX_REGULAR_OPENING_OBSERVATION_ENABLED = True
+        settings.KRX_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES = 10
+        settings.KRX_REGULAR_OPENING_GUARD_ENABLED = True
+        settings.KRX_REGULAR_OPENING_GUARD_MAX_POSITION_PCT = 15.0
+        settings.KRX_REGULAR_OPENING_GUARD_SIZE_SCALE = 0.7
+        settings.US_REGULAR_OPENING_OBSERVATION_ENABLED = True
+        settings.US_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES = 15
         settings.US_REGULAR_OPENING_GUARD_ENABLED = True
         settings.US_REGULAR_OPENING_GUARD_MAX_POSITION_PCT = 10.0
         settings.US_REGULAR_OPENING_GUARD_SIZE_SCALE = 0.5
@@ -430,6 +444,79 @@ class RiskManagerPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["combined_position_pct"], 5.0)
         self.assertTrue(result["opening_guard_active"])
         self.assertIn("정규장 오프닝 가드", result["reason"])
+
+    async def test_opening_observation_rejects_buy(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="005930",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=70_000.0,
+            suggested_quantity=10,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="STABLE_SHORT",
+            metadata={
+                "market": "KRX",
+                "price_krw": 70_000.0,
+                "session": "KRX_NXT",
+                "opening_policy": "OBSERVE_ONLY",
+                "opening_observation_active": True,
+                "minutes_from_regular_open": 4,
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=1_000_000,
+                portfolio_budget=2_000_000,
+                today_trade_count=0,
+                current_holding_count=0,
+            )
+
+        self.assertFalse(result["approved"])
+        self.assertTrue(result["opening_observation_active"])
+        self.assertEqual(result["opening_policy"], "OBSERVE_ONLY")
+        self.assertIn("모든 BUY", result["reason"])
+
+    async def test_krx_regular_opening_guard_caps_position_and_scales_quantity(self):
+        manager = RiskManager()
+        signal = TradeSignal(
+            symbol="005930",
+            stock_id="",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=100.0,
+            suggested_quantity=200,
+            urgency=SignalUrgency.IMMEDIATE,
+            strategy_type="STABLE_SHORT",
+            metadata={
+                "market": "KRX",
+                "price_krw": 100.0,
+                "session": "KRX_NXT",
+                "opening_policy": "SOFT_GUARD",
+                "opening_guard_active": True,
+                "minutes_from_regular_open": 18,
+            },
+        )
+
+        with patch("strategy.risk_manager.activity_logger.log", AsyncMock()):
+            result = await manager.check(
+                signal=signal,
+                portfolio_cash=50_000,
+                portfolio_budget=100_000,
+                today_trade_count=0,
+                current_holding_count=0,
+                dynamic_limits={"max_single_order_krw": 0, "max_position_pct": 90.0},
+            )
+
+        self.assertTrue(result["approved"])
+        self.assertEqual(result["adjusted_quantity"], 105)
+        self.assertAlmostEqual(result["combined_position_pct"], 10.5)
+        self.assertTrue(result["opening_guard_active"])
+        self.assertEqual(result["opening_policy"], "SOFT_GUARD")
+        self.assertIn("국내 정규장 오프닝 가드", result["reason"])
 
 
 if __name__ == "__main__":

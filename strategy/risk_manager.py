@@ -101,9 +101,35 @@ class RiskManager:
         session = str(metadata.get("session") or "").upper()
         return bool(
             signal.action == SignalAction.BUY
-            and is_us_market(market_code)
-            and session == "US_REGULAR"
+            and session in {"US_REGULAR", "KRX_NXT"}
             and metadata.get("opening_guard_active")
+        )
+
+    @staticmethod
+    def _is_opening_observation_buy(signal: TradeSignal) -> bool:
+        metadata = signal.metadata or {}
+        session = str(metadata.get("session") or "").upper()
+        return bool(
+            signal.action == SignalAction.BUY
+            and session in {"US_REGULAR", "KRX_NXT"}
+            and (
+                metadata.get("opening_observation_active")
+                or str(metadata.get("opening_policy") or "").upper() == "OBSERVE_ONLY"
+            )
+        )
+
+    @staticmethod
+    def _opening_guard_limits(market_code: str) -> tuple[float, float, str]:
+        if is_us_market(market_code):
+            return (
+                settings.us_regular_opening_guard_max_position_pct,
+                settings.us_regular_opening_guard_size_scale,
+                "미국 정규장 오프닝 가드",
+            )
+        return (
+            settings.krx_regular_opening_guard_max_position_pct,
+            settings.krx_regular_opening_guard_size_scale,
+            "국내 정규장 오프닝 가드",
         )
 
     @staticmethod
@@ -181,6 +207,18 @@ class RiskManager:
             )
             return result
 
+        if self._is_opening_observation_buy(signal):
+            result = {
+                "approved": False,
+                "reason": "개장 관찰 구간에서는 모든 BUY가 차단됩니다",
+                "opening_observation_active": True,
+                "opening_policy": "OBSERVE_ONLY",
+            }
+            await self._log_result(
+                symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily
+            )
+            return result
+
         # 일일 매매 한도 검사 (0 = 무제한)
         if eff_max_daily > 0 and today_trade_count >= eff_max_daily:
             logger.warning("일일 매매 한도 초과: {}/{}", today_trade_count, eff_max_daily)
@@ -244,10 +282,15 @@ class RiskManager:
                 eff_max_pos_pct *= leverage_ratio
 
         opening_guard_active = self._is_us_regular_opening_buy(signal)
+        opening_guard_scale = 1.0
+        opening_guard_label = "정규장 오프닝 가드"
         if opening_guard_active:
+            guard_max_position_pct, opening_guard_scale, opening_guard_label = self._opening_guard_limits(
+                market_code
+            )
             eff_max_pos_pct = min(
                 eff_max_pos_pct,
-                settings.us_regular_opening_guard_max_position_pct,
+                guard_max_position_pct,
             )
 
         total_amount = requested_amount_krw if _is_crypto else unit_price_krw * quantity
@@ -460,8 +503,6 @@ class RiskManager:
 
         requested_quantity = quantity
         adjustment_labels: list[str] = []
-        opening_guard_scale = settings.us_regular_opening_guard_size_scale if opening_guard_active else 1.0
-
         def _apply_quantity_cap(capped_qty: float, label: str) -> tuple[bool, dict | None]:
             nonlocal quantity, total_amount
             if capped_qty >= quantity:
@@ -578,7 +619,7 @@ class RiskManager:
         if opening_guard_scale > 0 and opening_guard_scale < 1.0:
             _, reject_result = _apply_quantity_cap(
                 normalize_quantity(quantity * opening_guard_scale, market_code),
-                "정규장 오프닝 가드",
+                opening_guard_label,
             )
             if reject_result:
                 reject_result.update({
@@ -586,6 +627,7 @@ class RiskManager:
                     "cash_basis_krw": cash_basis_krw,
                     "orderable_cash_krw": orderable_cash_krw,
                     "opening_guard_active": True,
+                    "opening_policy": "SOFT_GUARD",
                 })
                 await self._log_result(
                     symbol, reject_result, today_trade_count, cycle_id, product_context, eff_max_daily
@@ -616,6 +658,7 @@ class RiskManager:
             "cash_basis_krw": cash_basis_krw,
             "orderable_cash_krw": orderable_cash_krw,
             "opening_guard_active": opening_guard_active,
+            "opening_policy": "SOFT_GUARD" if opening_guard_active else str(metadata.get("opening_policy") or "NONE"),
         }
         await self._log_result(
             symbol, result, today_trade_count, cycle_id, product_context, eff_max_daily

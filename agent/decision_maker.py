@@ -156,6 +156,94 @@ class DecisionMaker:
             return None
 
     @classmethod
+    def _first_positive_float(cls, *values) -> float | None:
+        for value in values:
+            numeric = cls._try_float(value)
+            if numeric is not None and numeric > 0:
+                return numeric
+        return None
+
+    @classmethod
+    def _normalize_take_profit_levels(cls, raw_levels) -> list[dict]:
+        if not isinstance(raw_levels, list):
+            return []
+
+        normalized: list[dict] = []
+        for index, level in enumerate(raw_levels):
+            if not isinstance(level, dict):
+                continue
+            level_type = str(level.get("type") or "TAKE_PROFIT").upper()
+            if level_type != "TAKE_PROFIT":
+                continue
+            price = cls._try_float(level.get("price"))
+            pct = cls._coerce_int(level.get("pct"))
+            if price is None or price <= 0:
+                continue
+            normalized.append({
+                "type": "TAKE_PROFIT",
+                "price": round(price, 4),
+                "pct": min(max(pct or 100, 1), 100),
+                "reason": str(level.get("reason") or f"익절 레벨 {index + 1}"),
+                "triggered": bool(level.get("triggered")),
+                "triggered_at": level.get("triggered_at"),
+            })
+
+        if not normalized:
+            return []
+
+        normalized.sort(key=lambda item: item["price"])
+        normalized[-1]["pct"] = 100
+        return normalized
+
+    @classmethod
+    def _build_exit_plan_levels(cls, analysis_context: dict | None) -> list[dict]:
+        ctx = analysis_context or {}
+        raw_payload = ctx.get("trade_threshold_payload")
+        payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+
+        for raw_levels in (ctx.get("exit_levels"), payload.get("exit_levels")):
+            normalized = cls._normalize_take_profit_levels(raw_levels)
+            if normalized:
+                return normalized
+
+        payload_tp_levels = payload.get("tp_levels")
+        if isinstance(payload_tp_levels, list) and payload_tp_levels:
+            converted_levels = [
+                {
+                    "type": "TAKE_PROFIT",
+                    "price": level.get("price"),
+                    "pct": level.get("pct", 100),
+                    "reason": level.get("reason") or f"익절 레벨 {index + 1}",
+                    "triggered": False,
+                    "triggered_at": None,
+                }
+                for index, level in enumerate(payload_tp_levels)
+                if isinstance(level, dict)
+            ]
+            normalized = cls._normalize_take_profit_levels(converted_levels)
+            if normalized:
+                return normalized
+
+        fallback_take_profit = cls._first_positive_float(
+            ctx.get("ai_take_profit_price"),
+            ctx.get("take_profit_price"),
+            ctx.get("ai_target_price"),
+            payload.get("take_profit"),
+            payload.get("target_price"),
+        )
+        if fallback_take_profit is None:
+            return []
+
+        return [{
+            "type": "TAKE_PROFIT",
+            "price": round(fallback_take_profit, 4),
+            "pct": 100,
+            "reason": "단일 익절 (fallback)",
+            "triggered": False,
+            "triggered_at": None,
+        }]
+
+    @classmethod
     def _build_trade_notes(
         cls,
         *,
@@ -196,6 +284,21 @@ class DecisionMaker:
 
         if "last_close_review_date" in ctx:
             trade_notes["last_close_review_date"] = ctx.get("last_close_review_date")
+
+        if ctx.get("entry_price_source"):
+            trade_notes["entry_price_source"] = ctx.get("entry_price_source")
+        if ctx.get("pending_buy_price_reconciliation") is not None:
+            trade_notes["pending_buy_price_reconciliation"] = bool(ctx.get("pending_buy_price_reconciliation"))
+        if ctx.get("pending_buy_reconcile_order_id"):
+            trade_notes["pending_buy_reconcile_order_id"] = str(ctx.get("pending_buy_reconcile_order_id"))
+
+        exit_levels = cls._build_exit_plan_levels(ctx)
+        if exit_levels:
+            trade_notes["exit_levels"] = exit_levels
+
+        trade_threshold_payload = cls._build_trade_threshold_payload(analysis_context=ctx)
+        if trade_threshold_payload:
+            trade_notes["trade_threshold_payload"] = trade_threshold_payload
 
         return trade_notes
 
@@ -289,6 +392,100 @@ class DecisionMaker:
             if value:
                 return ensure_kst(value)
         return None
+
+    async def _find_stock_buy_dedupe_issue(
+        self,
+        *,
+        symbol: str,
+        market: str,
+    ) -> dict | None:
+        market_code = normalize_market(market)
+        if is_crypto_market(market_code):
+            return None
+
+        symbol_code = str(symbol or "").upper().strip()
+        cooldown_seconds = settings.buy_order_dedupe_cooldown_seconds
+        pending_statuses = {"SUBMITTED", "OPEN", "PARTIAL"}
+        now = now_kst()
+
+        async with AsyncSessionLocal() as session:
+            orders = list(
+                (
+                    await session.execute(
+                        select(BrokerOrder)
+                        .where(BrokerOrder.market == market_code)
+                        .where(BrokerOrder.symbol == symbol_code)
+                        .where(BrokerOrder.side == "BUY")
+                        .order_by(BrokerOrder.created_at.desc())
+                        .limit(10)
+                    )
+                ).scalars().all()
+            )
+
+        for order in orders:
+            status = str(order.status or "").upper()
+            if status in pending_statuses:
+                return {
+                    "reason": "동일 종목의 미체결 BUY 주문이 이미 존재합니다",
+                    "reason_code": "BUY_ORDER_DEDUPE_PENDING",
+                    "existing_order_id": order.kis_order_id,
+                    "existing_status": status,
+                    "cooldown_remaining_sec": None,
+                }
+
+        if cooldown_seconds <= 0:
+            return None
+
+        cooldown_delta = timedelta(seconds=cooldown_seconds)
+        for order in orders:
+            status = str(order.status or "").upper()
+            if status != "FILLED":
+                continue
+            filled_at = self._broker_order_filled_at(order)
+            if not filled_at:
+                continue
+            remaining = int((filled_at + cooldown_delta - now).total_seconds())
+            if remaining > 0:
+                return {
+                    "reason": "동일 종목 BUY가 최근 체결되어 재매수 쿨다운 중입니다",
+                    "reason_code": "BUY_ORDER_DEDUPE_COOLDOWN",
+                    "existing_order_id": order.kis_order_id,
+                    "existing_status": status,
+                    "cooldown_remaining_sec": remaining,
+                }
+        return None
+
+    async def _reject_duplicate_stock_buy(
+        self,
+        *,
+        signal: TradeSignal,
+        cycle_id: str | None,
+        dedupe_issue: dict,
+        phase_label: str,
+    ) -> dict:
+        result = {
+            "mode": "AUTONOMOUS",
+            "symbol": signal.symbol,
+            "action": signal.action.value,
+            "success": False,
+            "order_id": "",
+            "message": dedupe_issue["reason"],
+            "data": dedupe_issue,
+        }
+        await activity_logger.log(
+            ActivityType.DECISION, ActivityPhase.ERROR,
+            f"⚠️ [{signal.symbol}] {phase_label}: {dedupe_issue['reason_code']}",
+            cycle_id=cycle_id,
+            symbol=signal.symbol,
+            error_message=dedupe_issue["reason"],
+            detail=self._enrich_detail(signal, dedupe_issue),
+        )
+        await event_bus.publish(Event(
+            type=EventType.ORDER_EXECUTED,
+            data=result,
+            source="decision_maker",
+        ))
+        return result
 
     @staticmethod
     def _order_quantity(value: object, market: str) -> float:
@@ -1099,6 +1296,32 @@ class DecisionMaker:
             recommendation["fallback_session"] = paper_session_block["session"]
             return recommendation
 
+        if signal.action == SignalAction.BUY and not is_crypto_market(market_code):
+            dedupe_issue = await self._find_stock_buy_dedupe_issue(
+                symbol=signal.symbol,
+                market=market_code,
+            )
+            if dedupe_issue:
+                return await self._reject_duplicate_stock_buy(
+                    signal=signal,
+                    cycle_id=cycle_id,
+                    dedupe_issue=dedupe_issue,
+                    phase_label="중복 BUY 차단",
+                )
+
+        if signal.action == SignalAction.BUY and not is_crypto_market(market_code):
+            dedupe_issue = await self._find_stock_buy_dedupe_issue(
+                symbol=signal.symbol,
+                market=market_code,
+            )
+            if dedupe_issue:
+                return await self._reject_duplicate_stock_buy(
+                    signal=signal,
+                    cycle_id=cycle_id,
+                    dedupe_issue=dedupe_issue,
+                    phase_label="주문 직전 중복 BUY 차단",
+                )
+
         response = await mcp_client.place_order(
             symbol=signal.symbol,
             side=signal.action.value,
@@ -1370,6 +1593,8 @@ class DecisionMaker:
                     break
 
             if not matched_order:
+                if side == "BUY":
+                    event_detector.clear_trade_thresholds(symbol, market=market_code)
                 logger.info("[{}] 주문 {} 미체결 (체결내역에서 미발견)", symbol, order_id)
                 return
 
@@ -1385,12 +1610,16 @@ class DecisionMaker:
                 market_code,
             )
             remaining_qty = self._order_quantity(matched_order.get("remaining_qty"), market_code)
-            filled_price = mcp_client._to_float(
-                matched_order.get("filled_price")
-                or matched_order.get("avg_prvs")
-                or matched_order.get("ccld_pric")
-                or expected_price
-            )
+            requested_price = self._first_positive_float(
+                matched_order.get("order_price"),
+                expected_price,
+            ) or 0.0
+            filled_price = self._first_positive_float(
+                matched_order.get("filled_price"),
+                matched_order.get("avg_prvs"),
+                matched_order.get("ccld_pric"),
+                requested_price,
+            ) or 0.0
             filled_price_krw = self._to_trade_krw(filled_price, currency, exchange_rate)
             status_text = str(matched_order.get("status") or "체결 대기")
             reject_reason = str(matched_order.get("reject_reason") or "")
@@ -1445,6 +1674,8 @@ class DecisionMaker:
                         symbol=symbol,
                         error_message="broker ledger 저장 실패",
                     )
+                if side == "BUY":
+                    event_detector.clear_trade_thresholds(symbol, market=market_code)
                 logger.info("[{}] 주문 {} 체결수량 0 → 미체결 ({})", symbol, order_id, status_text)
                 return
 
@@ -1507,7 +1738,14 @@ class DecisionMaker:
                 )
                 return
 
-            await self._record_trade_result(
+            record_analysis_context = dict(ctx)
+            if requested_price > 0:
+                record_analysis_context.setdefault("requested_price", requested_price)
+                record_analysis_context.setdefault(
+                    "requested_price_krw",
+                    self._to_trade_krw(requested_price, currency, exchange_rate),
+                )
+            record_meta = await self._record_trade_result(
                 symbol=symbol,
                 market=market_code,
                 side=side,
@@ -1516,10 +1754,18 @@ class DecisionMaker:
                 filled_price=filled_price,
                 currency=currency,
                 exchange_rate_to_krw=exchange_rate,
-                analysis_context=analysis_context,
+                analysis_context=record_analysis_context,
                 exit_reason=exit_reason,
                 cycle_id=cycle_id,
             )
+            if side == "BUY":
+                record_meta_dict = record_meta if isinstance(record_meta, dict) else {}
+                self._activate_buy_trade_thresholds(
+                    symbol=symbol,
+                    market=market_code,
+                    analysis_context=record_analysis_context,
+                    exit_plan_id=record_meta_dict.get("exit_plan_id"),
+                )
 
             # 체결 확인 후 계좌 캐시 무효화 → 다음 조회 시 최신 반영
             from trading.account_manager import account_manager
@@ -1756,7 +2002,7 @@ class DecisionMaker:
         analysis_context: dict | None = None,
         exit_reason: str = "",
         cycle_id: str | None = None,
-    ) -> None:
+    ) -> dict | None:
         """체결 확인 후 TradeResult 생성/업데이트"""
         market_code = normalize_market(market)
         if is_crypto_market(market_code):
@@ -1771,14 +2017,33 @@ class DecisionMaker:
                 exit_reason=exit_reason,
                 cycle_id=cycle_id,
             )
-            return
+            return None
 
         filled_qty = int(float(filled_qty or 0.0))
-        ctx = analysis_context or {}
+        ctx = dict(analysis_context or {})
         now = now_kst()
         filled_price_krw = self._to_trade_krw(filled_price, currency, exchange_rate_to_krw)
+        effective_entry_price = self._first_positive_float(
+            filled_price,
+            ctx.get("requested_price"),
+        ) or 0.0
+        effective_entry_price_krw = self._first_positive_float(
+            filled_price_krw if filled_price_krw > 0 else None,
+            ctx.get("requested_price_krw"),
+            self._to_trade_krw(effective_entry_price, currency, exchange_rate_to_krw)
+            if effective_entry_price > 0
+            else None,
+        ) or 0.0
+        entry_price_source = (
+            "filled"
+            if filled_price > 0
+            else ("requested_fallback" if effective_entry_price > 0 else "missing")
+        )
+        if entry_price_source != "filled":
+            ctx["entry_price_source"] = entry_price_source
 
         try:
+            exit_plan_id: str | None = None
             async with AsyncSessionLocal() as session:
                 async with session.begin():
                     repo = TradeResultRepository(session)
@@ -1809,12 +2074,30 @@ class DecisionMaker:
                             )
                             previous_qty = int(open_buy.quantity or 0)
                             combined_qty = previous_qty + filled_qty
-                            combined_price = (
-                                ((open_buy.entry_price or 0.0) * previous_qty) + (filled_price * filled_qty)
-                            ) / combined_qty
-                            combined_price_krw = (
-                                ((open_buy.entry_price_krw or 0.0) * previous_qty) + (filled_price_krw * filled_qty)
-                            ) / combined_qty
+                            if effective_entry_price > 0:
+                                combined_price = (
+                                    ((open_buy.entry_price or 0.0) * previous_qty)
+                                    + (effective_entry_price * filled_qty)
+                                ) / combined_qty
+                                combined_price_krw = (
+                                    ((open_buy.entry_price_krw or 0.0) * previous_qty)
+                                    + (effective_entry_price_krw * filled_qty)
+                                ) / combined_qty
+                            else:
+                                combined_price = float(open_buy.entry_price or 0.0)
+                                combined_price_krw = float(open_buy.entry_price_krw or 0.0)
+                                ctx["pending_buy_price_reconciliation"] = True
+                                ctx["pending_buy_reconcile_order_id"] = order_id
+                                trade_notes["pending_buy_price_reconciliation"] = True
+                                trade_notes["pending_buy_reconcile_order_id"] = order_id
+                                logger.warning(
+                                    "[TradeResult] 추가매수 체결가 누락: {} {} 주문 {} → 기존 평균단가 유지",
+                                    market,
+                                    symbol,
+                                    order_id,
+                                )
+                            if entry_price_source != "filled":
+                                trade_notes["entry_price_source"] = entry_price_source
 
                             open_buy.order_id = order_id
                             open_buy.stock_name = ctx.get("stock_name", symbol)
@@ -1843,6 +2126,19 @@ class DecisionMaker:
                                 self._format_trade_price(combined_price, currency, exchange_rate_to_krw),
                             )
                         else:
+                            if effective_entry_price <= 0:
+                                ctx["pending_buy_price_reconciliation"] = True
+                                ctx["pending_buy_reconcile_order_id"] = order_id
+                                trade_notes["pending_buy_price_reconciliation"] = True
+                                trade_notes["pending_buy_reconcile_order_id"] = order_id
+                                logger.warning(
+                                    "[TradeResult] 신규 매수 체결가 누락: {} {} 주문 {} → 0원 기록, 추후 보정 필요",
+                                    market,
+                                    symbol,
+                                    order_id,
+                                )
+                            if entry_price_source != "filled":
+                                trade_notes["entry_price_source"] = entry_price_source
                             tr = TradeResult(
                                 order_id=order_id,
                                 stock_symbol=symbol,
@@ -1852,8 +2148,8 @@ class DecisionMaker:
                                 market=market,
                                 side="BUY",
                                 strategy_type=ctx.get("strategy_type", ""),
-                                entry_price=filled_price,
-                                entry_price_krw=filled_price_krw,
+                                entry_price=effective_entry_price,
+                                entry_price_krw=effective_entry_price_krw,
                                 exit_price=0.0,
                                 exit_price_krw=0.0,
                                 quantity=filled_qty,
@@ -1880,20 +2176,21 @@ class DecisionMaker:
                                 market,
                                 symbol,
                                 filled_qty,
-                                self._format_trade_price(filled_price, currency, exchange_rate_to_krw),
+                                self._format_trade_price(effective_entry_price, currency, exchange_rate_to_krw),
                             )
                         await activity_logger.log(
                             ActivityType.TRADE_RESULT, ActivityPhase.COMPLETE,
                             f"\U0001f4dd [{symbol}] {'추가매수 체결 기록' if is_add_on else '매수 체결 기록'}: "
-                            f"{filled_qty}주 @{self._format_trade_price(filled_price, currency, exchange_rate_to_krw)}",
+                            f"{filled_qty}주 @{self._format_trade_price(effective_entry_price, currency, exchange_rate_to_krw)}",
                             cycle_id=cycle_id,
                             symbol=symbol,
                             detail={
                                 "market": market,
                                 "currency": currency,
                                 "exchange_rate_to_krw": exchange_rate_to_krw,
-                                "entry_price": filled_price,
-                                "entry_price_krw": filled_price_krw,
+                                "entry_price": effective_entry_price,
+                                "entry_price_krw": effective_entry_price_krw,
+                                "entry_price_source": entry_price_source,
                                 "entry_mode": ctx.get("entry_mode", ""),
                                 "combined_position_pct": ctx.get("combined_position_pct"),
                                 "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
@@ -1901,6 +2198,10 @@ class DecisionMaker:
                                 "event_type": ctx.get("event_type"),
                                 "broker_cash_krw": ctx.get("broker_cash_krw"),
                                 "planned_hold_days": ctx.get("planned_hold_days"),
+                                "exit_levels": self._build_exit_plan_levels(ctx),
+                                "trade_threshold_payload": self._build_trade_threshold_payload(
+                                    analysis_context=ctx,
+                                ),
                                 "symbol_orderable_amount_krw": ctx.get("symbol_orderable_amount_krw"),
                                 "symbol_orderable_amount_foreign": ctx.get("symbol_orderable_amount_foreign"),
                                 "symbol_orderable_qty": ctx.get("symbol_orderable_qty"),
@@ -1910,14 +2211,16 @@ class DecisionMaker:
                         )
 
                         # ExitPlan 생성/업데이트 (DB 트랜잭션 외부)
-                        await self._sync_exit_plan(
+                        exit_plan = await self._sync_exit_plan(
                             symbol=symbol,
                             market=market_code,
-                            avg_entry_price=combined_price if is_add_on else filled_price,
+                            avg_entry_price=combined_price if is_add_on else effective_entry_price,
                             total_quantity=combined_qty if is_add_on else filled_qty,
                             analysis_context=ctx,
                             is_add_on=is_add_on,
+                            order_id=order_id,
                         )
+                        exit_plan_id = getattr(exit_plan, "id", None) if exit_plan is not None else None
 
                     elif side == "SELL":
                         # 매도 체결 → 미청산 BUY 기록 찾아서 업데이트
@@ -2015,8 +2318,13 @@ class DecisionMaker:
                             },
                         )
 
+            if side == "BUY":
+                return {"exit_plan_id": exit_plan_id}
+            return None
+
         except Exception as e:
             logger.error("[TradeResult] 기록 실패 ({}): {}", symbol, str(e))
+            return None
 
     async def _sync_exit_plan(
         self,
@@ -2027,12 +2335,21 @@ class DecisionMaker:
         total_quantity: int,
         analysis_context: dict | None = None,
         is_add_on: bool = False,
-    ) -> None:
+        order_id: str | None = None,
+    ) -> object | None:
         """BUY 체결 후 ExitPlan 생성 또는 추가매수 시 업데이트"""
         ctx = analysis_context or {}
-        exit_levels = ctx.get("exit_levels")
-        if not isinstance(exit_levels, list) or not exit_levels:
-            return  # exit_levels 없으면 ExitPlan 미생성 (기존 로직 유지)
+        exit_levels = self._build_exit_plan_levels(ctx)
+        if not exit_levels:
+            logger.warning(
+                "[ExitPlan] 생성 스킵: {}/{} order_id={} exit_levels={} trade_threshold_payload={}",
+                market,
+                symbol,
+                order_id or "",
+                ctx.get("exit_levels"),
+                ctx.get("trade_threshold_payload"),
+            )
+            return None
 
         # SL 레벨 추가
         sl_price = self._try_float(ctx.get("ai_stop_loss_price") or ctx.get("stop_loss_price"))
@@ -2052,11 +2369,12 @@ class DecisionMaker:
         try:
             from strategy.exit_plan_manager import exit_plan_manager
 
+            reason = ctx.get("position_intent", "ADD_ON_PYRAMID" if is_add_on else "INITIAL")
+            if reason not in ("INITIAL", "ADD_ON_PYRAMID", "ADD_ON_AVERAGE_DOWN", "AI_REVIEW", "TRAILING_UPDATE"):
+                reason = "ADD_ON_PYRAMID" if is_add_on else "INITIAL"
+
             if is_add_on:
-                reason = ctx.get("position_intent", "ADD_ON_PYRAMID")
-                if reason not in ("ADD_ON_PYRAMID", "ADD_ON_AVERAGE_DOWN"):
-                    reason = "ADD_ON_PYRAMID"
-                await exit_plan_manager.update_plan(
+                plan = await exit_plan_manager.update_plan(
                     symbol=symbol,
                     market=market,
                     new_levels=levels_for_plan,
@@ -2065,24 +2383,37 @@ class DecisionMaker:
                     reason=reason,
                     ai_reasoning=ctx.get("exit_reasoning", ""),
                 )
+                if plan is None:
+                    plan = await exit_plan_manager.create_plan(
+                        symbol=symbol,
+                        market=market,
+                        avg_entry_price=avg_entry_price,
+                        total_quantity=int(total_quantity),
+                        levels=levels_for_plan,
+                        trailing_stop_pct=float(trailing or 0.0),
+                        reason=reason,
+                        ai_reasoning=ctx.get("exit_reasoning", ""),
+                    )
             else:
-                await exit_plan_manager.create_plan(
+                plan = await exit_plan_manager.create_plan(
                     symbol=symbol,
                     market=market,
                     avg_entry_price=avg_entry_price,
                     total_quantity=int(total_quantity),
                     levels=levels_for_plan,
                     trailing_stop_pct=float(trailing or 0.0),
-                    reason="INITIAL",
+                    reason=reason,
                     ai_reasoning=ctx.get("exit_reasoning", ""),
                 )
             logger.info(
-                "[ExitPlan] %s %s/%s avg=%.2f qty=%d levels=%d",
+                "[ExitPlan] {} {}/{} avg={:.2f} qty={} levels={}",
                 "업데이트" if is_add_on else "생성",
                 symbol, market, avg_entry_price, total_quantity, len(levels_for_plan),
             )
+            return plan
         except Exception as e:
             logger.error("[ExitPlan] 생성/업데이트 실패 ({}): {}", symbol, str(e))
+            return None
 
     @staticmethod
     def _try_float(value) -> float | None:
@@ -2093,6 +2424,125 @@ class DecisionMaker:
             return v if not (v != v) else None  # NaN 체크
         except (TypeError, ValueError):
             return None
+
+    @classmethod
+    def _build_trade_threshold_payload(
+        cls,
+        *,
+        analysis_context: dict | None,
+        exit_plan_id: str | None = None,
+    ) -> dict:
+        """체결 후 활성화할 거래용 임계값 payload를 정규화한다."""
+        ctx = analysis_context or {}
+        raw_payload = ctx.get("trade_threshold_payload")
+        payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+
+        stop_loss = cls._first_positive_float(
+            payload.get("stop_loss"),
+            ctx.get("ai_stop_loss_price"),
+            ctx.get("stop_loss_price"),
+        )
+        if stop_loss and stop_loss > 0:
+            payload["stop_loss"] = round(stop_loss, 4)
+
+        take_profit = cls._first_positive_float(
+            payload.get("take_profit"),
+            ctx.get("ai_take_profit_price"),
+            ctx.get("take_profit_price"),
+            ctx.get("ai_target_price"),
+        )
+        if take_profit and take_profit > 0:
+            payload["take_profit"] = round(take_profit, 4)
+
+        trailing = cls._first_positive_float(
+            payload.get("trailing_stop_pct"),
+            ctx.get("trailing_stop_pct"),
+        )
+        if trailing and trailing > 0:
+            payload["trailing_stop_pct"] = round(trailing, 4)
+
+        raw_tp_levels = payload.get("tp_levels")
+        if not isinstance(raw_tp_levels, list):
+            raw_tp_levels = []
+
+        normalized_exit_levels = cls._build_exit_plan_levels(ctx)
+        if normalized_exit_levels:
+            payload["exit_levels"] = normalized_exit_levels
+
+        if not raw_tp_levels:
+            if normalized_exit_levels:
+                raw_tp_levels = [
+                    {
+                        "price": round(float(level["price"]), 4),
+                        "pct": float(level["pct"]),
+                        "level_index": index,
+                    }
+                    for index, level in enumerate(normalized_exit_levels)
+                    if isinstance(level, dict)
+                    and level.get("type") == "TAKE_PROFIT"
+                    and not level.get("triggered")
+                    and cls._try_float(level.get("price"))
+                    and cls._try_float(level.get("pct")) is not None
+                ]
+
+        if raw_tp_levels:
+            payload["tp_levels"] = [
+                {
+                    "price": round(float(level["price"]), 4),
+                    "pct": float(level["pct"]),
+                    "level_index": int(level.get("level_index", index)),
+                }
+                for index, level in enumerate(raw_tp_levels)
+                if isinstance(level, dict)
+                and cls._try_float(level.get("price"))
+                and cls._try_float(level.get("pct")) is not None
+            ]
+            if ("take_profit" not in payload or not payload["take_profit"]) and payload["tp_levels"]:
+                payload["take_profit"] = payload["tp_levels"][0]["price"]
+
+        if exit_plan_id:
+            payload["exit_plan_id"] = exit_plan_id
+
+        return payload
+
+    def _activate_buy_trade_thresholds(
+        self,
+        *,
+        symbol: str,
+        market: str,
+        analysis_context: dict | None,
+        exit_plan_id: str | None = None,
+    ) -> None:
+        """BUY 체결 후에만 손절/익절 감시 임계값을 활성화한다."""
+        payload = self._build_trade_threshold_payload(
+            analysis_context=analysis_context,
+            exit_plan_id=exit_plan_id,
+        )
+        kwargs = {
+            key: payload[key]
+            for key in ("stop_loss", "take_profit", "trailing_stop_pct")
+            if key in payload
+        }
+        tp_levels = payload.get("tp_levels")
+        detector_kwargs = dict(kwargs)
+        if payload.get("exit_plan_id"):
+            detector_kwargs["exit_plan_id"] = payload["exit_plan_id"]
+
+        if not detector_kwargs and not tp_levels:
+            return
+
+        event_detector.set_thresholds(
+            symbol,
+            market=market,
+            tp_levels=tp_levels if isinstance(tp_levels, list) and tp_levels else None,
+            **detector_kwargs,
+        )
+        logger.info(
+            "[TradeThreshold] BUY 체결 후 활성화: {} {}{}",
+            market,
+            symbol,
+            f" (TP레벨 {len(tp_levels)}개)" if isinstance(tp_levels, list) and tp_levels else "",
+        )
 
     async def _create_recommendation(
         self, signal: TradeSignal, analysis_id: str, cycle_id: str | None = None,

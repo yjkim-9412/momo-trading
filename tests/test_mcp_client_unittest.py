@@ -889,6 +889,47 @@ class MCPClientHybridScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["sector"], "SOFTWARE")
         self.assertEqual(data["etp_type_name"], "COMMON")
 
+    async def test_get_minute_price_resamples_domestic_bars_to_requested_interval(self):
+        client = MCPClient()
+
+        with patch(
+            "trading.kis_api.get_minute_chart",
+            new=AsyncMock(return_value={
+                "success": True,
+                "prices": [
+                    {"time": "093600", "open": "103", "high": "105", "low": "102", "close": "104", "volume": "50"},
+                    {"time": "093100", "open": "100", "high": "101", "low": "99", "close": "100", "volume": "10"},
+                    {"time": "093500", "open": "102", "high": "104", "low": "101", "close": "103", "volume": "40"},
+                    {"time": "093400", "open": "101", "high": "103", "low": "100", "close": "102", "volume": "30"},
+                    {"time": "093200", "open": "100", "high": "102", "low": "100", "close": "101", "volume": "20"},
+                ],
+            }),
+        ):
+            response = await client.get_minute_price("005930", period="5", market="KRX")
+
+        self.assertTrue(response.success)
+        self.assertEqual(
+            response.data["prices"],
+            [
+                {
+                    "time": "093000",
+                    "open": 100.0,
+                    "high": 103.0,
+                    "low": 99.0,
+                    "close": 102.0,
+                    "volume": 60,
+                },
+                {
+                    "time": "093500",
+                    "open": 102.0,
+                    "high": 105.0,
+                    "low": 101.0,
+                    "close": 104.0,
+                    "volume": 90,
+                },
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

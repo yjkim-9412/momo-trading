@@ -90,8 +90,22 @@ class Settings(BaseSettings):
     US_PREMARKET_MIN_MONITOR_CANDIDATES: int = 10
     US_PREMARKET_EXPANSION_ENABLED: bool = False
     US_PREMARKET_EXPANSION_MAX_STAGE: int = 3
+    KRX_REGULAR_OPENING_OBSERVATION_ENABLED: bool = False
+    KRX_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES: int = 0
+    KRX_REGULAR_OPENING_GUARD_ENABLED: bool = False
+    KRX_REGULAR_OPENING_GUARD_WINDOW_MINUTES: int = 0
+    KRX_REGULAR_OPENING_GUARD_LOW_PRICE_KRW: float = 5000.0
+    KRX_REGULAR_OPENING_GUARD_MID_PRICE_KRW: float = 10000.0
+    KRX_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT: float = 12.0
+    KRX_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT: float = 18.0
+    KRX_REGULAR_OPENING_GUARD_MAX_POSITION_PCT: float = 15.0
+    KRX_REGULAR_OPENING_GUARD_SIZE_SCALE: float = 0.7
+    KRX_HOT_MOVER_CHASE_MIN_CHANGE_PCT: float = 7.0
+    KRX_HOT_MOVER_PULLBACK_ENTRY_PCT: float = 0.5
+    US_REGULAR_OPENING_OBSERVATION_ENABLED: bool = False
+    US_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES: int = 0
     US_REGULAR_OPENING_GUARD_ENABLED: bool = False
-    US_REGULAR_OPENING_GUARD_WINDOW_MINUTES: int = 60
+    US_REGULAR_OPENING_GUARD_WINDOW_MINUTES: int = 30
     US_REGULAR_OPENING_GUARD_MIN_PRICE_USD: float = 5.0
     US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT: float = 20.0
     US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT: float = 50.0
@@ -203,6 +217,8 @@ class Settings(BaseSettings):
     AUTONOMY_MODE: str = "AUTONOMOUS"  # AUTONOMOUS / SEMI_AUTO
     RECOMMENDATION_EXPIRE_MIN: int = 60
     MIN_BUY_QUANTITY: int = 1
+    TIER2_REFRESH_MAX_AGE_SECONDS: int = 20
+    BUY_ORDER_DEDUPE_COOLDOWN_SECONDS: int = 180
 
     # === Trading Safety ===
     TRADING_ENABLED: bool = True
@@ -503,13 +519,143 @@ class Settings(BaseSettings):
         from trading.market_profile import is_us_market, normalize_market
 
         norm = normalize_market(market)
+        observation_window = (
+            self.us_regular_opening_observation_window_minutes
+            if self.US_REGULAR_OPENING_OBSERVATION_ENABLED
+            else 0
+        )
         return bool(
             is_us_market(norm)
             and self.US_REGULAR_OPENING_GUARD_ENABLED
             and session == "US_REGULAR"
             and minutes_from_regular_open is not None
-            and 0 <= minutes_from_regular_open < self.us_regular_opening_guard_window_minutes
+            and observation_window <= minutes_from_regular_open < self.us_regular_opening_guard_window_minutes
         )
+
+    def get_minutes_from_regular_open(
+        self,
+        market: str,
+        session: str | None = None,
+        *,
+        now_local,
+    ) -> int | None:
+        """정규장 시작 후 경과 분을 반환한다."""
+        from trading.market_profile import is_crypto_market, is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        current_session = str(session or "").upper()
+        if is_crypto_market(norm):
+            return None
+
+        open_hour = 9
+        open_minute = 30 if is_us_market(norm) else 0
+        expected_session = "US_REGULAR" if is_us_market(norm) else "KRX_NXT"
+        if current_session != expected_session:
+            return None
+
+        regular_open_time = now_local.replace(
+            hour=open_hour,
+            minute=open_minute,
+            second=0,
+            microsecond=0,
+        )
+        return max(0, int((now_local - regular_open_time).total_seconds() / 60))
+
+    def is_krx_regular_opening_observation_session(
+        self,
+        market: str,
+        session: str | None = None,
+        *,
+        minutes_from_regular_open: int | None = None,
+    ) -> bool:
+        """국내 정규장 관찰 전용 세션 여부."""
+        from trading.market_profile import is_crypto_market, is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        return bool(
+            not is_crypto_market(norm)
+            and not is_us_market(norm)
+            and self.KRX_REGULAR_OPENING_OBSERVATION_ENABLED
+            and session == "KRX_NXT"
+            and minutes_from_regular_open is not None
+            and 0 <= minutes_from_regular_open < self.krx_regular_opening_observation_window_minutes
+        )
+
+    def is_krx_regular_opening_guard_session(
+        self,
+        market: str,
+        session: str | None = None,
+        *,
+        minutes_from_regular_open: int | None = None,
+    ) -> bool:
+        """국내 정규장 오프닝 보수 가드 세션 여부."""
+        from trading.market_profile import is_crypto_market, is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        observation_window = (
+            self.krx_regular_opening_observation_window_minutes
+            if self.KRX_REGULAR_OPENING_OBSERVATION_ENABLED
+            else 0
+        )
+        return bool(
+            not is_crypto_market(norm)
+            and not is_us_market(norm)
+            and self.KRX_REGULAR_OPENING_GUARD_ENABLED
+            and session == "KRX_NXT"
+            and minutes_from_regular_open is not None
+            and observation_window <= minutes_from_regular_open < self.krx_regular_opening_guard_window_minutes
+        )
+
+    def is_us_regular_opening_observation_session(
+        self,
+        market: str,
+        session: str | None = None,
+        *,
+        minutes_from_regular_open: int | None = None,
+    ) -> bool:
+        """미국 정규장 관찰 전용 세션 여부."""
+        from trading.market_profile import is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        return bool(
+            is_us_market(norm)
+            and self.US_REGULAR_OPENING_OBSERVATION_ENABLED
+            and session == "US_REGULAR"
+            and minutes_from_regular_open is not None
+            and 0 <= minutes_from_regular_open < self.us_regular_opening_observation_window_minutes
+        )
+
+    def get_regular_opening_policy(
+        self,
+        market: str,
+        session: str | None = None,
+        *,
+        minutes_from_regular_open: int | None = None,
+    ) -> str:
+        """시장별 개장 직후 운영 정책을 반환한다."""
+        if self.is_krx_regular_opening_observation_session(
+            market,
+            session=session,
+            minutes_from_regular_open=minutes_from_regular_open,
+        ) or self.is_us_regular_opening_observation_session(
+            market,
+            session=session,
+            minutes_from_regular_open=minutes_from_regular_open,
+        ):
+            return "OBSERVE_ONLY"
+
+        if self.is_krx_regular_opening_guard_session(
+            market,
+            session=session,
+            minutes_from_regular_open=minutes_from_regular_open,
+        ) or self.is_us_regular_opening_guard_session(
+            market,
+            session=session,
+            minutes_from_regular_open=minutes_from_regular_open,
+        ):
+            return "SOFT_GUARD"
+
+        return "NONE"
 
     def get_market_config(self, market: str, session: str | None = None) -> dict:
         """시장별 매수마감/강제청산 시간 설정 반환 (크립토는 24/7 → 제한 없음)"""
@@ -878,6 +1024,59 @@ class Settings(BaseSettings):
         return min(3, max(0, int(self.US_PREMARKET_EXPANSION_MAX_STAGE or 0)))
 
     @property
+    def krx_regular_opening_observation_window_minutes(self) -> int:
+        """국내 정규장 관찰 전용 시간."""
+        return max(0, int(self.KRX_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES or 0))
+
+    @property
+    def krx_regular_opening_guard_window_minutes(self) -> int:
+        """국내 정규장 오프닝 가드 적용 시간."""
+        return max(0, int(self.KRX_REGULAR_OPENING_GUARD_WINDOW_MINUTES or 0))
+
+    @property
+    def krx_regular_opening_guard_thresholds(self) -> dict[str, float]:
+        """국내 정규장 오프닝 가드 threshold preset."""
+        low_price = max(0.0, float(self.KRX_REGULAR_OPENING_GUARD_LOW_PRICE_KRW or 0.0))
+        mid_price = max(low_price, float(self.KRX_REGULAR_OPENING_GUARD_MID_PRICE_KRW or 0.0))
+        return {
+            "low_price_krw": low_price,
+            "mid_price_krw": mid_price,
+            "low_price_max_abs_change_pct": max(
+                0.0,
+                float(self.KRX_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT or 0.0),
+            ),
+            "mid_price_max_abs_change_pct": max(
+                0.0,
+                float(self.KRX_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT or 0.0),
+            ),
+        }
+
+    @property
+    def krx_regular_opening_guard_max_position_pct(self) -> float:
+        """국내 정규장 오프닝 가드 최대 비중 상한."""
+        return max(0.0, float(self.KRX_REGULAR_OPENING_GUARD_MAX_POSITION_PCT or 0.0))
+
+    @property
+    def krx_regular_opening_guard_size_scale(self) -> float:
+        """국내 정규장 오프닝 가드 신규 매수 수량 축소 비율."""
+        return min(1.0, max(0.0, float(self.KRX_REGULAR_OPENING_GUARD_SIZE_SCALE or 0.0)))
+
+    @property
+    def krx_hot_mover_chase_min_change_pct(self) -> float:
+        """국내 급등 추격 가드 최소 등락률."""
+        return max(0.0, float(self.KRX_HOT_MOVER_CHASE_MIN_CHANGE_PCT or 0.0))
+
+    @property
+    def krx_hot_mover_pullback_entry_pct(self) -> float:
+        """국내 급등 추격 가드가 요구하는 최소 눌림목 진입 퍼센트."""
+        return max(0.0, float(self.KRX_HOT_MOVER_PULLBACK_ENTRY_PCT or 0.0))
+
+    @property
+    def us_regular_opening_observation_window_minutes(self) -> int:
+        """미국 정규장 관찰 전용 시간."""
+        return max(0, int(self.US_REGULAR_OPENING_OBSERVATION_WINDOW_MINUTES or 0))
+
+    @property
     def us_regular_opening_guard_window_minutes(self) -> int:
         """미국 정규장 오프닝 가드 적용 시간."""
         return max(0, int(self.US_REGULAR_OPENING_GUARD_WINDOW_MINUTES or 0))
@@ -907,6 +1106,16 @@ class Settings(BaseSettings):
     def us_regular_opening_guard_size_scale(self) -> float:
         """미국 정규장 오프닝 가드 신규 매수 수량 축소 비율."""
         return min(1.0, max(0.0, float(self.US_REGULAR_OPENING_GUARD_SIZE_SCALE or 0.0)))
+
+    @property
+    def tier2_refresh_max_age_seconds(self) -> float:
+        """Tier2 직전 실시간 스냅샷 재조회 기준."""
+        return max(0.0, float(self.TIER2_REFRESH_MAX_AGE_SECONDS or 0.0))
+
+    @property
+    def buy_order_dedupe_cooldown_seconds(self) -> int:
+        """동일 종목 재매수 금지 쿨다운."""
+        return max(0, int(self.BUY_ORDER_DEDUPE_COOLDOWN_SECONDS or 0))
 
     @property
     def us_leverage_allowed_sessions_list(self) -> list[str]:

@@ -8,7 +8,7 @@ import {
 } from './app-state.js';
 import { connectSSE, initAgentMonitor, updateBackgroundBadge } from './app-sse.js';
 import { loadMarketAccountInfo, loadWatchlist } from './app-account.js';
-import { loadLLMStatus, loadLLMUsage } from './app-llm.js';
+import { loadLLMStatus } from './app-llm.js';
 import { loadScheduleTimeline, loadSystemStatus } from './app-schedule.js';
 import { loadReportList, loadReport, createReportCard, renderReportComparison } from './app-reports.js';
 import * as Toast from '../shared/admin-toast.js';
@@ -695,7 +695,6 @@ document.addEventListener('DOMContentLoaded', async function () {
   loadMarketAccountInfo();
   loadWatchlist();
   loadLLMStatus();
-  loadLLMUsage();
   loadScheduleTimeline();
   connectSSE();
   loadTodayActivities();
@@ -703,7 +702,6 @@ document.addEventListener('DOMContentLoaded', async function () {
   setInterval(loadSystemStatus, 15000);
   state.accountPollTimer = setInterval(loadMarketAccountInfo, 30000);
   setInterval(loadWatchlist, 30000);
-  setInterval(loadLLMUsage, 60000);
   setInterval(loadScheduleTimeline, 15000);
 
   // Responsive sidebar: measure header height and init

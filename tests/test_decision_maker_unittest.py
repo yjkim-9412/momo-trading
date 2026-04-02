@@ -270,6 +270,209 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_price"], 70100.0)
         self.assertEqual(maker._record_trade_result.await_args.kwargs["filled_qty"], 10)
 
+    async def test_confirm_and_record_uses_requested_price_when_filled_price_is_string_zero(self):
+        maker = DecisionMaker()
+        maker._load_broker_order = AsyncMock(return_value=None)
+        maker._upsert_broker_order = AsyncMock()
+        maker._record_trade_result = AsyncMock()
+
+        filled_response = MCPResponse(success=True, data={
+            "output": [{
+                "order_id": "0000036701",
+                "market": "KRX",
+                "symbol": "003670",
+                "name": "포스코퓨처엠",
+                "status": "체결",
+                "order_qty": 1,
+                "filled_qty": 1,
+                "remaining_qty": 0,
+                "order_price": 227500.0,
+                "filled_price": "0",
+                "currency": "KRW",
+                "exchange_rate_to_krw": 1.0,
+            }],
+        })
+
+        async def _timeout_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
+        with (
+            patch("agent.decision_maker.asyncio.sleep", AsyncMock()),
+            patch("agent.decision_maker.asyncio.wait_for", AsyncMock(side_effect=_timeout_wait_for)),
+            patch(
+                "agent.decision_maker.mcp_client.get_order_list",
+                AsyncMock(return_value=filled_response),
+            ),
+            patch("agent.decision_maker.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1.0)),
+            patch("trading.account_manager.account_manager.invalidate_cache"),
+        ):
+            await maker.confirm_and_record(
+                symbol="003670",
+                market="KRX",
+                side="BUY",
+                order_id="0000036701",
+                quantity=1,
+                expected_price=227500.0,
+                analysis_context={"stock_name": "포스코퓨처엠", "currency": "KRW"},
+                cycle_id="cycle-domestic-zero-price",
+            )
+
+        maker._record_trade_result.assert_awaited_once()
+        record_kwargs = maker._record_trade_result.await_args.kwargs
+        self.assertEqual(record_kwargs["filled_price"], 227500.0)
+        self.assertEqual(record_kwargs["analysis_context"]["requested_price"], 227500.0)
+
+    async def test_confirm_and_record_buy_fill_activates_trade_thresholds_from_payload(self):
+        maker = DecisionMaker()
+        maker._load_broker_order = AsyncMock(return_value=None)
+        maker._upsert_broker_order = AsyncMock()
+        maker._record_trade_result = AsyncMock(return_value={"exit_plan_id": "plan-319400"})
+
+        event_detector.set_thresholds(
+            "319400",
+            market="KRX",
+            surge_pct=3.0,
+            drop_pct=-3.0,
+            volume_spike_ratio=4.0,
+        )
+
+        filled_response = MCPResponse(success=True, data={
+            "output": [{
+                "order_id": "0000091001",
+                "market": "KRX",
+                "symbol": "319400",
+                "name": "테스트종목",
+                "status": "체결",
+                "order_qty": 6,
+                "filled_qty": 6,
+                "remaining_qty": 0,
+                "order_price": 29500.0,
+                "filled_price": 29480.0,
+                "currency": "KRW",
+                "exchange_rate_to_krw": 1.0,
+            }],
+        })
+
+        async def _timeout_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
+        with (
+            patch("agent.decision_maker.asyncio.sleep", AsyncMock()),
+            patch("agent.decision_maker.asyncio.wait_for", AsyncMock(side_effect=_timeout_wait_for)),
+            patch(
+                "agent.decision_maker.mcp_client.get_order_list",
+                AsyncMock(return_value=filled_response),
+            ) as order_list_mock,
+            patch("agent.decision_maker.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1.0)),
+            patch("trading.account_manager.account_manager.invalidate_cache"),
+        ):
+            await maker.confirm_and_record(
+                symbol="319400",
+                market="KRX",
+                side="BUY",
+                order_id="0000091001",
+                quantity=6,
+                expected_price=29500.0,
+                analysis_context={
+                    "stock_name": "테스트종목",
+                    "currency": "KRW",
+                    "ai_stop_loss_price": 28825.0,
+                    "ai_take_profit_price": 30035.0,
+                    "trailing_stop_pct": 2.8,
+                    "trade_threshold_payload": {
+                        "stop_loss": 28825.0,
+                        "take_profit": 30035.0,
+                        "trailing_stop_pct": 2.8,
+                        "tp_levels": [
+                            {"price": 30035.0, "pct": 50, "level_index": 0},
+                            {"price": 30750.0, "pct": 100, "level_index": 1},
+                        ],
+                    },
+                },
+                cycle_id="cycle-threshold-activate",
+            )
+
+        order_list_mock.assert_awaited_once()
+        maker._record_trade_result.assert_awaited_once()
+        thresholds = event_detector.get_thresholds("319400", market="KRX")
+        self.assertEqual(thresholds.surge_pct, 3.0)
+        self.assertEqual(thresholds.drop_pct, -3.0)
+        self.assertEqual(thresholds.volume_spike_ratio, 4.0)
+        self.assertEqual(thresholds.stop_loss, 28825.0)
+        self.assertEqual(thresholds.take_profit, 30035.0)
+        self.assertEqual(thresholds.trailing_stop_pct, 2.8)
+        self.assertEqual(thresholds.exit_plan_id, "plan-319400")
+        self.assertEqual(len(thresholds.tp_levels), 2)
+
+    async def test_confirm_and_record_zero_fill_clears_trade_thresholds_only(self):
+        maker = DecisionMaker()
+        maker._load_broker_order = AsyncMock(return_value=None)
+        maker._upsert_broker_order = AsyncMock(return_value=object())
+        maker._record_trade_result = AsyncMock()
+
+        event_detector.set_thresholds(
+            "319400",
+            market="KRX",
+            surge_pct=3.0,
+            drop_pct=-3.0,
+            volume_spike_ratio=4.0,
+            stop_loss=28825.0,
+            take_profit=30035.0,
+            trailing_stop_pct=2.8,
+        )
+
+        open_response = MCPResponse(success=True, data={
+            "output": [{
+                "order_id": "0000091002",
+                "market": "KRX",
+                "symbol": "319400",
+                "name": "테스트종목",
+                "status": "접수",
+                "order_qty": 6,
+                "filled_qty": 0,
+                "remaining_qty": 6,
+                "order_price": 29500.0,
+                "filled_price": 0.0,
+                "currency": "KRW",
+                "exchange_rate_to_krw": 1.0,
+            }],
+        })
+
+        async def _timeout_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError
+
+        with (
+            patch("agent.decision_maker.asyncio.sleep", AsyncMock()),
+            patch("agent.decision_maker.asyncio.wait_for", AsyncMock(side_effect=_timeout_wait_for)),
+            patch(
+                "agent.decision_maker.mcp_client.get_order_list",
+                AsyncMock(return_value=open_response),
+            ),
+            patch("agent.decision_maker.mcp_client._get_exchange_rate_to_krw", AsyncMock(return_value=1.0)),
+        ):
+            await maker.confirm_and_record(
+                symbol="319400",
+                market="KRX",
+                side="BUY",
+                order_id="0000091002",
+                quantity=6,
+                expected_price=29500.0,
+                analysis_context={"stock_name": "테스트종목", "currency": "KRW"},
+                cycle_id="cycle-threshold-clear",
+            )
+
+        maker._record_trade_result.assert_not_awaited()
+        thresholds = event_detector.get_thresholds("319400", market="KRX")
+        self.assertEqual(thresholds.surge_pct, 3.0)
+        self.assertEqual(thresholds.drop_pct, -3.0)
+        self.assertEqual(thresholds.volume_spike_ratio, 4.0)
+        self.assertEqual(thresholds.stop_loss, 0.0)
+        self.assertEqual(thresholds.take_profit, 0.0)
+        self.assertEqual(thresholds.trailing_stop_pct, 0.0)
+
     async def test_execute_logs_error_when_broker_ledger_write_fails(self):
         signal = TradeSignal(
             symbol="COIN",
@@ -306,6 +509,7 @@ class DecisionMakerPriceGuardTest(unittest.IsolatedAsyncioTestCase):
             patch("agent.decision_maker.event_bus.publish", AsyncMock()),
             patch("agent.decision_maker.market_calendar.get_market_session", return_value="US_REGULAR"),
             patch("agent.decision_maker.asyncio.create_task", side_effect=fake_create_task),
+            patch.object(maker, "_find_stock_buy_dedupe_issue", AsyncMock(return_value=None)),
             patch(
                 "agent.decision_maker.mcp_client.place_order",
                 AsyncMock(return_value=MCPResponse(success=True, data={
@@ -435,6 +639,204 @@ class DecisionMakerTradeResultPersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trade_result.ai_take_profit_price, 157.0)
         self.assertEqual(trade_result.ai_stop_loss_price, 145.0)
 
+    async def test_record_trade_result_persists_exit_plan_context_in_notes(self):
+        maker = DecisionMaker()
+        repo = MagicMock()
+        repo.get_open_buy = AsyncMock(return_value=None)
+        maker._sync_exit_plan = AsyncMock(return_value=MagicMock(id="plan-aapl"))
+
+        class DummyTransaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class DummySession:
+            def __init__(self):
+                self.added = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def begin(self):
+                return DummyTransaction()
+
+            def add(self, obj):
+                self.added.append(obj)
+
+        session = DummySession()
+
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", return_value=session),
+            patch("agent.decision_maker.TradeResultRepository", return_value=repo),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()),
+        ):
+            await maker._record_trade_result(
+                symbol="AAPL",
+                market="NASDAQ",
+                side="BUY",
+                order_id="ord-1a",
+                filled_qty=2,
+                filled_price=151.5,
+                currency="USD",
+                exchange_rate_to_krw=1450.0,
+                analysis_context={
+                    "stock_name": "Apple",
+                    "strategy_type": "STABLE_SHORT",
+                    "ai_recommendation": "BUY",
+                    "ai_confidence": 0.82,
+                    "ai_target_price": 160.0,
+                    "ai_stop_loss_price": 145.0,
+                    "ai_take_profit_price": 157.0,
+                    "trailing_stop_pct": 3.5,
+                    "planned_hold_days": 4,
+                    "trade_threshold_payload": {
+                        "stop_loss": 145.0,
+                        "take_profit": 157.0,
+                        "trailing_stop_pct": 3.5,
+                    },
+                },
+                cycle_id="cycle-tr-1a",
+            )
+
+        self.assertEqual(len(session.added), 1)
+        trade_result = session.added[0]
+        notes = json.loads(trade_result.notes)
+        self.assertEqual(notes["trade_threshold_payload"]["stop_loss"], 145.0)
+        self.assertEqual(notes["trade_threshold_payload"]["take_profit"], 157.0)
+        self.assertEqual(notes["exit_levels"][0]["price"], 157.0)
+        self.assertEqual(notes["exit_levels"][0]["pct"], 100)
+
+    async def test_record_trade_result_buy_add_on_uses_requested_price_fallback(self):
+        maker = DecisionMaker()
+        open_buy = TradeResult(
+            order_id="buy-open",
+            stock_symbol="003670",
+            stock_name="포스코퓨처엠",
+            currency="KRW",
+            exchange_rate_to_krw=1.0,
+            market="KRX",
+            side="BUY",
+            strategy_type="AGGRESSIVE_SHORT",
+            entry_price=227500.0,
+            entry_price_krw=227500.0,
+            exit_price=0.0,
+            exit_price_krw=0.0,
+            quantity=1,
+            raw_pnl=0.0,
+            pnl=0.0,
+            return_pct=0.0,
+            is_win=False,
+            hold_days=0,
+            ai_recommendation="BUY",
+            ai_confidence=0.7,
+            entry_at=now_kst(),
+            notes=json.dumps({}, ensure_ascii=False),
+        )
+        repo = MagicMock()
+        repo.get_open_buy = AsyncMock(return_value=open_buy)
+        maker._sync_exit_plan = AsyncMock(return_value=MagicMock(id="plan-003670"))
+
+        class DummyTransaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class DummySession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def begin(self):
+                return DummyTransaction()
+
+        session = DummySession()
+
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", return_value=session),
+            patch("agent.decision_maker.TradeResultRepository", return_value=repo),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()),
+        ):
+            await maker._record_trade_result(
+                symbol="003670",
+                market="KRX",
+                side="BUY",
+                order_id="ord-003670-add",
+                filled_qty=1,
+                filled_price=0.0,
+                currency="KRW",
+                exchange_rate_to_krw=1.0,
+                analysis_context={
+                    "stock_name": "포스코퓨처엠",
+                    "strategy_type": "AGGRESSIVE_SHORT",
+                    "ai_recommendation": "BUY",
+                    "ai_confidence": 0.7,
+                    "ai_target_price": 250000.0,
+                    "ai_stop_loss_price": 212500.0,
+                    "ai_take_profit_price": 250000.0,
+                    "requested_price": 228000.0,
+                    "requested_price_krw": 228000.0,
+                },
+                cycle_id="cycle-tr-003670-add",
+            )
+
+        self.assertEqual(open_buy.quantity, 2)
+        self.assertAlmostEqual(open_buy.entry_price, 227750.0)
+        self.assertAlmostEqual(open_buy.entry_price_krw, 227750.0)
+        notes = json.loads(open_buy.notes)
+        self.assertEqual(notes["entry_price_source"], "requested_fallback")
+
+    async def test_sync_exit_plan_creates_single_tp_fallback_when_exit_levels_missing(self):
+        maker = DecisionMaker()
+        created_plan = MagicMock(id="plan-003670")
+
+        with (
+            patch(
+                "strategy.exit_plan_manager.exit_plan_manager.create_plan",
+                AsyncMock(return_value=created_plan),
+            ) as create_plan_mock,
+            patch(
+                "strategy.exit_plan_manager.exit_plan_manager.update_plan",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            result = await maker._sync_exit_plan(
+                symbol="003670",
+                market="KRX",
+                avg_entry_price=227666.6667,
+                total_quantity=3,
+                analysis_context={
+                    "ai_stop_loss_price": 212500.0,
+                    "ai_take_profit_price": 250000.0,
+                    "trailing_stop_pct": 6.5,
+                    "trade_threshold_payload": {
+                        "stop_loss": 212500.0,
+                        "take_profit": 250000.0,
+                        "trailing_stop_pct": 6.5,
+                    },
+                },
+                is_add_on=True,
+                order_id="ord-003670-plan",
+            )
+
+        self.assertIs(result, created_plan)
+        create_kwargs = create_plan_mock.await_args.kwargs
+        self.assertEqual(create_kwargs["avg_entry_price"], 227666.6667)
+        self.assertEqual(create_kwargs["total_quantity"], 3)
+        self.assertEqual(create_kwargs["trailing_stop_pct"], 6.5)
+        self.assertEqual(create_kwargs["levels"][0]["type"], "TAKE_PROFIT")
+        self.assertEqual(create_kwargs["levels"][0]["price"], 250000.0)
+        self.assertEqual(create_kwargs["levels"][-1]["type"], "STOP_LOSS")
+        self.assertEqual(create_kwargs["levels"][-1]["price"], 212500.0)
+
     async def test_record_trade_result_tags_us_premarket_scalp_entry_in_notes(self):
         maker = DecisionMaker()
         repo = MagicMock()
@@ -498,6 +900,123 @@ class DecisionMakerTradeResultPersistenceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notes["holding_policy"], "PREMARKET_SCALP")
         self.assertEqual(notes["must_exit_by_time"], "09:25")
         self.assertEqual(notes["must_exit_tz"], "America/New_York")
+
+
+class DecisionMakerBuyDedupeTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        async with test_async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                await session.execute(delete(BrokerOrder))
+
+    async def asyncTearDown(self):
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                await session.execute(delete(BrokerOrder))
+
+    @staticmethod
+    def _signal() -> TradeSignal:
+        return TradeSignal(
+            symbol="003670",
+            stock_id="stock-003670",
+            action=SignalAction.BUY,
+            strength=0.8,
+            suggested_price=228000.0,
+            suggested_quantity=1,
+            urgency=SignalUrgency.IMMEDIATE,
+            metadata={
+                "market": "KRX",
+                "currency": "KRW",
+                "exchange_rate_to_krw": 1.0,
+                "live_price": 228000.0,
+                "live_price_krw": 228000.0,
+                "entry_price_krw": 228000.0,
+            },
+        )
+
+    async def test_execute_blocks_duplicate_buy_when_pending_order_exists(self):
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    BrokerOrder(
+                        cycle_id="cycle-existing",
+                        market="KRX",
+                        symbol="003670",
+                        stock_name="포스코퓨처엠",
+                        side="BUY",
+                        status="OPEN",
+                        strategy_type="STABLE_SHORT",
+                        quantity=1,
+                        requested_price=227500.0,
+                        requested_price_krw=227500.0,
+                        filled_quantity=0,
+                        filled_price=0.0,
+                        filled_price_krw=0.0,
+                        currency="KRW",
+                        exchange_rate_to_krw=1.0,
+                        kis_order_id="pending-003670",
+                        submitted_at=now_kst(),
+                    )
+                )
+
+        maker = DecisionMaker()
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", TestAsyncSessionLocal),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()) as log_mock,
+            patch("agent.decision_maker.event_bus.publish", AsyncMock()) as publish_mock,
+            patch("agent.decision_maker.mcp_client.place_order", AsyncMock()) as place_order_mock,
+        ):
+            result = await maker.execute(self._signal(), cycle_id="cycle-dedupe-open")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["data"]["reason_code"], "BUY_ORDER_DEDUPE_PENDING")
+        place_order_mock.assert_not_awaited()
+        publish_mock.assert_awaited_once()
+        self.assertGreaterEqual(log_mock.await_count, 2)
+
+    async def test_execute_blocks_duplicate_buy_during_recent_fill_cooldown(self):
+        recent_fill_time = now_kst() - timedelta(seconds=60)
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    BrokerOrder(
+                        cycle_id="cycle-filled",
+                        market="KRX",
+                        symbol="003670",
+                        stock_name="포스코퓨처엠",
+                        side="BUY",
+                        status="FILLED",
+                        strategy_type="STABLE_SHORT",
+                        quantity=1,
+                        requested_price=227500.0,
+                        requested_price_krw=227500.0,
+                        filled_quantity=1,
+                        filled_price=227500.0,
+                        filled_price_krw=227500.0,
+                        currency="KRW",
+                        exchange_rate_to_krw=1.0,
+                        kis_order_id="filled-003670",
+                        submitted_at=recent_fill_time,
+                        filled_at=recent_fill_time,
+                    )
+                )
+
+        maker = DecisionMaker()
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", TestAsyncSessionLocal),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()) as log_mock,
+            patch("agent.decision_maker.event_bus.publish", AsyncMock()) as publish_mock,
+            patch("agent.decision_maker.mcp_client.place_order", AsyncMock()) as place_order_mock,
+        ):
+            result = await maker.execute(self._signal(), cycle_id="cycle-dedupe-filled")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["data"]["reason_code"], "BUY_ORDER_DEDUPE_COOLDOWN")
+        self.assertGreater(result["data"]["cooldown_remaining_sec"], 0)
+        place_order_mock.assert_not_awaited()
+        publish_mock.assert_awaited_once()
+        self.assertGreaterEqual(log_mock.await_count, 2)
 
 
 class DecisionMakerStaleRepairTest(unittest.IsolatedAsyncioTestCase):
