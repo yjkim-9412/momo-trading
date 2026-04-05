@@ -75,6 +75,7 @@ logs/
 *.sqlite
 *.sqlite3
 *.db-journal
+data/*.backup.*
 
 # ===== 테스트 및 커버리지 =====
 htmlcov/
