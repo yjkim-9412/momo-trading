@@ -10,6 +10,8 @@ from agent.decision_maker import DecisionMaker
 from models.agent_activity import AgentActivityLog
 from models.base import Base
 from models.broker_order import BrokerOrder
+from models.coin_trade_result import CoinTradeResult
+from models.exit_plan import ExitPlan, ExitPlanHistory
 from models.trade_result import TradeResult
 from realtime.event_detector import event_detector
 from strategy.signal import TradeSignal
@@ -1017,6 +1019,149 @@ class DecisionMakerBuyDedupeTest(unittest.IsolatedAsyncioTestCase):
         place_order_mock.assert_not_awaited()
         publish_mock.assert_awaited_once()
         self.assertGreaterEqual(log_mock.await_count, 2)
+
+
+class DecisionMakerCoinExitPlanTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        event_detector.clear_all()
+        async with test_async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                await session.execute(delete(ExitPlanHistory))
+                await session.execute(delete(ExitPlan))
+                await session.execute(delete(CoinTradeResult))
+
+    async def asyncTearDown(self):
+        event_detector.clear_all()
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                await session.execute(delete(ExitPlanHistory))
+                await session.execute(delete(ExitPlan))
+                await session.execute(delete(CoinTradeResult))
+
+    @staticmethod
+    async def _get_coin_trades(symbol: str) -> list[CoinTradeResult]:
+        async with TestAsyncSessionLocal() as session:
+            result = await session.execute(
+                select(CoinTradeResult)
+                .where(CoinTradeResult.symbol == symbol)
+                .order_by(CoinTradeResult.created_at.asc())
+            )
+            return list(result.scalars().all())
+
+    async def test_record_trade_result_coin_buy_returns_exit_plan_id_and_persists_exit_context(self):
+        maker = DecisionMaker()
+        maker._sync_exit_plan = AsyncMock(return_value=MagicMock(id="plan-btc"))
+
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", TestAsyncSessionLocal),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()),
+        ):
+            result = await maker._record_trade_result(
+                symbol="BTC",
+                market="BITHUMB",
+                side="BUY",
+                order_id="coin-buy-1",
+                filled_qty=0.125,
+                filled_price=150000000.0,
+                currency="KRW",
+                exchange_rate_to_krw=1.0,
+                analysis_context={
+                    "stock_name": "비트코인",
+                    "strategy_type": "STABLE_SHORT",
+                    "ai_recommendation": "BUY",
+                    "ai_confidence": 0.91,
+                    "ai_target_price": 154000000.0,
+                    "ai_stop_loss_price": 145000000.0,
+                    "ai_take_profit_price": 151000000.0,
+                    "trailing_stop_pct": 3.0,
+                    "trade_threshold_payload": {
+                        "stop_loss": 145000000.0,
+                        "take_profit": 151000000.0,
+                        "trailing_stop_pct": 3.0,
+                    },
+                },
+                cycle_id="coin-cycle-buy",
+            )
+
+        self.assertEqual(result, {"exit_plan_id": "plan-btc"})
+        maker._sync_exit_plan.assert_awaited_once()
+        self.assertAlmostEqual(maker._sync_exit_plan.await_args.kwargs["total_quantity"], 0.125, places=8)
+
+        trades = await self._get_coin_trades("BTC")
+        self.assertEqual(len(trades), 1)
+        notes = json.loads(trades[0].notes)
+        self.assertEqual(notes["market"], "BITHUMB")
+        self.assertEqual(notes["trade_threshold_payload"]["stop_loss"], 145000000.0)
+        self.assertEqual(notes["exit_levels"][0]["price"], 151000000.0)
+        self.assertEqual(notes["exit_levels"][0]["pct"], 100)
+
+    async def test_record_trade_result_coin_partial_sell_keeps_open_position(self):
+        maker = DecisionMaker()
+        entry_at = now_kst() - timedelta(hours=3)
+
+        async with TestAsyncSessionLocal() as session:
+            async with session.begin():
+                session.add(
+                    CoinTradeResult(
+                        order_id="coin-open-1",
+                        symbol="BTC",
+                        coin_name="비트코인",
+                        side="BUY",
+                        strategy_type="STABLE_SHORT",
+                        entry_price=150000000.0,
+                        exit_price=0.0,
+                        quantity=0.12,
+                        pnl=0.0,
+                        return_pct=0.0,
+                        is_win=False,
+                        hold_hours=0,
+                        ai_recommendation="BUY",
+                        ai_confidence=0.88,
+                        ai_target_price=154000000.0,
+                        ai_stop_loss_price=145000000.0,
+                        market_regime="BULL_RUN",
+                        notes=json.dumps({"market": "BITHUMB"}, ensure_ascii=False),
+                        entry_at=entry_at,
+                    )
+                )
+
+        with (
+            patch("agent.decision_maker.AsyncSessionLocal", TestAsyncSessionLocal),
+            patch("agent.decision_maker.activity_logger.log", AsyncMock()),
+            patch(
+                "strategy.exit_plan_manager.exit_plan_manager.deactivate_by_symbol",
+                AsyncMock(),
+            ) as deactivate_mock,
+        ):
+            result = await maker._record_trade_result(
+                symbol="BTC",
+                market="BITHUMB",
+                side="SELL",
+                order_id="coin-sell-1",
+                filled_qty=0.03,
+                filled_price=151000000.0,
+                currency="KRW",
+                exchange_rate_to_krw=1.0,
+                analysis_context={"stock_name": "비트코인"},
+                exit_reason="TAKE_PROFIT",
+                cycle_id="coin-cycle-sell",
+            )
+
+        self.assertIsNone(result)
+        deactivate_mock.assert_not_awaited()
+
+        trades = await self._get_coin_trades("BTC")
+        open_trades = [trade for trade in trades if trade.side == "BUY" and trade.exit_at is None]
+        closed_trades = [trade for trade in trades if trade.side == "BUY" and trade.exit_at is not None]
+
+        self.assertEqual(len(open_trades), 1)
+        self.assertEqual(len(closed_trades), 1)
+        self.assertAlmostEqual(open_trades[0].quantity, 0.09, places=8)
+        self.assertAlmostEqual(closed_trades[0].quantity, 0.03, places=8)
+        self.assertEqual(closed_trades[0].exit_reason, "TAKE_PROFIT")
+        self.assertGreater(closed_trades[0].pnl, 0.0)
 
 
 class DecisionMakerStaleRepairTest(unittest.IsolatedAsyncioTestCase):

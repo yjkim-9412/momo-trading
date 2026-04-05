@@ -8,7 +8,7 @@ from core.config import settings
 # ── Async Engine & Session ──
 async_engine = create_async_engine(
     settings.async_database_url,
-    echo=settings.is_local,
+    echo=settings.sql_echo,
 )
 AsyncSessionLocal = async_sessionmaker(async_engine, expire_on_commit=False)
 

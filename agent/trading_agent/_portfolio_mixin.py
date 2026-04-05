@@ -427,6 +427,51 @@ class PortfolioMixin:
         }
 
     @staticmethod
+    def _format_account_context_for_prompt(
+        account_context: dict[str, float | int | str | None],
+        *,
+        market: str,
+        currency: str,
+        compact: bool = False,
+    ) -> str:
+        """프롬프트용 계좌 상태 텍스트를 생성한다."""
+        if not compact:
+            return str(account_context.get("text") or "계좌 상태 없음")
+
+        market_code = normalize_market(market)
+        current_position_pct = float(account_context.get("current_position_pct") or 0.0)
+        max_quantity = format_quantity(account_context.get("max_additional_quantity") or 0, market_code)
+        additional_label = (
+            "추가매수 가능 최대"
+            if current_position_pct > 0
+            else "신규 진입 가능 최대"
+        )
+
+        cash_label = "실주문 기준 현금"
+        cash_value = "조회값 없음"
+        if bool(account_context.get("use_foreign_display")):
+            available_cash_foreign = account_context.get("available_cash_foreign")
+            if isinstance(available_cash_foreign, (int, float)) and available_cash_foreign > 0:
+                cash_value = f"{float(available_cash_foreign):,.2f}{currency}"
+            else:
+                cash_label = "가용 현금"
+                cash_value = f"조회값 없음 ({currency})"
+        else:
+            available_cash = account_context.get("available_cash")
+            if isinstance(available_cash, (int, float)):
+                cash_value = f"{float(available_cash):,.0f}원"
+
+        return "\n".join(
+            [
+                f"- 총자산: {account_context.get('total_asset_text') or '조회값 없음'}",
+                f"- {cash_label}: {cash_value}",
+                f"- 현재 이 종목 비중: {current_position_pct:.1f}%",
+                f"- {additional_label}: {account_context.get('max_additional_amount_text') or '0원'}",
+                f"- 현재가 기준 최대 수량: {max_quantity}",
+            ]
+        )
+
+    @staticmethod
     def _normalize_position_intent(intent: str | None, *, has_current_position: bool) -> str:
         normalized = str(intent or "").strip().upper()
         aliases = {
@@ -499,8 +544,12 @@ class PortfolioMixin:
         market_regime: str,
         recommendation: str,
         has_current_position: bool = False,
+        analysis_source: str = "cycle",
+        opening_guard_active: bool = False,
+        opening_observation_active: bool = False,
+        has_hot_mover_guard: bool = False,
     ) -> bool:
-        return (
+        if (
             market_scope == "CRYPTO"
             and
             not has_current_position
@@ -508,6 +557,20 @@ class PortfolioMixin:
             not is_restricted_product
             and tier1_confidence >= 0.80
             and market_regime in ("THEME", "BULL", "BULL_RUN", "ALTSEASON", "ALT_SEASON")
+            and recommendation == "BUY"
+        ):
+            return True
+
+        return (
+            market_scope in {"KRX", "US"}
+            and not has_current_position
+            and not is_restricted_product
+            and str(analysis_source or "").lower() != "event"
+            and not opening_guard_active
+            and not opening_observation_active
+            and not has_hot_mover_guard
+            and tier1_confidence >= settings.stock_tier2_fast_path_min_confidence
+            and market_regime in {"BULL", "THEME"}
             and recommendation == "BUY"
         )
 

@@ -120,7 +120,7 @@ class Settings(BaseSettings):
     US_LEVERAGED_PRODUCTS_ENABLED: bool = True
     US_INVERSE_PRODUCTS_ENABLED: bool = True
     US_LEVERAGE_ALLOWED_SESSIONS: str = "US_REGULAR"
-    US_LEVERAGE_ALLOWED_STRATEGIES: str = "STABLE_SHORT"
+    US_LEVERAGE_ALLOWED_STRATEGIES: str = "STABLE_SHORT,ROADMAP_PULLBACK"
     US_LEVERAGE_MAX_SINGLE_ORDER_RATIO: float = 0.3
     US_LEVERAGE_ALLOWLIST: str = ""
     US_LEVERAGE_DENYLIST: str = ""
@@ -209,9 +209,12 @@ class Settings(BaseSettings):
     CODEX_REASONING_EFFORT_REPORT: str = ""  # 리포트/회고 생성 추론 강도
     CODEX_REASONING_EFFORT_TIER1: str = ""
     CODEX_REASONING_EFFORT_TIER1_SCAN: str = ""
-    CODEX_REASONING_EFFORT_TIER1_ANALYSIS: str = ""
-    CODEX_REASONING_EFFORT_TIER2: str = "xhigh"
+    CODEX_REASONING_EFFORT_TIER1_ANALYSIS: str = "low"
+    CODEX_REASONING_EFFORT_TIER2: str = "high"
     CODEX_CLI_PATH: str = ""
+    CODEX_DISABLE_LOCAL_MCP: bool = True
+    CODEX_DISABLED_LOCAL_MCP_SERVERS: str = "agentation,context7,playwright,shadcn"
+    SQL_ECHO: bool = False
 
     # === AI Agent ===
     AUTONOMY_MODE: str = "AUTONOMOUS"  # AUTONOMOUS / SEMI_AUTO
@@ -219,6 +222,15 @@ class Settings(BaseSettings):
     MIN_BUY_QUANTITY: int = 1
     TIER2_REFRESH_MAX_AGE_SECONDS: int = 20
     BUY_ORDER_DEDUPE_COOLDOWN_SECONDS: int = 180
+    EVENT_DETECTOR_DEDUP_SEC: int = 180
+    EVENT_ANALYSIS_COOLDOWN_SEC: int = 300
+    EVENT_DYNAMIC_LIMITS_CACHE_SEC: int = 900
+    KRX_CYCLE_CANDIDATE_CAP: int = 4
+    US_PRE_CYCLE_CANDIDATE_CAP: int = 3
+    US_REGULAR_CYCLE_CANDIDATE_CAP: int = 4
+    US_LATE_CYCLE_CANDIDATE_CAP: int = 2
+    STOCK_SOFT_EXPLORATION_MAX_CANDIDATES: int = 1
+    STOCK_TIER2_FAST_PATH_MIN_CONFIDENCE: float = 0.85
 
     # === Trading Safety ===
     TRADING_ENABLED: bool = True
@@ -245,6 +257,15 @@ class Settings(BaseSettings):
     AI_DYNAMIC_RESCAN_MIN_INTERVAL_MINUTES: int = 15
     AI_DYNAMIC_RESCAN_MAX_INTERVAL_MINUTES: int = 120
     AI_DYNAMIC_RESCAN_DEFAULT_INTERVAL_MINUTES: int = 60
+    ROADMAP_PULLBACK_ENABLED_KRX: bool = False
+    ROADMAP_PULLBACK_ENABLED_US: bool = False
+    ROADMAP_PULLBACK_SMA20_LOWER_PCT: float = -1.5
+    ROADMAP_PULLBACK_SMA20_UPPER_PCT: float = 2.0
+    ROADMAP_PULLBACK_SMA60_LOWER_PCT: float = -1.5
+    ROADMAP_PULLBACK_SMA60_UPPER_PCT: float = 2.5
+    ROADMAP_PULLBACK_CHASE_MAX_ABOVE_SMA20_PCT: float = 6.0
+    ROADMAP_PULLBACK_SMA60_MIN_SLOPE_PCT: float = 0.0
+    ROADMAP_PULLBACK_EVENT_COOLDOWN_SEC: int = 900
 
     @property
     def kis_account_type_normalized(self) -> str:
@@ -760,6 +781,42 @@ class Settings(BaseSettings):
         norm = normalize_market(market)
         return bool(self.AI_DYNAMIC_RESCAN_ENABLED and not is_crypto_market(norm))
 
+    def roadmap_pullback_enabled_for_market(self, market: str) -> bool:
+        """시장별 20/60일 눌림형 게이트 활성화 여부."""
+        from trading.market_profile import is_crypto_market, is_us_market, normalize_market
+
+        norm = normalize_market(market)
+        if is_crypto_market(norm):
+            return False
+        if is_us_market(norm):
+            return bool(self.ROADMAP_PULLBACK_ENABLED_US)
+        return bool(self.ROADMAP_PULLBACK_ENABLED_KRX)
+
+    @property
+    def roadmap_pullback_thresholds(self) -> dict[str, float]:
+        """20/60일 눌림형 밴드와 추격 제한 설정."""
+        return {
+            "sma20_lower_pct": float(self.ROADMAP_PULLBACK_SMA20_LOWER_PCT or 0.0),
+            "sma20_upper_pct": float(self.ROADMAP_PULLBACK_SMA20_UPPER_PCT or 0.0),
+            "sma60_lower_pct": float(self.ROADMAP_PULLBACK_SMA60_LOWER_PCT or 0.0),
+            "sma60_upper_pct": float(self.ROADMAP_PULLBACK_SMA60_UPPER_PCT or 0.0),
+            "chase_max_above_sma20_pct": max(
+                0.0,
+                float(self.ROADMAP_PULLBACK_CHASE_MAX_ABOVE_SMA20_PCT or 0.0),
+            ),
+            "sma60_min_slope_pct": float(self.ROADMAP_PULLBACK_SMA60_MIN_SLOPE_PCT or 0.0),
+        }
+
+    @property
+    def roadmap_pullback_event_cooldown_seconds(self) -> int:
+        """로드맵 실시간 재분석 최소 간격."""
+        return max(60, int(self.ROADMAP_PULLBACK_EVENT_COOLDOWN_SEC or 900))
+
+    @property
+    def sql_echo(self) -> bool:
+        """SQLAlchemy SQL echo 활성화 여부."""
+        return bool(self.SQL_ECHO)
+
     @property
     def crypto_watchlist_symbols(self) -> list[str]:
         """크립토 스캔용 감시 코인 목록"""
@@ -996,6 +1053,56 @@ class Settings(BaseSettings):
         return max(0, int(self.US_REGULAR_MIN_SELECTED_CANDIDATES or 0))
 
     @property
+    def krx_cycle_candidate_cap(self) -> int:
+        """국내장 장중 종목 분석 최대 개수."""
+        return max(1, int(self.KRX_CYCLE_CANDIDATE_CAP or 4))
+
+    @property
+    def us_pre_cycle_candidate_cap(self) -> int:
+        """미국 프리마켓 장중 종목 분석 최대 개수."""
+        return max(1, int(self.US_PRE_CYCLE_CANDIDATE_CAP or 3))
+
+    @property
+    def us_regular_cycle_candidate_cap(self) -> int:
+        """미국 정규장 장중 종목 분석 최대 개수."""
+        return max(1, int(self.US_REGULAR_CYCLE_CANDIDATE_CAP or 4))
+
+    @property
+    def us_late_cycle_candidate_cap(self) -> int:
+        """미국장 마감 임박 구간 종목 분석 최대 개수."""
+        return max(1, int(self.US_LATE_CYCLE_CANDIDATE_CAP or 2))
+
+    @property
+    def stock_soft_exploration_max_candidates(self) -> int:
+        """주식 soft exploration 최대 재평가 개수."""
+        return max(0, int(self.STOCK_SOFT_EXPLORATION_MAX_CANDIDATES or 1))
+
+    @property
+    def stock_tier2_fast_path_min_confidence(self) -> float:
+        """주식 Tier2 fast-path 최소 신뢰도."""
+        return min(1.0, max(0.0, float(self.STOCK_TIER2_FAST_PATH_MIN_CONFIDENCE or 0.85)))
+
+    def get_stock_cycle_candidate_cap(
+        self,
+        market: str,
+        session: str,
+        *,
+        minutes_until_cutoff: int | None = None,
+    ) -> int:
+        """주식 장중 세션별 종목 분석 cap."""
+        from trading.market_profile import is_us_market, normalize_market
+
+        market_code = normalize_market(market)
+        session_code = str(session or "").upper()
+        if is_us_market(market_code):
+            if session_code == "US_PRE":
+                return self.us_pre_cycle_candidate_cap
+            if minutes_until_cutoff is not None and int(minutes_until_cutoff) <= 30:
+                return self.us_late_cycle_candidate_cap
+            return self.us_regular_cycle_candidate_cap
+        return self.krx_cycle_candidate_cap
+
+    @property
     def us_premarket_junk_filter_profile(self) -> str:
         """프리마켓 잡주 필터 프로파일을 정규화한다."""
         raw = (self.US_PREMARKET_JUNK_FILTER_PROFILE or "MODERATE").strip().upper()
@@ -1116,6 +1223,21 @@ class Settings(BaseSettings):
     def buy_order_dedupe_cooldown_seconds(self) -> int:
         """동일 종목 재매수 금지 쿨다운."""
         return max(0, int(self.BUY_ORDER_DEDUPE_COOLDOWN_SECONDS or 0))
+
+    @property
+    def event_detector_dedup_seconds(self) -> int:
+        """이벤트 감지기 동일 이벤트 재발행 방지 간격."""
+        return max(0, int(self.EVENT_DETECTOR_DEDUP_SEC or 0))
+
+    @property
+    def event_analysis_cooldown_seconds(self) -> int:
+        """실시간 이벤트 재분석 최소 간격."""
+        return max(0, int(self.EVENT_ANALYSIS_COOLDOWN_SEC or 0))
+
+    @property
+    def event_dynamic_limits_cache_seconds(self) -> int:
+        """실시간 이벤트에서 cycle 동적 한도를 재사용하는 최대 간격."""
+        return max(0, int(self.EVENT_DYNAMIC_LIMITS_CACHE_SEC or 0))
 
     @property
     def us_leverage_allowed_sessions_list(self) -> list[str]:
@@ -1336,10 +1458,10 @@ class Settings(BaseSettings):
     ) -> str:
         """Codex reasoning effort 기본값"""
         if tier == LLMTier.TIER2:
-            return "xhigh"
+            return "high"
         if profile == Tier1Profile.SCAN:
             return "low"
-        return "medium"
+        return "low"
 
     @staticmethod
     def _parse_codex_reasoning_effort(raw_value: str) -> tuple[str | None, bool]:
@@ -1423,6 +1545,19 @@ class Settings(BaseSettings):
                 os.path.expanduser("~/.npm-global/bin/codex"),
             ],
         )
+
+    @property
+    def codex_disabled_local_mcp_servers(self) -> tuple[str, ...]:
+        """Codex 비대화형 호출에서 비활성화할 로컬 stdio MCP 이름 목록"""
+        if not self.CODEX_DISABLE_LOCAL_MCP:
+            return ()
+
+        names: list[str] = []
+        for raw_name in self.CODEX_DISABLED_LOCAL_MCP_SERVERS.split(","):
+            name = raw_name.strip()
+            if name and name not in names:
+                names.append(name)
+        return tuple(names)
 
 
 settings = Settings()

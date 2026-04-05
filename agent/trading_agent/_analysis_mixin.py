@@ -13,6 +13,7 @@ from agent.decision_maker import decision_maker
 from analysis.chart_analyzer import ChartAnalysisResult, chart_analyzer
 from analysis.feedback.context_builder import FeedbackContextBuilder
 from analysis.llm.llm_factory import llm_factory
+from analysis.technical.roadmap_pullback import RoadmapPullbackSnapshot, roadmap_pullback_analyzer
 from analysis.llm.prompts.final_review import (
     FINAL_REVIEW_PROMPT, FINAL_REVIEW_SYSTEM,
     STOCK_CLOSE_REVIEW_PROMPT,
@@ -1320,7 +1321,7 @@ class AnalysisMixin:
                 if is_us_market(market_code)
                 else mcp_client.get_current_price(symbol, market=market_code)
             ),
-            mcp_client.get_daily_price(symbol, count=60, market=market_code),
+            mcp_client.get_daily_price(symbol, count=70, market=market_code),
             mcp_client.get_minute_price(symbol, period="5", market=market_code),
         )
         snapshot_fetched_at_monotonic = time.monotonic()
@@ -1529,29 +1530,105 @@ class AnalysisMixin:
             )
             return result
         chart_result = chart_analyzer.analyze(daily_df, minute_df)
+        roadmap_snapshot = RoadmapPullbackSnapshot()
 
         indicators = chart_result.indicators
+        if settings.roadmap_pullback_enabled_for_market(market_code):
+            roadmap_snapshot = roadmap_pullback_analyzer.evaluate(
+                daily_df,
+                current_price=current_price,
+            )
+            stock_info.update(roadmap_snapshot.to_metadata())
+            stock_info["strategy_type"] = "ROADMAP_PULLBACK"
+            strategy_type = "ROADMAP_PULLBACK"
+            roadmap_context = self._format_roadmap_context(roadmap_snapshot)
+            analysis_trading_context = "\n".join(
+                part for part in (analysis_trading_context, roadmap_context) if part
+            )
+            if not roadmap_snapshot.qualified:
+                await activity_logger.log(
+                    ActivityType.RISK_GATE,
+                    ActivityPhase.SKIP,
+                    f"🚫 [{name}] 로드맵 게이트 차단: {roadmap_snapshot.reason}",
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    detail=self._enrich_activity_detail(
+                        roadmap_snapshot.to_metadata(),
+                        product_context,
+                    ),
+                )
+                return result
+
+        session_context = self._build_market_session_context(market_code)
 
         # 3c. 피드백 컨텍스트 빌드
         feedback_context = "매매 이력 없음"
+        prechecked_analysis = None
+        precheck_gate_detail: dict[str, object] = {}
+        price_payload = dict(price_resp.data or {})
+        if market_code and not price_payload.get("market"):
+            price_payload["market"] = market_code
+
+        if tier1_override is None:
+            prechecked_analysis, precheck_gate_detail = self._precheck_stock_tier1_gate(
+                market_code=market_code,
+                current_price=current_price,
+                change_rate=self._try_float(price_payload.get("change_rate")),
+                current_position=current_position,
+                chart_result=chart_result,
+                session_context=session_context,
+            )
+            if prechecked_analysis:
+                reason = prechecked_analysis.get("reason") or "코드 레벨 오프닝 가드"
+                gate_log_detail = {
+                    key: value
+                    for key, value in precheck_gate_detail.items()
+                    if value not in (None, "", {})
+                }
+                await activity_logger.log(
+                    ActivityType.TIER1_ANALYSIS, ActivityPhase.COMPLETE,
+                    f"\U0001f4ca [{name}] Tier1: HOLD → 스킵 | {reason[:100]}",
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    detail=self._enrich_activity_detail(
+                        {
+                            "recommendation": "HOLD",
+                            "reason": reason,
+                            "confidence": 0,
+                            **gate_log_detail,
+                            **orderable_detail,
+                        },
+                        product_context,
+                    ),
+                    llm_provider="deterministic-gate",
+                    llm_tier="TIER1",
+                    execution_time_ms=0,
+                    confidence=0,
+                )
+                return result
+
         try:
             async with AsyncSessionLocal() as session:
                 builder = FeedbackContextBuilder(session, market_scope=scope)
                 rsi_val = indicators.get("rsi_14")
-                feedback_context = await builder.build_full_context(
-                    strategy_type=strategy_type,
-                    symbol=symbol,
-                    current_rsi=rsi_val,
-                    market_scope=scope,
-                )
+                if scope == "CRYPTO":
+                    feedback_context = await builder.build_full_context(
+                        strategy_type=strategy_type,
+                        symbol=symbol,
+                        current_rsi=rsi_val,
+                        market_scope=scope,
+                    )
+                else:
+                    feedback_context = await builder.build_compact_context(
+                        strategy_type=strategy_type,
+                        symbol=symbol,
+                        market_scope=scope,
+                    )
         except Exception as e:
             logger.warning("피드백 컨텍스트 빌드 실패: {}", str(e))
 
         # 3d. Tier 1 AI 심층 분석
         t1_elapsed = 0
-        price_payload = dict(price_resp.data or {})
-        if market_code and not price_payload.get("market"):
-            price_payload["market"] = market_code
 
         if tier1_override is not None:
             analysis = dict(tier1_override)
@@ -1606,7 +1683,6 @@ class AnalysisMixin:
                 )
                 return result
 
-        session_context = self._build_market_session_context(market_code)
         analysis, premarket_gate_detail = self._apply_us_premarket_scalp_tier1_gate(
             analysis,
             market_code=market_code,
@@ -2102,6 +2178,10 @@ class AnalysisMixin:
             has_current_position=bool(
                 current_position and has_quantity(current_position.get("quantity") or 0, market_code)
             ),
+            analysis_source=analysis_source,
+            opening_guard_active=bool(session_context.get("opening_guard_active")),
+            opening_observation_active=bool(session_context.get("opening_observation_active")),
+            has_hot_mover_guard=bool(hot_mover_setup),
         )
 
         if skip_tier2:
@@ -2112,8 +2192,10 @@ class AnalysisMixin:
                 "entry_price": current_price,
                 "target_price": analysis.get("target_price"),
                 "stop_loss_price": analysis.get("stop_loss_price"),
+                "take_profit_price": analysis.get("target_price"),
                 "trailing_stop_pct": analysis.get("trailing_stop_pct", 0),
                 "planned_hold_days": 1,
+                "exit_levels": list(analysis.get("exit_levels") or []),
                 "reason": f"Tier2 fast-path: Tier1 신뢰도 {tier1_confidence:.0%} + {mkt_state.market_regime} 국면",
                 "provider": "fast-path",
             }
@@ -2344,6 +2426,7 @@ class AnalysisMixin:
         }
         # 4. 전략 적용
         strategy = mkt_state.strategies.get(strategy_type)
+        trade_threshold_payload = self._build_trade_threshold_payload(analysis, final)
         crypto_buy_plan = (
             self._resolve_crypto_buy_plan(
                 final,
@@ -2426,6 +2509,7 @@ class AnalysisMixin:
                     "current_position": dict(current_position or {}),
                     "analysis_source": analysis_source,
                     "event_type": event_type or None,
+                    **roadmap_snapshot.to_metadata(),
                     **session_signal_metadata,
                     **orderable_signal_metadata,
                     **freshness_signal_metadata,
@@ -2436,6 +2520,10 @@ class AnalysisMixin:
                     "market_alignment": product_context.get("market_alignment"),
                     "alignment_reason": product_context.get("alignment_reason"),
                 },
+            )
+            trade_threshold_payload = self._merge_signal_trade_threshold_payload(
+                trade_threshold_payload,
+                signal,
             )
 
             result["signal"] = True
@@ -2477,6 +2565,7 @@ class AnalysisMixin:
                 "currency": currency,
                 "exchange_rate_to_krw": exchange_rate_to_krw,
                 "price_krw": price_krw,
+                **roadmap_snapshot.to_metadata(),
                 **classification.to_metadata(),
             }
 
@@ -2534,6 +2623,10 @@ class AnalysisMixin:
                 signal.take_profit_price = final["take_profit_price"]
             elif final.get("target_price"):
                 signal.take_profit_price = final["target_price"]
+            trade_threshold_payload = self._merge_signal_trade_threshold_payload(
+                trade_threshold_payload,
+                signal,
+            )
 
             signal.metadata = {
                 **(signal.metadata or {}),
@@ -2550,6 +2643,7 @@ class AnalysisMixin:
                 "current_position": dict(current_position or {}),
                 "analysis_source": analysis_source,
                 "event_type": event_type or None,
+                **roadmap_snapshot.to_metadata(),
                 **session_signal_metadata,
                 **orderable_signal_metadata,
                 **freshness_signal_metadata,
@@ -2592,7 +2686,19 @@ class AnalysisMixin:
                 "current_position": dict(current_position or {}),
             })
 
-        trade_threshold_payload = self._build_trade_threshold_payload(analysis, final)
+        if signal.action == SignalAction.BUY and strategy_type == "ROADMAP_PULLBACK":
+            if entry_mode == _ENTRY_MODE_NEW:
+                current_qty = self._try_float(signal.suggested_quantity)
+                if current_qty is not None and current_qty > 1 and market_scope(market_code) != "CRYPTO":
+                    signal.suggested_quantity = max(1.0, float(int(current_qty / 2)))
+                elif market_scope(market_code) == "CRYPTO":
+                    current_amount = self._try_float(signal.suggested_amount_krw)
+                    if current_amount is not None and current_amount > 0:
+                        signal.suggested_amount_krw = round(current_amount * 0.5, 4)
+                signal.metadata["roadmap_position_slice"] = "FIRST_TRANCHE"
+            elif str(roadmap_snapshot.stage or "") == "SMA60_PULLBACK":
+                signal.metadata["roadmap_position_slice"] = "SECOND_TRANCHE"
+
         applied_thresholds = self._resolve_applied_trade_thresholds(
             symbol,
             signal,
@@ -2689,6 +2795,7 @@ class AnalysisMixin:
             "market_bias": product_context.get("market_bias"),
             "market_alignment": product_context.get("market_alignment"),
             "alignment_reason": product_context.get("alignment_reason"),
+            **roadmap_snapshot.to_metadata(),
             **session_signal_metadata,
             **orderable_signal_metadata,
         })
@@ -2731,6 +2838,7 @@ class AnalysisMixin:
             "current_position": dict(current_position or {}),
             "analysis_source": analysis_source,
             "event_type": event_type or None,
+            **roadmap_snapshot.to_metadata(),
             **orderable_signal_metadata,
         }
         exec_result = await decision_maker.execute(
@@ -3006,7 +3114,170 @@ class AnalysisMixin:
             lines.append(f"- {next_plan_label}: {str(report.next_day_plan)[:180]}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _build_compact_market_context(market_context: str) -> str:
+        """장중 주식 프롬프트용 시장 컨텍스트를 압축한다."""
+        if not market_context:
+            return "시장 컨텍스트 없음"
+
+        regime = ""
+        analysis = ""
+        sectors = ""
+        for raw_line in str(market_context).splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("시장 국면:") and not regime:
+                regime = line
+            elif line.startswith("시장 분석:") and not analysis:
+                analysis = line[:160]
+            elif line.startswith("주도 섹터:") and not sectors:
+                payload = line.split(":", 1)[-1].strip()
+                sector_items = [item.strip() for item in payload.split(",") if item.strip()]
+                sectors = f"주도 섹터: {', '.join(sector_items[:2])}" if sector_items else ""
+
+        lines = [item for item in (regime, analysis, sectors) if item]
+        return "\n".join(lines) if lines else "시장 컨텍스트 없음"
+
+    @classmethod
+    def _build_compact_trading_context(cls, trading_context: str) -> str:
+        """장중 주식 프롬프트용 트레이딩 컨텍스트를 압축한다."""
+        if not trading_context:
+            return "트레이딩 컨텍스트 없음"
+
+        lines = [line.strip() for line in str(trading_context).splitlines() if line.strip()]
+        compact_lines = lines[:2]
+        flag_matches = re.findall(
+            r"(?:session|opening_policy|holding_policy|minutes_until_buy_cutoff|"
+            r"minutes_until_force_liquidation|minutes_from_regular_open|"
+            r"opening_guard_active|opening_observation_active|krx_hot_mover_guard)=[^\s|]+",
+            trading_context,
+        )
+        if flag_matches:
+            compact_lines.append(f"핵심 플래그: {' | '.join(dict.fromkeys(flag_matches))}")
+        return "\n".join(compact_lines) if compact_lines else "트레이딩 컨텍스트 없음"
+
+    @staticmethod
+    def _build_compact_tier1_prompt_payload(tier1_analysis: dict) -> dict:
+        """Tier2 검토용 Tier1 요약 payload."""
+        payload = {
+            "recommendation": tier1_analysis.get("recommendation"),
+            "position_intent": tier1_analysis.get("position_intent"),
+            "confidence": tier1_analysis.get("confidence"),
+            "target_price": tier1_analysis.get("target_price"),
+            "stop_loss_price": tier1_analysis.get("stop_loss_price"),
+            "trailing_stop_pct": tier1_analysis.get("trailing_stop_pct"),
+            "reason": tier1_analysis.get("reason"),
+        }
+        key_factors = tier1_analysis.get("key_factors")
+        if isinstance(key_factors, list):
+            payload["key_factors"] = [
+                str(item)
+                for item in key_factors[:3]
+                if str(item).strip()
+            ]
+        return payload
+
+    @staticmethod
+    def _build_compact_tier2_risk_flags(chart_result: ChartAnalysisResult | None) -> str:
+        """Tier2 검토용 짧은 리스크 플래그."""
+        if not chart_result or not chart_result.trend:
+            return "리스크 플래그 없음"
+
+        trend = chart_result.trend
+        flags: list[str] = []
+        if trend.direction == "BEARISH" and trend.strength == "STRONG":
+            flags.append("강한 하락 추세")
+        if trend.momentum == "DECELERATING":
+            flags.append("모멘텀 감속")
+        if trend.volatility_state == "EXPANDING":
+            flags.append("변동성 확대")
+        if trend.volatility_state == "CONTRACTING":
+            flags.append("변동성 수축")
+        if not flags:
+            return "리스크 플래그 없음"
+        return "\n".join(f"- {item}" for item in flags[:3])
+
+    @classmethod
+    def _precheck_stock_tier1_gate(
+        cls,
+        *,
+        market_code: str,
+        current_price: float,
+        change_rate: float | None,
+        current_position: dict | None,
+        chart_result: ChartAnalysisResult | None,
+        session_context: dict | None,
+    ) -> tuple[dict | None, dict]:
+        """Tier1 호출 전에 코드 레벨로 확정 가능한 HOLD를 판정한다."""
+        if market_scope(market_code) == "CRYPTO":
+            return None, {}
+
+        analysis: dict | None = {
+            "recommendation": "BUY",
+            "position_intent": "NEW",
+            "reason": "pre_tier1_gate_probe",
+        }
+        gate_details: dict[str, object] = {}
+        analysis, detail = cls._apply_regular_opening_observation_tier1_gate(
+            analysis,
+            market_code=market_code,
+            session_context=session_context,
+        )
+        gate_details = cls._merge_tier1_gate_details(gate_details, detail)
+        analysis, detail = cls._apply_us_regular_opening_tier1_gate(
+            analysis,
+            market_code=market_code,
+            current_price=current_price,
+            change_rate=change_rate,
+            current_position=current_position,
+            chart_result=chart_result,
+            session_context=session_context,
+        )
+        gate_details = cls._merge_tier1_gate_details(gate_details, detail)
+        analysis, detail = cls._apply_krx_regular_opening_tier1_gate(
+            analysis,
+            market_code=market_code,
+            current_price=current_price,
+            change_rate=change_rate,
+            current_position=current_position,
+            chart_result=chart_result,
+            session_context=session_context,
+        )
+        gate_details = cls._merge_tier1_gate_details(gate_details, detail)
+
+        if not analysis or str(analysis.get("recommendation") or "").upper() == "BUY":
+            return None, gate_details
+        return analysis, gate_details
+
     # ── 임계값 적용 ──
+
+    @staticmethod
+    def _format_roadmap_context(snapshot: RoadmapPullbackSnapshot) -> str:
+        """로드맵 판정 결과를 프롬프트용 텍스트로 정리한다."""
+        if not snapshot.qualified:
+            return f"로드맵 상태: 진입 불가 ({snapshot.reason or '조건 미충족'})"
+
+        parts = [
+            f"로드맵 상태: {snapshot.stage}",
+            (
+                f"기준선 {snapshot.roadmap_anchor_price:,.2f}"
+                if isinstance(snapshot.roadmap_anchor_price, (int, float))
+                else None
+            ),
+            (
+                f"무효화 {snapshot.roadmap_invalid_price:,.2f}"
+                if isinstance(snapshot.roadmap_invalid_price, (int, float))
+                else None
+            ),
+            (
+                f"목표 {snapshot.roadmap_take_profit_price:,.2f}"
+                if isinstance(snapshot.roadmap_take_profit_price, (int, float))
+                else None
+            ),
+        ]
+        filtered = [part for part in parts if part]
+        return " | ".join(filtered)
 
     def _apply_scan_thresholds(self, candidates: list[dict]) -> None:
         """시장 스캔 결과에서 AI가 결정한 모니터링 임계값을 event_detector에 적용"""
@@ -3034,6 +3305,22 @@ class AnalysisMixin:
                         key,
                         raw_value,
                     )
+
+            for roadmap_key in (
+                "roadmap_enabled",
+                "roadmap_strategy_type",
+                "roadmap_stage",
+                "roadmap_sma20_entry_low",
+                "roadmap_sma20_entry_high",
+                "roadmap_sma60_entry_low",
+                "roadmap_sma60_entry_high",
+                "roadmap_invalid_price",
+                "roadmap_take_profit_price",
+            ):
+                raw_value = monitoring.get(roadmap_key)
+                if raw_value in (None, ""):
+                    continue
+                kwargs[roadmap_key] = raw_value
 
             if kwargs:
                 event_detector.set_thresholds(symbol, market=market_code, **kwargs)
@@ -3088,6 +3375,26 @@ class AnalysisMixin:
                 payload["tp_levels"] = tp_levels_for_detector
 
         return payload
+
+    @staticmethod
+    def _merge_signal_trade_threshold_payload(
+        payload: dict[str, object],
+        signal: TradeSignal,
+    ) -> dict[str, object]:
+        """전략 폴백 시그널의 손절/익절값을 payload에 보강한다."""
+        merged = dict(payload or {})
+        if "stop_loss" not in merged and signal.stop_loss_price:
+            merged["stop_loss"] = round(float(signal.stop_loss_price), 4)
+        take_profit_price = signal.take_profit_price or signal.target_price
+        if "take_profit" not in merged and take_profit_price:
+            merged["take_profit"] = round(float(take_profit_price), 4)
+        if (
+            "tp_levels" not in merged
+            and isinstance(take_profit_price, (int, float))
+            and take_profit_price > 0
+        ):
+            merged["tp_levels"] = [{"price": round(float(take_profit_price), 4), "pct": 100.0, "level_index": 0}]
+        return merged
 
     def _apply_trade_thresholds(
         self, symbol: str, tier1: dict, tier2: dict, market: str | None = None,
@@ -3212,6 +3519,7 @@ class AnalysisMixin:
             exchange_rate_to_krw=exchange_rate_to_krw,
             orderable_amount_context=orderable_amount_context,
         )
+        compact_prompt = scope != "CRYPTO"
         current_price_text = f"{current_price:,.2f}{'원' if currency == 'KRW' else currency}"
         trade_value = float(price_data.get("trade_value") or 0)
         trade_value_text = (
@@ -3238,13 +3546,26 @@ class AnalysisMixin:
             daily_data=chart_result.trend_text or "추세 데이터 없음",
             product_context=self._format_product_context_for_prompt(product_context),
             current_position_context=current_position_context,
-            account_context=str(account_context["text"]),
+            account_context=self._format_account_context_for_prompt(
+                account_context,
+                market=market_code,
+                currency=currency,
+                compact=compact_prompt,
+            ),
             per=price_data.get("per", "N/A"),
             pbr=price_data.get("pbr", "N/A"),
             market_cap=price_data.get("market_cap", "N/A"),
             feedback_context=feedback_context or "매매 이력 없음",
-            market_context=market_context or "시장 컨텍스트 없음",
-            trading_context=trading_context or "트레이딩 컨텍스트 없음",
+            market_context=(
+                self._build_compact_market_context(market_context)
+                if compact_prompt
+                else (market_context or "시장 컨텍스트 없음")
+            ),
+            trading_context=(
+                self._build_compact_trading_context(trading_context)
+                if compact_prompt
+                else (trading_context or "트레이딩 컨텍스트 없음")
+            ),
         )
 
         try:
@@ -3315,27 +3636,27 @@ class AnalysisMixin:
             if currency == "KRW"
             else f"{trade_value:,.2f}{currency}"
         )
-        tier1_prompt_payload = {
-            key: value
-            for key, value in tier1_analysis.items()
-            if key != "price_krw"
-        }
-        chart_snapshot = chart_result.prompt_text if chart_result and chart_result.prompt_text else "차트 요약 없음"
-
-        tuning_suggestions = "조정 제안 없음"
-        if chart_result and chart_result.trend:
-            trend = chart_result.trend
-            suggestions = []
-            if trend.direction == "BEARISH" and trend.strength == "STRONG":
-                suggestions.append("강한 하락 추세 - 매수 진입 자제, 손절 타이트하게 설정 권장")
-            if trend.momentum == "DECELERATING":
-                suggestions.append("모멘텀 감속 중 - 진입 시점 재고 필요")
-            if trend.volatility_state == "EXPANDING":
-                suggestions.append("변동성 확대 구간 - 포지션 사이즈 축소 권장")
-            if trend.volatility_state == "CONTRACTING":
-                suggestions.append("변동성 수축 - 돌파 대기, 포지션 준비")
-            if suggestions:
-                tuning_suggestions = "\n".join(f"- {s}" for s in suggestions)
+        compact_prompt = scope != "CRYPTO"
+        tier1_prompt_payload = (
+            self._build_compact_tier1_prompt_payload(tier1_analysis)
+            if compact_prompt
+            else {
+                key: value
+                for key, value in tier1_analysis.items()
+                if key != "price_krw"
+            }
+        )
+        chart_snapshot = (
+            chart_result.review_text
+            if compact_prompt and chart_result and chart_result.review_text
+            else chart_result.prompt_text if chart_result and chart_result.prompt_text
+            else "차트 요약 없음"
+        )
+        tuning_suggestions = (
+            self._build_compact_tier2_risk_flags(chart_result)
+            if compact_prompt
+            else "조정 제안 없음"
+        )
 
         if scope == "CRYPTO":
             max_hold_window = f"{settings.crypto_timebox_hours}시간 (만료 시 자동 청산)"
@@ -3357,7 +3678,12 @@ class AnalysisMixin:
             currency=currency,
             current_position_context=current_position_context,
             hold_plan_context=hold_plan_context,
-            account_context=str(account_context["text"]),
+            account_context=self._format_account_context_for_prompt(
+                account_context,
+                market=market_code,
+                currency=currency,
+                compact=compact_prompt,
+            ),
             chart_snapshot=chart_snapshot,
             product_context=self._format_product_context_for_prompt(product_context),
             current_price_text=current_price_text,
@@ -3377,8 +3703,16 @@ class AnalysisMixin:
             max_position_pct=account_context["max_position_pct"],
             feedback_context=feedback_context or "매매 이력 없음",
             tuning_suggestions=tuning_suggestions,
-            market_context=market_context or "시장 컨텍스트 없음",
-            trading_context=trading_context or "트레이딩 컨텍스트 없음",
+            market_context=(
+                self._build_compact_market_context(market_context)
+                if compact_prompt
+                else (market_context or "시장 컨텍스트 없음")
+            ),
+            trading_context=(
+                self._build_compact_trading_context(trading_context)
+                if compact_prompt
+                else (trading_context or "트레이딩 컨텍스트 없음")
+            ),
         )
 
         try:

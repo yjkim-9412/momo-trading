@@ -22,6 +22,7 @@ class MarketScannerPolicyTest(unittest.TestCase):
             "US_REGULAR_OPENING_GUARD_MIN_PRICE_USD": settings.US_REGULAR_OPENING_GUARD_MIN_PRICE_USD,
             "US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT": settings.US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT,
             "US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT": settings.US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT,
+            "US_LATE_CYCLE_CANDIDATE_CAP": settings.US_LATE_CYCLE_CANDIDATE_CAP,
         }
         settings.US_LEVERAGED_PRODUCTS_ENABLED = True
         settings.US_INVERSE_PRODUCTS_ENABLED = True
@@ -32,6 +33,7 @@ class MarketScannerPolicyTest(unittest.TestCase):
         settings.US_REGULAR_OPENING_GUARD_MIN_PRICE_USD = 5.0
         settings.US_REGULAR_OPENING_GUARD_LOW_PRICE_MAX_ABS_CHANGE_PCT = 20.0
         settings.US_REGULAR_OPENING_GUARD_MID_PRICE_MAX_ABS_CHANGE_PCT = 50.0
+        settings.US_LATE_CYCLE_CANDIDATE_CAP = 2
 
     def tearDown(self):
         for field_name, value in self._original.items():
@@ -96,6 +98,21 @@ class MarketScannerPolicyTest(unittest.TestCase):
         self.assertEqual(filtered, [])
         self.assertEqual(stats["dropped"], 1)
         self.assertEqual(stats["reasons"]["opening_mid_price_extreme_mover"], 1)
+
+    def test_cap_selected_candidates_limits_late_us_session(self):
+        limited, stats = MarketScanner._cap_selected_candidates(
+            [
+                {"symbol": "AAPL"},
+                {"symbol": "MSFT"},
+                {"symbol": "NVDA"},
+            ],
+            market="NASDAQ",
+            session="US_REGULAR",
+            minutes_until_cutoff=20,
+        )
+
+        self.assertEqual([item["symbol"] for item in limited], ["AAPL", "MSFT"])
+        self.assertEqual(stats, {"cap": 2, "before": 3, "after": 2, "dropped": 1})
 
 
 class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
@@ -305,6 +322,10 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch(
+                "util.time_util.now_kst",
+                return_value=datetime(2026, 4, 2, 23, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+            ),
             patch.object(scanner, "_get_volume_rank", AsyncMock(return_value=affordable)),
             patch.object(scanner, "_get_fluctuation_rank", AsyncMock(return_value=[])),
             patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),
@@ -360,6 +381,10 @@ class MarketScannerCashTest(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("agent.market_scanner.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch(
+                "util.time_util.now_kst",
+                return_value=datetime(2026, 4, 2, 23, 0, tzinfo=ZoneInfo("Asia/Seoul")),
+            ),
             patch.object(scanner, "_get_volume_rank", AsyncMock(side_effect=volume_side_effect)),
             patch.object(scanner, "_get_fluctuation_rank", AsyncMock(side_effect=fluctuation_side_effect)),
             patch.object(scanner, "_get_performance_summary", AsyncMock(return_value="매매 이력 없음")),

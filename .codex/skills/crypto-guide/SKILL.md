@@ -46,6 +46,8 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 | `services/coin_order_service.py` | 코인 수동 주문 preview/place/get/cancel helper + 브로커 에러 표준화 |
 | `services/coin_daily_report_service.py` | 코인 자동 정산/수동 리포트 생성 |
 | `repositories/coin_daily_report_repository.py` | 코인 리포트 latest/list/applied_cycle 조회 |
+| `strategy/exit_plan_manager.py` | 코인/주식 공통 ExitPlan CRUD + 다단계 TP/SL 수량 계산 |
+| `models/exit_plan.py` | 공통 ExitPlan/History 테이블 (코인 fractional quantity 저장 지원) |
 | `trading/market_profile.py` | `is_crypto_market()`, `MARKET_SCOPE_CRYPTO` |
 | `trading/risk_policy.py` | 코인 canonical regime alias 정규화, shared RR floor 상수 |
 | `core/config.py` | `CRYPTO_*`, `BITHUMB_*` 환경변수 |
@@ -122,6 +124,8 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 - 코인 소수점 수량은 `trading/quantity_policy.py`를 기준으로 end-to-end 8자리 floor 정책을 유지한다. 포지션 스냅샷, 계좌 컨텍스트, 리스크 캡, Tier2 제안 수량, 빗썸 주문 payload는 코인만 fractional 을 보존하고 주식 API/스키마는 그대로 둔다.
 - 코인 BUY 계약은 **수량 중심이 아니라 KRW 금액 중심**이다. `TradeSignal.suggested_amount_krw`가 authoritative 하고, `suggested_quantity`는 `entry_price` 기준 추정 수량이다.
 - 코인 BUY 실행은 빗썸 `ord_type="price"` 시장가 매수로 통일한다. `DecisionMaker`/`BithumbClient`는 `place_order(symbol, side="BUY", quantity=<KRW amount>, price=None)` 형태를 사용한다.
+- 코인 BUY 체결 후 `DecisionMaker.confirm_and_record()`는 공통 `exit_plans`에 plan을 생성/갱신하고, `event_detector`에 `stop_loss`, `tp_levels`, `exit_plan_id`를 활성화한다.
+- 공통 `exit_plans.total_quantity` / `exit_plan_history.total_quantity`는 코인 소수 수량을 위해 `float`로 저장한다. 부분 익절 수량 계산은 `ExitPlanManager.calculate_sell_quantity(..., market)`처럼 market-aware 경로를 사용할 것.
 - 빗썸 KRW 현물 BUY 최소 주문금액은 `5,000 KRW`이며, 코인 프롬프트와 `RiskManager`가 같은 기준을 공유한다.
 - 캔들 정렬: newest-first → oldest-first 재정렬 (미국장과 동일 방어)
 - JWT 인증: PyJWT HS256. `Authorization: Bearer {jwt}`. Payload: access_key, nonce(UUID), timestamp(ms), query_hash(SHA512)

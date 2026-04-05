@@ -199,3 +199,37 @@ class FeedbackContextBuilder:
             parts.append(rsi_ctx)
 
         return "\n\n".join(parts)
+
+    async def build_compact_context(
+        self,
+        strategy_type: str,
+        symbol: str,
+        market_scope: str | None = None,
+    ) -> str:
+        """주식 장중 프롬프트용 compact 피드백 컨텍스트."""
+        parts: list[str] = []
+
+        consecutive_warning = await self.build_consecutive_loss_warning(
+            market_scope=market_scope,
+        )
+        if consecutive_warning:
+            parts.append(consecutive_warning)
+
+        parts.append(await self.build_strategy_context(strategy_type, market_scope=market_scope))
+        parts.append(await self.build_symbol_context(symbol, market_scope=market_scope))
+
+        wins = await self.tracker.get_recent_wins(limit=1, market_scope=market_scope)
+        if wins:
+            win = wins[0]
+            parts.append(
+                f"[최근 성공 1건] {win.stock_symbol} {win.return_pct:+.2f}% / 전략 {win.strategy_type}"
+            )
+
+        losses = await self.tracker.get_recent_losses(limit=1, market_scope=market_scope)
+        if losses:
+            loss = losses[0]
+            parts.append(
+                f"[최근 손실 1건] {loss.stock_symbol} {loss.return_pct:+.2f}% / 사유 {loss.exit_reason}"
+            )
+
+        return "\n".join(part for part in parts if part)

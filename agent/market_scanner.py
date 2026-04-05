@@ -1,8 +1,10 @@
 """시장 스캔 + 종목 선별 통합 — MCP 데이터 병렬 수집 → AI 한 번에 분석+선별"""
 import asyncio
 
+import pandas as pd
 from loguru import logger
 
+from analysis.technical.roadmap_pullback import roadmap_pullback_analyzer
 from core.config import settings
 from analysis.feedback.performance_tracker import PerformanceTracker
 from analysis.llm.llm_factory import llm_factory
@@ -240,6 +242,105 @@ class MarketScanner:
                 market_code = normalize_market(item.get("market", settings.primary_market_code))
                 lookup[(market_code, symbol.upper())] = item
         return lookup
+
+    @staticmethod
+    def _daily_items_to_frame(items: list[dict]) -> pd.DataFrame:
+        """일봉 응답을 DataFrame으로 정규화한다."""
+        if not items:
+            return pd.DataFrame()
+
+        daily_df = pd.DataFrame(items)
+        for col in ("open", "high", "low", "close"):
+            if col in daily_df.columns:
+                daily_df[col] = pd.to_numeric(daily_df[col], errors="coerce")
+        if "volume" in daily_df.columns:
+            daily_df["volume"] = pd.to_numeric(daily_df["volume"], errors="coerce")
+        sort_key = "date" if "date" in daily_df.columns else None
+        if sort_key:
+            daily_df = daily_df.sort_values(sort_key).reset_index(drop=True)
+        return daily_df
+
+    async def _apply_roadmap_pullback_gate(
+        self,
+        selected: list[dict],
+        *,
+        default_market: str,
+    ) -> tuple[list[dict], dict[str, int]]:
+        """선정 후보에 20/60일 눌림형 하드 게이트를 적용한다."""
+        if not selected:
+            return [], {"before": 0, "after": 0, "dropped": 0}
+
+        tasks = []
+        indexed_candidates: list[tuple[dict, str]] = []
+        for item in selected:
+            market_code = normalize_market(item.get("market", default_market), default=default_market)
+            if not settings.roadmap_pullback_enabled_for_market(market_code):
+                continue
+            indexed_candidates.append((item, market_code))
+            tasks.append(
+                mcp_client.get_daily_price(
+                    str(item.get("symbol", "")).upper(),
+                    count=70,
+                    market=market_code,
+                )
+            )
+
+        responses = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+        roadmap_lookup: dict[tuple[str, str], dict[str, object]] = {}
+        dropped = 0
+
+        for (item, market_code), response in zip(indexed_candidates, responses, strict=False):
+            symbol = str(item.get("symbol", "")).upper()
+            current_price = self._to_float(item.get("price", item.get("current_price", 0.0)), 0.0)
+            if not symbol or current_price <= 0:
+                dropped += 1
+                continue
+            if isinstance(response, Exception) or not getattr(response, "success", False):
+                dropped += 1
+                continue
+            daily_items = (response.data or {}).get("prices", (response.data or {}).get("items", []))
+            daily_df = self._daily_items_to_frame(daily_items)
+            snapshot = roadmap_pullback_analyzer.evaluate(daily_df, current_price=current_price)
+            if not snapshot.qualified:
+                dropped += 1
+                continue
+            roadmap_lookup[(market_code, symbol)] = {
+                **snapshot.to_metadata(),
+                "monitoring": snapshot.to_monitoring(),
+            }
+
+        filtered: list[dict] = []
+        for item in selected:
+            market_code = normalize_market(item.get("market", default_market), default=default_market)
+            symbol = str(item.get("symbol", "")).upper()
+            if not settings.roadmap_pullback_enabled_for_market(market_code):
+                filtered.append(item)
+                continue
+            roadmap = roadmap_lookup.get((market_code, symbol))
+            if not roadmap:
+                continue
+            filtered.append(
+                {
+                    **item,
+                    "strategy_type": "ROADMAP_PULLBACK",
+                    "reason": f"{item.get('reason', '').strip()} | {roadmap.get('roadmap_reason', '')}".strip(" |"),
+                    **{
+                        key: value
+                        for key, value in roadmap.items()
+                        if key != "monitoring"
+                    },
+                    "monitoring": {
+                        **(item.get("monitoring") if isinstance(item.get("monitoring"), dict) else {}),
+                        **dict(roadmap.get("monitoring") or {}),
+                    },
+                }
+            )
+
+        return filtered, {
+            "before": len(selected),
+            "after": len(filtered),
+            "dropped": max(0, len(selected) - len(filtered)),
+        }
 
     def _filter_selected_by_available_cash(
         self,
@@ -941,6 +1042,28 @@ class MarketScanner:
             return "3~5"
         return "5~8"
 
+    @staticmethod
+    def _cap_selected_candidates(
+        selected: list[dict],
+        *,
+        market: str,
+        session: str,
+        minutes_until_cutoff: int,
+    ) -> tuple[list[dict], dict[str, int]]:
+        """장중 종목 분석 cap 적용."""
+        cap = settings.get_stock_cycle_candidate_cap(
+            market,
+            session,
+            minutes_until_cutoff=minutes_until_cutoff,
+        )
+        limited = list(selected[:cap])
+        return limited, {
+            "cap": cap,
+            "before": len(selected),
+            "after": len(limited),
+            "dropped": max(0, len(selected) - len(limited)),
+        }
+
     async def scan(
         self,
         market: str | None = None,
@@ -1333,6 +1456,7 @@ class MarketScanner:
             parsed = self._parse_json_response(result_text)
             selected = parsed.get("selected", [])
             stock_lookup = self._build_stock_lookup(volume_rank, surge_data, drop_data)
+            roadmap_gate_stats = {"before": 0, "after": 0, "dropped": 0}
             for item in selected:
                 item["market"] = normalize_market(item.get("market", primary_market), default=primary_market)
             selected, selected_affordability_dropped = self._filter_selected_by_available_cash(
@@ -1357,6 +1481,16 @@ class MarketScanner:
                 regular_floor_stats["backfilled_count"] = backfilled_count
                 regular_floor_stats["candidate_pool_count"] = len(regular_floor_candidate_pool)
                 regular_floor_stats["unmet_floor"] = len(selected) < regular_floor_target
+            selected, roadmap_gate_stats = await self._apply_roadmap_pullback_gate(
+                selected,
+                default_market=primary_market,
+            )
+            selected, candidate_cap_stats = self._cap_selected_candidates(
+                selected,
+                market=primary_market,
+                session=session,
+                minutes_until_cutoff=minutes_until_cutoff,
+            )
             elapsed = activity_logger.elapsed_ms(timer)
 
             logger.info(
@@ -1402,6 +1536,8 @@ class MarketScanner:
                     "opening_guard": opening_guard_stats,
                     "expansion": expansion_stats,
                     "regular_floor": regular_floor_stats,
+                    "roadmap_gate": roadmap_gate_stats,
+                    "candidate_cap": candidate_cap_stats,
                 },
                 llm_provider=provider,
                 llm_tier="TIER1",
@@ -1421,6 +1557,8 @@ class MarketScanner:
                 "provider": provider,
                 "markets": scan_markets,
                 "regular_floor": regular_floor_stats,
+                "roadmap_gate": roadmap_gate_stats,
+                "candidate_cap": candidate_cap_stats,
             }
         except Exception as e:
             elapsed = activity_logger.elapsed_ms(timer)

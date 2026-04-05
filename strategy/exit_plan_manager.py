@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import json
 import logging
-import math
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
 
 from core.database import AsyncSessionLocal
 from models.exit_plan import ExitPlan, ExitPlanHistory
+from trading.quantity_policy import format_quantity, normalize_quantity, quantity_step
 from util.time_util import now_kst
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ class ExitPlanManager:
         symbol: str,
         market: str,
         avg_entry_price: float,
-        total_quantity: int,
+        total_quantity: float,
         levels: list[dict[str, Any]],
         trailing_stop_pct: float = 0.0,
         reason: str = REASON_INITIAL,
@@ -86,8 +87,8 @@ class ExitPlanManager:
                 session.add(history)
 
         logger.info(
-            "ExitPlan created: %s/%s avg=%.2f qty=%d levels=%d",
-            symbol, market, avg_entry_price, total_quantity, len(levels),
+            "ExitPlan created: %s/%s avg=%.2f qty=%s levels=%d",
+            symbol, market, avg_entry_price, format_quantity(total_quantity, market), len(levels),
         )
         return plan
 
@@ -100,7 +101,7 @@ class ExitPlanManager:
         market: str,
         new_levels: list[dict[str, Any]],
         new_avg_price: float,
-        new_qty: int,
+        new_qty: float,
         reason: str,
         ai_reasoning: str | None = None,
     ) -> ExitPlan | None:
@@ -221,12 +222,23 @@ class ExitPlanManager:
     # ── 수량 계산 ──
 
     @staticmethod
-    def calculate_sell_quantity(total_quantity: int, sell_pct: int) -> int:
-        """레벨의 pct 기준 매도 수량 계산. 최소 1주, 최대 전량."""
+    def calculate_sell_quantity(total_quantity: float, sell_pct: int, market: str) -> float:
+        """레벨의 pct 기준 매도 수량 계산. 시장별 수량 step을 보존한다."""
+        normalized_total = normalize_quantity(total_quantity, market)
+        if normalized_total <= 0:
+            return 0.0
+        if sell_pct <= 0:
+            return 0.0
         if sell_pct >= 100:
-            return total_quantity
-        qty = math.floor(total_quantity * sell_pct / 100)
-        return max(1, min(qty, total_quantity))
+            return normalized_total
+
+        qty = normalize_quantity(
+            (Decimal(str(normalized_total)) * Decimal(str(sell_pct))) / Decimal("100"),
+            market,
+        )
+        if qty <= 0:
+            qty = min(normalized_total, float(quantity_step(market)))
+        return normalize_quantity(min(qty, normalized_total), market)
 
     # ── 유틸 ──
 

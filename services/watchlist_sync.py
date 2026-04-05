@@ -44,6 +44,10 @@ def _normalize_selected_watchlist(
             "trade_value",
             "strategy_type",
             "reason",
+            "roadmap_stage",
+            "roadmap_anchor_price",
+            "roadmap_invalid_price",
+            "roadmap_take_profit_price",
         ):
             value = item.get(meta_key)
             if value not in (None, ""):

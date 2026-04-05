@@ -10,21 +10,35 @@ class ExitPlanManagerTest(unittest.TestCase):
     """ExitPlanManager 유틸리티 메서드 테스트"""
 
     def test_calculate_sell_quantity_50pct(self):
-        self.assertEqual(ExitPlanManager.calculate_sell_quantity(10, 50), 5)
+        self.assertEqual(ExitPlanManager.calculate_sell_quantity(10, 50, "KRX"), 5)
 
     def test_calculate_sell_quantity_100pct(self):
-        self.assertEqual(ExitPlanManager.calculate_sell_quantity(10, 100), 10)
+        self.assertEqual(ExitPlanManager.calculate_sell_quantity(10, 100, "KRX"), 10)
 
     def test_calculate_sell_quantity_min_1(self):
         # 1주일 때 50% → 최소 1주
-        self.assertEqual(ExitPlanManager.calculate_sell_quantity(1, 50), 1)
+        self.assertEqual(ExitPlanManager.calculate_sell_quantity(1, 50, "KRX"), 1)
 
     def test_calculate_sell_quantity_floor(self):
         # 3주의 30% = 0.9 → floor → 0 → max(1, 0) = 1
-        self.assertEqual(ExitPlanManager.calculate_sell_quantity(3, 30), 1)
+        self.assertEqual(ExitPlanManager.calculate_sell_quantity(3, 30, "KRX"), 1)
 
     def test_calculate_sell_quantity_large(self):
-        self.assertEqual(ExitPlanManager.calculate_sell_quantity(100, 70), 70)
+        self.assertEqual(ExitPlanManager.calculate_sell_quantity(100, 70, "KRX"), 70)
+
+    def test_calculate_sell_quantity_crypto_preserves_fractional_precision(self):
+        self.assertAlmostEqual(
+            ExitPlanManager.calculate_sell_quantity(0.12345678, 50, "BITHUMB"),
+            0.06172839,
+            places=8,
+        )
+
+    def test_calculate_sell_quantity_crypto_uses_min_step(self):
+        self.assertAlmostEqual(
+            ExitPlanManager.calculate_sell_quantity(0.00000003, 10, "BITHUMB"),
+            0.00000001,
+            places=8,
+        )
 
     def test_parse_levels(self):
         levels_json = json.dumps([

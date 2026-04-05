@@ -45,6 +45,7 @@ class PortfolioType(str, Enum):
     """포트폴리오 유형"""
     STABLE_SHORT = "STABLE_SHORT"
     AGGRESSIVE_SHORT = "AGGRESSIVE_SHORT"
+    ROADMAP_PULLBACK = "ROADMAP_PULLBACK"
 
 
 class TradingMode(str, Enum):

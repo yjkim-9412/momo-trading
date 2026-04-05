@@ -199,6 +199,12 @@ class CodexCLIProvider:
         if reasoning_effort:
             cmd.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
 
+    @staticmethod
+    def _append_local_mcp_overrides(cmd: list[str]) -> None:
+        """Headless 서버용 stdio MCP 비활성화 override 추가"""
+        for server_name in settings.codex_disabled_local_mcp_servers:
+            cmd.extend(["-c", f"mcp_servers.{server_name}.enabled=false"])
+
     def _build_command(
         self,
         codex_path: str,
@@ -223,6 +229,7 @@ class CodexCLIProvider:
                 if self._model:
                     cmd.extend(["--model", self._model])
                 self._append_reasoning_effort(cmd, reasoning_effort)
+                self._append_local_mcp_overrides(cmd)
                 cmd.extend([state["active_session_id"], "-"])
                 return cmd, output_path
 
@@ -239,6 +246,7 @@ class CodexCLIProvider:
             if self._model:
                 cmd.extend(["--model", self._model])
             self._append_reasoning_effort(cmd, reasoning_effort)
+            self._append_local_mcp_overrides(cmd)
             cmd.append("-")
             return cmd, output_path
 
@@ -256,6 +264,7 @@ class CodexCLIProvider:
         if self._model:
             cmd.extend(["--model", self._model])
         self._append_reasoning_effort(cmd, reasoning_effort)
+        self._append_local_mcp_overrides(cmd)
         cmd.append("-")
         return cmd, output_path
 

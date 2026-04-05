@@ -17,6 +17,7 @@ class ChartAnalysisResult:
     trend: TrendReport = field(default_factory=TrendReport)
     signal_summary: dict = field(default_factory=dict)
     prompt_text: str = ""
+    review_text: str = ""
     patterns_text: str = ""
     indicators_text: str = ""
     trend_text: str = ""
@@ -49,6 +50,7 @@ class ChartAnalyzer:
             result.patterns_text = ChartPatterns.format_for_prompt(result.patterns)
             result.trend_text = self.trend_analyzer.format_for_prompt(result.trend)
             result.prompt_text = self._format_full_prompt(result)
+            result.review_text = self._format_review_prompt(result)
         except Exception as e:
             logger.error("차트 종합 분석 오류: {}", str(e))
 
@@ -150,6 +152,45 @@ class ChartAnalyzer:
             "[추세 분석]",
             result.trend_text,
         ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_review_prompt(result: ChartAnalysisResult) -> str:
+        """Tier2 검토용 차트 요약 텍스트."""
+        summary = result.signal_summary or {}
+        trend = result.trend
+        indicators = result.indicators or {}
+        patterns = (result.patterns or {}).get("patterns", [])
+
+        pattern_names = []
+        for item in patterns[:2]:
+            name = str(item.get("name") or item.get("pattern") or "").strip()
+            signal = str(item.get("signal") or "").strip()
+            if name and signal:
+                pattern_names.append(f"{name}({signal})")
+            elif name:
+                pattern_names.append(name)
+
+        intraday = dict(getattr(trend, "intraday", None) or {})
+        lines = [
+            "=== 검토용 차트 요약 ===",
+            (
+                f"- 종합 시그널: {summary.get('direction', 'NEUTRAL')} "
+                f"(신뢰도 {summary.get('confidence', 0):.0%})"
+            ),
+            f"- 추세: {getattr(trend, 'direction', 'NEUTRAL')} / {getattr(trend, 'strength', 'WEAK')}",
+            (
+                f"- 핵심 지표: RSI {indicators.get('rsi_14', 'N/A')}, "
+                f"MACD Hist {indicators.get('macd_histogram', 'N/A')}, "
+                f"Cross {indicators.get('cross_signal', 'NONE')}"
+            ),
+            (
+                f"- 분봉: direction={intraday.get('direction', 'NEUTRAL')} / "
+                f"vwap={intraday.get('vwap_position', 'AT_VWAP')}"
+            ),
+        ]
+        if pattern_names:
+            lines.append(f"- 패턴: {', '.join(pattern_names)}")
         return "\n".join(lines)
 
 

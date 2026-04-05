@@ -80,6 +80,8 @@ async def test_admin_llm_usage_endpoint(client, monkeypatch):
             "daily_model_tokens": [],
             "provider_data": {},
             "app_usage": {"total_calls": 2},
+            "by_scope_tier": {"KRX:TIER1": {"calls": 1}},
+            "last_cycle_delta": {"scope": "KRX", "phase": "cycle", "calls": 1},
         },
     )
 
@@ -88,3 +90,4 @@ async def test_admin_llm_usage_endpoint(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["data"]["provider"] == "CODEX_CLI"
     assert response.json()["data"]["summary"]["total_sessions"] == 3
+    assert response.json()["data"]["last_cycle_delta"]["scope"] == "KRX"

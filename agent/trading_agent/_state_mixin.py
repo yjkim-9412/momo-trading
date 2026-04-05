@@ -31,8 +31,7 @@ class StateMixin:
         self._last_cycle_time = None
         # 실시간 이벤트 중복 분석 방지 (종목별 쿨다운)
         self._analyzing: set[str] = set()
-        self._cooldowns: dict[str, float] = {}  # symbol -> last_trigger_time
-        self.EVENT_COOLDOWN_SEC = 120  # 동일 종목 재분석 최소 간격 (초)
+        self._cooldowns: dict[str, float] = {}  # market:symbol:event_group -> last_trigger_time
         # 시장별 격리 상태 (KRX/US 동시 운영 지원)
         self._market_states: dict[str, MarketState] = {}
         # 종목별 상품 메타데이터 캐시 (실시간 이벤트 경로 재사용)
@@ -69,6 +68,8 @@ class StateMixin:
             runtime.last_completed_review_date = None
             runtime.last_schedule_hint = {}
             runtime.last_selected_watchlist = []
+            runtime.cached_dynamic_limits = None
+            runtime.cached_dynamic_limits_at = None
             runtime.last_cycle_attempt_at = None
             runtime.last_cycle_status = None
             runtime.last_cycle_error = None

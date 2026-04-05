@@ -4,7 +4,7 @@ from loguru import logger
 
 from agent.decision_maker import decision_maker
 from core.config import settings
-from core.events import Event
+from core.events import Event, EventType
 from realtime.event_detector import event_detector
 from scheduler.market_calendar import market_calendar
 from services.activity_logger import activity_logger
@@ -12,10 +12,44 @@ from trading.enums import ActivityPhase, ActivityType
 from trading.market_profile import is_crypto_market, market_scope, market_timezone, normalize_market
 from trading.mcp_client import mcp_client
 from trading.quantity_policy import format_quantity_with_unit
+from util.time_util import now_kst
 
 
 class EventMixin:
     """실시간 이벤트 핸들러 Mixin"""
+
+    @staticmethod
+    def _event_analysis_group(event: Event) -> str:
+        """실시간 재분석 쿨다운에 사용하는 이벤트 그룹."""
+        if event.type in {EventType.PRICE_SURGE, EventType.VOLUME_SPIKE}:
+            return "MOMENTUM"
+        if event.type == EventType.PRICE_DROP:
+            return "PRICE_DROP"
+        if event.type == EventType.INDICATOR_SIGNAL:
+            signal = str(event.data.get("indicator_signal") or "").strip().upper()
+            if signal in {"PRICE_SURGE", "VOLUME_SPIKE", "MOMENTUM"}:
+                return "MOMENTUM"
+            return signal or EventType.INDICATOR_SIGNAL.value
+        return event.type.value
+
+    @staticmethod
+    def _copy_dynamic_limits(dynamic_limits: dict | None) -> dict | None:
+        return dict(dynamic_limits) if isinstance(dynamic_limits, dict) else None
+
+    def _get_event_dynamic_limits_from_cache(
+        self,
+        runtime,
+    ) -> tuple[dict | None, float | None]:
+        """최근 cycle에서 계산한 동적 한도를 이벤트 경로에서 재사용."""
+        cached_limits = self._copy_dynamic_limits(runtime.cached_dynamic_limits)
+        cached_at = runtime.cached_dynamic_limits_at
+        if not cached_limits or cached_at is None:
+            return None, None
+
+        age_seconds = max(0.0, (now_kst() - cached_at).total_seconds())
+        if age_seconds > settings.event_dynamic_limits_cache_seconds:
+            return None, age_seconds
+        return cached_limits, age_seconds
 
     async def _on_market_event(self, event: Event) -> None:
         """실시간 시장 이벤트 → 즉시 해당 종목 분석/매매"""
@@ -46,14 +80,69 @@ class EventMixin:
         if not symbol:
             return
 
+        if (
+            settings.roadmap_pullback_enabled_for_market(market_code)
+            and event.type in {
+                EventType.VOLUME_SPIKE,
+                EventType.PRICE_SURGE,
+                EventType.PRICE_DROP,
+            }
+        ):
+            return
+
         # 쿨다운 체크 (동일 종목 연속 분석 방지)
         import time as _time
         now_ts = _time.time()
-        cooldown_key = f"{market_code}:{symbol}"
+        event_group = self._event_analysis_group(event)
+        cooldown_key = f"{market_code}:{symbol}:{event_group}"
         last_ts = self._cooldowns.get(cooldown_key, 0)
-        if now_ts - last_ts < self.EVENT_COOLDOWN_SEC:
+        cooldown_sec = (
+            settings.roadmap_pullback_event_cooldown_seconds
+            if (
+                settings.roadmap_pullback_enabled_for_market(market_code)
+                and event.type == EventType.INDICATOR_SIGNAL
+            )
+            else settings.event_analysis_cooldown_seconds
+        )
+        elapsed_since_last = now_ts - last_ts
+        if elapsed_since_last < cooldown_sec:
+            await activity_logger.log(
+                ActivityType.EVENT,
+                ActivityPhase.SKIP,
+                f"⏭️ 실시간 감지 스킵: {event_group} - {symbol} (cooldown)",
+                market_scope=scope,
+                trading_date=trading_date,
+                symbol=symbol,
+                detail={
+                    "event_skip_reason": (
+                        "momentum_group_dedup" if event_group == "MOMENTUM" else "cooldown"
+                    ),
+                    "event_group": event_group,
+                    "event_type": event.type.value,
+                    "cooldown_key": cooldown_key,
+                    "cooldown_seconds": cooldown_sec,
+                    "elapsed_seconds": round(elapsed_since_last, 3),
+                },
+            )
             return
         if cooldown_key in self._analyzing:
+            await activity_logger.log(
+                ActivityType.EVENT,
+                ActivityPhase.SKIP,
+                f"⏭️ 실시간 감지 스킵: {event_group} - {symbol} (already analyzing)",
+                market_scope=scope,
+                trading_date=trading_date,
+                symbol=symbol,
+                detail={
+                    "event_skip_reason": (
+                        "momentum_group_dedup" if event_group == "MOMENTUM" else "cooldown"
+                    ),
+                    "event_group": event_group,
+                    "event_type": event.type.value,
+                    "cooldown_key": cooldown_key,
+                    "already_analyzing": True,
+                },
+            )
             return
 
         self._cooldowns[cooldown_key] = now_ts
@@ -61,7 +150,10 @@ class EventMixin:
 
         price = event.data.get("price", 0)
         change_rate = event.data.get("change_rate", 0)
-        event_type = event.type.value
+        event_type = str(
+            event.data.get("indicator_signal")
+            or event.type.value
+        ).upper()
 
         with activity_logger.context(market_scope=scope, trading_date=trading_date):
             await activity_logger.log(
@@ -82,12 +174,18 @@ class EventMixin:
                     "symbol": symbol,
                     "name": product_metadata.get("name") or event.data.get("name", symbol),
                     "market": market_code,
-                    "strategy_type": "AGGRESSIVE_SHORT" if abs(change_rate) >= 5 else "STABLE_SHORT",
+                    "strategy_type": (
+                        str(event.data.get("strategy_type") or "").upper()
+                        or ("AGGRESSIVE_SHORT" if abs(change_rate) >= 5 else "STABLE_SHORT")
+                    ),
                     "analysis_source": "event",
                     "event_type": event_type,
                     "trigger": event_type,
                     "event_price": price,
                     "event_change_rate": change_rate,
+                    "roadmap_stage": event.data.get("roadmap_stage"),
+                    "roadmap_invalid_price": event.data.get("roadmap_invalid_price"),
+                    "roadmap_take_profit_price": event.data.get("roadmap_take_profit_price"),
                     **product_metadata,
                 }
                 cycle_id = activity_logger.start_cycle()
@@ -135,17 +233,22 @@ class EventMixin:
 
                 dynamic_limits = None
                 if settings.AI_RISK_TUNING_ENABLED:
-                    try:
-                        from strategy.ai_risk_tuner import ai_risk_tuner
-
-                        dynamic_limits = await ai_risk_tuner.compute_limits(
-                            market=market_code,
-                            risk_appetite=settings.risk_appetite_for_market(market_code),
+                    dynamic_limits, cache_age_seconds = self._get_event_dynamic_limits_from_cache(event_state)
+                    if dynamic_limits is not None:
+                        await activity_logger.log(
+                            ActivityType.RISK_TUNING,
+                            ActivityPhase.SKIP,
+                            f"🎯 AI 한도 결정 재사용: {symbol} ({event_group})",
                             cycle_id=cycle_id,
-                            balance=balance,
+                            symbol=symbol,
+                            detail={
+                                "event_skip_reason": "reuse_cached_dynamic_limits",
+                                "event_group": event_group,
+                                "cached_scope": scope,
+                                "cache_age_seconds": round(float(cache_age_seconds or 0.0), 3),
+                                "cache_ttl_seconds": settings.event_dynamic_limits_cache_seconds,
+                            },
                         )
-                    except Exception:
-                        pass
 
                 result = await self._analyze_and_trade(
                     stock_info,
@@ -295,7 +398,11 @@ class EventMixin:
                     # 부분 매도: sell_pct에 따라 매도 수량 계산
                     if sell_pct < 100 and exit_plan_id:
                         from strategy.exit_plan_manager import ExitPlanManager
-                        sell_qty = ExitPlanManager.calculate_sell_quantity(holding.quantity, sell_pct)
+                        sell_qty = ExitPlanManager.calculate_sell_quantity(
+                            holding.quantity,
+                            sell_pct,
+                            market_code,
+                        )
                     else:
                         sell_qty = holding.quantity
 

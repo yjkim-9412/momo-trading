@@ -1,5 +1,7 @@
 import unittest
+from unittest.mock import patch
 
+from core.config import settings
 from realtime.event_detector import EventDetector
 
 
@@ -61,6 +63,15 @@ class EventDetectorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(thresholds.take_profit, 0.0)
         self.assertEqual(thresholds.trailing_stop_pct, 0.0)
         self.assertEqual(thresholds.highest_price, 0.0)
+
+    async def test_should_dedup_respects_configured_window(self):
+        with patch.object(settings, "EVENT_DETECTOR_DEDUP_SEC", 180):
+            detector = EventDetector()
+
+        with patch("time.time", side_effect=[100.0, 220.0, 281.0]):
+            self.assertFalse(detector._should_dedup("KRX:005930", "PRICE_SURGE"))
+            self.assertTrue(detector._should_dedup("KRX:005930", "PRICE_SURGE"))
+            self.assertFalse(detector._should_dedup("KRX:005930", "PRICE_SURGE"))
 
 
 if __name__ == "__main__":

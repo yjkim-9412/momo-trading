@@ -291,6 +291,8 @@ class DecisionMaker:
             trade_notes["pending_buy_price_reconciliation"] = bool(ctx.get("pending_buy_price_reconciliation"))
         if ctx.get("pending_buy_reconcile_order_id"):
             trade_notes["pending_buy_reconcile_order_id"] = str(ctx.get("pending_buy_reconcile_order_id"))
+        if ctx.get("exit_reasoning"):
+            trade_notes["exit_reasoning"] = str(ctx.get("exit_reasoning"))
 
         exit_levels = cls._build_exit_plan_levels(ctx)
         if exit_levels:
@@ -1785,26 +1787,17 @@ class DecisionMaker:
         analysis_context: dict | None = None,
         exit_reason: str = "",
         cycle_id: str | None = None,
-    ) -> None:
-        """코인 체결 결과를 coin_trade_results에 기록"""
-        ctx = analysis_context or {}
+    ) -> dict | None:
+        """코인 체결 결과를 coin_trade_results에 기록한다."""
+        ctx = dict(analysis_context or {})
         now = now_kst()
         qty_text = self._quantity_text(filled_qty, market)
         price_krw = float(filled_price or 0.0)
-        trade_notes = {
-            "entry_mode": ctx.get("entry_mode", ""),
-            "combined_position_pct": ctx.get("combined_position_pct"),
-            "post_trade_cash_ratio": ctx.get("post_trade_cash_ratio"),
-            "analysis_source": ctx.get("analysis_source"),
-            "event_type": ctx.get("event_type"),
-            "trailing_stop_pct": ctx.get("trailing_stop_pct"),
-            "broker_cash_krw": ctx.get("broker_cash_krw"),
-            "symbol_orderable_amount_krw": ctx.get("symbol_orderable_amount_krw"),
-            "symbol_orderable_amount_foreign": ctx.get("symbol_orderable_amount_foreign"),
-            "symbol_orderable_qty": ctx.get("symbol_orderable_qty"),
-            "orderable_amount_source": ctx.get("orderable_amount_source"),
-            "market": market,
-        }
+        should_sync_exit_plan = False
+        should_deactivate_exit_plan = False
+        is_add_on = False
+        plan_avg_entry_price = 0.0
+        plan_total_quantity = 0.0
 
         try:
             async with AsyncSessionLocal() as session:
@@ -1822,11 +1815,16 @@ class DecisionMaker:
 
                     if side == "BUY":
                         is_add_on = open_buy is not None
+                        trade_notes = self._build_trade_notes(
+                            analysis_context=ctx,
+                            market=market,
+                            existing_notes=getattr(open_buy, "notes", None) if open_buy else None,
+                        )
                         if open_buy:
-                            previous_qty = float(open_buy.quantity or 0.0)
-                            combined_qty = previous_qty + filled_qty
+                            previous_qty = normalize_quantity(open_buy.quantity, market)
+                            combined_qty = normalize_quantity(previous_qty + filled_qty, market)
                             if combined_qty <= 0:
-                                return
+                                return None
                             combined_price = (
                                 ((open_buy.entry_price or 0.0) * previous_qty)
                                 + (price_krw * filled_qty)
@@ -1847,6 +1845,8 @@ class DecisionMaker:
                             open_buy.btc_dominance = ctx.get("btc_dominance")
                             open_buy.entry_24h_volume = ctx.get("entry_24h_volume")
                             open_buy.notes = json.dumps(trade_notes, ensure_ascii=False, default=str)
+                            plan_avg_entry_price = combined_price
+                            plan_total_quantity = combined_qty
                             logger.info(
                                 "[CoinTradeResult] 추가매수 병합 기록: {} {} 추가 → 총 {} @{:,.0f}원",
                                 symbol,
@@ -1889,7 +1889,10 @@ class DecisionMaker:
                                 qty_text,
                                 price_krw,
                             )
+                            plan_avg_entry_price = price_krw
+                            plan_total_quantity = normalize_quantity(filled_qty, market)
 
+                        should_sync_exit_plan = plan_avg_entry_price > 0 and plan_total_quantity > 0
                         await activity_logger.log(
                             ActivityType.TRADE_RESULT,
                             ActivityPhase.COMPLETE,
@@ -1904,90 +1907,190 @@ class DecisionMaker:
                                 "is_add_on": is_add_on,
                                 "analysis_source": ctx.get("analysis_source"),
                                 "event_type": ctx.get("event_type"),
+                                "exit_levels": self._build_exit_plan_levels(ctx),
+                                "trade_threshold_payload": self._build_trade_threshold_payload(
+                                    analysis_context=ctx,
+                                ),
                             },
                         )
-                        return
-
-                    if not open_buy:
-                        logger.warning("[CoinTradeResult] {} 미청산 매수 기록 없음 → 매도 기록만 생성", symbol)
-                        session.add(
-                            CoinTradeResult(
-                                order_id=order_id,
-                                symbol=symbol,
-                                coin_name=ctx.get("stock_name", symbol),
-                                side="SELL",
-                                strategy_type=ctx.get("strategy_type", ""),
-                                entry_price=0.0,
-                                exit_price=price_krw,
-                                quantity=filled_qty,
-                                pnl=0.0,
-                                return_pct=0.0,
-                                is_win=False,
-                                hold_hours=0,
-                                exit_reason=exit_reason or "SIGNAL",
-                                notes=json.dumps(trade_notes, ensure_ascii=False, default=str),
-                                entry_at=now,
-                                exit_at=now,
-                            )
+                    else:
+                        trade_notes = self._build_trade_notes(
+                            analysis_context=ctx,
+                            market=market,
+                            existing_notes=getattr(open_buy, "notes", None) if open_buy else None,
                         )
-                        return
 
-                    sell_qty = min(float(open_buy.quantity or 0.0), float(filled_qty or 0.0))
-                    if sell_qty <= 0:
-                        return
+                        if not open_buy:
+                            logger.warning("[CoinTradeResult] {} 미청산 매수 기록 없음 → 매도 기록만 생성", symbol)
+                            session.add(
+                                CoinTradeResult(
+                                    order_id=order_id,
+                                    symbol=symbol,
+                                    coin_name=ctx.get("stock_name", symbol),
+                                    side="SELL",
+                                    strategy_type=ctx.get("strategy_type", ""),
+                                    entry_price=0.0,
+                                    exit_price=price_krw,
+                                    quantity=filled_qty,
+                                    pnl=0.0,
+                                    return_pct=0.0,
+                                    is_win=False,
+                                    hold_hours=0,
+                                    exit_reason=exit_reason or "SIGNAL",
+                                    notes=json.dumps(trade_notes, ensure_ascii=False, default=str),
+                                    entry_at=now,
+                                    exit_at=now,
+                                )
+                            )
+                            should_deactivate_exit_plan = True
+                        else:
+                            open_qty = normalize_quantity(open_buy.quantity, market)
+                            sell_qty = normalize_quantity(min(open_qty, float(filled_qty or 0.0)), market)
+                            if sell_qty <= 0:
+                                return None
 
-                    entry_price = float(open_buy.entry_price or 0.0)
-                    pnl = (price_krw - entry_price) * sell_qty
-                    return_pct = ((price_krw - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
-                    hold_hours = (
-                        max(0, int((now - open_buy.entry_at).total_seconds() // 3600))
-                        if open_buy.entry_at
-                        else 0
-                    )
-                    is_win = pnl > 0
+                            remaining_qty = normalize_quantity(open_qty - sell_qty, market)
+                            entry_price = float(open_buy.entry_price or 0.0)
+                            pnl = (price_krw - entry_price) * sell_qty
+                            return_pct = ((price_krw - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+                            entry_at = ensure_kst(open_buy.entry_at) if open_buy.entry_at else None
+                            hold_hours = (
+                                max(0, int((now - entry_at).total_seconds() // 3600))
+                                if entry_at
+                                else 0
+                            )
+                            is_win = pnl > 0
+                            pnl_sign = "+" if pnl >= 0 else ""
 
-                    open_buy.order_id = order_id
-                    open_buy.exit_price = price_krw
-                    open_buy.quantity = sell_qty
-                    open_buy.pnl = pnl
-                    open_buy.return_pct = round(return_pct, 2)
-                    open_buy.is_win = is_win
-                    open_buy.hold_hours = hold_hours
-                    open_buy.exit_reason = exit_reason or "SIGNAL"
-                    open_buy.exit_at = now
-                    open_buy.notes = json.dumps(trade_notes, ensure_ascii=False, default=str)
+                            if remaining_qty > 0:
+                                session.add(
+                                    CoinTradeResult(
+                                        order_id=order_id,
+                                        symbol=symbol,
+                                        coin_name=open_buy.coin_name,
+                                        side="BUY",
+                                        strategy_type=open_buy.strategy_type,
+                                        entry_price=entry_price,
+                                        exit_price=price_krw,
+                                        quantity=sell_qty,
+                                        pnl=pnl,
+                                        return_pct=round(return_pct, 2),
+                                        is_win=is_win,
+                                        hold_hours=hold_hours,
+                                        exit_reason=exit_reason or "SIGNAL",
+                                        ai_recommendation=open_buy.ai_recommendation,
+                                        ai_confidence=open_buy.ai_confidence,
+                                        ai_target_price=open_buy.ai_target_price,
+                                        ai_stop_loss_price=open_buy.ai_stop_loss_price,
+                                        entry_rsi=open_buy.entry_rsi,
+                                        entry_macd_hist=open_buy.entry_macd_hist,
+                                        entry_bb_position=open_buy.entry_bb_position,
+                                        market_regime=open_buy.market_regime,
+                                        btc_dominance=open_buy.btc_dominance,
+                                        entry_24h_volume=open_buy.entry_24h_volume,
+                                        notes=json.dumps(trade_notes, ensure_ascii=False, default=str),
+                                        entry_at=entry_at,
+                                        exit_at=now,
+                                    )
+                                )
+                                open_buy.notes = json.dumps(trade_notes, ensure_ascii=False, default=str)
+                                open_buy.quantity = remaining_qty
 
-                    pnl_sign = "+" if pnl >= 0 else ""
-                    logger.info(
-                        "[CoinTradeResult] 매도 청산: {} {} 진입@{:,.0f}원 → 청산@{:,.0f}원 = {}{:,.0f}원 ({:+.2f}%)",
-                        symbol,
-                        self._quantity_text(sell_qty, market),
-                        entry_price,
-                        price_krw,
-                        pnl_sign,
-                        abs(pnl),
-                        return_pct,
-                    )
-                    await activity_logger.log(
-                        ActivityType.TRADE_RESULT,
-                        ActivityPhase.COMPLETE,
-                        f"{'✅' if is_win else '❌'} [{symbol}] 매도 청산: "
-                        f"{pnl_sign}{abs(pnl):,.0f}원 ({return_pct:+.1f}%) "
-                        f"| {exit_reason or 'SIGNAL'} | {hold_hours}시간 보유",
-                        cycle_id=cycle_id,
-                        symbol=symbol,
-                        detail={
-                            "market": market,
-                            "entry_price": entry_price,
-                            "exit_price": price_krw,
-                            "quantity": sell_qty,
-                            "pnl": pnl,
-                            "return_pct": return_pct,
-                            "hold_hours": hold_hours,
-                        },
-                    )
+                                logger.info(
+                                    "[CoinTradeResult] 부분 청산: {} {} 진입@{:,.0f}원 → 청산@{:,.0f}원 = {}{:,.0f}원 ({:+.2f}%), 잔여 {}",
+                                    symbol,
+                                    self._quantity_text(sell_qty, market),
+                                    entry_price,
+                                    price_krw,
+                                    pnl_sign,
+                                    abs(pnl),
+                                    return_pct,
+                                    self._quantity_text(remaining_qty, market),
+                                )
+                                await activity_logger.log(
+                                    ActivityType.TRADE_RESULT,
+                                    ActivityPhase.COMPLETE,
+                                    f"{'✅' if is_win else '❌'} [{symbol}] 부분 청산: "
+                                    f"{pnl_sign}{abs(pnl):,.0f}원 ({return_pct:+.1f}%) "
+                                    f"| {exit_reason or 'SIGNAL'} | 잔여 {self._quantity_text(remaining_qty, market)}",
+                                    cycle_id=cycle_id,
+                                    symbol=symbol,
+                                    detail={
+                                        "market": market,
+                                        "entry_price": entry_price,
+                                        "exit_price": price_krw,
+                                        "quantity": sell_qty,
+                                        "remaining_quantity": remaining_qty,
+                                        "pnl": pnl,
+                                        "return_pct": return_pct,
+                                        "hold_hours": hold_hours,
+                                        "is_partial_exit": True,
+                                    },
+                                )
+                            else:
+                                open_buy.order_id = order_id
+                                open_buy.exit_price = price_krw
+                                open_buy.quantity = sell_qty
+                                open_buy.pnl = pnl
+                                open_buy.return_pct = round(return_pct, 2)
+                                open_buy.is_win = is_win
+                                open_buy.hold_hours = hold_hours
+                                open_buy.exit_reason = exit_reason or "SIGNAL"
+                                open_buy.exit_at = now
+                                open_buy.notes = json.dumps(trade_notes, ensure_ascii=False, default=str)
+                                should_deactivate_exit_plan = True
+
+                                logger.info(
+                                    "[CoinTradeResult] 매도 청산: {} {} 진입@{:,.0f}원 → 청산@{:,.0f}원 = {}{:,.0f}원 ({:+.2f}%)",
+                                    symbol,
+                                    self._quantity_text(sell_qty, market),
+                                    entry_price,
+                                    price_krw,
+                                    pnl_sign,
+                                    abs(pnl),
+                                    return_pct,
+                                )
+                                await activity_logger.log(
+                                    ActivityType.TRADE_RESULT,
+                                    ActivityPhase.COMPLETE,
+                                    f"{'✅' if is_win else '❌'} [{symbol}] 매도 청산: "
+                                    f"{pnl_sign}{abs(pnl):,.0f}원 ({return_pct:+.1f}%) "
+                                    f"| {exit_reason or 'SIGNAL'} | {hold_hours}시간 보유",
+                                    cycle_id=cycle_id,
+                                    symbol=symbol,
+                                    detail={
+                                        "market": market,
+                                        "entry_price": entry_price,
+                                        "exit_price": price_krw,
+                                        "quantity": sell_qty,
+                                        "pnl": pnl,
+                                        "return_pct": return_pct,
+                                        "hold_hours": hold_hours,
+                                        "is_partial_exit": False,
+                                    },
+                                )
+
+            if should_sync_exit_plan:
+                exit_plan = await self._sync_exit_plan(
+                    symbol=symbol,
+                    market=market,
+                    avg_entry_price=plan_avg_entry_price,
+                    total_quantity=plan_total_quantity,
+                    analysis_context=ctx,
+                    is_add_on=is_add_on,
+                    order_id=order_id,
+                )
+                return {"exit_plan_id": getattr(exit_plan, "id", None) if exit_plan is not None else None}
+
+            if should_deactivate_exit_plan:
+                from strategy.exit_plan_manager import exit_plan_manager
+
+                await exit_plan_manager.deactivate_by_symbol(symbol, market)
+
+            return None
         except Exception as e:
             logger.error("[CoinTradeResult] 기록 실패 ({}): {}", symbol, str(e))
+            return None
 
     async def _record_trade_result(
         self,
@@ -2006,7 +2109,7 @@ class DecisionMaker:
         """체결 확인 후 TradeResult 생성/업데이트"""
         market_code = normalize_market(market)
         if is_crypto_market(market_code):
-            await self._record_coin_trade_result(
+            return await self._record_coin_trade_result(
                 symbol=symbol,
                 market=market_code,
                 side=side,
@@ -2332,7 +2435,7 @@ class DecisionMaker:
         symbol: str,
         market: str,
         avg_entry_price: float,
-        total_quantity: int,
+        total_quantity: float,
         analysis_context: dict | None = None,
         is_add_on: bool = False,
         order_id: str | None = None,
@@ -2379,7 +2482,7 @@ class DecisionMaker:
                     market=market,
                     new_levels=levels_for_plan,
                     new_avg_price=avg_entry_price,
-                    new_qty=int(total_quantity),
+                    new_qty=float(total_quantity),
                     reason=reason,
                     ai_reasoning=ctx.get("exit_reasoning", ""),
                 )
@@ -2388,7 +2491,7 @@ class DecisionMaker:
                         symbol=symbol,
                         market=market,
                         avg_entry_price=avg_entry_price,
-                        total_quantity=int(total_quantity),
+                        total_quantity=float(total_quantity),
                         levels=levels_for_plan,
                         trailing_stop_pct=float(trailing or 0.0),
                         reason=reason,
@@ -2399,7 +2502,7 @@ class DecisionMaker:
                     symbol=symbol,
                     market=market,
                     avg_entry_price=avg_entry_price,
-                    total_quantity=int(total_quantity),
+                    total_quantity=float(total_quantity),
                     levels=levels_for_plan,
                     trailing_stop_pct=float(trailing or 0.0),
                     reason=reason,
@@ -2408,7 +2511,7 @@ class DecisionMaker:
             logger.info(
                 "[ExitPlan] {} {}/{} avg={:.2f} qty={} levels={}",
                 "업데이트" if is_add_on else "생성",
-                symbol, market, avg_entry_price, total_quantity, len(levels_for_plan),
+                symbol, market, avg_entry_price, self._quantity_text(total_quantity, market), len(levels_for_plan),
             )
             return plan
         except Exception as e:

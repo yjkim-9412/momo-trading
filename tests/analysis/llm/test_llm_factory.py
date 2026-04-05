@@ -8,6 +8,7 @@ from trading.enums import LLMProvider, LLMTier, Tier1Profile
 
 class DummyCodexProvider:
     _sessions: dict[tuple[str, str], str | None] = {("KRX", "cycle"): "dummy-session"}
+    _usage: dict[str, object] = {}
 
     def __init__(
         self,
@@ -57,6 +58,19 @@ class DummyCodexProvider:
     ) -> str:
         session = self.get_session_id(scope, phase) or "no-session"
         effort = reasoning_effort_override or self.configured_reasoning_effort or "none"
+        usage = self._usage.setdefault(
+            "codex:gpt-5.4",
+            {
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_input_tokens": 0,
+            },
+        )
+        usage["calls"] += 1
+        usage["input_tokens"] += 40
+        usage["output_tokens"] += 10
+        usage["cached_input_tokens"] += 5
         return (
             f"{self.provider.value}:{self.configured_model}:{scope or 'NONE'}:"
             f"{phase}:{session}:{effort}|{system_prompt}|{prompt}"
@@ -91,24 +105,24 @@ class DummyCodexProvider:
 
     @classmethod
     def get_usage_snapshot(cls) -> dict:
+        total_calls = sum(int(stats["calls"]) for stats in cls._usage.values())
+        total_input_tokens = sum(int(stats["input_tokens"]) for stats in cls._usage.values())
+        total_output_tokens = sum(int(stats["output_tokens"]) for stats in cls._usage.values())
+        total_cached_input_tokens = sum(
+            int(stats["cached_input_tokens"])
+            for stats in cls._usage.values()
+        )
         return {
             "provider": LLMProvider.CODEX_CLI.value,
             "session_id": cls.get_session_id(),
-            "total_calls": 3,
-            "total_input_tokens": 120,
-            "total_output_tokens": 30,
-            "total_cached_input_tokens": 40,
+            "total_calls": total_calls,
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "total_cached_input_tokens": total_cached_input_tokens,
             "total_cache_read": 0,
             "total_cache_creation": 0,
             "total_cost_usd": 0.0,
-            "by_model": {
-                "codex:gpt-5.4": {
-                    "calls": 3,
-                    "input_tokens": 120,
-                    "output_tokens": 30,
-                    "cached_input_tokens": 40,
-                },
-            },
+            "by_model": {model: dict(stats) for model, stats in cls._usage.items()},
         }
 
     @classmethod
@@ -132,11 +146,35 @@ class DummyCodexProvider:
 def reset_llm_factory(monkeypatch):
     monkeypatch.setattr(settings, "LLM_PROVIDER", LLMProvider.CLAUDE_CODE.value)
     monkeypatch.setattr(settings, "CRYPTO_LLM_PROVIDER", "")
+    monkeypatch.setattr(settings, "CODEX_MODEL", "gpt-5.4")
+    monkeypatch.setattr(settings, "CODEX_MODEL_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_MODEL_TIER2", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_REPORT", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1_SCAN", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1_ANALYSIS", "low")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER2", "high")
+    monkeypatch.setattr(settings, "CRYPTO_CODEX_MODEL", "")
+    monkeypatch.setattr(settings, "CRYPTO_CODEX_MODEL_TIER1_SCAN", "")
+    monkeypatch.setattr(settings, "CRYPTO_CODEX_MODEL_TIER1_ANALYSIS", "")
+    monkeypatch.setattr(settings, "CRYPTO_CODEX_MODEL_TIER2", "")
     monkeypatch.setattr(llm_factory, "_selected_provider", None)
     monkeypatch.setattr(llm_factory, "_providers", {})
     monkeypatch.setattr(llm_factory, "_crypto_provider", None)
     monkeypatch.setattr(llm_factory, "_crypto_providers", {})
     DummyCodexProvider._sessions = {("KRX", "cycle"): "dummy-session"}
+    DummyCodexProvider._usage = {
+        "codex:gpt-5.4": {
+            "calls": 3,
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "cached_input_tokens": 40,
+        },
+    }
+    monkeypatch.setattr(llm_factory, "_usage_by_scope_tier", {})
+    monkeypatch.setattr(llm_factory, "_cycle_usage_markers", {})
+    monkeypatch.setattr(llm_factory, "_last_cycle_delta", None)
 
 
 @pytest.mark.asyncio
@@ -154,6 +192,8 @@ async def test_generate_routes_to_selected_provider(monkeypatch):
 
     assert result == "CODEX_CLI:gpt-5.4:KRX:cycle:dummy-session:low|SYSTEM|PROMPT"
     assert provider == LLMProvider.CODEX_CLI.value
+    usage = llm_factory.get_llm_usage()
+    assert usage["by_scope_tier"]["KRX:TIER1"]["calls"] >= 1
 
 
 @pytest.mark.asyncio
@@ -191,13 +231,13 @@ async def test_get_llm_status_uses_selected_provider(monkeypatch):
     assert status["tier1"] == {
         "provider": LLMProvider.CODEX_CLI.value,
         "model": "gpt-5.4",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "low",
         "display_name": "후보 분석 에이전트",
         "short_label": "후보 분석",
         "description": "차트·시장 컨텍스트를 바탕으로 매수 후보와 목표/손절을 1차 판단",
     }
     assert status["tier1_profiles"]["scan"]["reasoning_effort"] == "low"
-    assert status["tier1_profiles"]["analysis"]["reasoning_effort"] == "medium"
+    assert status["tier1_profiles"]["analysis"]["reasoning_effort"] == "low"
     assert status["tier2"]["reasoning_effort"] == "high"
     assert status["tier2"]["display_name"] == "최종 검토 에이전트"
     assert status["session_id"] == "dummy-session"
@@ -218,6 +258,8 @@ def test_get_llm_usage_for_codex_returns_generic_shape(monkeypatch):
     assert usage["provider"] == LLMProvider.CODEX_CLI.value
     assert usage["summary"]["total_sessions"] == 7
     assert usage["app_usage"]["total_calls"] == 3
+    assert usage["last_cycle_delta"] is None
+    assert usage["by_scope_tier"] == {}
 
 
 def test_session_methods_are_scope_aware(monkeypatch):

@@ -29,7 +29,7 @@ class ExitPlan(Base, TimestampMixin):
     market: Mapped[str] = mapped_column(String(10), nullable=False)  # KRX, NYSE, NASDAQ
 
     avg_entry_price: Mapped[float] = mapped_column(Float, nullable=False)
-    total_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_quantity: Mapped[float] = mapped_column(Float, nullable=False)
 
     # 다단계 청산 레벨 (JSON string)
     levels: Mapped[str] = mapped_column(Text, nullable=False)
@@ -60,7 +60,7 @@ class ExitPlanHistory(Base):
     # INITIAL | ADD_ON_PYRAMID | ADD_ON_AVERAGE_DOWN | AI_REVIEW | TRAILING_UPDATE
 
     avg_entry_price: Mapped[float] = mapped_column(Float, nullable=False)
-    total_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    total_quantity: Mapped[float] = mapped_column(Float, nullable=False)
     ai_reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

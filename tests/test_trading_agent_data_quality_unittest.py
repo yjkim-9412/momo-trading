@@ -163,25 +163,13 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("### 트레이딩 상황", STOCK_ANALYSIS_PROMPT)
         self.assertNotIn("### 기존 보유 계획 상태", STOCK_ANALYSIS_PROMPT)
         self.assertNotIn("planned_hold_days", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn(f"BULL/THEME 국면: {BULL_THEME_RR_FLOOR:.1f}:1 이상이면 적정", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn(f"SIDEWAYS/BEAR 국면: 최소 {DEFENSIVE_RR_FLOOR:.1f}:1", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn(f"BULL/THEME 국면 RR 기준: {BULL_THEME_RR_FLOOR:.1f}:1 이상", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn(f"SIDEWAYS/BEAR 국면 RR 기준: {DEFENSIVE_RR_FLOOR:.1f}:1 이상", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("recommendation은 BUY 또는 HOLD만 사용", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("recommendation: BUY 또는 HOLD만 사용하세요", STOCK_ANALYSIS_PROMPT)
         self.assertIn("confidence: 이 매매가 손절 전에 목표가에 도달할 확률", STOCK_ANALYSIS_PROMPT)
-        self.assertIn("holding_policy=PREMARKET_SCALP", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("신규 매수 마감까지 10분 미만이면 BUY 금지, HOLD", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("강제 청산까지 30분 이하이면 목표가는 현재 세션 내 도달 가능한 근거리 목표만 허용", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("정규장 carry, 보유일 계획, 늦은 시간의 과도한 목표가 논리를 사용하지 마세요", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("opening_policy=OBSERVE_ONLY", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("모든 BUY를 HOLD로 판단", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("opening_policy=SOFT_GUARD", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("opening_guard_active=true", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("정규장 시작 직후에는 추격 매수보다 확인을 우선", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("price < 5USD and abs(change_rate) >= 20%", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("price < 5000KRW and abs(change_rate) >= 12%", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("인버스/레버리지 상품은 종목 가격 변화가 아니라 `시장 노출 방향` 기준으로 해석", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("BEAR + inverse(-x) 매수", STOCK_ANALYSIS_SYSTEM)
-        self.assertIn("THEME/SIDEWAYS", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("현재 포지션이 있으면 신규 진입이 아니라 추가매수 적합성으로 해석", STOCK_ANALYSIS_SYSTEM)
+        self.assertIn("제한 상품은 일반 종목보다 더 보수적으로 판단", STOCK_ANALYSIS_SYSTEM)
         self.assertIn("target_price는 이번 세션 내 실현 가능한 목표가", STOCK_ANALYSIS_PROMPT)
         self.assertIn("reason`에는 시간 제약을 반영했는지 반드시 한 줄 포함", STOCK_ANALYSIS_PROMPT)
         self.assertNotIn('"recommendation": "BUY/SELL/HOLD"', STOCK_ANALYSIS_PROMPT)
@@ -208,14 +196,12 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("### 상품 특성", FINAL_REVIEW_PROMPT)
         self.assertIn("### 기존 보유 계획 상태", FINAL_REVIEW_PROMPT)
         self.assertIn("{hold_plan_context}", FINAL_REVIEW_PROMPT)
-        self.assertIn("배수(1x/2x/3x)", FINAL_REVIEW_PROMPT)
         self.assertIn("{exchange_rate_line}", FINAL_REVIEW_PROMPT)
         self.assertIn("- 종목당 최대: {max_amount_text}", FINAL_REVIEW_PROMPT)
-        self.assertIn("stop_loss_price: 손절 기준가 ({currency})", FINAL_REVIEW_PROMPT)
         self.assertIn("가격 필드에 넣지 마세요", FINAL_REVIEW_PROMPT)
-        self.assertIn(f"RR비율: {BULL_THEME_RR_FLOOR:.1f}:1 이상이면 허용", FINAL_REVIEW_SYSTEM)
-        self.assertIn(f"RR비율: 최소 {DEFENSIVE_RR_FLOOR:.1f}:1", FINAL_REVIEW_SYSTEM)
-        self.assertIn("기존 보유 계획 정보는 참고용", FINAL_REVIEW_SYSTEM)
+        self.assertIn(f"THEME/BULL RR 기준: {BULL_THEME_RR_FLOOR:.1f}:1 이상", FINAL_REVIEW_SYSTEM)
+        self.assertIn(f"SIDEWAYS/BEAR RR 기준: {DEFENSIVE_RR_FLOOR:.1f}:1 이상", FINAL_REVIEW_SYSTEM)
+        self.assertIn("opening_policy, opening_guard_active, krx_hot_mover_guard", FINAL_REVIEW_SYSTEM)
         self.assertIn(
             f"THEME/BULL: {BULL_THEME_RR_FLOOR:.1f}:1 이상, SIDEWAYS/BEAR: {DEFENSIVE_RR_FLOOR:.1f}:1 이상",
             FINAL_REVIEW_PROMPT,
@@ -223,22 +209,9 @@ class TradingAgentDataQualityTest(unittest.TestCase):
         self.assertIn("take_profit_price", FINAL_REVIEW_PROMPT)
         self.assertIn("planned_hold_days", FINAL_REVIEW_PROMPT)
         self.assertIn("stop_loss_price < entry_price < take_profit_price <= target_price", FINAL_REVIEW_PROMPT)
-        self.assertIn("웹 검색, 뉴스/기사 확인, 외부 사실 보강, URL/도메인/출처 인용을 금지합니다", FINAL_REVIEW_SYSTEM)
-        self.assertIn("외부 링크, 뉴스 출처, URL, 웹페이지 이름을 reason/risk_warnings에 쓰지 마세요", FINAL_REVIEW_PROMPT)
-        self.assertIn("opening_policy=OBSERVE_ONLY", FINAL_REVIEW_SYSTEM)
-        self.assertIn("신규/추가 BUY 금지", FINAL_REVIEW_SYSTEM)
-        self.assertIn("opening_policy=SOFT_GUARD", FINAL_REVIEW_SYSTEM)
-        self.assertIn("opening_guard_active=true", FINAL_REVIEW_SYSTEM)
-        self.assertIn("정규장 시작 직후에는 추격 매수보다 확인을 우선", FINAL_REVIEW_SYSTEM)
-        self.assertIn("krx_hot_mover_guard=true", FINAL_REVIEW_SYSTEM)
-        self.assertIn("눌림목 `entry_price`", FINAL_REVIEW_SYSTEM)
+        self.assertIn("외부 링크, 뉴스, URL, 출처 인용은 금지", FINAL_REVIEW_SYSTEM)
         self.assertIn("krx_hot_mover_guard=true", FINAL_REVIEW_PROMPT)
         self.assertIn("눌림목 진입가인가", FINAL_REVIEW_PROMPT)
-        self.assertIn("BEAR/SIDEWAYS + 저가 급등주 + 과열 지표 다중 발생 + 분봉/VWAP 확인 부족", FINAL_REVIEW_SYSTEM)
-        self.assertIn("국내장은 저가 급등주 + 분봉/VWAP 확인 부족", FINAL_REVIEW_SYSTEM)
-        self.assertIn("인버스/레버리지 상품은 종목 가격 방향이 아니라 `시장 노출 방향` 기준", FINAL_REVIEW_SYSTEM)
-        self.assertIn("BEAR + inverse(-x)", FINAL_REVIEW_SYSTEM)
-        self.assertIn("THEME/SIDEWAYS", FINAL_REVIEW_SYSTEM)
         self.assertNotIn("- 손절: {stop_loss_pct}%", FINAL_REVIEW_PROMPT)
         self.assertNotIn("- 익절: {take_profit_pct}%", FINAL_REVIEW_PROMPT)
         self.assertIn("confidence: 이 매매가 손절 전에 목표가에 도달할 확률", FINAL_REVIEW_PROMPT)
@@ -364,7 +337,16 @@ class TradingAgentDataQualityTest(unittest.TestCase):
             )
         )
 
-    def test_should_skip_tier2_is_crypto_only_fast_path(self):
+    def test_should_skip_tier2_supports_stock_fast_path_with_strict_conditions(self):
+        self.assertTrue(
+            TradingAgent._should_skip_tier2(
+                market_scope="KRX",
+                is_restricted_product=False,
+                tier1_confidence=0.95,
+                market_regime="BULL",
+                recommendation="BUY",
+            )
+        )
         self.assertFalse(
             TradingAgent._should_skip_tier2(
                 market_scope="KRX",
@@ -372,6 +354,7 @@ class TradingAgentDataQualityTest(unittest.TestCase):
                 tier1_confidence=0.95,
                 market_regime="BULL",
                 recommendation="BUY",
+                analysis_source="event",
             )
         )
         self.assertTrue(

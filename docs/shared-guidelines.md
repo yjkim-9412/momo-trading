@@ -22,6 +22,14 @@ CLAUDE.md와 AGENTS.md에서 공유하는 운영 규칙. 양쪽 지침 파일이
 - 실시간 이벤트 기반 분석은 scheduled 재스캔 예산을 차감하지 않는다.
 - 롤백 시에는 `AI_DYNAMIC_RESCAN_ENABLED=false`로 두면 기존 고정 `11:00/13:00` 장중 재스캔으로 복귀한다.
 
+## 주식 로드맵 눌림형 운영
+
+- `ROADMAP_PULLBACK_ENABLED_KRX` 또는 `ROADMAP_PULLBACK_ENABLED_US`가 켜진 시장은 신규 BUY 후보를 `20/60일선 눌림형` 하드 게이트로 제한한다.
+- 하드 게이트 기본 규칙은 `SMA20 >= SMA60`, `SMA60` 최근 기울기 비하락, 현재가가 `SMA20` 또는 `SMA60` 눌림 밴드 안에 있을 때만 통과다.
+- 이 모드에서는 `PRICE_SURGE`, `PRICE_DROP`, `VOLUME_SPIKE`가 신규 진입 실시간 트리거가 아니다. 대신 `INDICATOR_SIGNAL` 기반 `ROADMAP_SMA20_PULLBACK`, `ROADMAP_SMA60_PULLBACK` 진입 신호만 재분석 트리거로 사용한다.
+- 신규 BUY는 기본적으로 `FIRST_TRANCHE` 분할 진입으로 기록하고, `SMA60_PULLBACK` 구간은 `SECOND_TRANCHE` 후보로만 해석한다.
+- 로드맵 모드에서도 보유 포지션의 `STOP_LOSS_HIT`, `TAKE_PROFIT_HIT` 실시간 청산은 그대로 유지한다.
+
 ## 미국장 구현 회고
 
 - 미국 프리마켓은 `US_PREMARKET_ENABLED=true`일 때 정식 분석 세션이다. 스케줄 기준은 `03:50 ET` 준비, `04:05 ET` 오픈 스캔이며, 그 이후 장중 재스캔은 `schedule_hint` 기반 adaptive one-shot으로 이어진다. 미국장 스케줄은 `scheduler/scheduler.py` 프로필과 adaptive 흐름을 기준으로 사용하고, 정규장 시간 하드코딩을 다시 넣지 말 것.

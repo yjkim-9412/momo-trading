@@ -95,6 +95,7 @@ class CycleMixin:
         event_bus.subscribe(EventType.VOLUME_SPIKE, self._on_market_event)
         event_bus.subscribe(EventType.PRICE_SURGE, self._on_market_event)
         event_bus.subscribe(EventType.PRICE_DROP, self._on_market_event)
+        event_bus.subscribe(EventType.INDICATOR_SIGNAL, self._on_market_event)
         event_bus.subscribe(EventType.STOP_LOSS_HIT, self._on_stop_loss)
         event_bus.subscribe(EventType.TAKE_PROFIT_HIT, self._on_take_profit)
 
@@ -366,6 +367,8 @@ class CycleMixin:
                     )
                 except Exception as e:
                     logger.warning("AI 한도 결정 실패, 기본값 사용: {}", str(e))
+            state.cached_dynamic_limits = dict(dynamic_limits) if isinstance(dynamic_limits, dict) else None
+            state.cached_dynamic_limits_at = now_kst() if state.cached_dynamic_limits else None
 
             # 1. 시장 스캔 + 종목 선별 (통합 1회 LLM 호출)
             stage = "market_scan"
@@ -422,6 +425,10 @@ class CycleMixin:
                         "strategy_type": c.get("strategy_type", ""),
                         "reason": c.get("reason", ""),
                         "scan_source": c.get("scan_source", ""),
+                        "roadmap_stage": c.get("roadmap_stage", ""),
+                        "roadmap_anchor_price": c.get("roadmap_anchor_price"),
+                        "roadmap_invalid_price": c.get("roadmap_invalid_price"),
+                        "roadmap_take_profit_price": c.get("roadmap_take_profit_price"),
                     }
                     for c in candidates if c.get("symbol")
                 ]
@@ -1317,7 +1324,7 @@ class CycleMixin:
         ranked_candidates = sorted(
             candidates,
             key=lambda item: (float(item.get("rank_score") or 999.0), str(item.get("symbol") or "")),
-        )[:2]
+        )[: settings.stock_soft_exploration_max_candidates]
         if not ranked_candidates:
             return {"attempted": False, "attempted_count": 0}
 

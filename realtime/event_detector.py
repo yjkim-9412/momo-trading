@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from loguru import logger
 
+from core.config import settings
 from core.events import Event, EventType, event_bus
 
 
@@ -26,6 +27,15 @@ class StockThresholds:
     exit_plan_id: str | None = None
     tp_levels: list[dict] = field(default_factory=list)
     # tp_levels 예시: [{"price": 155.0, "pct": 50, "level_index": 0}, ...]
+    roadmap_enabled: bool = False
+    roadmap_strategy_type: str = ""
+    roadmap_stage: str = ""
+    roadmap_sma20_entry_low: float = 0.0
+    roadmap_sma20_entry_high: float = 0.0
+    roadmap_sma60_entry_low: float = 0.0
+    roadmap_sma60_entry_high: float = 0.0
+    roadmap_invalid_price: float = 0.0
+    roadmap_take_profit_price: float = 0.0
 
 
 # 기본 임계값 (AI 미설정 시 폴백)
@@ -50,7 +60,7 @@ class EventDetector:
 
         # 이벤트 중복 발행 방지 (종목별 마지막 이벤트 타입+시간)
         self._last_events: dict[str, tuple[str, float]] = {}
-        self.EVENT_DEDUP_SEC = 60  # 같은 이벤트 60초 내 재발행 방지
+        self.EVENT_DEDUP_SEC = settings.event_detector_dedup_seconds
 
     @staticmethod
     def _instrument_key(symbol: str, market: str | None = None) -> str:
@@ -90,7 +100,15 @@ class EventDetector:
 
         # 값 검증: NaN, None, 숫자가 아닌 값 필터링
         validated = {}
+        passthrough: dict[str, object] = {}
         for k, v in kwargs.items():
+            if k in {"roadmap_enabled"}:
+                passthrough[k] = bool(v)
+                continue
+            if k in {"roadmap_strategy_type", "roadmap_stage"}:
+                if v not in (None, ""):
+                    passthrough[k] = str(v)
+                continue
             if isinstance(v, (int, float)) and not math.isnan(v):
                 validated[k] = v
             else:
@@ -103,8 +121,11 @@ class EventDetector:
             for k, v in validated.items():
                 if hasattr(th, k):
                     setattr(th, k, v)
+            for k, v in passthrough.items():
+                if hasattr(th, k):
+                    setattr(th, k, v)
         else:
-            self._thresholds[instrument_key] = StockThresholds(**validated)
+            self._thresholds[instrument_key] = StockThresholds(**validated, **passthrough)
 
         # trailing_stop 설정 시 highest_price를 stop_loss 기반으로 초기화
         th = self._thresholds[instrument_key]
@@ -251,6 +272,9 @@ class EventDetector:
         # 급등/급락 감지
         await self._check_price_movement(instrument_key, price, change_rate, th, data)
 
+        # 로드맵 눌림형 진입 구간 감지
+        await self._check_roadmap_pullback(instrument_key, price, th, data)
+
         # 손절/익절 감지
         await self._check_stop_take(instrument_key, price, th, data)
 
@@ -359,6 +383,76 @@ class EventDetector:
                     },
                     source="event_detector",
                 ))
+
+    async def _check_roadmap_pullback(
+        self,
+        symbol: str,
+        price: float,
+        th: StockThresholds,
+        data: dict,
+    ) -> None:
+        """20/60일선 눌림 구간 진입을 감지한다."""
+        if not th.roadmap_enabled:
+            return
+
+        prev_price = self._prev_prices.get(symbol)
+        if self._entered_band(
+            prev_price,
+            price,
+            th.roadmap_sma60_entry_low,
+            th.roadmap_sma60_entry_high,
+        ):
+            if not self._should_dedup(symbol, "ROADMAP_SMA60_PULLBACK"):
+                await event_bus.publish(Event(
+                    type=EventType.INDICATOR_SIGNAL,
+                    data={
+                        **data,
+                        "indicator_signal": "ROADMAP_SMA60_PULLBACK",
+                        "strategy_type": th.roadmap_strategy_type or "ROADMAP_PULLBACK",
+                        "roadmap_stage": "SMA60_PULLBACK",
+                        "roadmap_invalid_price": th.roadmap_invalid_price,
+                        "roadmap_take_profit_price": th.roadmap_take_profit_price,
+                    },
+                    source="event_detector",
+                ))
+            return
+
+        if self._entered_band(
+            prev_price,
+            price,
+            th.roadmap_sma20_entry_low,
+            th.roadmap_sma20_entry_high,
+        ):
+            if not self._should_dedup(symbol, "ROADMAP_SMA20_PULLBACK"):
+                await event_bus.publish(Event(
+                    type=EventType.INDICATOR_SIGNAL,
+                    data={
+                        **data,
+                        "indicator_signal": "ROADMAP_SMA20_PULLBACK",
+                        "strategy_type": th.roadmap_strategy_type or "ROADMAP_PULLBACK",
+                        "roadmap_stage": "SMA20_PULLBACK",
+                        "roadmap_invalid_price": th.roadmap_invalid_price,
+                        "roadmap_take_profit_price": th.roadmap_take_profit_price,
+                    },
+                    source="event_detector",
+                ))
+
+    @staticmethod
+    def _entered_band(
+        prev_price: float | None,
+        current_price: float,
+        lower_bound: float,
+        upper_bound: float,
+    ) -> bool:
+        """가격이 지정 밴드에 새로 진입했는지 판정한다."""
+        if lower_bound <= 0 or upper_bound <= 0 or lower_bound > upper_bound:
+            return False
+        current_in_band = lower_bound <= current_price <= upper_bound
+        if not current_in_band:
+            return False
+        if prev_price is None:
+            return True
+        return not (lower_bound <= prev_price <= upper_bound)
 
     def _should_dedup(self, symbol: str, event_type: str) -> bool:
         """같은 종목+이벤트 중복 발행 방지"""

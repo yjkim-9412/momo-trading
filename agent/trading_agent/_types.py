@@ -2,8 +2,10 @@
 import asyncio
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from typing import Any
 
 from strategy.aggressive_short import AggressiveShortStrategy
+from strategy.roadmap_pullback import RoadmapPullbackStrategy
 from strategy.stable_short import StableShortStrategy
 
 _DATA_CONSISTENCY_MAX_GAP_PCT = 0.25
@@ -26,6 +28,7 @@ def _default_strategies() -> dict[str, object]:
     return {
         "STABLE_SHORT": StableShortStrategy(),
         "AGGRESSIVE_SHORT": AggressiveShortStrategy(),
+        "ROADMAP_PULLBACK": RoadmapPullbackStrategy(),
     }
 
 
@@ -52,6 +55,8 @@ class MarketState:
     last_completed_review_date: date | None = None
     last_schedule_hint: dict = field(default_factory=dict)
     last_selected_watchlist: list[dict[str, object]] = field(default_factory=list)
+    cached_dynamic_limits: dict[str, Any] | None = None
+    cached_dynamic_limits_at: datetime | None = None
     _pipeline_snapshot: dict = field(default_factory=dict)
     liquidation_complete: bool = False
     last_cycle_attempt_at: datetime | None = None

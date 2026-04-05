@@ -73,15 +73,15 @@ def test_get_llm_reasoning_effort_defaults_tier1_profiles():
     )
 
     assert scan_effort == "low"
-    assert analysis_effort == "medium"
+    assert analysis_effort == "low"
 
 
-def test_get_llm_reasoning_effort_defaults_tier2_to_xhigh():
+def test_get_llm_reasoning_effort_defaults_tier2_to_high():
     settings = Settings(_env_file=None)
 
     effort = settings.get_llm_reasoning_effort(LLMProvider.CODEX_CLI, LLMTier.TIER2)
 
-    assert effort == "xhigh"
+    assert effort == "high"
 
 
 def test_get_llm_reasoning_effort_ignores_invalid_value():
@@ -106,8 +106,8 @@ def test_get_llm_reasoning_effort_ignores_invalid_value():
     tier2 = settings.get_llm_reasoning_effort(LLMProvider.CODEX_CLI, LLMTier.TIER2)
 
     assert tier1_scan == "medium"
-    assert tier1_analysis == "medium"
-    assert tier2 == "xhigh"
+    assert tier1_analysis == "low"
+    assert tier2 == "high"
 
 
 def test_crypto_scope_provider_specific_model_and_effort():
@@ -340,3 +340,12 @@ def test_invalid_kis_account_type_raises():
 
     with pytest.raises(ValueError, match="KIS_ACCOUNT_TYPE"):
         _ = settings.kis_account_type_normalized
+
+
+def test_event_runtime_defaults():
+    settings = Settings(_env_file=None)
+
+    assert settings.sql_echo is False
+    assert settings.event_detector_dedup_seconds == 180
+    assert settings.event_analysis_cooldown_seconds == 300
+    assert settings.event_dynamic_limits_cache_seconds == 900

@@ -9,6 +9,7 @@ from analysis.technical.trend_analyzer import TrendReport
 from core.config import settings
 from core.events import Event, EventType
 from scheduler.market_calendar import market_calendar
+from trading.enums import ActivityPhase, ActivityType
 from trading.models import AccountBalance, HoldingInfo, MCPResponse
 
 
@@ -764,7 +765,7 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["signal"])
         self.assertFalse(result["executed"])
-        tier1_mock.assert_awaited_once()
+        tier1_mock.assert_not_awaited()
         tier2_mock.assert_not_awaited()
         risk_mock.assert_not_awaited()
         decision_mock.assert_not_awaited()
@@ -887,6 +888,137 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agent.get_runtime("NASDAQ").available_cash, self._balance().effective_cash - 25_000)
         reconcile_mock.assert_awaited_once_with("NASDAQ")
         subscribe_mock.assert_awaited_once_with("PLTR", market="NASDAQ")
+
+    async def test_on_market_event_dedups_momentum_group_within_cooldown(self):
+        self.agent._running = True
+        surge_event = Event(
+            type=EventType.PRICE_SURGE,
+            data={
+                "symbol": "PLTR",
+                "market": "NASDAQ",
+                "price": 149.18,
+                "change_rate": 5.21,
+                "currency": "USD",
+            },
+            source="test",
+        )
+        volume_event = Event(
+            type=EventType.VOLUME_SPIKE,
+            data={
+                "symbol": "PLTR",
+                "market": "NASDAQ",
+                "price": 149.24,
+                "change_rate": 5.34,
+                "currency": "USD",
+            },
+            source="test",
+        )
+
+        with (
+            patch.object(self.agent, "_build_trading_context", AsyncMock(return_value="ctx")),
+            patch.object(self.agent, "_get_today_trade_count", AsyncMock(return_value=0)),
+            patch("agent.trading_agent._event_mixin.settings.AI_RISK_TUNING_ENABLED", False),
+            patch("agent.trading_agent._event_mixin.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch("trading.account_manager.account_manager.get_account_snapshot", AsyncMock(return_value=(self._balance(), [self._holding()]))),
+            patch("agent.trading_agent.activity_logger.log", AsyncMock()) as log_mock,
+            patch.object(self.agent, "_ensure_realtime_subscription", AsyncMock()),
+            patch.object(self.agent, "_analyze_and_trade", AsyncMock(return_value={"executed": False})) as analyze_mock,
+            patch("time.time", side_effect=[1_000.0, 1_001.0]),
+        ):
+            await self.agent._on_market_event(surge_event)
+            await self.agent._on_market_event(volume_event)
+
+        analyze_mock.assert_awaited_once()
+        skip_logs = [
+            call.kwargs.get("detail", {})
+            for call in log_mock.await_args_list
+            if call.args[1] == ActivityPhase.SKIP
+        ]
+        self.assertTrue(any(detail.get("event_skip_reason") == "momentum_group_dedup" for detail in skip_logs))
+
+    async def test_on_market_event_reuses_cached_dynamic_limits(self):
+        self.agent._running = True
+        event = Event(
+            type=EventType.PRICE_SURGE,
+            data={
+                "symbol": "PLTR",
+                "market": "NASDAQ",
+                "price": 149.18,
+                "change_rate": 5.21,
+                "currency": "USD",
+            },
+            source="test",
+        )
+        runtime = self.agent.get_runtime("US")
+        runtime.trading_date = market_calendar.market_date(market="US")
+        expected_limits = {
+            "max_single_order_krw": 1_500_000,
+            "max_position_pct": 12.5,
+            "min_cash_ratio": 0.08,
+        }
+        runtime.cached_dynamic_limits = {
+            **expected_limits,
+        }
+        runtime.cached_dynamic_limits_at = datetime.now().astimezone()
+
+        with (
+            patch.object(self.agent, "_build_trading_context", AsyncMock(return_value="ctx")),
+            patch.object(self.agent, "_get_today_trade_count", AsyncMock(return_value=0)),
+            patch("agent.trading_agent._event_mixin.settings.AI_RISK_TUNING_ENABLED", True),
+            patch("agent.trading_agent._event_mixin.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch("trading.account_manager.account_manager.get_account_snapshot", AsyncMock(return_value=(self._balance(), [self._holding()]))),
+            patch("agent.trading_agent.activity_logger.log", AsyncMock()) as log_mock,
+            patch.object(self.agent, "_ensure_realtime_subscription", AsyncMock()),
+            patch.object(self.agent, "_analyze_and_trade", AsyncMock(return_value={"executed": False})) as analyze_mock,
+        ):
+            await self.agent._on_market_event(event)
+
+        self.assertEqual(
+            analyze_mock.await_args.kwargs["dynamic_limits"],
+            expected_limits,
+        )
+        self.assertTrue(
+            any(
+                call.kwargs.get("detail", {}).get("event_skip_reason") == "reuse_cached_dynamic_limits"
+                for call in log_mock.await_args_list
+            )
+        )
+
+    async def test_on_market_event_uses_defaults_when_dynamic_limits_cache_is_stale(self):
+        self.agent._running = True
+        event = Event(
+            type=EventType.PRICE_SURGE,
+            data={
+                "symbol": "PLTR",
+                "market": "NASDAQ",
+                "price": 149.18,
+                "change_rate": 5.21,
+                "currency": "USD",
+            },
+            source="test",
+        )
+        runtime = self.agent.get_runtime("US")
+        runtime.trading_date = market_calendar.market_date(market="US")
+        runtime.cached_dynamic_limits = {
+            "max_single_order_krw": 1_500_000,
+            "max_position_pct": 12.5,
+            "min_cash_ratio": 0.08,
+        }
+        runtime.cached_dynamic_limits_at = datetime(2020, 1, 1).astimezone()
+
+        with (
+            patch.object(self.agent, "_build_trading_context", AsyncMock(return_value="ctx")),
+            patch.object(self.agent, "_get_today_trade_count", AsyncMock(return_value=0)),
+            patch("agent.trading_agent._event_mixin.settings.AI_RISK_TUNING_ENABLED", True),
+            patch("agent.trading_agent._event_mixin.market_calendar.get_market_session", return_value="US_REGULAR"),
+            patch("trading.account_manager.account_manager.get_account_snapshot", AsyncMock(return_value=(self._balance(), [self._holding()]))),
+            patch("agent.trading_agent.activity_logger.log", AsyncMock()),
+            patch.object(self.agent, "_ensure_realtime_subscription", AsyncMock()),
+            patch.object(self.agent, "_analyze_and_trade", AsyncMock(return_value={"executed": False})) as analyze_mock,
+        ):
+            await self.agent._on_market_event(event)
+
+        self.assertIsNone(analyze_mock.await_args.kwargs["dynamic_limits"])
 
     async def test_on_stop_loss_skips_sell_when_symbol_is_not_held(self):
         self.agent._running = True
@@ -1012,7 +1144,7 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
                     "action": "BUY",
                     "position_intent": "NEW",
                     "suggested_quantity": 6,
-                    "entry_price": 29_500,
+                    "entry_price": 29_200,
                     "target_price": 31_000,
                     "stop_loss_price": 28_825,
                     "take_profit_price": 30_035,
@@ -1202,9 +1334,9 @@ class TradingAgentExistingPositionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["signal"])
         self.assertFalse(result["executed"])
-        price_mock.assert_awaited_once()
+        self.assertEqual(price_mock.await_count, 2)
         daily_mock.assert_awaited_once()
-        minute_mock.assert_awaited_once()
+        self.assertEqual(minute_mock.await_count, 2)
         orderable_mock.assert_awaited_once_with("PLTR", 150.5, market="NASDAQ")
         tier1_mock.assert_awaited_once()
         tier2_mock.assert_awaited_once()

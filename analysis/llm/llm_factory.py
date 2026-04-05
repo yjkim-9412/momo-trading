@@ -57,6 +57,9 @@ class LLMFactory:
         # 코인 전용 provider 캐시 (주식과 독립)
         self._crypto_provider: LLMProvider | None = None
         self._crypto_providers: dict[LLMTier, LLMProviderProtocol] = {}
+        self._usage_by_scope_tier: dict[str, dict[str, int]] = {}
+        self._cycle_usage_markers: dict[tuple[str, str], dict[str, int]] = {}
+        self._last_cycle_delta: dict[str, Any] | None = None
 
     def _instantiate_provider(
         self,
@@ -167,6 +170,61 @@ class LLMFactory:
         return dict(cls.TIER_METADATA[tier])
 
     @staticmethod
+    def _usage_counter(snapshot: dict[str, Any] | None) -> dict[str, int]:
+        """usage snapshot에서 비교 가능한 카운터만 추출"""
+        data = snapshot or {}
+        return {
+            "calls": int(data.get("total_calls") or 0),
+            "input_tokens": int(data.get("total_input_tokens") or 0),
+            "output_tokens": int(data.get("total_output_tokens") or 0),
+            "cached_input_tokens": int(data.get("total_cached_input_tokens") or 0),
+        }
+
+    @staticmethod
+    def _usage_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+        """usage before/after delta 계산"""
+        return {
+            key: max(0, int(after.get(key, 0)) - int(before.get(key, 0)))
+            for key in ("calls", "input_tokens", "output_tokens", "cached_input_tokens")
+        }
+
+    @staticmethod
+    def _scope_tier_usage_key(scope: str | None, tier: LLMTier) -> str:
+        """scope/tier별 usage bucket key."""
+        return f"{normalize_market_scope(scope or 'GLOBAL')}:{tier.value}"
+
+    def _get_provider_usage_counter(self, provider: LLMProviderProtocol) -> dict[str, int]:
+        """provider cumulative usage snapshot 반환"""
+        provider_class = cast(type[LLMSessionProtocol], type(provider))
+        return self._usage_counter(provider_class.get_usage_snapshot())
+
+    def _record_scope_tier_usage(
+        self,
+        *,
+        scope: str | None,
+        tier: LLMTier,
+        delta: dict[str, int],
+    ) -> None:
+        """scope/tier별 usage 누적"""
+        if not any(delta.values()):
+            return
+
+        key = self._scope_tier_usage_key(scope, tier)
+        bucket = self._usage_by_scope_tier.setdefault(
+            key,
+            {
+                "scope": normalize_market_scope(scope or "GLOBAL"),
+                "tier": tier.value,
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_input_tokens": 0,
+            },
+        )
+        for field_name in ("calls", "input_tokens", "output_tokens", "cached_input_tokens"):
+            bucket[field_name] += int(delta.get(field_name, 0))
+
+    @staticmethod
     def _serialize_tier_status(provider: LLMProviderProtocol) -> dict[str, Any]:
         """Tier별 provider 상태 직렬화"""
         tier_status = {
@@ -217,6 +275,7 @@ class LLMFactory:
         last_error = None
         for attempt in range(2):
             try:
+                usage_before = self._get_provider_usage_counter(provider)
                 start = time.time()
                 result = await provider.generate(
                     prompt,
@@ -228,6 +287,12 @@ class LLMFactory:
                 elapsed_ms = int((time.time() - start) * 1000)
                 provider_name = provider.provider.value
                 model_id = provider.model_id
+                usage_after = self._get_provider_usage_counter(provider)
+                self._record_scope_tier_usage(
+                    scope=scope,
+                    tier=tier,
+                    delta=self._usage_delta(usage_before, usage_after),
+                )
 
                 logger.debug(
                     "LLM 생성 완료: {} / {} ({}ms)",
@@ -366,6 +431,7 @@ class LLMFactory:
             logger.debug("LLM fallback activity 로깅 실패 (무시): {}", str(activity_error))
 
         try:
+            usage_before = self._get_provider_usage_counter(fallback_provider)
             start = time.time()
             result = await fallback_provider.generate(
                 prompt,
@@ -377,6 +443,12 @@ class LLMFactory:
             elapsed_ms = int((time.time() - start) * 1000)
             provider_name = fallback_provider.provider.value
             model_id = fallback_provider.model_id
+            usage_after = self._get_provider_usage_counter(fallback_provider)
+            self._record_scope_tier_usage(
+                scope=scope,
+                tier=tier,
+                delta=self._usage_delta(usage_before, usage_after),
+            )
             await self._log_llm_conversation(
                 tier=tier,
                 provider=provider_name,
@@ -514,11 +586,29 @@ class LLMFactory:
 
     def start_session(self, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """선택된 provider 세션 시작"""
-        return self._get_session_provider_class(scope).start_session(scope, phase)
+        session_provider_class = self._get_session_provider_class(scope)
+        self._cycle_usage_markers[(normalize_market_scope(scope), phase)] = self._usage_counter(
+            session_provider_class.get_usage_snapshot()
+        )
+        return session_provider_class.start_session(scope, phase)
 
     def end_session(self, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """선택된 provider 세션 종료"""
-        return self._get_session_provider_class(scope).end_session(scope, phase)
+        session_provider_class = self._get_session_provider_class(scope)
+        scope_key = normalize_market_scope(scope)
+        marker = self._cycle_usage_markers.pop((scope_key, phase), None)
+        if marker is not None:
+            delta = self._usage_delta(
+                marker,
+                self._usage_counter(session_provider_class.get_usage_snapshot()),
+            )
+            self._last_cycle_delta = {
+                "scope": scope_key,
+                "phase": phase,
+                "provider": settings.llm_provider_for_scope(scope).value,
+                **delta,
+            }
+        return session_provider_class.end_session(scope, phase)
 
     def pause_session(self, scope: str = "KRX", phase: str = "cycle") -> str | None:
         """선택된 provider 세션 일시 중지"""
@@ -546,6 +636,17 @@ class LLMFactory:
         report.setdefault("model_usage", {})
         report.setdefault("daily_activity", [])
         report.setdefault("daily_model_tokens", [])
+        report.setdefault(
+            "by_scope_tier",
+            {
+                key: dict(value)
+                for key, value in self._usage_by_scope_tier.items()
+            },
+        )
+        report.setdefault(
+            "last_cycle_delta",
+            dict(self._last_cycle_delta) if self._last_cycle_delta else None,
+        )
         return report
 
     async def get_llm_status(self) -> dict[str, Any]:

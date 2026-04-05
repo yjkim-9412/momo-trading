@@ -30,6 +30,12 @@ def test_build_command_adds_override_reasoning_effort_on_first_session_call(monk
     monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT", "")
     monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1", "")
     monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1_ANALYSIS", "")
+    monkeypatch.setattr(settings, "CODEX_DISABLE_LOCAL_MCP", True)
+    monkeypatch.setattr(
+        settings,
+        "CODEX_DISABLED_LOCAL_MCP_SERVERS",
+        "agentation,context7,playwright,shadcn",
+    )
 
     provider = CodexCLIProvider(LLMTier.TIER1)
     state = {
@@ -42,6 +48,10 @@ def test_build_command_adds_override_reasoning_effort_on_first_session_call(monk
     try:
         assert cmd[:2] == ["/tmp/codex", "exec"]
         assert "model_reasoning_effort=low" in cmd
+        assert "mcp_servers.agentation.enabled=false" in cmd
+        assert "mcp_servers.context7.enabled=false" in cmd
+        assert "mcp_servers.playwright.enabled=false" in cmd
+        assert "mcp_servers.shadcn.enabled=false" in cmd
         assert cmd[-1] == "-"
     finally:
         os.remove(output_path)
@@ -52,6 +62,12 @@ def test_build_command_adds_reasoning_effort_on_resume(monkeypatch):
     monkeypatch.setattr(settings, "CODEX_MODEL_TIER2", "")
     monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT", "")
     monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER2", "xhigh")
+    monkeypatch.setattr(settings, "CODEX_DISABLE_LOCAL_MCP", True)
+    monkeypatch.setattr(
+        settings,
+        "CODEX_DISABLED_LOCAL_MCP_SERVERS",
+        "agentation,context7,playwright,shadcn",
+    )
 
     provider = CodexCLIProvider(LLMTier.TIER2)
     state = {
@@ -59,11 +75,12 @@ def test_build_command_adds_reasoning_effort_on_resume(monkeypatch):
         "session_initialized": True,
         "active_session_id": "thread-123",
     }
-    cmd, output_path = provider._build_command("/tmp/codex", state)
+    cmd, output_path = provider._build_command("/tmp/codex", state, provider.configured_reasoning_effort)
 
     try:
         assert cmd[:3] == ["/tmp/codex", "exec", "resume"]
         assert "model_reasoning_effort=xhigh" in cmd
+        assert "mcp_servers.agentation.enabled=false" in cmd
         assert cmd[-2:] == ["thread-123", "-"]
     finally:
         os.remove(output_path)
@@ -75,6 +92,12 @@ def test_build_command_uses_provider_default_when_override_missing(monkeypatch):
     monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT", "")
     monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1", "")
     monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1_ANALYSIS", "")
+    monkeypatch.setattr(settings, "CODEX_DISABLE_LOCAL_MCP", True)
+    monkeypatch.setattr(
+        settings,
+        "CODEX_DISABLED_LOCAL_MCP_SERVERS",
+        "agentation,context7,playwright,shadcn",
+    )
 
     provider = CodexCLIProvider(LLMTier.TIER1)
     state = {
@@ -87,5 +110,30 @@ def test_build_command_uses_provider_default_when_override_missing(monkeypatch):
     try:
         assert "model_reasoning_effort=medium" in cmd
         assert "--ephemeral" in cmd
+        assert "mcp_servers.playwright.enabled=false" in cmd
+    finally:
+        os.remove(output_path)
+
+
+def test_build_command_skips_local_mcp_overrides_when_disabled(monkeypatch):
+    monkeypatch.setattr(settings, "CODEX_MODEL", "gpt-5.4")
+    monkeypatch.setattr(settings, "CODEX_MODEL_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1", "")
+    monkeypatch.setattr(settings, "CODEX_REASONING_EFFORT_TIER1_ANALYSIS", "")
+    monkeypatch.setattr(settings, "CODEX_DISABLE_LOCAL_MCP", False)
+    monkeypatch.setattr(settings, "CODEX_DISABLED_LOCAL_MCP_SERVERS", "agentation,context7")
+
+    provider = CodexCLIProvider(LLMTier.TIER1)
+    state = {
+        "session_enabled": False,
+        "session_initialized": False,
+        "active_session_id": None,
+    }
+    cmd, output_path = provider._build_command("/tmp/codex", state, provider.configured_reasoning_effort)
+
+    try:
+        assert "mcp_servers.agentation.enabled=false" not in cmd
+        assert "mcp_servers.context7.enabled=false" not in cmd
     finally:
         os.remove(output_path)
