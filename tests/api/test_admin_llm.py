@@ -15,6 +15,12 @@ async def test_admin_llm_status_endpoint(client, monkeypatch):
                 "provider": "CODEX_CLI",
                 "model": "gpt-5.4",
                 "reasoning_effort": "medium",
+                "requested_profile": "analysis",
+                "effective_profile": "scan",
+                "effective_model": "gpt-5.4-mini",
+                "effective_reasoning_effort": "low",
+                "session_mode": "persistent",
+                "capabilities": {"profile_specific_models": True},
                 "display_name": "후보 분석 에이전트",
                 "short_label": "후보 분석",
                 "description": "차트·시장 컨텍스트를 바탕으로 매수 후보와 목표/손절을 1차 판단",
@@ -24,6 +30,12 @@ async def test_admin_llm_status_endpoint(client, monkeypatch):
                     "provider": "CODEX_CLI",
                     "model": "gpt-5.4",
                     "reasoning_effort": "low",
+                    "requested_profile": "scan",
+                    "effective_profile": "scan",
+                    "effective_model": "gpt-5.4-mini",
+                    "effective_reasoning_effort": "low",
+                    "session_mode": "persistent",
+                    "capabilities": {"profile_specific_models": True},
                     "display_name": "시장 스캔 프로필",
                     "short_label": "스캔",
                     "description": "시장 스캔·스크리닝·뉴스 요약에 사용하는 저비용 추론 프로필",
@@ -32,6 +44,12 @@ async def test_admin_llm_status_endpoint(client, monkeypatch):
                     "provider": "CODEX_CLI",
                     "model": "gpt-5.4",
                     "reasoning_effort": "medium",
+                    "requested_profile": "analysis",
+                    "effective_profile": "scan",
+                    "effective_model": "gpt-5.4-mini",
+                    "effective_reasoning_effort": "low",
+                    "session_mode": "persistent",
+                    "capabilities": {"profile_specific_models": True},
                     "display_name": "종목 판단 프로필",
                     "short_label": "판단",
                     "description": "종목 1차 분석·AI 한도 결정에 사용하는 기본 추론 프로필",
@@ -41,10 +59,17 @@ async def test_admin_llm_status_endpoint(client, monkeypatch):
                 "provider": "CODEX_CLI",
                 "model": "gpt-5.4",
                 "reasoning_effort": "high",
+                "requested_profile": None,
+                "effective_profile": None,
+                "effective_model": "gpt-5.4",
+                "effective_reasoning_effort": "high",
+                "session_mode": "persistent",
+                "capabilities": {"profile_specific_models": True},
                 "display_name": "최종 검토 에이전트",
                 "short_label": "최종 검토",
                 "description": "1차 분석 결과를 리스크·포트폴리오 관점에서 재검증해 주문 승인 여부를 결정",
             },
+            "status_scope": "KRX",
             "available_providers": [],
             "session_id": None,
         }
@@ -56,6 +81,7 @@ async def test_admin_llm_status_endpoint(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["data"]["selected_provider"] == "CODEX_CLI"
     assert response.json()["data"]["tier1"]["display_name"] == "후보 분석 에이전트"
+    assert response.json()["data"]["tier1"]["effective_profile"] == "scan"
     assert response.json()["data"]["tier1_profiles"]["scan"]["reasoning_effort"] == "low"
     assert response.json()["data"]["tier2"]["short_label"] == "최종 검토"
 
@@ -81,7 +107,9 @@ async def test_admin_llm_usage_endpoint(client, monkeypatch):
             "provider_data": {},
             "app_usage": {"total_calls": 2},
             "by_scope_tier": {"KRX:TIER1": {"calls": 1}},
+            "by_scope_tier_phase": {"KRX:TIER1:cycle": {"calls": 1}},
             "last_cycle_delta": {"scope": "KRX", "phase": "cycle", "calls": 1},
+            "default_cycle_plan": {"provider": "CODEX_CLI", "effective_profile": "scan"},
         },
     )
 
@@ -91,3 +119,5 @@ async def test_admin_llm_usage_endpoint(client, monkeypatch):
     assert response.json()["data"]["provider"] == "CODEX_CLI"
     assert response.json()["data"]["summary"]["total_sessions"] == 3
     assert response.json()["data"]["last_cycle_delta"]["scope"] == "KRX"
+    assert response.json()["data"]["by_scope_tier_phase"]["KRX:TIER1:cycle"]["calls"] == 1
+    assert response.json()["data"]["default_cycle_plan"]["effective_profile"] == "scan"

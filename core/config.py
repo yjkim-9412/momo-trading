@@ -188,6 +188,7 @@ class Settings(BaseSettings):
 
     # === AI / LLM ===
     LLM_PROVIDER: str = LLMProvider.CLAUDE_CODE.value
+    LOW_COST_STOCK_TIER1_ANALYSIS_ENABLED: bool = True
 
     # Claude Code CLI
     CLAUDE_CODE_MODEL: str = "sonnet"  # 기본 모델 (Tier별 미지정 시 사용)
@@ -204,6 +205,8 @@ class Settings(BaseSettings):
     # Codex CLI
     CODEX_MODEL: str = "gpt-5.4"
     CODEX_MODEL_TIER1: str = ""
+    CODEX_MODEL_TIER1_SCAN: str = ""
+    CODEX_MODEL_TIER1_ANALYSIS: str = ""
     CODEX_MODEL_TIER2: str = ""
     CODEX_REASONING_EFFORT: str = ""
     CODEX_REASONING_EFFORT_REPORT: str = ""  # 리포트/회고 생성 추론 강도
@@ -251,6 +254,7 @@ class Settings(BaseSettings):
 
     # === Scheduler ===
     SCHEDULER_ENABLED: bool = True
+    AI_SCHEDULE_HINT_ENABLED: bool = False
     AI_DYNAMIC_RESCAN_ENABLED: bool = True
     AI_DYNAMIC_RESCAN_MAX_CYCLES_PER_SESSION: int = 3
     AI_DYNAMIC_RESCAN_ALLOWED_INTERVALS: str = "15,30,45,60,90,120"
@@ -402,15 +406,10 @@ class Settings(BaseSettings):
 
     @property
     def enabled_market_groups(self) -> list[str]:
-        """스케줄링용 시장 그룹 목록 (US → NASDAQ 대표, CRYPTO → BITHUMB)"""
+        """스케줄링용 시장 그룹 목록 (ENABLED_MARKETS에 명시된 시장만 등록)"""
         from trading.market_profile import is_crypto_market, is_us_market, normalize_market
 
         raw = self._parse_csv(self.ENABLED_MARKETS) or [self.PRIMARY_MARKET]
-        # CRYPTO_ENABLED이면 CRYPTO도 시장 그룹에 포함
-        if self.CRYPTO_ENABLED and not any(
-            s.upper() in {"CRYPTO", "BITHUMB", "BTH", "COIN"} for s in raw
-        ):
-            raw.append(self.crypto_primary_market_code)
         seen: list[str] = []
         for m in raw:
             norm = normalize_market(m)
@@ -841,6 +840,27 @@ class Settings(BaseSettings):
         if scope and normalize_market_scope(scope) == "CRYPTO":
             return self.crypto_llm_provider
         return self.llm_provider
+
+    def resolve_runtime_tier1_profile(
+        self,
+        profile: Tier1Profile | None,
+        *,
+        scope: str | None = None,
+        phase: str | None = None,
+    ) -> Tier1Profile | None:
+        """실행 시점의 Tier1 profile 결정."""
+        from trading.market_profile import normalize_market_scope
+
+        if profile is None:
+            return None
+        if (
+            profile != Tier1Profile.ANALYSIS
+            or not self.LOW_COST_STOCK_TIER1_ANALYSIS_ENABLED
+            or self._is_report_phase(phase)
+            or normalize_market_scope(scope or "KRX") == "CRYPTO"
+        ):
+            return profile
+        return Tier1Profile.SCAN
 
     def get_crypto_llm_model(
         self,
@@ -1342,6 +1362,20 @@ class Settings(BaseSettings):
             return self.CLAUDE_CODE_MODEL_TIER2 or self.CLAUDE_CODE_MODEL or "sonnet"
 
         if tier == LLMTier.TIER1:
+            if profile == Tier1Profile.SCAN:
+                return (
+                    self.CODEX_MODEL_TIER1_SCAN
+                    or self.CODEX_MODEL_TIER1
+                    or self.CODEX_MODEL
+                    or "gpt-5.4"
+                )
+            if profile == Tier1Profile.ANALYSIS:
+                return (
+                    self.CODEX_MODEL_TIER1_ANALYSIS
+                    or self.CODEX_MODEL_TIER1
+                    or self.CODEX_MODEL
+                    or "gpt-5.4"
+                )
             return self.CODEX_MODEL_TIER1 or self.CODEX_MODEL or "gpt-5.4"
         return self.CODEX_MODEL_TIER2 or self.CODEX_MODEL or "gpt-5.4"
 

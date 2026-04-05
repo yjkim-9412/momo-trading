@@ -108,7 +108,7 @@ def test_build_command_uses_provider_default_when_override_missing(monkeypatch):
     cmd, output_path = provider._build_command("/tmp/codex", state, provider.configured_reasoning_effort)
 
     try:
-        assert "model_reasoning_effort=medium" in cmd
+        assert "model_reasoning_effort=low" in cmd
         assert "--ephemeral" in cmd
         assert "mcp_servers.playwright.enabled=false" in cmd
     finally:

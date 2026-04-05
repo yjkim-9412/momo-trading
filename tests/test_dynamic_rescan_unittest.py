@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime
 from unittest.mock import AsyncMock, PropertyMock, patch
+from zoneinfo import ZoneInfo
 
 from agent.trading_agent import TradingAgent
 from core.config import settings
@@ -55,6 +56,17 @@ class DynamicRescanSchedulerSetupTest(unittest.TestCase):
         job_ids = {job.id for job in scheduler.scheduler.get_jobs()}
         self.assertIn("crypto_settlement_BITHUMB", job_ids)
         self.assertNotIn("post_market_BITHUMB", job_ids)
+
+    def test_setup_jobs_does_not_register_crypto_when_not_listed_in_enabled_markets(self):
+        settings.ENABLED_MARKETS = "KRX"
+        settings.CRYPTO_ENABLED = True
+        scheduler = TradingScheduler()
+
+        scheduler._setup_jobs()
+
+        job_ids = {job.id for job in scheduler.scheduler.get_jobs()}
+        self.assertIn("market_open_scan_KRX", job_ids)
+        self.assertNotIn("crypto_settlement_BITHUMB", job_ids)
 
     def test_setup_jobs_registers_us_premarket_scalp_liquidation_job(self):
         settings.ENABLED_MARKETS = "US"
@@ -134,9 +146,16 @@ class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.scheduler, "_log_schedule", AsyncMock()) as log_schedule, \
                 patch.object(
-                    self.scheduler,
+                    type(self.scheduler),
                     "_market_now",
-                    side_effect=lambda _market, dt=None: dt or datetime(2026, 3, 13, 9, 20),
+                    side_effect=lambda _market, dt=None: dt or datetime(
+                        2026,
+                        3,
+                        13,
+                        9,
+                        20,
+                        tzinfo=ZoneInfo("America/New_York"),
+                    ),
                 ):
             await self.scheduler._schedule_next_adaptive_rescan(
                 "NASDAQ",
@@ -290,7 +309,9 @@ class DynamicRescanSchedulerRuntimeTest(unittest.IsolatedAsyncioTestCase):
 class TradingAgentScheduleHintTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._original_dynamic = settings.AI_DYNAMIC_RESCAN_ENABLED
+        self._original_schedule_hint = settings.AI_SCHEDULE_HINT_ENABLED
         settings.AI_DYNAMIC_RESCAN_ENABLED = True
+        settings.AI_SCHEDULE_HINT_ENABLED = True
         self.agent = TradingAgent()
         runtime = self.agent.get_runtime("KRX")
         runtime.market_regime = "BULL"
@@ -300,6 +321,7 @@ class TradingAgentScheduleHintTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         settings.AI_DYNAMIC_RESCAN_ENABLED = self._original_dynamic
+        settings.AI_SCHEDULE_HINT_ENABLED = self._original_schedule_hint
 
     async def test_generate_schedule_hint_clamps_ai_interval_to_allowed_bucket(self):
         with patch.object(
@@ -361,6 +383,32 @@ class TradingAgentScheduleHintTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(hint["next_run_in_minutes"], 45)
         self.assertEqual(hint["source"], "fallback")
         self.assertIn("AI action 무효", hint["reason"])
+
+    async def test_generate_schedule_hint_uses_fallback_when_ai_schedule_hint_disabled(self):
+        settings.AI_SCHEDULE_HINT_ENABLED = False
+
+        with patch.object(
+            TradingAgent,
+            "_minutes_until_market_buy_cutoff",
+            return_value=120,
+        ), patch(
+            "agent.trading_agent.market_calendar.is_trading_hours",
+            return_value=True,
+        ), patch(
+            "agent.trading_agent.llm_factory.generate_tier1",
+            AsyncMock(return_value=("{}", "CODEX_CLI")),
+        ) as generate_tier1:
+            hint = await self.agent._generate_schedule_hint(
+                "KRX",
+                results={"scanned": 4, "analyzed": 2, "signals": 0, "executed": 0},
+                snapshot={"cash": 500_000, "total_asset": 1_050_000, "today_trade_count": 1},
+                scheduled_budget_remaining=2,
+                cycle_id="cycle-disabled",
+            )
+
+        self.assertEqual(hint["source"], "fallback")
+        self.assertIn("AI schedule_hint 비활성화", hint["reason"])
+        generate_tier1.assert_not_awaited()
 
     async def test_fallback_schedule_hint_shortens_interval_for_crypto_momentum_regime(self):
         runtime = self.agent.get_runtime("BITHUMB")

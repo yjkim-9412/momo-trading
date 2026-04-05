@@ -3958,8 +3958,20 @@ class AnalysisMixin:
         chart_result = chart_analyzer.analyze(daily_df, minute_df)
         current_position_context = self._format_current_position_for_prompt(current_position)
         runtime = self._get_state(scope)
-        market_context = runtime.market_context or "시장 컨텍스트 없음"
-        trading_context = runtime.trading_context or await self._build_trading_context(market_code)
+        market_context = self._build_compact_market_context(runtime.market_context or "시장 컨텍스트 없음")
+        trading_context = self._build_compact_trading_context(
+            runtime.trading_context or await self._build_trading_context(market_code)
+        )
+        account_context = self._build_account_context(
+            market=market_code,
+            portfolio_snapshot=portfolio_snapshot,
+            current_position=current_position,
+            dynamic_limits=None,
+            current_price=current_price,
+            currency=currency,
+            exchange_rate_to_krw=exchange_rate_to_krw,
+            orderable_amount_context=None,
+        )
 
         feedback_context = "매매 이력 없음"
         try:
@@ -3967,11 +3979,9 @@ class AnalysisMixin:
                 feedback_context = await FeedbackContextBuilder(
                     session,
                     market_scope=scope,
-                ).build_full_context(
+                ).build_compact_context(
                     trade_result.strategy_type or "",
                     symbol,
-                    current_regime=runtime.market_regime or "",
-                    current_rsi=chart_result.indicators.get("rsi_14"),
                     market_scope=scope,
                 )
         except Exception as e:
@@ -3992,7 +4002,13 @@ class AnalysisMixin:
         stop_loss_price = self._try_float(getattr(trade_result, "ai_stop_loss_price", None))
         take_profit_price = self._try_float(getattr(trade_result, "ai_take_profit_price", None))
         trailing_stop_pct = trade_plan["notes"].get("trailing_stop_pct")
-        chart_snapshot = chart_result.prompt_text if chart_result and chart_result.prompt_text else "차트 요약 없음"
+        chart_snapshot = (
+            chart_result.review_text
+            if chart_result and chart_result.review_text
+            else chart_result.trend_text if chart_result and chart_result.trend_text
+            else chart_result.prompt_text if chart_result and chart_result.prompt_text
+            else "차트 요약 없음"
+        )
         entry_snapshot_lines = [
             f"- entry_at: {entry_at.isoformat() if entry_at else '없음'}",
             f"- entry_price: {entry_price:,.2f}{currency}" if entry_price > 0 else "- entry_price: 없음",
@@ -4011,16 +4027,12 @@ class AnalysisMixin:
             market_context=market_context,
             trading_context=trading_context,
             current_position_context=current_position_context,
-            account_context=self._build_account_context(
+            account_context=self._format_account_context_for_prompt(
+                account_context,
                 market=market_code,
-                portfolio_snapshot=portfolio_snapshot,
-                current_position=current_position,
-                dynamic_limits=None,
-                current_price=current_price,
                 currency=currency,
-                exchange_rate_to_krw=exchange_rate_to_krw,
-                orderable_amount_context=None,
-            )["text"],
+                compact=True,
+            ),
             entry_snapshot="\n".join(entry_snapshot_lines),
             chart_snapshot=chart_snapshot,
             product_context=self._format_product_context_for_prompt(product_context),

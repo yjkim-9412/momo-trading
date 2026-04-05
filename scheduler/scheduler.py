@@ -845,6 +845,16 @@ class TradingScheduler:
             normalized = default
         return max(minimum, normalized)
 
+    @staticmethod
+    def _coerce_float(value, *, default: float = 0.0, minimum: float | None = None) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            normalized = default
+        if minimum is not None:
+            normalized = max(minimum, normalized)
+        return normalized
+
     @classmethod
     def _resolve_open_position_hold_plan(cls, trade_result) -> dict[str, int | str | None]:
         notes = cls._parse_trade_notes(getattr(trade_result, "notes", None))
@@ -892,6 +902,70 @@ class TradingScheduler:
         notes["trailing_stop_pct"] = trailing_stop_pct
         trade_result.notes = json.dumps(notes, ensure_ascii=False, default=str)
         return notes
+
+    @classmethod
+    def _build_existing_close_review_payload(cls, trade_result, hold_plan: dict) -> dict[str, float | int]:
+        """AI 재리뷰 없이 기존 보유 계획을 1회 연장할 때 사용할 payload."""
+        return {
+            "planned_hold_days": hold_plan["planned_hold_days"],
+            "confidence": getattr(trade_result, "ai_confidence", 0.0),
+            "stop_loss_price": getattr(trade_result, "ai_stop_loss_price", 0.0),
+            "take_profit_price": (
+                getattr(trade_result, "ai_take_profit_price", None)
+                or getattr(trade_result, "ai_target_price", 0.0)
+            ),
+            "trailing_stop_pct": hold_plan["notes"].get("trailing_stop_pct") or 0.0,
+        }
+
+    @classmethod
+    def _should_run_close_review_llm(
+        cls,
+        *,
+        holding,
+        trade_result,
+        current_price: float,
+        hold_plan: dict,
+    ) -> tuple[bool, str]:
+        """리스크가 높거나 기존 계획을 벗어날 때만 장마감 Tier2 재리뷰를 수행한다."""
+        planned_hold_days = int(hold_plan["planned_hold_days"])
+        next_review_count = int(hold_plan["close_review_count"]) + 1
+        if next_review_count >= planned_hold_days:
+            return True, "planned_hold_days 경계 재검토"
+
+        confidence = cls._coerce_float(getattr(trade_result, "ai_confidence", None), default=0.0)
+        if confidence < 0.70:
+            return True, "low_confidence"
+
+        pnl_rate = cls._coerce_float(getattr(holding, "pnl_rate", None), default=0.0)
+        if pnl_rate <= -4.0 or pnl_rate >= 7.0:
+            return True, "손익률 변동 확대"
+
+        stop_loss_price = cls._coerce_float(
+            getattr(trade_result, "ai_stop_loss_price", None),
+            default=0.0,
+            minimum=0.0,
+        )
+        if stop_loss_price > 0:
+            if current_price <= stop_loss_price:
+                return True, "stop_loss 근접/하향"
+            distance_to_stop = abs(current_price - stop_loss_price) / current_price * 100
+            if distance_to_stop <= 1.0:
+                return True, "stop_loss 근접/하향"
+
+        take_profit_price = cls._coerce_float(
+            getattr(trade_result, "ai_take_profit_price", None)
+            or getattr(trade_result, "ai_target_price", None),
+            default=0.0,
+            minimum=0.0,
+        )
+        if take_profit_price > 0:
+            if current_price >= take_profit_price:
+                return True, "take_profit 도달/근접"
+            distance_to_take_profit = abs(take_profit_price - current_price) / current_price * 100
+            if distance_to_take_profit <= 1.5:
+                return True, "take_profit 도달/근접"
+
+        return False, "기존 보유 계획 유지"
 
     @classmethod
     def _build_open_position_threshold_kwargs(cls, trade_result) -> dict[str, float]:
@@ -2452,6 +2526,48 @@ class TradingScheduler:
                     continue
 
                 hold_plan = self._resolve_open_position_hold_plan(trade_result)
+                should_run_llm, llm_reason = self._should_run_close_review_llm(
+                    holding=h,
+                    trade_result=trade_result,
+                    current_price=current_price,
+                    hold_plan=hold_plan,
+                )
+                if not should_run_llm:
+                    async with AsyncSessionLocal() as session:
+                        async with session.begin():
+                            repo = TradeResultRepository(session)
+                            open_trade = await repo.get_open_buy(h.symbol, market=h.market)
+                            if not open_trade:
+                                to_sell.append(h)
+                                logger.warning("[{}] 기존 HOLD 계획 반영 중 TradeResult 유실 {} → SELL", market, h.symbol)
+                                continue
+                            notes = self._apply_close_review_hold_update(
+                                open_trade,
+                                self._build_existing_close_review_payload(open_trade, hold_plan),
+                                review_date=review_date,
+                            )
+                    hold_trade = open_trade
+                    threshold_kwargs = {
+                        "stop_loss": 0.0,
+                        "take_profit": 0.0,
+                        "trailing_stop_pct": 0.0,
+                        **self._build_open_position_threshold_kwargs(hold_trade),
+                    }
+                    threshold_kwargs["highest_price"] = (
+                        current_price if float(threshold_kwargs.get("trailing_stop_pct") or 0.0) > 0 else 0.0
+                    )
+                    event_detector.set_thresholds(h.symbol, market=h.market, **threshold_kwargs)
+                    to_hold.append(h)
+                    logger.info(
+                        "[{}] 스마트 청산 HOLD(규칙): {} — {} | planned {}일, review {}회",
+                        market,
+                        h.symbol,
+                        llm_reason,
+                        notes.get("planned_hold_days"),
+                        notes.get("close_review_count"),
+                    )
+                    continue
+
                 decision = await trading_agent.review_close_hold_position(
                     holding=h,
                     trade_result=trade_result,
@@ -2461,6 +2577,7 @@ class TradingScheduler:
 
                 if decision is None:
                     if int(hold_plan["close_review_count"]) < int(hold_plan["planned_hold_days"]):
+                        open_trade = None
                         async with AsyncSessionLocal() as session:
                             async with session.begin():
                                 repo = TradeResultRepository(session)
@@ -2468,33 +2585,22 @@ class TradingScheduler:
                                 if open_trade:
                                     notes = self._apply_close_review_hold_update(
                                         open_trade,
-                                        {
-                                            "planned_hold_days": hold_plan["planned_hold_days"],
-                                            "confidence": getattr(open_trade, "ai_confidence", 0.0),
-                                            "stop_loss_price": getattr(open_trade, "ai_stop_loss_price", 0.0),
-                                            "take_profit_price": (
-                                                getattr(open_trade, "ai_take_profit_price", None)
-                                                or getattr(open_trade, "ai_target_price", 0.0)
-                                            ),
-                                            "trailing_stop_pct": hold_plan["notes"].get("trailing_stop_pct") or 0.0,
-                                        },
+                                        self._build_existing_close_review_payload(open_trade, hold_plan),
                                         review_date=review_date,
                                     )
                                 else:
                                     notes = hold_plan["notes"]
-                        trailing_stop_pct = float(notes.get("trailing_stop_pct") or 0.0)
-                        event_detector.set_thresholds(
-                            h.symbol,
-                            market=h.market,
-                            stop_loss=float(getattr(trade_result, "ai_stop_loss_price", 0.0) or 0.0),
-                            take_profit=float(
-                                getattr(trade_result, "ai_take_profit_price", None)
-                                or getattr(trade_result, "ai_target_price", 0.0)
-                                or 0.0
-                            ),
-                            trailing_stop_pct=trailing_stop_pct,
-                            highest_price=current_price if trailing_stop_pct > 0 else 0.0,
+                        hold_trade = open_trade or trade_result
+                        threshold_kwargs = {
+                            "stop_loss": 0.0,
+                            "take_profit": 0.0,
+                            "trailing_stop_pct": 0.0,
+                            **self._build_open_position_threshold_kwargs(hold_trade),
+                        }
+                        threshold_kwargs["highest_price"] = (
+                            current_price if float(threshold_kwargs.get("trailing_stop_pct") or 0.0) > 0 else 0.0
                         )
+                        event_detector.set_thresholds(h.symbol, market=h.market, **threshold_kwargs)
                         to_hold.append(h)
                         logger.warning(
                             "[{}] 장마감 AI 재리뷰 실패 {} → 기존 계획 유지 HOLD ({}/{})",

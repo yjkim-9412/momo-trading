@@ -10,15 +10,27 @@ from typing import Any
 
 from loguru import logger
 
-from analysis.llm.base import empty_usage_snapshot
+from analysis.llm.base import (
+    LLMExecutionPlan,
+    LLMProviderCapabilities,
+    LLMRequest,
+    LLMSessionHandle,
+    empty_usage_snapshot,
+)
 from core.config import settings
-from trading.enums import LLMProvider, LLMTier
+from trading.enums import LLMProvider, LLMTier, Tier1Profile
 from trading.market_profile import normalize_market_scope
 
 
 class CodexCLIProvider:
     """Codex CLI를 subprocess로 호출하는 LLM provider"""
 
+    CAPABILITIES = LLMProviderCapabilities(
+        profile_specific_models=True,
+        reasoning_effort_control=True,
+        persistent_session=True,
+        usage_reporting="jsonl_usage",
+    )
     _session_states: dict[tuple[str, str], dict[str, Any]] = {}
     _session_locks: dict[tuple[str, str], asyncio.Lock] = {}
     cumulative_usage: dict[str, Any] = empty_usage_snapshot(LLMProvider.CODEX_CLI)
@@ -32,6 +44,8 @@ class CodexCLIProvider:
     ):
         self._tier = tier
         self._codex_path: str | None = None
+        self._model_override = model
+        self._reasoning_effort_override = reasoning_effort
         self._model = model if model is not None else settings.get_llm_model(LLMProvider.CODEX_CLI, tier)
         self._reasoning_effort = (
             reasoning_effort
@@ -138,15 +152,87 @@ class CodexCLIProvider:
 
     @property
     def configured_model(self) -> str:
-        return self._model
+        if self._model_override is not None:
+            return self._model_override
+        return settings.get_llm_model(self.provider, self.tier)
 
     @property
     def configured_reasoning_effort(self) -> str | None:
-        return self._reasoning_effort
+        if self._reasoning_effort_override is not None:
+            return self._reasoning_effort_override
+        return settings.get_llm_reasoning_effort(self.provider, self.tier)
 
     @property
     def model_id(self) -> str:
         return self._resolved_model
+
+    @property
+    def capabilities(self) -> LLMProviderCapabilities:
+        return self.CAPABILITIES
+
+    @classmethod
+    def get_session_handle(cls, scope: str = "KRX", phase: str = "cycle") -> LLMSessionHandle:
+        scope_key = normalize_market_scope(scope)
+        state = cls._get_state(scope, phase)
+        return LLMSessionHandle(
+            provider=LLMProvider.CODEX_CLI,
+            scope=scope_key,
+            phase=phase or "cycle",
+            external_id=state.get("active_session_id"),
+            session_enabled=bool(state.get("session_enabled")),
+            initialized=bool(state.get("session_initialized")),
+        )
+
+    def plan_request(self, request: LLMRequest) -> LLMExecutionPlan:
+        effective_profile: Tier1Profile | None = None
+        if request.tier == LLMTier.TIER1:
+            effective_profile = settings.resolve_runtime_tier1_profile(
+                request.requested_profile,
+                scope=request.scope,
+                phase=request.phase,
+            )
+        scope = normalize_market_scope(request.scope or "GLOBAL")
+        if request.scope is None:
+            session_handle = LLMSessionHandle(
+                provider=self.provider,
+                scope=scope,
+                phase=request.phase,
+                external_id=None,
+                session_enabled=False,
+                initialized=False,
+            )
+        else:
+            session_handle = self.get_session_handle(request.scope, request.phase)
+        model = self._model_override or settings.get_llm_model_for_scope_provider(
+            request.scope,
+            self.provider,
+            request.tier,
+            effective_profile,
+        )
+        reasoning_effort = (
+            request.reasoning_effort_override
+            or self._reasoning_effort_override
+            or settings.get_llm_reasoning_effort_for_scope_provider(
+                request.scope,
+                self.provider,
+                request.tier,
+                effective_profile,
+                request.phase,
+            )
+        )
+        return LLMExecutionPlan(
+            provider=self.provider,
+            tier=request.tier,
+            requested_profile=request.requested_profile,
+            effective_profile=effective_profile,
+            scope=scope,
+            phase=request.phase,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            session_mode=session_handle.mode,
+            session_handle=session_handle,
+            capabilities=self.capabilities,
+        )
 
     def _find_codex(self) -> str | None:
         """codex CLI 경로 탐색"""
@@ -168,21 +254,44 @@ class CodexCLIProvider:
         reasoning_effort_override: str | None = None,
     ) -> str:
         """codex exec로 텍스트 생성"""
+        request = LLMRequest(
+            tier=self.tier,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            scope=scope,
+            phase=phase,
+            requested_profile=None,
+            reasoning_effort_override=reasoning_effort_override,
+        )
+        plan = self.plan_request(request)
+        return await self.generate_from_plan(request, plan)
+
+    async def generate_from_plan(
+        self,
+        request: LLMRequest,
+        plan: LLMExecutionPlan,
+    ) -> str:
+        """사전 계산된 execution plan으로 Codex CLI 실행."""
         codex = self._find_codex()
         if not codex:
             raise RuntimeError("codex CLI를 찾을 수 없습니다 (PATH 확인)")
 
-        actual_prompt = self._build_prompt(prompt, system_prompt)
-        state = self.__class__._get_state(scope, phase) if scope is not None else {
+        actual_prompt = self._build_prompt(request.prompt, request.system_prompt)
+        state = self.__class__._get_state(request.scope, request.phase) if request.scope is not None else {
             "session_enabled": False,
             "active_session_id": None,
             "session_initialized": False,
         }
-        reasoning_effort = reasoning_effort_override or self._reasoning_effort
-        cmd, output_path = self._build_command(codex, state, reasoning_effort)
+        self._resolved_model = f"codex:{plan.model}" if plan.model else "codex"
+        cmd, output_path = self._build_command(
+            codex,
+            state,
+            plan.reasoning_effort,
+            model=plan.model,
+        )
 
-        if state["session_enabled"] and scope is not None:
-            async with self._get_lock(scope, phase):
+        if state["session_enabled"] and request.scope is not None:
+            async with self._get_lock(request.scope, request.phase):
                 return await self._execute(cmd, actual_prompt, output_path, state)
         return await self._execute(cmd, actual_prompt, output_path, state)
 
@@ -210,10 +319,13 @@ class CodexCLIProvider:
         codex_path: str,
         state: dict[str, Any],
         reasoning_effort: str | None = None,
+        *,
+        model: str | None = None,
     ) -> tuple[list[str], str]:
         """세션 상태에 맞는 Codex CLI 명령 구성"""
         fd, output_path = tempfile.mkstemp(prefix="codex-llm-", suffix=".txt")
         os.close(fd)
+        resolved_model = model if model is not None else self._model
 
         if state["session_enabled"]:
             if state["session_initialized"] and state["active_session_id"]:
@@ -226,8 +338,8 @@ class CodexCLIProvider:
                     "-o",
                     output_path,
                 ]
-                if self._model:
-                    cmd.extend(["--model", self._model])
+                if resolved_model:
+                    cmd.extend(["--model", resolved_model])
                 self._append_reasoning_effort(cmd, reasoning_effort)
                 self._append_local_mcp_overrides(cmd)
                 cmd.extend([state["active_session_id"], "-"])
@@ -243,8 +355,8 @@ class CodexCLIProvider:
                 "-o",
                 output_path,
             ]
-            if self._model:
-                cmd.extend(["--model", self._model])
+            if resolved_model:
+                cmd.extend(["--model", resolved_model])
             self._append_reasoning_effort(cmd, reasoning_effort)
             self._append_local_mcp_overrides(cmd)
             cmd.append("-")
@@ -261,8 +373,8 @@ class CodexCLIProvider:
             "-o",
             output_path,
         ]
-        if self._model:
-            cmd.extend(["--model", self._model])
+        if resolved_model:
+            cmd.extend(["--model", resolved_model])
         self._append_reasoning_effort(cmd, reasoning_effort)
         self._append_local_mcp_overrides(cmd)
         cmd.append("-")

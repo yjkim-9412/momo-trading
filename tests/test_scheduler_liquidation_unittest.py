@@ -193,7 +193,7 @@ class SchedulerSmartLiquidationReviewTest(unittest.IsolatedAsyncioTestCase):
         holding = self._holding()
         trade = self._trade(
             {
-                "planned_hold_days": 2,
+                "planned_hold_days": 1,
                 "close_review_count": 0,
                 "trailing_stop_pct": 1.5,
             }
@@ -240,6 +240,51 @@ class SchedulerSmartLiquidationReviewTest(unittest.IsolatedAsyncioTestCase):
             stop_loss=101.0,
             take_profit=118.0,
             trailing_stop_pct=2.0,
+            highest_price=105.0,
+        )
+
+    async def test_smart_liquidation_skips_llm_for_low_risk_hold_with_plan_room(self):
+        scheduler = TradingScheduler()
+        holding = self._holding()
+        trade = self._trade(
+            {
+                "planned_hold_days": 3,
+                "close_review_count": 1,
+                "trailing_stop_pct": 1.5,
+            }
+        )
+        trade.ai_confidence = 0.84
+        repo = MagicMock()
+        repo.get_open_buy = AsyncMock(side_effect=[trade, trade])
+        detector = MagicMock()
+
+        with patch("core.database.AsyncSessionLocal", side_effect=[self._dummy_session(), self._dummy_session()]), \
+                patch("repositories.trade_result_repository.TradeResultRepository", return_value=repo), \
+                patch(
+                    "trading.mcp_client.mcp_client.get_current_price",
+                    AsyncMock(return_value=SimpleNamespace(success=True, data={"price": 105.0})),
+                ), \
+                patch(
+                    "agent.trading_agent.trading_agent.review_close_hold_position",
+                    AsyncMock(return_value={"action": "SELL", "reason": "unused"}),
+                ) as review_close_hold_position, \
+                patch("realtime.event_detector.event_detector", detector), \
+                patch.object(market_calendar, "market_date", return_value=date(2026, 3, 26)):
+            to_sell, to_hold = await scheduler._smart_liquidation([holding], "NASDAQ")
+
+        self.assertEqual(to_sell, [])
+        self.assertEqual(to_hold, [holding])
+        notes = json.loads(trade.notes)
+        self.assertEqual(notes["planned_hold_days"], 3)
+        self.assertEqual(notes["close_review_count"], 2)
+        self.assertEqual(notes["last_close_review_date"], "2026-03-26")
+        review_close_hold_position.assert_not_awaited()
+        detector.set_thresholds.assert_called_once_with(
+            "AAPL",
+            market="NASDAQ",
+            stop_loss=98.0,
+            take_profit=110.0,
+            trailing_stop_pct=1.5,
             highest_price=105.0,
         )
 

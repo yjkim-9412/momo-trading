@@ -1,9 +1,93 @@
 """LLM provider 공통 인터페이스와 보조 헬퍼."""
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol, runtime_checkable
 
-from trading.enums import LLMProvider, LLMTier
+from trading.enums import LLMProvider, LLMTier, Tier1Profile
+
+LLMSessionMode = Literal["ephemeral", "persistent"]
+
+
+@dataclass(frozen=True)
+class LLMProviderCapabilities:
+    """Provider가 지원하는 실행 capability."""
+
+    profile_specific_models: bool
+    reasoning_effort_control: bool
+    persistent_session: bool
+    usage_reporting: str = "provider"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "profile_specific_models": self.profile_specific_models,
+            "reasoning_effort_control": self.reasoning_effort_control,
+            "persistent_session": self.persistent_session,
+            "usage_reporting": self.usage_reporting,
+        }
+
+
+@dataclass(frozen=True)
+class LLMSessionHandle:
+    """Provider-agnostic 세션 상태."""
+
+    provider: LLMProvider
+    scope: str
+    phase: str
+    external_id: str | None
+    session_enabled: bool
+    initialized: bool
+
+    @property
+    def mode(self) -> LLMSessionMode:
+        return "persistent" if self.session_enabled else "ephemeral"
+
+
+@dataclass(frozen=True)
+class LLMRequest:
+    """호출부가 provider에 전달하는 공통 요청."""
+
+    tier: LLMTier
+    prompt: str
+    system_prompt: str = ""
+    scope: str | None = None
+    phase: str = "cycle"
+    requested_profile: Tier1Profile | None = None
+    symbol: str | None = None
+    cycle_id: str | None = None
+    reasoning_effort_override: str | None = None
+
+
+@dataclass(frozen=True)
+class LLMExecutionPlan:
+    """Provider가 계산한 실제 실행 계획."""
+
+    provider: LLMProvider
+    tier: LLMTier
+    requested_profile: Tier1Profile | None
+    effective_profile: Tier1Profile | None
+    scope: str
+    phase: str
+    model: str
+    reasoning_effort: str | None
+    session_mode: LLMSessionMode
+    session_handle: LLMSessionHandle
+    capabilities: LLMProviderCapabilities
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider.value,
+            "tier": self.tier.value,
+            "requested_profile": self.requested_profile.value if self.requested_profile else None,
+            "effective_profile": self.effective_profile.value if self.effective_profile else None,
+            "scope": self.scope,
+            "phase": self.phase,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "session_mode": self.session_mode,
+            "session_id": self.session_handle.external_id,
+            "capabilities": self.capabilities.as_dict(),
+        }
 
 
 @runtime_checkable
@@ -28,6 +112,13 @@ class LLMProviderProtocol(Protocol):
     @property
     def model_id(self) -> str: ...
 
+    @property
+    def capabilities(self) -> LLMProviderCapabilities: ...
+
+    def plan_request(self, request: LLMRequest) -> LLMExecutionPlan:
+        """요청을 실제 실행 계획으로 변환"""
+        ...
+
     async def generate(
         self,
         prompt: str,
@@ -38,6 +129,14 @@ class LLMProviderProtocol(Protocol):
         reasoning_effort_override: str | None = None,
     ) -> str:
         """텍스트 생성"""
+        ...
+
+    async def generate_from_plan(
+        self,
+        request: LLMRequest,
+        plan: LLMExecutionPlan,
+    ) -> str:
+        """사전 계산된 실행 계획으로 텍스트 생성"""
         ...
 
     async def is_available(self) -> bool:
@@ -72,6 +171,11 @@ class LLMSessionProtocol(Protocol):
     @classmethod
     def get_session_id(cls, scope: str | None = None, phase: str = "cycle") -> str | None:
         """현재 세션 ID 반환"""
+        ...
+
+    @classmethod
+    def get_session_handle(cls, scope: str = "KRX", phase: str = "cycle") -> LLMSessionHandle:
+        """현재 세션 상태 반환"""
         ...
 
     @classmethod

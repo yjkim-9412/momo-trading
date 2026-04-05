@@ -82,6 +82,7 @@ description: 빗썸 암호화폐 거래 시스템 구조 가이드. 코인 관�
 BITHUMB_API_KEY / BITHUMB_API_SECRET    # API 인증
 BITHUMB_WS_URL_PUBLIC / BITHUMB_WS_URL_PRIVATE  # 빗썸 Public/Private WS 엔드포인트
 CRYPTO_ENABLED                          # 코인 기능 on/off
+ENABLED_MARKETS                         # 스케줄러에 실제 등록할 시장 목록, 코인을 돌리려면 BITHUMB/CRYPTO를 명시해야 함
 CRYPTO_PRIMARY_MARKET                   # 코인 기본 시장 코드, 비어있거나 잘못되면 BITHUMB 고정
 CRYPTO_TRADING_ENABLED                  # 실제 주문 허용
 CRYPTO_AUTONOMY_MODE                    # SEMI_AUTO / AUTONOMOUS
@@ -115,6 +116,7 @@ CRYPTO_MIN_CASH_RATIO                   # 최소 현금 비중
 ## 코인 구현 주의사항
 
 - 빗썸 rate limit: 공식 Public **150**/s, Private **140**/s, 주문 **10**/s. 코드는 보수적 10/5 semaphore
+- `CRYPTO_ENABLED=true`만으로는 코인 스케줄이 등록되지 않는다. 코인 자동 스캔/정산을 돌리려면 `ENABLED_MARKETS`에 `BITHUMB` 또는 `CRYPTO`를 명시해야 한다.
 - 빗썸 WebSocket: 최신 공식 엔드포인트는 `wss://ws-api.bithumb.com/websocket/v1` / `/private`
 - Public WS는 `ticker`, `trade`, `orderbook`으로 가격/거래량/호가 이벤트를 만들고, Private WS는 `myOrder`, `myAsset`로 주문/자산 동기화를 수행한다
 - 코인 미체결 주문의 source of truth 는 빗썸 REST placeholder 가 아니라 `coin_broker_orders` 원장이다. `AccountManager.get_pending_orders("BITHUMB")` 는 `SUBMITTED` / `OPEN` / `PARTIAL` 상태를 DB에서 읽어 코인 어드민 overview 로 반환한다.

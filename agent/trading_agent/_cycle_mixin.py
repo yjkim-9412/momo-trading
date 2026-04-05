@@ -1494,6 +1494,13 @@ class CycleMixin:
 
         if fallback["action"] == "STOP_FOR_SESSION":
             return fallback
+        if not settings.AI_SCHEDULE_HINT_ENABLED:
+            return self._fallback_schedule_hint(
+                target,
+                results=results,
+                scheduled_budget_remaining=remaining_budget,
+                reason_prefix="AI schedule_hint 비활성화",
+            )
 
         market_now = now_kst().astimezone(ZoneInfo(market_timezone(target)))
         available_cash = float(snap.get("cash", state.available_cash) or 0.0)

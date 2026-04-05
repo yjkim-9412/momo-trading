@@ -13,9 +13,15 @@ from uuid import uuid4
 
 from loguru import logger
 
-from analysis.llm.base import empty_usage_snapshot
+from analysis.llm.base import (
+    LLMExecutionPlan,
+    LLMProviderCapabilities,
+    LLMRequest,
+    LLMSessionHandle,
+    empty_usage_snapshot,
+)
 from core.config import settings
-from trading.enums import LLMProvider, LLMTier
+from trading.enums import LLMProvider, LLMTier, Tier1Profile
 from trading.market_profile import normalize_market_scope
 
 
@@ -30,6 +36,13 @@ class ClaudeCodeProvider:
 
     세션이 없으면 일회성 호출 (--no-session-persistence)
     """
+
+    CAPABILITIES = LLMProviderCapabilities(
+        profile_specific_models=True,
+        reasoning_effort_control=True,
+        persistent_session=True,
+        usage_reporting="json_response",
+    )
 
     # 클래스 레벨 세션 관리 ((scope, phase)별)
     _session_states: dict[tuple[str, str], dict[str, Any]] = {}
@@ -47,6 +60,8 @@ class ClaudeCodeProvider:
     ):
         self._tier = tier
         self._claude_path: str | None = None
+        self._model_override = model
+        self._reasoning_effort_override = reasoning_effort
         self._model = model if model is not None else settings.get_llm_model(LLMProvider.CLAUDE_CODE, tier)
         self._reasoning_effort = (
             reasoning_effort
@@ -160,15 +175,89 @@ class ClaudeCodeProvider:
 
     @property
     def configured_model(self) -> str:
-        return self._model
+        if self._model_override is not None:
+            return self._model_override
+        return settings.get_llm_model(self.provider, self.tier)
 
     @property
     def configured_reasoning_effort(self) -> str | None:
-        return self._reasoning_effort
+        if self._reasoning_effort_override is not None:
+            return self._reasoning_effort_override
+        return settings.get_llm_reasoning_effort(self.provider, self.tier)
 
     @property
     def model_id(self) -> str:
         return self._resolved_model or f"claude-code:{self._model}"
+
+    @property
+    def capabilities(self) -> LLMProviderCapabilities:
+        return self.CAPABILITIES
+
+    @classmethod
+    def get_session_handle(cls, scope: str = "KRX", phase: str = "cycle") -> LLMSessionHandle:
+        scope_key = normalize_market_scope(scope)
+        state = cls._get_state(scope, phase)
+        external_id = state.get("active_session_id")
+        initialized = bool(state.get("session_initialized"))
+        return LLMSessionHandle(
+            provider=LLMProvider.CLAUDE_CODE,
+            scope=scope_key,
+            phase=phase or "cycle",
+            external_id=external_id,
+            session_enabled=bool(external_id),
+            initialized=initialized,
+        )
+
+    def plan_request(self, request: LLMRequest) -> LLMExecutionPlan:
+        effective_profile: Tier1Profile | None = None
+        if request.tier == LLMTier.TIER1:
+            effective_profile = settings.resolve_runtime_tier1_profile(
+                request.requested_profile,
+                scope=request.scope,
+                phase=request.phase,
+            )
+        scope = normalize_market_scope(request.scope or "GLOBAL")
+        if request.scope is None:
+            session_handle = LLMSessionHandle(
+                provider=self.provider,
+                scope=scope,
+                phase=request.phase,
+                external_id=None,
+                session_enabled=False,
+                initialized=False,
+            )
+        else:
+            session_handle = self.get_session_handle(request.scope, request.phase)
+        model = self._model_override or settings.get_llm_model_for_scope_provider(
+            request.scope,
+            self.provider,
+            request.tier,
+            effective_profile,
+        )
+        reasoning_effort = (
+            request.reasoning_effort_override
+            or self._reasoning_effort_override
+            or settings.get_llm_reasoning_effort_for_scope_provider(
+                request.scope,
+                self.provider,
+                request.tier,
+                effective_profile,
+                request.phase,
+            )
+        )
+        return LLMExecutionPlan(
+            provider=self.provider,
+            tier=request.tier,
+            requested_profile=request.requested_profile,
+            effective_profile=effective_profile,
+            scope=scope,
+            phase=request.phase,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            session_mode=session_handle.mode,
+            session_handle=session_handle,
+            capabilities=self.capabilities,
+        )
 
     def _find_claude(self) -> str | None:
         """claude CLI 경로 탐색"""
@@ -189,6 +278,23 @@ class ClaudeCodeProvider:
         phase: str = "cycle",
         reasoning_effort_override: str | None = None,
     ) -> str:
+        request = LLMRequest(
+            tier=self.tier,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            scope=scope,
+            phase=phase,
+            requested_profile=None,
+            reasoning_effort_override=reasoning_effort_override,
+        )
+        plan = self.plan_request(request)
+        return await self.generate_from_plan(request, plan)
+
+    async def generate_from_plan(
+        self,
+        request: LLMRequest,
+        plan: LLMExecutionPlan,
+    ) -> str:
         """claude -p 로 텍스트 생성
 
         세션이 활성화된 경우:
@@ -204,26 +310,27 @@ class ClaudeCodeProvider:
             raise RuntimeError("claude CLI를 찾을 수 없습니다 (PATH 확인)")
 
         # Tier별 effort: TIER1(스캔/분석)=medium, TIER2(최종검토)=high
-        effort = reasoning_effort_override or self._reasoning_effort or "medium"
+        effort = plan.reasoning_effort or "medium"
 
         cmd = [
             claude, "-p",
             "--output-format", "json",
-            "--model", self._model,
+            "--model", plan.model,
             "--max-turns", "1",
         ]
         # Haiku는 extended thinking 미지원이므로 effort 생략
-        if "haiku" not in (self._model or "").lower():
+        if "haiku" not in (plan.model or "").lower():
             cmd.extend(["--effort", effort])
         cmd.append("--dangerously-skip-permissions")
+        self._resolved_model = f"claude-code:{plan.model}"
 
-        actual_prompt = prompt
+        actual_prompt = request.prompt
 
         session_id = None
         session_initialized = False
         state: dict[str, Any] | None = None
-        if scope is not None:
-            state = self.__class__._get_state(scope, phase)
+        if request.scope is not None:
+            state = self.__class__._get_state(request.scope, request.phase)
             session_id = state.get("active_session_id")
             session_initialized = bool(state.get("session_initialized"))
 
@@ -232,22 +339,22 @@ class ClaudeCodeProvider:
                 # 기존 세션 이어감
                 cmd.extend(["--resume", session_id])
                 # resume 시 system_prompt 변경 불가 → 프롬프트 앞에 역할 명시
-                if system_prompt:
-                    actual_prompt = f"[역할]\n{system_prompt}\n\n[요청]\n{prompt}"
+                if request.system_prompt:
+                    actual_prompt = f"[역할]\n{request.system_prompt}\n\n[요청]\n{request.prompt}"
             else:
                 # 첫 호출: 세션 생성
                 cmd.extend(["--session-id", session_id])
-                if system_prompt:
-                    cmd.extend(["--system-prompt", system_prompt])
+                if request.system_prompt:
+                    cmd.extend(["--system-prompt", request.system_prompt])
         else:
             # 세션 없음: 일회성
             cmd.extend(["--no-session-persistence"])
-            if system_prompt:
-                cmd.extend(["--system-prompt", system_prompt])
+            if request.system_prompt:
+                cmd.extend(["--system-prompt", request.system_prompt])
 
         # 세션 사용 시 직렬화 (같은 세션에 동시 resume 방지)
-        if session_id and scope is not None:
-            async with self._get_lock(scope, phase):
+        if session_id and request.scope is not None:
+            async with self._get_lock(request.scope, request.phase):
                 result = await self._execute(cmd, actual_prompt)
                 # 첫 호출 성공 후 세션 초기화 완료 표시
                 if state is not None and not state["session_initialized"]:
