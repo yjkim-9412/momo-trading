@@ -6,6 +6,19 @@ from loguru import logger
 from core.config import settings
 
 
+NOISY_LOGGERS = (
+    "httpcore",
+    "httpx",
+    "hpack",
+    "h11",
+    "websockets",
+    "websockets.client",
+    "websockets.server",
+    "websockets.protocol",
+    "websockets.connection",
+)
+
+
 class InterceptHandler(logging.Handler):
     """표준 logging → loguru 브릿지. uvicorn, SQLAlchemy 등의 로그를 loguru로 통합"""
 
@@ -53,5 +66,5 @@ def setup_logging() -> None:
         logging.getLogger(name).handlers = [InterceptHandler()]
 
     # 노이즈 라이브러리 DEBUG 로그 억제
-    for name in ["httpcore", "httpx", "hpack", "h11"]:
+    for name in NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
